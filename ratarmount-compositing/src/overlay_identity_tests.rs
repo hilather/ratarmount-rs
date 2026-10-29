@@ -135,6 +135,7 @@ fn read_member(src: &dyn MountSource, path: &str) -> Vec<u8> {
 /// failed closed (the interval stays on).
 #[test]
 fn regression_base_swapped_between_commits_refused_by_next_gate() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -173,6 +174,7 @@ fn regression_base_swapped_between_commits_refused_by_next_gate() {
 #[cfg(unix)]
 #[test]
 fn regression_base_replaced_by_symlink_refused() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -204,6 +206,7 @@ fn sha(path: &Path) -> String {
 /// even though the supplied SHA-256 matched. Every gate shares one comparator.
 #[test]
 fn regression_reopen_byte_identical_copy_with_other_mtime_accepted_by_digest() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -250,6 +253,7 @@ fn regression_reopen_byte_identical_copy_with_other_mtime_accepted_by_digest() {
 /// and failed with "unavailable (local archive missing)".
 #[test]
 fn regression_accepted_remote_relocation_drops_local_stamp() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -340,6 +344,7 @@ fn regression_remote_base_without_scheme_creates_without_digest_lookup() {
 /// (kind-only by definition).
 #[test]
 fn regression_swapped_directory_refused_and_none_accepts_a_valid_tar() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -373,6 +378,7 @@ fn regression_swapped_directory_refused_and_none_accepts_a_valid_tar() {
 /// baseline (the refresh after the write).
 #[test]
 fn forced_commit_over_swapped_base_records_new_baseline() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -396,6 +402,7 @@ fn forced_commit_over_swapped_base_records_new_baseline() {
 /// overrides a changed stamp later.
 #[test]
 fn regression_commit_check_ignores_mount_supplied_digest() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -416,6 +423,7 @@ fn regression_commit_check_ignores_mount_supplied_digest() {
 /// compared with D1's stamp rows, not the retained mount digest D0.
 #[test]
 fn regression_two_unchanged_commits_both_pass() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -443,6 +451,7 @@ fn regression_two_unchanged_commits_both_pass() {
 /// rows, not only later ones.
 #[test]
 fn regression_first_commit_after_create_checks_creation_rows() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -466,6 +475,7 @@ fn regression_first_commit_after_create_checks_creation_rows() {
 /// goes through.
 #[test]
 fn regression_commit_check_refusal_does_not_fail_closed_mount() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -494,6 +504,7 @@ fn regression_commit_check_refusal_does_not_fail_closed_mount() {
 /// `base_location` row at the archive that was written (no second open).
 #[test]
 fn regression_commit_refresh_reuses_mount_token() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -524,6 +535,7 @@ fn regression_commit_refresh_reuses_mount_token() {
 /// and the swap check passes for it (the token describes a directory).
 #[test]
 fn regression_commit_refresh_non_archive_token_leaves_base_rows() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -561,6 +573,7 @@ fn regression_commit_refresh_non_archive_token_leaves_base_rows() {
 /// `base_kind` row is refreshed like any other and keeps `format_version=1`.
 #[test]
 fn regression_commit_refresh_repoints_legacy_overlay_with_kind() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -589,6 +602,7 @@ fn regression_commit_refresh_repoints_legacy_overlay_with_kind() {
 /// before the splice; a forced commit goes through.
 #[test]
 fn regression_offline_commit_checks_the_recorded_base() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -619,6 +633,7 @@ fn regression_offline_commit_checks_the_recorded_base() {
 /// says no identity was checked; with a database it refuses.
 #[test]
 fn regression_raw_dir_commit_refuses_when_overlay_db_exists() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let fx = Fixture::new();
     drop(fx.open(BaseDigestRequest::None, false));
     let err = crate::commit_overlay_raw_dir(&fx.overlay, &fx.archive, &Default::default())
@@ -629,6 +644,7 @@ fn regression_raw_dir_commit_refuses_when_overlay_db_exists() {
 
 #[test]
 fn regression_raw_dir_commit_succeeds_and_reports_no_identity_check() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -958,6 +974,7 @@ fn interrupt_append(archive: &Path) {
 /// on-exit paths, every digest kind (`none` is caught by the inode).
 #[test]
 fn regression_foreign_archive_with_own_journal_refused_untouched() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1052,6 +1069,7 @@ const JOURNAL_STEPS: [&str; 15] = [
 #[cfg(unix)]
 #[test]
 fn regression_real_sigkill_at_every_journal_phase_still_recovers() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1094,6 +1112,7 @@ fn regression_real_sigkill_at_every_journal_phase_still_recovers() {
 /// refused: a journal started for the old file never rolls back its successor.
 #[test]
 fn regression_archive_replaced_after_crash_is_refused() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1132,6 +1151,7 @@ fn regression_archive_replaced_after_crash_is_refused() {
 #[cfg(unix)]
 #[test]
 fn regression_retargeted_symlink_refused() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1177,6 +1197,7 @@ fn regression_retargeted_symlink_refused() {
 /// the rows present the same swap is refused (the sibling test above).
 #[test]
 fn regression_missing_stamp_rows_on_a_digest_record_skip_only_the_stamp_check() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1256,6 +1277,7 @@ fn assert_refused_untouched(
 #[cfg(unix)]
 #[test]
 fn regression_none_record_refuses_foreign_journal_with_fresh_token() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1294,6 +1316,7 @@ fn regression_none_record_refuses_foreign_journal_with_fresh_token() {
 #[cfg(unix)]
 #[test]
 fn regression_missing_stamp_rows_still_refuse_foreign_journal() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1325,6 +1348,7 @@ fn regression_missing_stamp_rows_still_refuse_foreign_journal() {
 #[cfg(unix)]
 #[test]
 fn regression_union_commit_target_with_foreign_journal_refused() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1400,6 +1424,7 @@ fn interrupt_complete(archive: &Path) {
 #[cfg(unix)]
 #[test]
 fn regression_union_member_complete_journal_leaves_recorded_stamp() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1456,6 +1481,7 @@ fn regression_union_member_complete_journal_leaves_recorded_stamp() {
 #[cfg(unix)]
 #[test]
 fn regression_roll_forward_marks_base_digest_pending() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1520,6 +1546,7 @@ fn regression_journal_dev_change_is_not_a_refusal() {
 #[cfg(unix)]
 #[test]
 fn regression_corrupt_journal_locator_refuses_commit() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1545,6 +1572,7 @@ fn regression_corrupt_journal_locator_refuses_commit() {
 #[cfg(unix)]
 #[test]
 fn regression_raw_dir_commit_refuses_foreign_journal() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1578,6 +1606,7 @@ fn regression_raw_dir_commit_refuses_foreign_journal() {
 /// the next unforced reopen over the copy is still refused.
 #[test]
 fn regression_forced_reopen_at_other_place_does_not_rebaseline() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1642,6 +1671,7 @@ fn regression_forced_reopen_at_other_place_does_not_rebaseline() {
 /// place's sidecar when one exists, else it is dropped.
 #[test]
 fn regression_accepted_archive_move_repoints_base_index_path() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1728,6 +1758,7 @@ fn stamp_rows(archive: &Path) -> (Option<String>, Option<String>) {
 #[cfg(unix)]
 #[test]
 fn regression_recover_journal_at_restamps_and_the_next_gate_accepts() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1779,6 +1810,7 @@ fn regression_recover_journal_at_restamps_and_the_next_gate_accepts() {
 #[cfg(unix)]
 #[test]
 fn regression_offline_commit_roll_forward_with_empty_plan_restamps() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1808,6 +1840,7 @@ fn regression_offline_commit_roll_forward_with_empty_plan_restamps() {
 #[cfg(unix)]
 #[test]
 fn regression_rows_committed_then_unlink_failed_is_accepted_by_every_gate() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1870,6 +1903,7 @@ fn regression_rows_committed_then_unlink_failed_is_accepted_by_every_gate() {
 #[cfg(unix)]
 #[test]
 fn regression_restamp_writes_the_locked_descriptor_not_the_name() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use ratarmount_compress::commit_journal::RecoverError;
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
@@ -1920,6 +1954,7 @@ fn regression_restamp_writes_the_locked_descriptor_not_the_name() {
 #[cfg(unix)]
 #[test]
 fn regression_locked_authorizer_accepts_union_member_journal() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1967,6 +2002,7 @@ fn regression_locked_authorizer_accepts_union_member_journal() {
 #[cfg(unix)]
 #[test]
 fn regression_symlink_unchanged_complete_recovery_restamps() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -2019,6 +2055,7 @@ fn regression_symlink_unchanged_complete_recovery_restamps() {
 #[cfg(unix)]
 #[test]
 fn regression_symlink_replaced_target_uses_resolved_identity() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use ratarmount_compress::commit_journal::RecoverError;
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
@@ -2062,6 +2099,7 @@ fn regression_symlink_replaced_target_uses_resolved_identity() {
 #[cfg(unix)]
 #[test]
 fn regression_symlink_retargeted_or_replaced_target_is_refused() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -2157,6 +2195,7 @@ fn rename_b_over_a(fx: &Fixture, complete: bool) -> (Vec<u8>, PathBuf, Vec<u8>) 
 #[cfg(unix)]
 #[test]
 fn regression_mount_rename_b_over_a_is_deferred_and_untouched() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -2211,6 +2250,7 @@ fn regression_mount_rename_b_over_a_is_deferred_and_untouched() {
 #[cfg(unix)]
 #[test]
 fn regression_mount_symlinked_overlay_db_defers_recovery() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -2263,6 +2303,7 @@ fn regression_mount_symlinked_overlay_db_defers_recovery() {
 #[cfg(unix)]
 #[test]
 fn regression_mount_directory_at_overlay_db_defers_recovery() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -2325,6 +2366,7 @@ fn regression_mount_directory_at_overlay_db_defers_recovery() {
 #[cfg(unix)]
 #[test]
 fn regression_replacement_error_fallback_leaves_foreign_journal() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -2371,6 +2413,7 @@ fn regression_replacement_error_fallback_leaves_foreign_journal() {
 #[cfg(unix)]
 #[test]
 fn regression_mount_journal_table() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -2476,6 +2519,7 @@ fn regression_mount_journal_table() {
 #[cfg(unix)]
 #[test]
 fn regression_verify_accepts_own_pending_journal() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -2644,6 +2688,7 @@ fn ino(path: &Path) -> u64 {
 #[cfg(unix)]
 #[test]
 fn regression_foreign_journal_at_the_name_is_never_recovered_or_overwritten() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -2725,6 +2770,7 @@ fn recorded_rows_live(ov: &WriteOverlay) -> Vec<Option<String>> {
 #[cfg(unix)]
 #[test]
 fn regression_swapped_archive_before_staging_is_refused() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -2806,6 +2852,7 @@ fn regression_swapped_archive_before_staging_is_refused() {
 #[cfg(unix)]
 #[test]
 fn regression_unpublished_attempt_collision_refuses_copy() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -2868,6 +2915,7 @@ fn regression_unpublished_attempt_collision_refuses_copy() {
 #[cfg(unix)]
 #[test]
 fn regression_failed_attempt_cleanup_holds_the_archive_lock() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -2947,6 +2995,7 @@ fn regression_failed_attempt_cleanup_holds_the_archive_lock() {
 #[cfg(unix)]
 #[test]
 fn regression_committed_hook_failure_after_link_retarget_stays_committed() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -3021,6 +3070,7 @@ fn regression_committed_hook_failure_after_link_retarget_stays_committed() {
 #[cfg(unix)]
 #[test]
 fn regression_committed_hook_failure_after_directory_rename_stays_committed() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -3152,6 +3202,7 @@ fn regression_commit_gate_judges_and_returns_one_snapshot() {
 #[cfg(unix)]
 #[test]
 fn regression_auto_copy_refuses_an_archive_that_changed_since_it_was_staged() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -3253,6 +3304,7 @@ enum AfterGate {
 #[cfg(unix)]
 #[test]
 fn regression_no_copy_over_an_archive_changed_after_the_gate() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -3423,6 +3475,7 @@ struct CopyRow {
 #[cfg(unix)]
 #[test]
 fn regression_copy_paths_compare_the_gate_stamp() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use crate::CommitMode::{Auto, Copy};
     use CopyFmt::*;
     use CopyWindow::*;
@@ -3866,6 +3919,7 @@ fn dangle_db(overlay: &Path) -> PathBuf {
 #[cfg(unix)]
 #[test]
 fn regression_overlay_db_entry_not_a_regular_file() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -4007,6 +4061,7 @@ fn regression_overlay_db_entry_not_a_regular_file() {
 /// refuses.
 #[test]
 fn regression_offline_db_deleted_after_gate_keeps_recorded_owner() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -4087,6 +4142,7 @@ type ArchiveAndJournal = (Vec<u8>, Vec<u8>);
 #[cfg(unix)]
 #[test]
 fn regression_offline_gates_refuse_non_regular_db() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use std::sync::{Arc, Mutex};
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
@@ -4217,6 +4273,7 @@ fn digest_rows(overlay: &Path) -> Vec<Option<String>> {
 #[cfg(unix)]
 #[test]
 fn regression_rollback_with_unrestored_mtime_restamps_and_the_next_commit_accepts() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -4261,6 +4318,7 @@ fn regression_rollback_with_unrestored_mtime_restamps_and_the_next_commit_accept
 #[cfg(unix)]
 #[test]
 fn regression_recovery_rollback_with_unrestored_mtime_restamps_and_reopen_accepts() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -4300,6 +4358,7 @@ fn regression_recovery_rollback_with_unrestored_mtime_restamps_and_reopen_accept
 #[cfg(unix)]
 #[test]
 fn regression_rows_rolled_back_then_unlink_failed_is_accepted_by_every_gate() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -4457,6 +4516,7 @@ fn regression_equal_stamp_roll_forward_invalidates_the_strong_digest() {
 #[cfg(unix)]
 #[test]
 fn regression_forced_rollback_over_a_swapped_base_keeps_the_record() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -4579,6 +4639,7 @@ fn regression_commit_restamp_after_rollback_moves_only_a_started_unrestored_stam
 #[cfg(unix)]
 #[test]
 fn regression_union_member_journal_is_never_adopted_from_matching_stamps() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -4649,6 +4710,7 @@ fn regression_union_member_journal_is_never_adopted_from_matching_stamps() {
 #[cfg(unix)]
 #[test]
 fn regression_journal_target_compares_device_and_inode() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use std::os::unix::fs::MetadataExt;
     let fx = Fixture::new();
     drop(fx.open(strong_digest(), false));
@@ -4695,6 +4757,7 @@ fn regression_journal_target_compares_device_and_inode() {
 #[cfg(unix)]
 #[test]
 fn regression_moved_base_complete_journal_is_recovered_through_its_new_name_and_defers() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -5146,6 +5209,7 @@ fn regression_stale_prepare_locator_unresolved_target_is_kept() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_t13a_unresolved_target_refuses_before_rollback_truncate() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use ratarmount_compress::commit_journal::RecoverError;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -5441,6 +5505,7 @@ fn replace_db_without_files(overlay: &Path) {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_marked_record_without_files_table_refuses_before_recovery() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use ratarmount_compress::commit_journal::RecoverError;
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
@@ -5530,6 +5595,7 @@ fn regression_marked_record_without_files_table_refuses_before_recovery() {
 #[cfg(unix)]
 #[test]
 fn regression_rows_guard_refuses_a_record_removed_after_it_was_seen() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use ratarmount_compress::commit_journal::RecoverError;
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
@@ -5594,6 +5660,7 @@ fn lose_db(overlay: &Path, shape: &str) {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_mount_lost_overlay_db_defers_recovery() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use ratarmount_compress::commit_journal::RecoverError;
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
@@ -5693,6 +5760,7 @@ fn regression_mount_lost_overlay_db_defers_recovery() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_lost_record_refuses_before_recovery() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use ratarmount_compress::commit_journal::RecoverError;
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
@@ -5782,6 +5850,7 @@ fn regression_lost_record_refuses_before_recovery() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_lost_record_beside_complete_journal_is_refused_not_committed() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use ratarmount_compress::commit_journal::RecoverError;
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
@@ -5862,6 +5931,7 @@ fn link_db(db: &Path, dir: &Path, name: &str) -> PathBuf {
 #[cfg(unix)]
 #[test]
 fn regression_payload_db_alias_preserves_process_locks() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let fx = Fixture::new();
     let ov = fx.open(BaseDigestRequest::Compute, false);
     let db = fx.overlay.join(HIDDEN_DB);
@@ -5905,6 +5975,7 @@ fn regression_payload_db_alias_preserves_process_locks() {
 #[cfg(unix)]
 #[test]
 fn regression_payload_db_alias_write_never_truncates() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let fx = Fixture::new();
     let ov = fx.open(BaseDigestRequest::Compute, false);
     let db = fx.overlay.join(HIDDEN_DB);
@@ -5934,6 +6005,7 @@ fn regression_payload_db_alias_write_never_truncates() {
 #[cfg(unix)]
 #[test]
 fn regression_payload_alias_other_overlay() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let a = Fixture::new();
     let b = Fixture::new();
     let ov_a = a.open(BaseDigestRequest::Compute, false);
@@ -5967,6 +6039,7 @@ fn regression_payload_alias_other_overlay() {
 #[cfg(unix)]
 #[test]
 fn regression_journal_reads_refuse_a_db_alias() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let fx = Fixture::new();
     let ov = fx.open(BaseDigestRequest::Compute, false);
     let db = fx.overlay.join(HIDDEN_DB);
@@ -5996,6 +6069,7 @@ fn regression_journal_reads_refuse_a_db_alias() {
 #[cfg(unix)]
 #[test]
 fn regression_manifest_read_refuses_a_db_alias() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let a = Fixture::new();
     let b = Fixture::new();
     drop(a.open(BaseDigestRequest::Compute, false));
@@ -6158,6 +6232,7 @@ fn regression_required_record_read_is_one_snapshot() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_mount_symlinked_db_stale_prepare_names_next_step() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -6596,6 +6671,7 @@ fn regression_offline_commit_cleanup_refuses_symlink_swaps() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_offline_commit_refuses_symlink_swaps() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use ratarmount_compress::commit_journal::fault;
     let gnu_tar_available = have_gnu_tar();
     let mut failures = Vec::new();
@@ -7206,6 +7282,7 @@ fn offline_commit_with_recovery_seams(
 ))]
 #[test]
 fn regression_offline_gate_refuses_swap_inside_sqlite_open() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use ratarmount_index::checked_open::test_seams::{Seam, Seams};
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
@@ -7303,6 +7380,7 @@ fn mutate_record_and_markers(overlay: &Path, db: &Path, row: &str) {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_required_record_after_acquisition_keeps_journal() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -7389,6 +7467,7 @@ fn regression_required_record_after_acquisition_keeps_journal() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_required_marker_observation_is_monotonic() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;

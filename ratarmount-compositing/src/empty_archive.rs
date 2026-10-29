@@ -260,6 +260,7 @@ mod tests {
     /// `t.tar` staged its temp file in `$TMPDIR` (EXDEV on `persist`).
     #[test]
     fn regression_134_initialize_empty_archive_bare_name_stages_beside_dest() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         if std::env::var_os("RATARMOUNT_BARE_NAME_CHILD").is_some() {
             let out = maybe_create_empty_write_archive(Path::new("t.tar"))
                 .unwrap_or_else(|e| panic!("init bare t.tar: {e}"));
@@ -575,6 +576,7 @@ mod tests {
 
     #[test]
     fn gnu_tar_append_smoke_on_1024_zero_file() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         let Some(tar_bin) = find_gnu_tar() else {
             eprintln!("skip: GNU tar missing");
             return;

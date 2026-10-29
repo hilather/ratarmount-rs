@@ -309,6 +309,8 @@ fn regression_cleanup_failure_keeps_attempt_data() {
 /// Regression: restart removes stale attempts only after unmount, retains bases, and excludes another daemon.
 #[test]
 fn regression_restart_reconciles_stale_mounts_and_locks_state() {
+    // Regression: a parallel child can retain daemon.lock until exec/exit (#242).
+    let _processes = ratarmount_index::test_process::exclusive();
     let (root, mut supervisor, fake) = setup(8);
     supervisor.handle(new(2)).unwrap();
     assert!(Supervisor::open(root.path(), 8, Duration::from_secs(1), fake.clone()).is_err());
@@ -335,6 +337,7 @@ fn regression_restart_reconciles_stale_mounts_and_locks_state() {
 /// Regression: a stale mount cleanup error must stop restart without deleting its backing files.
 #[test]
 fn regression_restart_failed_unmount_preserves_state() {
+    let _processes = ratarmount_index::test_process::exclusive();
     let (root, mut supervisor, fake) = setup(8);
     supervisor.handle(new(1)).unwrap();
     let path = supervisor
@@ -354,6 +357,7 @@ fn regression_restart_failed_unmount_preserves_state() {
 /// Regression: socket symlinks, foreign ownership and regular files are never replaced; sockets are 0600.
 #[test]
 fn regression_socket_permissions_and_unsafe_paths() {
+    let _processes = ratarmount_index::test_process::spawning();
     // Socket creation briefly changes umask before the daemon starts threads.
     // Run that startup code in its own process, away from parallel unit tests.
     if std::env::var_os("RATARMOUNT_SANDBOX_SOCKET_TEST").is_none() {
@@ -657,6 +661,7 @@ fn regression_live_diff_and_stats_do_not_reopen_locked_database() {
 #[cfg(target_os = "linux")]
 #[test]
 fn regression_tmpfs_overlay_path_and_restart_cleanup() {
+    let _processes = ratarmount_index::test_process::exclusive();
     use sha2::{Digest, Sha256};
     let root = private_tempdir();
     let ram_parent = private_tempdir();
@@ -812,6 +817,7 @@ fn regression_prepared_index_sandbox_worker_argv() {
 /// Regression: a registered base is prepared once across worker batches and reloads.
 #[test]
 fn regression_prepared_index_sandbox_prepares_once_across_batches() {
+    let _processes = ratarmount_index::test_process::exclusive();
     let (root, mut supervisor, fake) = setup(8);
     assert_eq!(fake.0.lock().unwrap().prepares, 1);
     for _ in 0..2 {

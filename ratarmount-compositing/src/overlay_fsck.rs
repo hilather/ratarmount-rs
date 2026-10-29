@@ -739,6 +739,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn regression_fsck_reports_incomplete_import() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         let (tmp, dir, source) = fixture();
         let ready = tmp.path().join("ready");
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())

@@ -832,6 +832,7 @@ fn regression_mount_union_member_journal_waits_for_the_gate() {
 #[cfg(unix)]
 #[test]
 fn regression_offline_commit_dangling_db_symlink_leaves_b_untouched() {
+    let _spawning = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -887,6 +888,7 @@ fn regression_offline_commit_dangling_db_symlink_leaves_b_untouched() {
 #[cfg(unix)]
 #[test]
 fn regression_offline_commit_lost_or_unresolved_db_leaves_b_untouched() {
+    let _spawning = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -991,6 +993,7 @@ fn regression_commit_overlay_refuses_sealed_overlay() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_239_sealed_pending_journal_force_cli_preserves_bytes() {
+    let _spawning = ratarmount_index::test_process::spawning();
     for complete in [false, true] {
         for offline in [false, true] {
             let env = Env::new();
@@ -1231,6 +1234,7 @@ fn offline_symlink_cases(suffix: &str) {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_offline_commit_refuses_symlinked_db() {
+    let _spawning = ratarmount_index::test_process::spawning();
     offline_symlink_cases("");
 }
 
@@ -1238,6 +1242,7 @@ fn regression_offline_commit_refuses_symlinked_db() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_offline_commit_refuses_symlinked_wal() {
+    let _spawning = ratarmount_index::test_process::spawning();
     offline_symlink_cases("-wal");
 }
 
@@ -1245,6 +1250,7 @@ fn regression_offline_commit_refuses_symlinked_wal() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_offline_commit_refuses_symlinked_journal() {
+    let _spawning = ratarmount_index::test_process::spawning();
     offline_symlink_cases("-journal");
 }
 
@@ -1252,6 +1258,7 @@ fn regression_offline_commit_refuses_symlinked_journal() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_offline_commit_refuses_symlinked_shm() {
+    let _spawning = ratarmount_index::test_process::spawning();
     offline_symlink_cases("-shm");
 }
 
@@ -1260,6 +1267,7 @@ fn regression_offline_commit_refuses_symlinked_shm() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_offline_no_mount_refuses_symlinked_overlay_state() {
+    let _spawning = ratarmount_index::test_process::spawning();
     for suffix in ["", "-wal", "-journal", "-shm"] {
         for journal in ["none", "prepare", "torn", "complete", "missing", "prepared"] {
             for lower in [false, true] {
@@ -1325,6 +1333,7 @@ fn regression_offline_no_mount_refuses_symlinked_overlay_state() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_offline_commit_regular_and_raw_controls() {
+    let _spawning = ratarmount_index::test_process::spawning();
     for raw in [false, true] {
         let (env, archive, overlay) = symlink_policy_fixture();
         let overlay = if raw {
@@ -2015,6 +2024,7 @@ fn regression_240_seal_blocks_cli_archive_initialization() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_239_240_sealed_symlink_policy_precedes_base_creation() {
+    let _spawning = ratarmount_index::test_process::spawning();
     use std::os::unix::fs::PermissionsExt;
 
     for suffix in ["", "-wal"] {

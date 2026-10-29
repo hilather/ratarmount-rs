@@ -418,6 +418,7 @@ mod tests {
     /// Regression: a hung helper must be killed and reaped when its deadline expires.
     #[test]
     fn regression_subprocess_deadline_reaps_child() {
+        let _processes = ratarmount_index::test_process::spawning();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",

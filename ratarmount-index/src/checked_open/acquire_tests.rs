@@ -837,6 +837,7 @@ fn regression_checked_open_invalid_request_reports_companion_symlink() {
 /// database: POSIX would release this process's locks on the target inode.
 #[test]
 fn regression_checked_open_refuse_symlink_keeps_target_locks() {
+    let _spawning = crate::test_process::spawning();
     let (_tmp, dir) = tempdir();
     let db = dir.join("overlay.sqlite");
     make_db(&db, 1);

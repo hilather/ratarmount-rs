@@ -2202,6 +2202,7 @@ fn regression_mount_in_base_no_mount_from_deleted_cwd_has_no_cwd_error() {
 /// inspection error before publishing, even when it would not open the overlay.
 #[test]
 fn regression_mount_in_base_publish_only_refuses_uninspectable_overlay_state() {
+    let _spawning = ratarmount_index::test_process::spawning();
     let mut env = Env::new();
     write_tiny_tar(&env.root.join("x.tar"));
     let archive_before = fs::read(env.root.join("x.tar")).unwrap();

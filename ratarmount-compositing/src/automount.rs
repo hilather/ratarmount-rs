@@ -1621,6 +1621,7 @@ mod tests {
 
     #[test]
     fn automount_nested_tar_via_reader_no_tmp() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         use ratarmount_core::OpenOptions;
         use ratarmount_formats_tar::SqliteIndexedTar;
         use std::process::Command;
@@ -1803,6 +1804,7 @@ mod tests {
 
     #[test]
     fn automount_split_with_real_tar_payload() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         use ratarmount_core::OpenOptions;
         use ratarmount_formats_tar::SqliteIndexedTar;
         use std::process::Command;
@@ -2054,6 +2056,7 @@ mod tests {
     /// Nested content under parallel-mounted archives is still reachable.
     #[test]
     fn parallel_eager_recurses_into_mounted_archives() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         use ratarmount_core::OpenOptions;
         use ratarmount_formats_tar::SqliteIndexedTar;
         use std::process::Command;

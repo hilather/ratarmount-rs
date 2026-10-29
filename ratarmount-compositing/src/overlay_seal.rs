@@ -999,6 +999,7 @@ mod tests {
     /// from metadata read before acquiring the overlay operation lock.
     #[test]
     fn regression_240_queued_public_seal_rechecks_unsealed_metadata() {
+        let _process_guard = ratarmount_index::test_process::exclusive();
         let f = Fixture::new();
         let base =
             crate::ClassifiedBase::for_tests(f.base.clone(), crate::ServedKind::Folder, None);
@@ -1059,6 +1060,7 @@ mod tests {
     /// the cleared seal without restoring the root's stale sealed mode.
     #[test]
     fn regression_240_queued_reseal_preserves_unsealed_root_mode() {
+        let _process_guard = ratarmount_index::test_process::exclusive();
         use std::process::{Child, Command};
         use std::time::{Duration, Instant};
 
@@ -1144,6 +1146,7 @@ mod tests {
     /// setgid or writable root modes, and never creates a coordination file.
     #[test]
     fn regression_240_directory_lock_preserves_root_modes() {
+        let _process_guard = ratarmount_index::test_process::exclusive();
         for mode in [0o500, 0o550, 0o2550, 0o700] {
             for stale_lock in [false, true] {
                 let f = Fixture::new();
@@ -1875,6 +1878,7 @@ mod tests {
     /// database: another process could then write under a holder's read.
     #[test]
     fn regression_reseal_keeps_shared_db_lock() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         let f = Fixture::new();
         seal(&f.dir, f.base.clone()).unwrap();
         let holder = shared_holder(&f.dir);
@@ -1897,6 +1901,7 @@ mod tests {
     /// read lock and would hide the bug from a probe made afterwards.
     #[test]
     fn regression_unseal_failure_keeps_shared_db_lock() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         let f = Fixture::new();
         seal(&f.dir, f.base.clone()).unwrap();
         let before = rows_and_modes(&f.dir);

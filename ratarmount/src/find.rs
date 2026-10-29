@@ -624,6 +624,7 @@ mod tests {
     /// Regression: `find '*.fits'` without FUSE returns every matching basename as TSV.
     #[test]
     fn find_glob() {
+        let _processes = ratarmount_index::test_process::spawning();
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("a.tar");
         write_fits_tar(&archive);
@@ -709,6 +710,7 @@ mod tests {
     /// Regression: find `--offset-order` TSV follows `offsetheader` (CLI path).
     #[test]
     fn find_offset_order() {
+        let _processes = ratarmount_index::test_process::spawning();
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("za.tar");
         write_za_tar(&archive);

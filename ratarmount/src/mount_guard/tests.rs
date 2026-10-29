@@ -1917,6 +1917,7 @@ fn regression_mount_in_base_realfs_end_to_end_refusal() {
 #[cfg(target_os = "linux")]
 #[test]
 fn regression_mount_in_base_bind_alias_verdicts_in_user_namespace() {
+    let _processes = ratarmount_index::test_process::spawning();
     let ok = std::process::Command::new("unshare")
         .args(["-Urm", "true"])
         .status()

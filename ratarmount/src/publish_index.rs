@@ -553,6 +553,8 @@ pub(crate) mod tests {
         assert!(err.contains("--no-recreate-index"), "{err}");
         assert_eq!(fs::read(&dest).unwrap(), b"old");
     }
+    // Acquire before test_process guards: a queued exclusive writer can block
+    // readers while a publication holding this mutex requests a lock probe.
     static PUBLISH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
     pub(crate) struct PublishEnv {
         saved: Vec<(String, Option<std::ffi::OsString>)>,

@@ -211,18 +211,21 @@ fn late_companion_cli_child() {
 /// Regression: #239 a late journal symlink must stay typed and exit 1 without force advice.
 #[test]
 fn regression_after_low_fd_fill_journal_symlink_recovery_exits_one() {
+    let _spawning = ratarmount_index::test_process::spawning();
     late_companion_recovery("-journal");
 }
 
 /// Regression: #239 a late WAL symlink on a WAL-mode DB must preserve policy and all bytes.
 #[test]
 fn regression_after_low_fd_fill_wal_symlink_recovery_exits_one() {
+    let _spawning = ratarmount_index::test_process::spawning();
     late_companion_recovery("-wal");
 }
 
 /// Regression: #239 a late SHM symlink on a WAL-mode DB must preserve policy and all bytes.
 #[test]
 fn regression_after_low_fd_fill_shm_symlink_recovery_exits_one() {
+    let _spawning = ratarmount_index::test_process::spawning();
     late_companion_recovery("-shm");
 }
 

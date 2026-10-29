@@ -192,6 +192,7 @@ fn materialize(entries: &BTreeMap<String, SnapshotEntry>, root: &Path) {
 /// Regression: Git must apply binary, symlink, empty-file, mode, type and rename patches exactly.
 #[test]
 fn regression_diff_git_apply_matches_overlay_view() {
+    let _processes = ratarmount_index::test_process::spawning();
     if Command::new("git").arg("--version").output().is_err() {
         eprintln!("skip: git is unavailable");
         return;
@@ -534,6 +535,7 @@ fn regression_diff_git_ignores_unrepresentable_permissions() {
 }
 
 fn git_roundtrip_case(case: &str) {
+    let _processes = ratarmount_index::test_process::spawning();
     let tmp = tempfile::tempdir().unwrap();
     let baseline: &[(&str, &[u8], u32)] = match case {
         "added" | "empty_dir" | "nested" => &[],
@@ -861,6 +863,7 @@ fn regression_diff_hash_json_base_digest_state_present_and_none() {
 /// Regression: --between rejects different stacks, gives the empty constant for identical trees, and applies A→B.
 #[test]
 fn regression_diff_between_stack_checks_and_apply() {
+    let _processes = ratarmount_index::test_process::spawning();
     let (tmp, mut args) = command_fixture();
     let base: Arc<dyn MountSource> = Arc::new(
         ratarmount_compositing::FolderMountSource::new(args.base_source.as_ref().unwrap()).unwrap(),

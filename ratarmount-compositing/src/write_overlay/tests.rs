@@ -37,6 +37,7 @@ fn regression_240_overlay_lock_held(root: &Path) -> bool {
 #[cfg(unix)]
 #[test]
 fn regression_240_live_commit_holds_overlay_lock_through_publication() {
+    let _process_guard = ratarmount_index::test_process::exclusive();
     use ratarmount_compress::commit_journal::fault;
 
     for live in [false, true] {
@@ -80,6 +81,7 @@ fn regression_240_live_commit_holds_overlay_lock_through_publication() {
 #[cfg(unix)]
 #[test]
 fn regression_240_live_entries_recheck_seal_under_overlay_lock() {
+    let _process_guard = ratarmount_index::test_process::exclusive();
     for entry in [
         "atomic",
         "live",
@@ -141,6 +143,7 @@ fn regression_240_live_entries_recheck_seal_under_overlay_lock() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_239_recovery_entries_guard_pending_journal() {
+    let _process_guard = ratarmount_index::test_process::exclusive();
     use ratarmount_compress::commit_journal::{self, fault};
 
     for with_records in [false, true] {
@@ -364,6 +367,7 @@ fn regression_rename_retry_releases_policy_gate() {
 /// Regression: post-persist read_dir failure disables further commits rather than duplicating members.
 #[test]
 fn regression_commit_cleanup_read_dir_failure_disables_interval() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("a.tar.zst");
     write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", b"seed")]);
@@ -570,6 +574,7 @@ fn name_has_cow_prefix(name: &str) -> bool {
 /// committed (#126).
 #[test]
 fn regression_cow_crash_mid_copy_hides_partial_and_skips_commit() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let original = b"abcdef";
     let dir = tempfile::tempdir().unwrap();
     let overlay = dir.path().join("ov");
@@ -1435,6 +1440,7 @@ fn commit_baseline_case(
 /// Regression: offline TAR commits left the overlay bound to the old archive bytes.
 #[test]
 fn regression_commit_overlay_tar_refreshes_baseline() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     for mode in [CommitMode::Copy, CommitMode::Append] {
         commit_baseline_case("tar", mode, false, false, false);
     }
@@ -1444,6 +1450,7 @@ fn regression_commit_overlay_tar_refreshes_baseline() {
 /// Regression: zstd splice and append commits caused a mismatch on remount.
 #[test]
 fn regression_commit_overlay_tar_zst_refreshes_baseline() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     for mode in [CommitMode::Copy, CommitMode::Append] {
         commit_baseline_case("tar.zst", mode, false, false, false);
     }
@@ -1452,12 +1459,14 @@ fn regression_commit_overlay_tar_zst_refreshes_baseline() {
 /// Regression: rebuilding ZIP left its recorded digest and size stale.
 #[test]
 fn regression_commit_overlay_zip_refreshes_baseline() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     commit_baseline_case("zip", CommitMode::Copy, false, false, false);
 }
 
 /// Regression: interval and on-exit commits required force-base-mismatch afterward.
 #[test]
 fn regression_live_commit_refreshes_baseline() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     for extension in ["tar", "tar.zst"] {
         for mode in [CommitMode::Copy, CommitMode::Append] {
             commit_baseline_case(extension, mode, true, false, false);
@@ -1565,24 +1574,28 @@ mod archive_metadata_regressions {
     /// Regression: offline copy commits replaced 0644/0640 TAR and zstd archives with 0600 files.
     #[test]
     fn regression_235_archive_offline_copy_modes() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         ordinary_copy("offline");
     }
 
     /// Regression: live idle copy publication discarded the TAR/zstd archive's mode.
     #[test]
     fn regression_235_archive_live_idle_copy_modes() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         ordinary_copy("idle");
     }
 
     /// Regression: atomic copy publication discarded the TAR/zstd archive's mode.
     #[test]
     fn regression_235_archive_atomic_copy_modes() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         ordinary_copy("atomic");
     }
 
     /// Regression: provenance direct TAR copy publication discarded the archive's mode.
     #[test]
     fn regression_235_archive_provenance_copy_modes() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         for mode in [0o644, 0o640] {
             let dir = tempfile::tempdir().unwrap();
             let archive = dir.path().join("base.tar");
@@ -1616,6 +1629,7 @@ mod archive_metadata_regressions {
     /// Regression: provenance Auto's ENOSPC rollback/copy fallback published a 0600 TAR.
     #[test]
     fn regression_235_archive_provenance_auto_rollback_modes() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         for mode in [0o644, 0o640] {
             let dir = tempfile::tempdir().unwrap();
             let archive = dir.path().join("base.tar");
@@ -1669,6 +1683,7 @@ mod archive_metadata_regressions {
     /// Regression: ZIP rebuilding replaced the archive's 0644/0640 mode with 0600.
     #[test]
     fn regression_235_archive_zip_copy_modes() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         for mode in [0o644, 0o640] {
             let dir = tempfile::tempdir().unwrap();
             let archive = dir.path().join("base.zip");
@@ -1822,12 +1837,14 @@ mod archive_metadata_regressions {
     /// Regression: an oversized zstd append copy discarded the original archive's metadata.
     #[test]
     fn regression_235_archive_oversized_append_copy_modes() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         oversized_commit(false);
     }
 
     /// Regression: oversized zstd fchmod errors must abort rather than permit Auto copy fallback.
     #[test]
     fn regression_235_archive_oversized_append_mode_failure_no_fallback() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         oversized_commit(true);
     }
 }
@@ -1869,6 +1886,7 @@ fn in_bare_name_child() -> bool {
 #[cfg(unix)]
 #[test]
 fn regression_134_recompress_replace_bare_name_stages_beside_dest() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if in_bare_name_child() {
         let plain = PathBuf::from(std::env::var_os("RM134_PLAIN").unwrap());
         for (dest, fmt) in [
@@ -1908,6 +1926,7 @@ fn regression_134_recompress_replace_bare_name_stages_beside_dest() {
 #[cfg(unix)]
 #[test]
 fn regression_134_commit_overlay_zip_bare_name_stages_beside_dest() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     if in_bare_name_child() {
         let overlay = PathBuf::from(std::env::var_os("RM134_OVERLAY").unwrap());
         let opts = CommitOverlayOptions {
@@ -1950,6 +1969,7 @@ fn regression_134_commit_overlay_zip_bare_name_stages_beside_dest() {
 /// Symptom: commit-overlay rejected non-TAR archives (upstream #154).
 #[test]
 fn commit_overlay_zip_add_file() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let zip_path = dir.path().join("a.zip");
     write_sample_zip(
@@ -2032,6 +2052,7 @@ fn commit_overlay_zip_add_file() {
 /// Regression: ZIP commit replaces existing member and honors DB delete.
 #[test]
 fn commit_overlay_zip_replace_and_delete() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let zip_path = dir.path().join("b.zip");
     write_sample_zip(
@@ -2114,6 +2135,7 @@ fn is_zip_archive_detects_pk_magic() {
 
 #[test]
 fn commit_overlay_add_file() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("data");
     fs::create_dir_all(&src).unwrap();
@@ -2165,6 +2187,7 @@ fn commit_overlay_add_file() {
 
 #[test]
 fn commit_overlay_add_file_tar_gz() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("data");
     fs::create_dir_all(&src).unwrap();
@@ -2247,6 +2270,7 @@ fn commit_overlay_add_file_tar_gz() {
 /// Regression: offline append must not bless a stale prefix index with fresh tarstats.
 #[test]
 fn commit_overlay_append_invalidates_stale_sidecar() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     for zstd in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join(if zstd { "a.tar.zst" } else { "a.tar" });
@@ -2299,6 +2323,7 @@ fn commit_overlay_append_invalidates_stale_sidecar() {
 /// Regression: successful append followed by reopen failure must refuse stale reads.
 #[test]
 fn live_commit_append_reopen_failure_refuses_base_reads() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     for zstd in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join(if zstd { "a.tar.zst" } else { "a.tar" });
@@ -2329,6 +2354,7 @@ fn live_commit_append_reopen_failure_refuses_base_reads() {
 #[cfg(unix)]
 #[test]
 fn regression_provenance_append_committed_refuses_stale_frame_map() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("a.tar.zst");
     append_fixture(&archive, true);
@@ -2388,6 +2414,7 @@ fn live_commit_append_failure_recovers_before_next_tick() {
 #[cfg(unix)]
 #[test]
 fn live_commit_append_recovery_failure_refuses_base_reads() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("a.tar");
     append_fixture(&archive, false);
@@ -2431,6 +2458,7 @@ fn live_commit_append_recovery_failure_refuses_base_reads() {
 #[cfg(unix)]
 #[test]
 fn live_commit_append_stale_preparation_retries_without_a_copy() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use std::os::unix::fs::MetadataExt;
     for mode in [CommitMode::Append, CommitMode::Auto] {
         let dir = tempfile::tempdir().unwrap();
@@ -2460,6 +2488,7 @@ fn live_commit_append_stale_preparation_retries_without_a_copy() {
 /// Regression: trailing garbage rejected during append preparation must not disable ticks.
 #[test]
 fn live_commit_append_checksum_error_keeps_interval_enabled() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("a.tar");
     append_fixture(&archive, false);
@@ -2571,6 +2600,7 @@ fn append_warm_open(path: &Path, zstd: bool, sidecar: &Path) -> Arc<dyn MountSou
 /// Regression: adds-only interval commits copied the entire archive and inode.
 #[test]
 fn live_commit_append_inode_space_sidecar_and_copy_content() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use std::os::unix::fs::MetadataExt;
     if let Err(e) = ensure_gnu_tar() {
         eprintln!("skip: {e}");
@@ -2666,6 +2696,7 @@ fn live_commit_append_inode_space_sidecar_and_copy_content() {
 /// Regression: uncompressed append must work without GNU tar and keep zero-tail bytes.
 #[test]
 fn commit_overlay_append_uncompressed_zero_tail_without_tools() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use std::os::unix::fs::MetadataExt;
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("a.tar");
@@ -2694,6 +2725,7 @@ fn commit_overlay_append_uncompressed_zero_tail_without_tools() {
 /// Regression: auto must not mutate another hard link, or append replacements.
 #[test]
 fn commit_overlay_append_auto_hardlink_and_replacement_fallback() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use std::os::unix::fs::MetadataExt;
     for hardlink in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -2736,6 +2768,7 @@ fn commit_overlay_append_auto_hardlink_and_replacement_fallback() {
 /// Regression: auto should append eligible seekable files, but never a table-less zstd.
 #[test]
 fn commit_overlay_append_auto_requires_seek_table() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use std::os::unix::fs::MetadataExt;
     for seek_table in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -2773,6 +2806,7 @@ fn commit_overlay_append_auto_requires_seek_table() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_240_empty_tar_offset_zero_crash_recovers() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use ratarmount_compress::commit_journal::{fault, journal_path, recover};
 
     for empty_len in [1024, 10240] {
@@ -2998,6 +3032,7 @@ fn padded_ustar_span(payload_len: usize) -> usize {
 /// without rewriting prefix frames.
 #[test]
 fn commit_overlay_tar_zst_multi_frame_append() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("off-mf-prefix");
     let last = generated_payload("off-mf-last");
@@ -3034,6 +3069,7 @@ fn commit_overlay_tar_zst_multi_frame_append() {
 /// Regression: offline --commit-overlay last-window replace keeps one name.
 #[test]
 fn commit_overlay_tar_zst_last_window_replace() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("off-rw-prefix");
     let old = generated_payload("off-rw-old");
@@ -3064,6 +3100,7 @@ fn commit_overlay_tar_zst_last_window_replace() {
 /// Regression: prefix-frame delete via offline --commit-overlay.
 #[test]
 fn commit_overlay_tar_zst_earlier_frame_delete() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let keep = generated_payload("off-ef-keep");
     let old = generated_payload("off-ef-old");
@@ -3108,6 +3145,7 @@ fn commit_overlay_tar_zst_earlier_frame_delete() {
 /// `commit_overlay_tar_zst_earlier_frame_delete`.
 #[test]
 fn commit_overlay_tar_zst_header_straddle_delete() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let keep = generated_payload("off-hs-keep");
     let big = generated_payload("off-hs-big").repeat(200);
@@ -3168,6 +3206,7 @@ fn commit_overlay_tar_zst_header_straddle_delete() {
 /// even when the caller omits `--ignore-zeros` (default offline CLI).
 #[test]
 fn commit_overlay_tar_zst_concatenated_delete_without_ignore_zeros() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("off-i0-prefix");
     let last = generated_payload("off-i0-last");
@@ -3213,6 +3252,7 @@ fn commit_overlay_tar_zst_concatenated_delete_without_ignore_zeros() {
 /// only for the mount that created the tombstone, not for offline classification.
 #[test]
 fn commit_overlay_tar_zst_concatenated_delete_ignore_zeros() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("off-i-prefix");
     let last = generated_payload("off-i-last");
@@ -3265,6 +3305,7 @@ fn commit_overlay_tar_zst_concatenated_delete_ignore_zeros() {
 /// warm remount.
 #[test]
 fn live_commit_tar_zst_single_frame_concatenated_patches_sidecar_after_interior_eof() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let first = generated_payload("live-1f-first");
     let second = generated_payload("live-1f-second");
@@ -3414,6 +3455,7 @@ fn patch_sidecar_uncompressed_concatenated_keeps_later_members() {
 /// frames when patching a sibling sidecar (not stop at the first TAR EOF).
 #[test]
 fn commit_overlay_tar_zst_concatenated_delete_patches_sidecar_later_frame() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("off-i0-sc-prefix");
     let mid = generated_payload("off-i0-sc-mid");
@@ -3492,6 +3534,7 @@ fn commit_overlay_tar_zst_concatenated_delete_patches_sidecar_later_frame() {
 /// Regression: offline --commit-overlay must not create a sibling *.index.sqlite.
 #[test]
 fn commit_overlay_tar_zst_no_durable_index() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("off-idx-seed");
     let extra = generated_payload("off-idx-new");
@@ -3524,6 +3567,7 @@ fn commit_overlay_tar_zst_no_durable_index() {
 /// (does not create one when missing).
 #[test]
 fn commit_overlay_tar_zst_patches_existing_sidecar() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("off-patch-prefix");
     let last = generated_payload("off-patch-last");
@@ -3597,6 +3641,7 @@ fn commit_overlay_tar_zst_patches_existing_sidecar() {
 
 #[test]
 fn commit_overlay_tar_zst_single_frame_fallback() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("off-sf-seed");
     let extra = generated_payload("off-sf-new");
@@ -3613,6 +3658,7 @@ fn commit_overlay_tar_zst_single_frame_fallback() {
 
 #[test]
 fn commit_overlay_tar_zst_seek_table_rewrite() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("off-st-prefix");
     let last = generated_payload("off-st-last");
@@ -3648,6 +3694,7 @@ fn commit_overlay_tar_zst_seek_table_rewrite() {
 
 #[test]
 fn commit_overlay_tar_zst_empty() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("off-empty");
     let archive = dir.path().join("a.tar.zst");
@@ -3662,6 +3709,7 @@ fn commit_overlay_tar_zst_empty() {
 
 #[test]
 fn commit_overlay_plain_zst_rejected() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("plain.zst");
     let zst = ratarmount_compress::encode_zstd_frame(b"not-a-tar-body", 3).unwrap();
@@ -4366,6 +4414,7 @@ fn overlay_open_accepts_new_empty_and_zero_byte() {
 /// still reads and writes.
 #[test]
 fn regression_failed_open_cleanup_keeps_empty_db_holders_lock() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let overlay = dir.path().canonicalize().unwrap().join("zero");
     fs::create_dir(&overlay).unwrap();
@@ -5446,6 +5495,7 @@ fn rename_keeps_destination_when_source_cow_fails() {
 
 #[test]
 fn live_commit_uncompressed_tar_add_replace_delete_no_duplicate() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let old_payload = dir.path().join("old-expected.bin");
     fs::write(&old_payload, b"old-body\n").unwrap();
@@ -5558,6 +5608,7 @@ fn live_commit_uncompressed_tar_add_replace_delete_no_duplicate() {
 /// `first.txt` from `cat a.tar b.tar`).
 #[test]
 fn live_commit_uncompressed_tar_concatenated_delete_keeps_later_archive() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let first = generated_payload("live-tar-first");
     let second = generated_payload("live-tar-second");
@@ -5596,6 +5647,7 @@ fn live_commit_uncompressed_tar_concatenated_delete_keeps_later_archive() {
 /// concatenated archives (and later-frame deletes were "Not found").
 #[test]
 fn commit_overlay_uncompressed_tar_concatenated_delete_keeps_later_archive() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let first = generated_payload("off-tar-first");
     let second = generated_payload("off-tar-second");
@@ -5645,6 +5697,7 @@ fn commit_overlay_uncompressed_tar_concatenated_delete_keeps_later_archive() {
 /// which persist filtered as success, and the member stayed on disk).
 #[test]
 fn commit_overlay_uncompressed_tar_concatenated_later_frame_delete() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let first = generated_payload("off-tar-later-first");
     let second = generated_payload("off-tar-later-second");
@@ -5681,6 +5734,7 @@ fn commit_overlay_uncompressed_tar_concatenated_later_frame_delete() {
 /// after deleting `first.txt` from `cat a.tar.bz2 b.tar.bz2`.
 #[test]
 fn commit_overlay_tar_bz2_concatenated_delete_keeps_later_archive() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let first = generated_payload("off-bz2-del-first");
     let second = generated_payload("off-bz2-del-second");
@@ -5723,6 +5777,7 @@ fn commit_overlay_tar_bz2_concatenated_delete_keeps_later_archive() {
 /// after deleting `first.txt` from `cat a.tar.xz b.tar.xz`.
 #[test]
 fn commit_overlay_tar_xz_concatenated_delete_keeps_later_archive() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let first = generated_payload("off-xz-del-first");
     let second = generated_payload("off-xz-del-second");
@@ -5923,6 +5978,7 @@ fn overlay_only_replace_plus_append_still_starts_at_eof() {
 /// `metadata().len()` (EOF padding would skip the new members).
 #[test]
 fn live_commit_gnu_append_window_is_eof_not_len() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let tar = make_tiny_tar(dir.path(), &[("old.txt", b"keep\n")]);
     let file_len = fs::metadata(&tar).unwrap().len();
@@ -5972,6 +6028,7 @@ fn live_commit_gnu_append_window_is_eof_not_len() {
 
 #[test]
 fn live_commit_rejects_gzip_and_zip() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("t");
     fs::create_dir_all(&src).unwrap();
@@ -6007,6 +6064,7 @@ pub(crate) fn generated_payload(tag: &str) -> Vec<u8> {
 /// pre-patch index hashes while hashing newly committed payloads.
 #[test]
 fn regression_provenance_append_manifest_reuses_index_hash() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     for compressed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join(if compressed {
@@ -6083,6 +6141,7 @@ fn regression_provenance_append_manifest_reuses_index_hash() {
 #[cfg(unix)]
 #[test]
 fn regression_provenance_manifest_symlinked_overlay_parent() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     for compressed in [false, true] {
         for mode in [CommitMode::Copy, CommitMode::Append] {
             for xattrs in [false, true] {
@@ -6221,6 +6280,7 @@ fn provenance_fixture(path: &Path, compressed: bool) {
 /// must survive reopen and TAR commit for both archive and overlay files.
 #[test]
 fn regression_overlay_chmod_metadata_only_reopen_commit() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     for compressed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join(if compressed {
@@ -6286,6 +6346,7 @@ fn regression_overlay_chmod_metadata_only_reopen_commit() {
 /// parent directories; creation modes must not be masked by the daemon.
 #[test]
 fn regression_overlay_chmod_nested_and_create_modes() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("base.tar");
     fs::write(&archive, pack_tar(&[ustar_file("sub/script", b"payload")])).unwrap();
@@ -6408,6 +6469,7 @@ fn regression_overlay_chmod_setattr_order_and_symlink() {
 /// Regression: metadata-only chmod is included in offline commit plans.
 #[test]
 fn regression_overlay_chmod_offline_commit() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("base.tar");
     provenance_fixture(&archive, false);
@@ -6656,6 +6718,7 @@ fn regression_provenance_migration_preserves_tombstones() {
 /// suffix reindex, remount, and binary PAX decoding for TAR and tar.zst.
 #[test]
 fn regression_provenance_commit_roundtrip_and_manifest() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     for compressed in [false, true] {
         for mode in [CommitMode::Copy, CommitMode::Append] {
             let dir = tempfile::tempdir().unwrap();
@@ -6734,6 +6797,7 @@ fn regression_provenance_commit_roundtrip_and_manifest() {
 /// the archive serving the new metadata and unchanged payload bytes.
 #[test]
 fn regression_provenance_live_cleanup_and_rename() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("base.tar.zst");
     provenance_fixture(&archive, true);
@@ -6981,6 +7045,7 @@ fn live_commit_accepts_tar_zst() {
 
 #[test]
 fn live_commit_tar_zst_multi_frame_append() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("mf-prefix");
     let last = generated_payload("mf-last");
@@ -7016,6 +7081,7 @@ fn live_commit_tar_zst_multi_frame_append() {
 
 #[test]
 fn live_commit_tar_zst_single_frame_fallback() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("sf-seed");
     let extra = generated_payload("sf-new");
@@ -7035,6 +7101,7 @@ fn live_commit_tar_zst_single_frame_fallback() {
 
 #[test]
 fn live_commit_tar_zst_seek_table_rewrite() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("st-prefix");
     let last = generated_payload("st-last");
@@ -7079,6 +7146,7 @@ fn live_commit_tar_zst_seek_table_rewrite() {
 
 #[test]
 fn live_commit_tar_zst_last_frame_starts_mid_member() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let big = generated_payload("mid-big").repeat(200);
     let after = generated_payload("mid-after");
@@ -7108,6 +7176,7 @@ fn live_commit_tar_zst_last_frame_starts_mid_member() {
 
 #[test]
 fn live_commit_tar_zst_last_window_replace_two_ticks() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("rw-seed");
     let tick1 = generated_payload("rw-t1");
@@ -7138,6 +7207,7 @@ fn live_commit_tar_zst_last_window_replace_two_ticks() {
 
 #[test]
 fn live_commit_tar_zst_earlier_frame_delete_unchanged() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("ef-prefix");
     let last = generated_payload("ef-last");
@@ -7168,6 +7238,7 @@ fn live_commit_tar_zst_earlier_frame_delete_unchanged() {
 /// Regression: same name in frame 0 and last frame; unlink must fail the tick.
 #[test]
 fn live_commit_tar_zst_same_name_both_frames_unlink_rejected() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let v1 = generated_payload("dup-v1");
     let v2 = generated_payload("dup-v2");
@@ -7194,6 +7265,7 @@ fn live_commit_tar_zst_same_name_both_frames_unlink_rejected() {
 
 #[test]
 fn live_commit_tar_zst_mixed_plan_skips_pending_appends() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("mix-old");
     let last = generated_payload("mix-last");
@@ -7227,6 +7299,7 @@ fn live_commit_tar_zst_mixed_plan_skips_pending_appends() {
 
 #[test]
 fn live_commit_tar_zst_reopen_fail_keeps_overlay_and_disables() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("rf-seed");
     let extra = generated_payload("rf-new");
@@ -7268,6 +7341,7 @@ fn live_commit_tar_zst_reopen_fail_keeps_overlay_and_disables() {
 
 #[test]
 fn live_commit_tar_zst_empty_second_tick() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("es-seed");
     let extra = generated_payload("es-new");
@@ -7314,6 +7388,7 @@ fn set_mtime_age(path: &Path, age: Duration) {
 /// Regression: interval settle time skips files still being written.
 #[test]
 fn live_commit_idle_skips_recent_keeps_overlay() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("idle-seed");
     let settled = generated_payload("idle-settled");
@@ -7415,6 +7490,7 @@ fn open_overlay_fd_create_does_not_leak_materialize_fd() {
 /// later pwrite bytes to a detached inode (silent truncation).
 #[test]
 fn live_commit_idle_skips_open_write_fd() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("idle-open-seed");
     let first = generated_payload("idle-open-first");
@@ -7470,6 +7546,7 @@ fn live_commit_idle_skips_open_write_fd() {
 /// persist/unlink the still-open file (later pwrite → detached inode).
 #[test]
 fn live_commit_idle_skips_open_write_fd_after_fd_reuse() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use std::os::unix::io::FromRawFd;
 
     let dir = tempfile::tempdir().unwrap();
@@ -7540,6 +7617,7 @@ fn live_commit_idle_skips_open_write_fd_after_fd_reuse() {
 /// then `release_write_fd`. Same pin-map / fd-reuse class as NFS.
 #[test]
 fn live_commit_idle_skips_open_write_fd_after_protocol_write_fd_reuse() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use std::os::unix::io::FromRawFd;
 
     let dir = tempfile::tempdir().unwrap();
@@ -7620,6 +7698,7 @@ fn live_commit_idle_skips_open_write_fd_after_protocol_write_fd_reuse() {
 /// sibling (`Ok(true)`) and leaves the renamed writer on disk.
 #[test]
 fn live_commit_idle_skips_open_write_fd_after_rename() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("idle-rename-seed");
     let first = generated_payload("idle-rename-first");
@@ -7692,6 +7771,7 @@ fn live_commit_idle_skips_open_write_fd_after_rename() {
 /// Regression: after the hot file settles, a later tick persists it once.
 #[test]
 fn live_commit_idle_second_tick_after_settle() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("idle2-seed");
     let settled = generated_payload("idle2-settled");
@@ -7733,6 +7813,7 @@ fn live_commit_idle_second_tick_after_settle() {
 /// Regression: a hot replace must not delete the base member without appending.
 #[test]
 fn live_commit_idle_hot_replace_leaves_base_member() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let orig = generated_payload("idle-rep-orig");
     let newer = generated_payload("idle-rep-new");
@@ -7767,6 +7848,7 @@ fn live_commit_idle_hot_replace_leaves_base_member() {
 /// tombstone — the member reappeared on the next `-i` remount.
 #[test]
 fn live_commit_idle_tar_zst_concatenated_delete_without_ignore_zeros() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("live-i0-prefix");
     let last = generated_payload("live-i0-last");
@@ -7820,6 +7902,7 @@ fn live_commit_idle_tar_zst_concatenated_delete_without_ignore_zeros() {
 /// Regression: delete tombstones are already settled and commit on an idle tick.
 #[test]
 fn live_commit_idle_commits_delete_tombstone() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let keep = generated_payload("idle-del-keep");
     let gone = generated_payload("idle-del-gone");
@@ -7849,6 +7932,7 @@ fn live_commit_idle_commits_delete_tombstone() {
 /// Regression: a hot nested sibling must keep its parent dir in the overlay.
 #[test]
 fn live_commit_idle_nested_hot_sibling_keeps_parent() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("idle-nest-seed");
     let settled = generated_payload("idle-nest-settled");
@@ -7882,6 +7966,7 @@ fn live_commit_idle_nested_hot_sibling_keeps_parent() {
 /// parent so a later tick does not persist a bare directory member.
 #[test]
 fn live_commit_idle_prunes_empty_parent_after_last_file() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("idle-prune-seed");
     let only = generated_payload("idle-prune-only");
@@ -7951,6 +8036,7 @@ fn tar_zst_member_count(archive: &Path, name: &str) -> usize {
 /// Regression: two interval fires during injected long persist → second Coalesced.
 #[test]
 fn overlay_commit_queue_second_interval_coalesced() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("q-coal-seed");
     let extra = generated_payload("q-coal-new");
@@ -8010,6 +8096,7 @@ fn overlay_commit_queue_second_interval_coalesced() {
 /// of remaining files (same plan is not spliced twice).
 #[test]
 fn overlay_commit_queue_on_exit_waits_then_atomic() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("q-wait-seed");
     let extra = generated_payload("q-wait-new");
@@ -8058,6 +8145,7 @@ fn overlay_commit_queue_on_exit_waits_then_atomic() {
 /// (2× last DidWork persist).
 #[test]
 fn overlay_commit_queue_empty_tick_does_not_shrink_persist_duration() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("q-dur-seed");
     let extra = generated_payload("q-dur-new");
@@ -8103,6 +8191,7 @@ fn overlay_commit_queue_empty_tick_does_not_shrink_persist_duration() {
 /// interval, still-hot B by on-exit); each name once.
 #[test]
 fn overlay_commit_queue_on_exit_commits_remaining_hot() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("q-hot-seed");
     let idle = generated_payload("q-hot-idle");
@@ -8153,6 +8242,7 @@ fn overlay_commit_queue_on_exit_commits_remaining_hot() {
 /// until inflight clears (commit_atomic does not forget overlay files).
 #[test]
 fn overlay_commit_queue_on_exit_timeout_waits_inflight() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("q-to-seed");
     let idle = generated_payload("q-to-idle");
@@ -8199,6 +8289,7 @@ fn overlay_commit_queue_on_exit_timeout_waits_inflight() {
 /// Regression: live prefix-frame delete still fail-closed via enqueue.
 #[test]
 fn overlay_commit_queue_prefix_frame_delete_fail_closed() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("q-ef-prefix");
     let last = generated_payload("q-ef-last");
@@ -8234,6 +8325,7 @@ fn overlay_commit_queue_prefix_frame_delete_fail_closed() {
 /// Regression: FileVersionLayer wrap (factory default); same name in both frames.
 #[test]
 fn live_commit_tar_zst_file_version_layer_same_name_unlink_rejected() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let v1 = generated_payload("fvl-v1");
     let v2 = generated_payload("fvl-v2");
@@ -8265,6 +8357,7 @@ fn live_commit_tar_zst_file_version_layer_same_name_unlink_rejected() {
 /// Regression: overlay symlink must persist as a symlink (`linkname` remounts).
 #[test]
 fn live_commit_tar_zst_overlay_symlink_persists_linkname() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("sy-seed");
     let target = format!("tgt-{}", std::process::id());
@@ -8291,6 +8384,7 @@ fn live_commit_tar_zst_overlay_symlink_persists_linkname() {
 /// Regression: FileVersionLayer(AutoMount) reports versions()==1; unlink still rejects.
 #[test]
 fn live_commit_tar_zst_file_version_layer_automount_same_name_unlink_rejected() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let v1 = generated_payload("am-v1");
     let v2 = generated_payload("am-v2");
@@ -8328,6 +8422,7 @@ fn live_commit_tar_zst_file_version_layer_automount_same_name_unlink_rejected() 
 /// Regression: versions()==1 still walks .versions/{i} until miss.
 #[test]
 fn live_commit_tar_zst_versions_undercount_still_probes_version_paths() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let v1 = generated_payload("uc-v1");
     let v2 = generated_payload("uc-v2");
@@ -8423,6 +8518,7 @@ impl MountSource for VersionsUndercount {
 /// Regression: complete-TAR multi-frame remount with ignore_zeros sees prefix + new.
 #[test]
 fn live_commit_tar_zst_complete_frames_ignore_zeros() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("cf-prefix");
     let last = generated_payload("cf-last");
@@ -8449,6 +8545,7 @@ fn live_commit_tar_zst_complete_frames_ignore_zeros() {
 
 #[test]
 fn live_commit_tar_zst_complete_frames_without_ignore_zeros() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("cf0-prefix");
     let last = generated_payload("cf0-last");
@@ -8506,6 +8603,7 @@ fn live_commit_tar_zst_complete_frames_without_ignore_zeros() {
 /// Multi-frame live splice records the pre-splice cut, not the new length.
 #[test]
 fn prefix_compressed_bytes_matches_splice_stats() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("plan-prefix");
     let last = generated_payload("plan-last");
@@ -8554,6 +8652,7 @@ fn prefix_compressed_bytes_matches_splice_stats() {
 /// Regression: uncompressed TAR publish plan stores prefix 0.
 #[test]
 fn uncompressed_tar_publish_plan_has_zero_prefix() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let tar = make_tiny_tar(dir.path(), &[("old.txt", b"keep\n")]);
     let overlay = dir.path().join("ov");
@@ -8576,6 +8675,7 @@ fn uncompressed_tar_publish_plan_has_zero_prefix() {
 /// Schema and 64-hex id match `IndexPointer::for_blob` only after the patch.
 #[test]
 fn pointer_plan_matches_index_pointer_for_blob() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("ptr-seed");
     let extra = generated_payload("ptr-new");
@@ -8697,6 +8797,7 @@ fn collect_overlay_commit_plan_from_conn_skips_planted_spool_name() {
 /// Offline `commit_overlay` must not take the live inflight flag.
 #[test]
 fn commit_overlay_is_not_enqueued() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("off-q-seed");
     let extra = generated_payload("off-q-new");
@@ -8735,6 +8836,7 @@ fn fresh_spool(src: &Path) -> RemoteDownload {
 /// Local `commit_live` does not call the publish hook, even if one is installed.
 #[test]
 fn remote_publish_not_called_for_local() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("loc-seed");
     let extra = generated_payload("loc-new");
@@ -8773,6 +8875,7 @@ fn remote_publish_not_called_for_local() {
 /// Regression: prefix-frame delete does not call the publish callback.
 #[test]
 fn earlier_frame_skips_publish() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("efp-prefix");
     let last = generated_payload("efp-last");
@@ -8826,6 +8929,7 @@ fn earlier_frame_skips_publish() {
 /// Regression: retry forgets only overlay bytes that were uploaded.
 #[test]
 fn publish_500_does_not_disable_interval() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("p500-seed");
     let extra = generated_payload("p500-new");
@@ -8900,6 +9004,7 @@ fn publish_500_does_not_disable_interval() {
 /// Regression: a GCS publish failure is not logged as an S3 publish.
 #[test]
 fn gs_publish_failure_is_not_labeled_s3() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("gs-fail-seed");
     let extra = generated_payload("gs-fail-new");
@@ -8939,6 +9044,7 @@ fn gs_publish_failure_is_not_labeled_s3() {
 /// 412 drops `Spliced` and the next tick downloads instead of resplicing.
 #[test]
 fn etag_mismatch_regets_instead_of_resplicing() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("etag-seed");
     let extra = generated_payload("etag-new");
@@ -9030,6 +9136,7 @@ fn count_member(bytes: &[u8], dir: &Path, name: &str) -> u32 {
 /// Regression: a PUT that lands and then times out must not splice again.
 #[test]
 fn remote_publish_timeout_after_landed_put_keeps_one_member() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("land-seed");
     let extra = generated_payload("land-new");
@@ -9119,6 +9226,7 @@ fn remote_publish_timeout_after_landed_put_keeps_one_member() {
 /// A moved ETag whose bytes differ is a concurrent writer: splice onto that object once.
 #[test]
 fn remote_publish_concurrent_object_is_spliced_once() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("conc-seed");
     let other_seed = generated_payload("conc-other");
@@ -9199,6 +9307,7 @@ fn remote_publish_concurrent_object_is_spliced_once() {
 /// body already matches the spool, so a remount does not append again.
 #[test]
 fn publish_refuses_partial_window_forgets_matching_object() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let prefix = generated_payload("pref-keep");
     let last = generated_payload("last-keep");
@@ -9301,6 +9410,7 @@ fn publish_refuses_partial_window_forgets_matching_object() {
 /// Regression: remote on-exit must not wait forever for a new interval PUT.
 #[test]
 fn remote_on_exit_bounds_wait_without_disabling() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let seed = generated_payload("exit-seed");
     let extra = generated_payload("exit-new");
@@ -9994,6 +10104,7 @@ fn rename_tx_pending_replays_on_next_db_write() {
 /// deletes `from` from the archive.
 #[test]
 fn rename_tx_pending_commit_refuses_then_replays() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let payload = b"pending-src-payload\n";
     let tar = make_tiny_tar(dir.path(), &[("src.txt", payload), ("keep.txt", b"keep\n")]);
@@ -10334,6 +10445,7 @@ fn restore_pending_front_keeps_older_rows_ahead() {
 /// cover deleting the check inside the plan builder.
 #[test]
 fn rename_tx_pending_on_exit_names_reappear_paths() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let dir = tempfile::tempdir().unwrap();
     let tar = make_tiny_tar(dir.path(), &[("a", b"from-a"), ("x", b"orig-x")]);
     let overlay = dir.path().join("ov");

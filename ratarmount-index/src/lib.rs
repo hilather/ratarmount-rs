@@ -32,6 +32,8 @@ mod payload_cache;
 mod prepared_tests;
 mod range_cache;
 mod search;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_process;
 
 pub use digest_cache::{
     archive_digest_cache_available, cached_archive_digest, cached_archive_digest_cancellable,

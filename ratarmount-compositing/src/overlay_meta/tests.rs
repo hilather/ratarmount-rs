@@ -654,6 +654,7 @@ fn regression_mount_without_base_digest_hashes_no_directory_content() {
 #[cfg(unix)]
 #[test]
 fn regression_directory_base_with_fifo_creates_weak() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let basedir = root.path().join("base");
@@ -688,6 +689,7 @@ fn regression_directory_base_with_fifo_creates_weak() {
 #[cfg(unix)]
 #[test]
 fn verify_base_strong_weak_skipped_table() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     let root = tempfile::tempdir().unwrap();
     let basedir = root.path().join("base");
     fs::create_dir(&basedir).unwrap();
@@ -1898,6 +1900,7 @@ fn s7_mode_child() {
 #[cfg(unix)]
 #[test]
 fn regression_exclusive_create_preserves_overlay_and_published_index_modes() {
+    let _process_guard = ratarmount_index::test_process::spawning();
     for umask in ["002", "022", "077"] {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().canonicalize().unwrap();

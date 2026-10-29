@@ -2743,6 +2743,7 @@ pub(crate) mod tests {
     /// (SHARED included, which `BEGIN IMMEDIATE` cannot see; read-only files
     /// too)? The child must exit successfully.
     fn other_process_sees_lock(db: &Path) -> bool {
+        let _processes = ratarmount_index::test_process::spawning();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -3248,6 +3249,7 @@ pub(crate) mod tests {
     /// Another process's `BEGIN IMMEDIATE` on `db` is busy (the child must
     /// exit successfully).
     pub(crate) fn pack_db_lock_busy_in_child(db: &Path) -> bool {
+        let _processes = ratarmount_index::test_process::spawning();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",

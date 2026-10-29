@@ -850,6 +850,7 @@ mod tests {
     /// validation cannot close an alias and release a held SQLite lock.
     #[test]
     fn regression_overlay_companions_preserve_hot_journal_recovery() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().canonicalize().unwrap().join("overlay.sqlite");
         real_db(&db);
@@ -1271,6 +1272,7 @@ mod tests {
     /// first still held RESERVED.
     #[test]
     fn regression_open_overlay_db_keeps_other_connections_locks() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().canonicalize().unwrap().join("overlay.sqlite");
         real_db(&db);

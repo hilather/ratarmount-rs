@@ -6838,6 +6838,7 @@ mod create_missing_cli_tests {
     }
 
     fn run_cli(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
+        let _processes = ratarmount_index::test_process::spawning();
         let bin = ratarmount_bin().expect("ratarmount binary next to test exe");
         Command::new(bin)
             .args(args)
@@ -6855,6 +6856,7 @@ mod create_missing_cli_tests {
     }
 
     fn skip_no_gnu_tar() -> bool {
+        let _processes = ratarmount_index::test_process::spawning();
         let out = Command::new("tar").arg("--version").output();
         match out {
             Ok(o) => !String::from_utf8_lossy(&o.stdout).contains("GNU tar"),
@@ -6871,6 +6873,7 @@ mod create_missing_cli_tests {
     }
 
     fn write_tiny_targz(dir: &std::path::Path) -> Option<PathBuf> {
+        let _processes = ratarmount_index::test_process::spawning();
         let tree = dir.join("gztree");
         fs::create_dir_all(&tree).unwrap();
         fs::write(tree.join("a.txt"), b"gz\n").unwrap();
@@ -7318,6 +7321,7 @@ mod create_missing_cli_tests {
         assert!(archive.is_file());
         let extract = dir.path().join("ex");
         fs::create_dir_all(&extract).unwrap();
+        let _processes = ratarmount_index::test_process::spawning();
         assert!(Command::new("tar")
             .args(["-xf"])
             .arg(&archive)
@@ -7737,6 +7741,7 @@ mod repack_seekable_cli_tests {
     /// Temp-dir gzip → `.tar.zst` using the in-tree decoder, not an external `zstd`.
     #[test]
     fn repack_seekable_gzip_round_trip_without_external_zstd() {
+        let _processes = ratarmount_index::test_process::spawning();
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.gz");
         let output = dir.path().join("out.tar.zst");
@@ -8698,6 +8703,7 @@ mod sandbox_preset_tests {
     /// Regression: the daemon parent must relinquish cleanup while the serving child retains it.
     #[test]
     fn regression_temp_overlay_daemon_parent_preserves_child_directory() {
+        let _processes = ratarmount_index::test_process::spawning();
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("child-owned");
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -8723,6 +8729,7 @@ mod sandbox_preset_tests {
 
     #[test]
     fn temp_overlay_daemon_cleanup_child() {
+        let _processes = ratarmount_index::test_process::spawning();
         let Some(marker) = std::env::var_os("RATARMOUNT_SB3_CLEANUP_TEST").map(PathBuf::from)
         else {
             return;
