@@ -42,6 +42,13 @@ pub fn zstd_splice_seek_table_limit_for_test(limit: u64) -> SeekTableLimitGuard 
     SeekTableLimitGuard(SEEK_TABLE_SIZE_LIMIT.with(|slot| slot.replace(limit)))
 }
 
+/// Exercise oversized splice publication without writing a 4 GiB test fixture.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn with_splice_frame_size_limit<T>(limit: u32, run: impl FnOnce() -> T) -> T {
+    let _reset = zstd_splice_seek_table_limit_for_test(u64::from(limit));
+    run()
+}
+
 /// Bytes copied / written by [`splice_zstd_last_frames`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpliceStats {
@@ -165,19 +172,38 @@ pub fn splice_zstd_last_frames_replace<F>(
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
 {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The copy splice convenience API delegates with the caller pre-publication guard"
+    )]
+    splice_zstd_last_frames_replace_guarded(path, from_idx, transform, reference, before_write)
+}
+
+/// Copy splice with a caller guard under the archive lock immediately before
+/// publication. Preparation may read and stage bytes but cannot publish them.
+pub fn splice_zstd_last_frames_replace_guarded<F>(
+    path: &Path,
+    from_idx: usize,
+    transform: F,
+    reference: &std::fs::Metadata,
+    before_write: crate::commit_journal::BeforeWrite,
+) -> Result<SpliceStats>
+where
+    F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
+{
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     #[expect(
         clippy::disallowed_methods,
-        reason = r###"internal-read:v1 {"id":"IR-B0277-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace","disposition":"output-owner","mode_policy":"private-staging-then-source-archive-metadata","category":"output-owner","reason":"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).","creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename."}}"###
+        reason = r###"internal-read:v1 {"id":"IR-B0277-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded","disposition":"output-owner","mode_policy":"private-staging-then-source-archive-metadata","category":"output-owner","reason":"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).","creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename."}}"###
     )]
     let mut tmp = NamedTempFile::new_in(parent)?;
     crate::commit_journal::fault::point("copy source open")?;
     #[expect(
         clippy::disallowed_methods,
-        reason = r###"internal-read:v1 {"id":"IR-B0278-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace","disposition":"residual","reason":"zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        reason = r###"internal-read:v1 {"id":"IR-B0278-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded","disposition":"residual","reason":"zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut src = File::open(path)?;
     let source = src.metadata()?;
@@ -209,10 +235,10 @@ where
         clippy::disallowed_methods,
         reason = "The splice implementation holds the journal copy guard while publishing the staged archive"
     )]
-    let _guard = crate::commit_journal::guard_copy(path, &source)
-        .map_err(|e| CompressError::Msg(e.to_string()))?;
+    let _guard = crate::commit_journal::guard_copy(path, &source).map_err(CompressError::Io)?;
     before_write()?;
     crate::commit_journal::test_prewrite_hold()?;
+    before_write()?;
     tmp.persist(path).map_err(|e| {
         CompressError::Msg(format!(
             "Failed to replace '{}' after zstd splice: {}",
@@ -266,10 +292,37 @@ pub fn splice_zstd_last_frames_append_with<F>(
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
 {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The append splice convenience API delegates with the caller pre-write guard"
+    )]
+    splice_zstd_last_frames_append_guarded(
+        path,
+        from_idx,
+        transform,
+        original,
+        before_write,
+        before_unlink,
+    )
+}
+
+/// Journaled splice with a caller guard before any journal, locator or archive
+/// mutation; the copy fallback uses it under the publication lock as well.
+pub fn splice_zstd_last_frames_append_guarded<F>(
+    path: &Path,
+    from_idx: usize,
+    transform: F,
+    original: &std::fs::Metadata,
+    before_write: crate::commit_journal::BeforeWrite,
+    before_unlink: crate::commit_journal::BeforeUnlink,
+) -> Result<SpliceStats>
+where
+    F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
+{
     crate::commit_journal::fault::check("before splice scan")?;
     #[expect(
         clippy::disallowed_methods,
-        reason = r###"internal-read:v1 {"id":"IR-B0279-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with","disposition":"residual","reason":"zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        reason = r###"internal-read:v1 {"id":"IR-B0279-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded","disposition":"residual","reason":"zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut src = File::open(path)?;
     let source = src.metadata()?;
@@ -290,7 +343,7 @@ where
         .unwrap_or(Path::new("."));
     #[expect(
         clippy::disallowed_methods,
-        reason = r###"internal-read:v1 {"id":"IR-B0280-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        reason = r###"internal-read:v1 {"id":"IR-B0280-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tail = NamedTempFile::new_in(parent)?;
     let stats = write_zstd_splice_suffix(&mut src, &map, from_idx, transform, tail.as_file_mut())?;
@@ -299,7 +352,7 @@ where
         // no-size-refusal rule: publish the staged suffix through copy/rename.
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0281-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with","disposition":"output-owner","mode_policy":"private-staging-then-source-archive-metadata","category":"output-owner","reason":"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).","creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-B0281-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded","disposition":"output-owner","mode_policy":"private-staging-then-source-archive-metadata","category":"output-owner","reason":"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).","creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename."}}"###
         )]
         let mut tmp = NamedTempFile::new_in(parent)?;
         let method = crate::fastcopy::copy_range(
@@ -320,10 +373,10 @@ where
             clippy::disallowed_methods,
             reason = "The oversized splice fallback holds the journal guard while publishing its staged copy"
         )]
-        let _guard = crate::commit_journal::guard_copy(path, &source)
-            .map_err(|e| CompressError::Msg(e.to_string()))?;
+        let _guard = crate::commit_journal::guard_copy(path, &source).map_err(CompressError::Io)?;
         before_write()?;
         crate::commit_journal::test_prewrite_hold()?;
+        before_write()?;
         tmp.persist(path).map_err(|e| e.error)?;
         return Ok(stats);
     }
@@ -331,7 +384,7 @@ where
         clippy::disallowed_methods,
         reason = "The append splice commits its checked suffix through the journal implementation"
     )]
-    crate::commit_journal::replace_suffix_if_unchanged_with(
+    crate::commit_journal::replace_suffix_if_unchanged_guarded(
         path,
         stats.prefix_compressed_bytes,
         tail.as_file_mut(),

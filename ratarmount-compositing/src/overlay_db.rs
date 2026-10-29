@@ -74,9 +74,8 @@ impl OverlayDbError {
 impl From<OverlayDbError> for OverlayError {
     fn from(error: OverlayDbError) -> Self {
         match error {
-            OverlayDbError::NotRegular(msg) | OverlayDbError::Refused(msg) => {
-                OverlayError::Msg(msg)
-            }
+            error @ OverlayDbError::NotRegular(_) => OverlayError::Io(error.into()),
+            OverlayDbError::Refused(msg) => OverlayError::Msg(msg),
             OverlayDbError::Io(e) => OverlayError::Io(e),
             OverlayDbError::Sqlite(e) => OverlayError::Sqlite(e),
         }
@@ -86,12 +85,140 @@ impl From<OverlayDbError> for OverlayError {
 impl From<OverlayDbError> for io::Error {
     fn from(error: OverlayDbError) -> Self {
         match error {
-            OverlayDbError::NotRegular(msg) => io::Error::new(io::ErrorKind::InvalidData, msg),
+            error @ OverlayDbError::NotRegular(_) => {
+                io::Error::new(io::ErrorKind::InvalidData, error)
+            }
             OverlayDbError::Refused(msg) => io::Error::other(msg),
             OverlayDbError::Io(e) => e,
             OverlayDbError::Sqlite(e) => io::Error::other(e),
         }
     }
+}
+
+/// A strict overlay-state policy refusal, retained through I/O wrappers so
+/// offline callers can distinguish it from a lost record or journal error.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct OverlayStateError(pub(crate) String);
+
+/// Whether an error reports a strict overlay-state policy refusal.
+///
+/// Several journal error types intentionally do not expose a source, and
+/// transparent I/O wrappers can skip their inner error's own identity.
+pub fn is_overlay_state_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    if error.is::<OverlayStateError>() {
+        return true;
+    }
+    if let Some(error) = error.downcast_ref::<rusqlite::Error>() {
+        return error
+            .sqlite_error()
+            .is_some_and(|error| error.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK);
+    }
+    if let Some(error) = error.downcast_ref::<io::Error>() {
+        return error
+            .get_ref()
+            .is_some_and(|error| is_overlay_state_error(error));
+    }
+    if let Some(error) = error.downcast_ref::<OverlayError>() {
+        match error {
+            OverlayError::Io(error) => return is_overlay_state_error(error),
+            OverlayError::Sqlite(error) => return is_overlay_state_error(error),
+            _ => {}
+        }
+    }
+    if let Some(error) = error.downcast_ref::<OverlayDbError>() {
+        match error {
+            OverlayDbError::NotRegular(_) => return true,
+            OverlayDbError::Io(error) => return is_overlay_state_error(error),
+            OverlayDbError::Sqlite(error) => return is_overlay_state_error(error),
+            _ => {}
+        }
+    }
+    use ratarmount_compress::commit_journal::{RecoverError, ReplaceError};
+    if let Some(error) = error.downcast_ref::<RecoverError>() {
+        let (RecoverError::Refused(error)
+        | RecoverError::Journal(error)
+        | RecoverError::Committed(error)) = error;
+        return is_overlay_state_error(error);
+    }
+    if let Some(error) = error.downcast_ref::<ReplaceError>() {
+        let (ReplaceError::Refused(error)
+        | ReplaceError::RolledBack(error, _)
+        | ReplaceError::Pending(error)
+        | ReplaceError::Committed(error)) = error;
+        return is_overlay_state_error(error);
+    }
+    if let Some(error) = error.downcast_ref::<ratarmount_compress::CompressError>() {
+        return match error {
+            ratarmount_compress::CompressError::Io(error) => is_overlay_state_error(error),
+            ratarmount_compress::CompressError::Replace(error) => is_overlay_state_error(error),
+            _ => false,
+        };
+    }
+    error.source().is_some_and(is_overlay_state_error)
+}
+
+/// Refuse symlinks and other nonregular entries at an overlay database's
+/// final component and its literal SQLite companion names. Missing entries
+/// are allowed; the caller retains its required-record checks.
+///
+/// This is stat-only: opening and closing an alias could release SQLite's
+/// POSIX locks. Parent symlinks remain supported; the final component is
+/// never canonicalized.
+pub fn validate_overlay_state(db: &Path) -> io::Result<()> {
+    inspect_overlay_entry(db, false)?;
+    for suffix in ["-wal", "-journal", "-shm"] {
+        let mut companion = db.as_os_str().to_os_string();
+        companion.push(suffix);
+        inspect_overlay_entry(Path::new(&companion), true)?;
+    }
+    Ok(())
+}
+
+fn inspect_overlay_entry(path: &Path, companion: bool) -> io::Result<()> {
+    let label = if companion {
+        "overlay database companion"
+    } else {
+        "overlay database"
+    };
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                OverlayStateError(format!(
+                    "cannot inspect {label} {}: {error}",
+                    path.display()
+                )),
+            ))
+        }
+    };
+    if metadata.is_file() {
+        return Ok(());
+    }
+    let message = if !companion {
+        not_regular_message(path, &metadata)
+    } else if metadata.file_type().is_symlink() {
+        format!(
+            "{label} {} is a symlink; it must be a regular file (move the companion file into place of the link)",
+            path.display()
+        )
+    } else if metadata.is_dir() {
+        format!(
+            "{label} {} is a directory, not a regular file; move it aside",
+            path.display()
+        )
+    } else {
+        format!(
+            "{label} {} is not a regular file; move it aside",
+            path.display()
+        )
+    };
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        OverlayStateError(message),
+    ))
 }
 
 /// The text for an overlay database entry of the wrong type.
@@ -271,11 +398,6 @@ pub(crate) fn open_overlay_db_required(
     } else {
         db
     };
-    let entry = crate::write_overlay::overlay_db_entry_for(db).map_err(|e| match e {
-        OverlayError::Io(e) => OverlayDbError::Io(e),
-        OverlayError::Msg(msg) => OverlayDbError::NotRegular(msg),
-        other => OverlayDbError::Refused(other.to_string()),
-    })?;
     if nofollow {
         if let Ok(m) = fs::symlink_metadata(db) {
             if m.file_type().is_symlink() {
@@ -283,6 +405,11 @@ pub(crate) fn open_overlay_db_required(
             }
         }
     }
+    let entry = crate::write_overlay::overlay_db_entry_for(db).map_err(|e| match e {
+        OverlayError::Io(e) => OverlayDbError::Io(e),
+        OverlayError::Msg(msg) => OverlayDbError::NotRegular(msg),
+        other => OverlayDbError::Refused(other.to_string()),
+    })?;
     let before = match &entry {
         DbEntry::Present { metadata, .. } => Some(metadata.clone()),
         _ => None,
@@ -316,19 +443,13 @@ pub(crate) fn open_overlay_db_required(
     };
     #[cfg(test)]
     fire(&AFTER_CLASSIFY, db);
-    let acquired = checked_open::open_checked(db, flags, mode, expect).map_err(|refusal| {
-        match refusal.error {
-            AcquireError::Sqlite(e)
-                if e.sqlite_error().is_some_and(|error| {
-                    error.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
-                }) =>
-            {
-                OverlayDbError::NotRegular(symlink_message(db))
-            }
-            AcquireError::Sqlite(e) => OverlayDbError::Sqlite(e),
-            _ => OverlayDbError::Refused(format!("overlay database {}: {refusal}", db.display())),
-        }
-    })?;
+    // SQLite NOFOLLOW protects the database name, but not its companions.
+    // Recheck after the classification seam, immediately before acquisition.
+    if nofollow {
+        validate_overlay_state(db)?;
+    }
+    let acquired = checked_open::open_checked(db, flags, mode, expect)
+        .map_err(|refusal| acquired_error(db, refusal))?;
     // Main's additional post-open path defense remains stat-only. The
     // acquired identity, rather than this path observation, is registered.
     let opened = if nofollow {
@@ -337,12 +458,21 @@ pub(crate) fn open_overlay_db_required(
         fs::metadata(db)
     }
     .map_err(|e| {
+        if let Err(error) = checked_open::refuse_symlink(db, flags) {
+            return OverlayDbError::Sqlite(error);
+        }
         OverlayDbError::NotRegular(format!(
             "overlay database {} changed while it was opened: {e}",
             db.display()
         ))
     })?;
     if !opened.is_file() {
+        if nofollow {
+            return Err(OverlayDbError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                OverlayStateError(not_regular_message(db, &opened)),
+            )));
+        }
         return Err(OverlayDbError::NotRegular(not_regular_message(db, &opened)));
     }
     if before.is_some_and(|before| !same_file(&before, &opened))
@@ -454,6 +584,42 @@ pub(crate) fn other_process_sees_lock(db: &Path) -> bool {
     false
 }
 
+fn acquired_error(db: &Path, refusal: checked_open::Refusal) -> OverlayDbError {
+    match refusal.error {
+        AcquireError::NotRegular { .. } => {
+            // Windows can observe a substituted final component in its
+            // post-open pathname check. Preserve policy identity even if
+            // that substitution has already been restored.
+            if let Err(error) = validate_overlay_state(db) {
+                return OverlayDbError::Io(error);
+            }
+            OverlayDbError::NotRegular(format!("overlay database {}: {refusal}", db.display()))
+        }
+        AcquireError::Sqlite(e)
+            if e.sqlite_error().is_some_and(|error| {
+                error.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
+            }) =>
+        {
+            let message = match e {
+                // Preserve the shared helper's offending companion path;
+                // native SQLite messages still need the overlay diagnosis.
+                rusqlite::Error::SqliteFailure(_, Some(message))
+                    if message.contains("is a symlink; it must be a regular file") =>
+                {
+                    message
+                }
+                _ => symlink_message(db),
+            };
+            OverlayDbError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                OverlayStateError(message),
+            ))
+        }
+        AcquireError::Sqlite(e) => OverlayDbError::Sqlite(e),
+        _ => OverlayDbError::Refused(format!("overlay database {}: {refusal}", db.display())),
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -465,6 +631,285 @@ mod tests {
             .unwrap()
             .execute_batch("CREATE TABLE t (x)")
             .unwrap();
+    }
+
+    /// Regression: #239 the Windows acquired-path type refusal must retain
+    /// its policy cause through recovery wrappers, even if a swap is restored.
+    #[test]
+    fn regression_overlay_acquired_type_refusal_preserves_policy_cause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("overlay.sqlite");
+        let target = tmp.path().join("target.sqlite");
+        real_db(&target);
+        let before = fs::read(&target).unwrap();
+        for linked in [true, false] {
+            if linked {
+                std::os::unix::fs::symlink(&target, &db).unwrap();
+            } else {
+                fs::remove_file(&db).unwrap();
+                fs::copy(&target, &db).unwrap();
+            }
+            let error = acquired_error(
+                &db,
+                checked_open::Refusal {
+                    error: AcquireError::NotRegular { mode: 0 },
+                    retained_fd: None,
+                },
+            );
+            let error = ratarmount_compress::commit_journal::RecoverError::Refused(error.into());
+            assert!(is_overlay_state_error(&error), "{error}");
+            assert!(
+                error.to_string().contains(&db.display().to_string()),
+                "{error}"
+            );
+            if linked {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("is a symlink; it must be a regular file"),
+                    "{error}"
+                );
+                assert!(fs::symlink_metadata(&db).unwrap().is_symlink());
+            } else {
+                assert!(error.to_string().contains("not a regular file"), "{error}");
+            }
+            assert_eq!(fs::read(&target).unwrap(), before);
+            assert_eq!(fs::read(&db).unwrap(), before);
+        }
+    }
+
+    /// Regression: #239 NOFOLLOW acquisitions refuse companion links and
+    /// nonregular entries without opening aliases or changing the database.
+    #[test]
+    fn regression_overlay_companion_path_classification() {
+        use std::os::unix::fs::symlink;
+        for suffix in ["-wal", "-journal", "-shm"] {
+            for shape in [
+                "missing",
+                "regular",
+                "link",
+                "empty-link",
+                "dangling",
+                "loop",
+                "fifo",
+                "directory",
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let dir = tmp.path().canonicalize().unwrap();
+                let db = dir.join("overlay.sqlite");
+                real_db(&db);
+                let before = fs::read(&db).unwrap();
+                let companion = dir.join(format!("overlay.sqlite{suffix}"));
+                let target = dir.join("target");
+                match shape {
+                    "missing" => (),
+                    "regular" => fs::write(&companion, b"").unwrap(),
+                    "link" | "empty-link" => {
+                        fs::write(
+                            &target,
+                            if shape == "link" {
+                                b"target bytes".as_slice()
+                            } else {
+                                b""
+                            },
+                        )
+                        .unwrap();
+                        symlink(&target, &companion).unwrap();
+                    }
+                    "dangling" => symlink(&target, &companion).unwrap(),
+                    "loop" => symlink(&companion, &companion).unwrap(),
+                    "fifo" => {
+                        let c = std::ffi::CString::new(companion.to_str().unwrap()).unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+                    }
+                    "directory" => fs::create_dir(&companion).unwrap(),
+                    _ => unreachable!(),
+                }
+                let target_before = fs::read(&target).ok();
+                let result =
+                    open_overlay_db(&db, RO | OpenFlags::SQLITE_OPEN_NOFOLLOW, DbName::Path);
+                if matches!(shape, "missing" | "regular") {
+                    result.unwrap();
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(is_overlay_state_error(&error), "typed acquisition refusal");
+                    let error =
+                        ratarmount_compress::commit_journal::RecoverError::Refused(error.into());
+                    assert!(is_overlay_state_error(&error), "typed recovery refusal");
+                    let error = error.to_string();
+                    assert!(
+                        error.contains(&companion.display().to_string()),
+                        "{shape} {suffix}: {error}"
+                    );
+                    if matches!(shape, "link" | "empty-link" | "dangling" | "loop") {
+                        assert!(
+                            error.contains("is a symlink; it must be a regular file"),
+                            "{shape} {suffix}: {error}"
+                        );
+                        assert!(fs::symlink_metadata(&companion)
+                            .unwrap()
+                            .file_type()
+                            .is_symlink());
+                    } else {
+                        assert!(
+                            error.contains("not a regular file"),
+                            "{shape} {suffix}: {error}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    fs::read(&db).unwrap(),
+                    before,
+                    "{shape} {suffix}: database unchanged"
+                );
+                assert_eq!(
+                    fs::read(&target).ok(),
+                    target_before,
+                    "{shape} {suffix}: target unchanged"
+                );
+                fs::remove_file(&db).unwrap();
+                // Companion policy also applies to raw, unmarked directories
+                // with no database, before an early-return or fresh creation.
+                let validation = validate_overlay_state(&db);
+                if matches!(shape, "missing" | "regular") {
+                    validation.unwrap();
+                } else {
+                    let error = validation.unwrap_err();
+                    assert!(is_overlay_state_error(&error));
+                    assert!(
+                        error.to_string().contains(&companion.display().to_string()),
+                        "{error}"
+                    );
+                }
+                assert!(!db.exists());
+            }
+        }
+        // ENOTDIR is an inspection failure, never absence.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("file");
+        fs::write(&parent, b"parent").unwrap();
+        let db = parent.join("overlay.sqlite");
+        let error = validate_overlay_state(&db).unwrap_err();
+        assert!(is_overlay_state_error(&error));
+        assert!(
+            error.to_string().contains(&db.display().to_string()),
+            "{error}"
+        );
+        assert!(error.to_string().contains("Not a directory"), "{error}");
+        assert_eq!(fs::read(parent).unwrap(), b"parent");
+    }
+
+    /// Regression: #239 initial NOFOLLOW and post-open type refusals must keep
+    /// their policy identity through wrappers, so force cannot waive them.
+    #[test]
+    fn regression_overlay_nofollow_type_refusal_preserves_policy_cause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("real.sqlite");
+        real_db(&db);
+        for shape in ["regular", "dangling", "loop"] {
+            let link = tmp.path().join(format!("{shape}.sqlite"));
+            let target = match shape {
+                "regular" => db.clone(),
+                "dangling" => tmp.path().join("missing.sqlite"),
+                "loop" => link.clone(),
+                _ => unreachable!(),
+            };
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            let error = open_overlay_db(&link, RO | OpenFlags::SQLITE_OPEN_NOFOLLOW, DbName::Path)
+                .unwrap_err();
+            assert!(
+                matches!(&error, OverlayDbError::NotRegular(_)),
+                "generic error shape retained"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("is a symlink; it must be a regular file"),
+                "{error}"
+            );
+            assert!(
+                is_overlay_state_error(&error),
+                "direct refusal must remain policy"
+            );
+            let error = io::Error::from(error);
+            assert!(
+                is_overlay_state_error(&error),
+                "I/O conversion must retain policy"
+            );
+        }
+        let error = OverlayError::from(OverlayDbError::NotRegular("type changed".into()));
+        assert!(
+            is_overlay_state_error(&error),
+            "overlay conversion must retain policy"
+        );
+        // The generic caller's opt-in contract remains unchanged.
+        open_overlay_db(&tmp.path().join("regular.sqlite"), RO, DbName::Path).unwrap();
+    }
+
+    /// Regression: #239 regular WAL/SHM and rollback journals remain usable;
+    /// validation cannot close an alias and release a held SQLite lock.
+    #[test]
+    fn regression_overlay_companions_preserve_hot_journal_recovery() {
+        let _process_guard = ratarmount_index::test_process::spawning();
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().canonicalize().unwrap().join("overlay.sqlite");
+        real_db(&db);
+        let holder = Connection::open(&db).unwrap();
+        holder
+            .execute_batch("PRAGMA journal_mode=WAL; INSERT INTO t VALUES (7)")
+            .unwrap();
+        let companion = |suffix: &str| {
+            let mut path = db.as_os_str().to_os_string();
+            path.push(suffix);
+            std::path::PathBuf::from(path)
+        };
+        assert!(fs::metadata(companion("-wal")).unwrap().len() > 0);
+        assert!(fs::metadata(companion("-shm")).unwrap().len() > 0);
+        let opened =
+            open_overlay_db(&db, RO | OpenFlags::SQLITE_OPEN_NOFOLLOW, DbName::Path).unwrap();
+        assert_eq!(
+            opened
+                .query_row("SELECT x FROM t", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        drop(opened);
+        drop(holder);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "overlay_db::tests::hot_journal_writer_child",
+                "--nocapture",
+            ])
+            .env("RATARMOUNT_TEST_HOT_JOURNAL", &db)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(fs::metadata(companion("-journal")).unwrap().len() > 0);
+        let opened = open_overlay_db(
+            &db,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            DbName::Path,
+        )
+        .unwrap();
+        assert_eq!(
+            opened
+                .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(!companion("-journal").exists(), "hot journal recovered");
+    }
+
+    #[test]
+    fn hot_journal_writer_child() {
+        let Some(db) = std::env::var_os("RATARMOUNT_TEST_HOT_JOURNAL") else {
+            return;
+        };
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA cache_size=1; BEGIN IMMEDIATE; INSERT INTO t SELECT zeroblob(1000000)").unwrap();
+        // Simulate a crashed writer without dropping its SQLite connection.
+        std::process::exit(0);
     }
 
     /// Regression: the established three-argument API keeps its optional

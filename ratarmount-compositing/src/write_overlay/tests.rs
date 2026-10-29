@@ -82,7 +82,13 @@ fn regression_240_live_commit_holds_overlay_lock_through_publication() {
 #[test]
 fn regression_240_live_entries_recheck_seal_under_overlay_lock() {
     let _process_guard = ratarmount_index::test_process::exclusive();
-    for entry in ["atomic", "live", "remote_interval", "recovery"] {
+    for entry in [
+        "atomic",
+        "live",
+        "remote_interval",
+        "recovery",
+        "recovery_with_records",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("base.tar");
         fs::write(&archive, pack_tar(&[ustar_file("old", b"original")])).unwrap();
@@ -103,6 +109,9 @@ fn regression_240_live_entries_recheck_seal_under_overlay_lock() {
             "remote_interval" => committing.commit_remote_interval(Duration::ZERO, |_| {
                 panic!("sealed remote commit reopened base")
             }),
+            "recovery_with_records" => committing
+                .recover_member_journal_with_records(&target, &crate::MountRecords::default())
+                .map(|_| false),
             _ => committing.recover_member_journal(&target).map(|_| false),
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -125,6 +134,93 @@ fn regression_240_live_entries_recheck_seal_under_overlay_lock() {
         assert_eq!(fs::read(&archive).unwrap(), before, "{entry}");
         assert!(!ratarmount_compress::commit_journal::journal_path(&archive).exists());
         assert!(!regression_240_overlay_lock_held(&overlay));
+    }
+}
+
+/// Regression: forced recovery with admitted records must refuse a sealed
+/// overlay without changing a pending journal or archive, and unsealed replay
+/// must retain the overlay lock through journal cleanup.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_239_recovery_entries_guard_pending_journal() {
+    let _process_guard = ratarmount_index::test_process::exclusive();
+    use ratarmount_compress::commit_journal::{self, fault};
+
+    for with_records in [false, true] {
+        for complete in [false, true] {
+            for sealed in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let archive = dir.path().join("base.tar");
+                let original = pack_tar(&[ustar_file("old", b"original")]);
+                let replacement = pack_tar(&[ustar_file("new", b"replacement")]);
+                fs::write(&archive, &original).unwrap();
+                let overlay = dir.path().join("overlay");
+                let mut ov = overlay_with_base(Arc::new(NullBase), &overlay);
+                ov.force_base_mismatch = true;
+                let suffix_path = dir.path().join("suffix");
+                fs::write(&suffix_path, &replacement).unwrap();
+                let mut suffix = File::open(suffix_path).unwrap();
+                let stop = if complete {
+                    "locator complete"
+                } else {
+                    "archive truncate"
+                };
+                commit_journal::replace_suffix_with_hook(&archive, 0, &mut suffix, &mut |step| {
+                    if step == stop {
+                        Err(io::Error::other("simulated crash"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+                let before = fs::read(&archive).unwrap();
+                let journal = commit_journal::journal_path(&archive);
+                let journal_before = fs::read(&journal).unwrap();
+                assert_eq!(
+                    commit_journal::pending(&archive).unwrap().unwrap().complete,
+                    complete
+                );
+                if sealed {
+                    ov.set_meta("sealed_at", "test seal before recovery")
+                        .unwrap();
+                }
+                let replayed = Arc::new(AtomicBool::new(false));
+                let reached = replayed.clone();
+                let locked_overlay = overlay.clone();
+                fault::install(move |step| {
+                    if matches!(step, "rollback truncate" | "rollback unlink") {
+                        assert!(!sealed, "sealed recovery reached a write");
+                        assert!(regression_240_overlay_lock_held(&locked_overlay));
+                        reached.store(true, Ordering::SeqCst);
+                    }
+                    Ok(())
+                });
+                let result = if with_records {
+                    ov.recover_member_journal_with_records(
+                        &archive,
+                        &crate::MountRecords::default(),
+                    )
+                } else {
+                    ov.recover_member_journal(&archive)
+                };
+                fault::clear();
+                if sealed {
+                    let error = result.unwrap_err();
+                    assert!(error.to_string().contains("is sealed"), "{error}");
+                    assert_eq!(fs::read(&archive).unwrap(), before);
+                    assert_eq!(fs::read(&journal).unwrap(), journal_before);
+                    assert!(!replayed.load(Ordering::SeqCst));
+                } else {
+                    result.unwrap();
+                    assert!(replayed.load(Ordering::SeqCst));
+                    assert_eq!(
+                        fs::read(&archive).unwrap(),
+                        if complete { replacement } else { original }
+                    );
+                    assert!(!journal.exists());
+                }
+            }
+        }
     }
 }
 
@@ -1638,7 +1734,15 @@ mod archive_metadata_regressions {
                 fs::write(&plain, &expected).unwrap();
                 fs::write(&archive, b"old archive bytes").unwrap();
                 let before = set_mode(&archive, mode);
-                recompress_replace(&plain, &archive, format, &before, &mut || Ok(())).unwrap();
+                recompress_replace(
+                    &plain,
+                    &archive,
+                    format,
+                    &before,
+                    &crate::journal_recovery::Rows::None,
+                    &mut || Ok(()),
+                )
+                .unwrap();
                 let file = File::open(&archive).unwrap();
                 let mut decoder: Box<dyn Read> = match format {
                     CompressionFormat::Gzip => Box::new(flate2::read::MultiGzDecoder::new(file)),
@@ -1792,8 +1896,15 @@ fn regression_134_recompress_replace_bare_name_stages_beside_dest() {
             // The replace is gated on the stamp of an existing `dest`.
             fs::write(dest, b"old").unwrap();
             let source = fs::metadata(dest).unwrap();
-            recompress_replace(&plain, Path::new(dest), fmt, &source, &mut || Ok(()))
-                .unwrap_or_else(|e| panic!("{dest}: {e}"));
+            recompress_replace(
+                &plain,
+                Path::new(dest),
+                fmt,
+                &source,
+                &crate::journal_recovery::Rows::None,
+                &mut || Ok(()),
+            )
+            .unwrap_or_else(|e| panic!("{dest}: {e}"));
             assert!(fs::metadata(dest).unwrap().len() > 0);
         }
         return;
@@ -4407,7 +4518,10 @@ fn regression_mount_refuses_symlinked_db() {
         assert_eq!(fs::read(&real).unwrap(), before, "target unchanged");
     }
     fs::remove_file(&real).unwrap();
-    assert!(msg_of(reopen_keep_overlay(&overlay)).contains("is missing"));
+    // Regression: #239 dangling database links have the same policy refusal.
+    assert!(
+        msg_of(reopen_keep_overlay(&overlay)).contains("is a symlink; it must be a regular file")
+    );
 }
 
 /// Regression: #222 swapping the classified database for a symlink to the
@@ -4451,12 +4565,61 @@ fn regression_mount_refuses_db_swapped_for_symlink_after_classify() {
     assert_eq!(fs::read(&real).unwrap(), before, "target unchanged");
 }
 
+/// Regression: #239 a writable mount refuses every companion link, both
+/// at admission and when planted immediately before SQLite acquisition.
+#[cfg(unix)]
+#[test]
+fn regression_mount_refuses_symlinked_companions() {
+    for suffix in ["-wal", "-journal", "-shm"] {
+        for after_classify in [false, true] {
+            let (dir, overlay) = overlay_with_keep_tombstone();
+            let db = overlay.canonicalize().unwrap().join(HIDDEN_DB);
+            let companion = PathBuf::from(format!("{}{suffix}", db.display()));
+            let target = dir.path().join("target");
+            fs::write(&target, b"").unwrap();
+            let before = fs::read(&db).unwrap();
+            let marker_before = fs::read(overlay.join(OVERLAY_MARKER)).unwrap();
+            if after_classify {
+                let companion = companion.clone();
+                let target = target.clone();
+                crate::overlay_db::AFTER_CLASSIFY.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |_| {
+                        std::os::unix::fs::symlink(&target, &companion).unwrap();
+                    }));
+                });
+            } else {
+                std::os::unix::fs::symlink(&target, &companion).unwrap();
+            }
+            let result = reopen_keep_overlay(&overlay);
+            crate::overlay_db::AFTER_CLASSIFY.with(|hook| *hook.borrow_mut() = None);
+            let error = msg_of(result);
+            assert!(
+                error.contains(&companion.display().to_string()),
+                "{suffix} seam={after_classify}: {error}"
+            );
+            assert!(
+                error.contains("is a symlink; it must be a regular file"),
+                "{error}"
+            );
+            assert!(fs::symlink_metadata(&companion)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(fs::read(&db).unwrap(), before, "database unchanged");
+            assert_eq!(fs::read(&target).unwrap(), b"", "target unchanged");
+            assert_eq!(
+                fs::read(overlay.join(OVERLAY_MARKER)).unwrap(),
+                marker_before
+            );
+        }
+    }
+}
+
 /// Regression (r17 skeptic #2, R7-E2): a dangling symlink at the
 /// database path was read as "no database" by `fs::metadata`. B8: a first
 /// open (no marker yet) created a fresh database THROUGH the symlink,
 /// outside the overlay. B7: the offline commit plan was built without the
-/// tombstones. Both refuse; nothing is created at the target. A symlink
-/// to a regular file stays supported by offline commit only.
+/// tombstones. Both refuse; nothing is created at the target.
 #[cfg(unix)]
 #[test]
 fn regression_dangling_db_symlink_is_not_an_absent_database() {

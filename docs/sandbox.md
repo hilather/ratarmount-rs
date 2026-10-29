@@ -341,17 +341,19 @@ the base with the same size and mtime cannot be caught without hashing; only
 `overlay verify` with a strong digest catches it (`overlay seal` of an
 already-strong base compares the stamp and does not rehash).
 `--commit-overlay` on a raw directory of files (no overlay database) has no
-identity to check and says so. Only a database path with nothing at all
-there counts as "no database": a dangling symlink, a directory or any other
-entry that is not a readable regular file is an existing but unreadable
-database, so the commit is refused (and any journal on the archive is left
-alone) instead of committing as a raw directory. A symlink to a regular
-database file keeps working. A database path whose target cannot be resolved
-(`ENOTDIR`, `EACCES`, `ELOOP`, `EIO`: for example a symlink to
-`plain-file/missing.sqlite`) is neither present nor absent: the error is
-reported with the path and nothing is recovered, committed or cleared. An
-overlay that was used (its marker remains) but whose database is missing,
-empty or a dangling symlink is a lost record: the commit exits 2 with the #96
+identity to check and says so. Only an absent database path in an unused
+overlay counts as "no database".
+Offline commit and recovery refuse a symlinked overlay database or any
+`-wal`, `-journal`, or `-shm` companion with exit 1.
+`--force-base-mismatch` cannot bypass this refusal.
+Before any write, refusal leaves the archive, symlink targets, database and
+recovery state unchanged. The same path rule applies to writable mounts and
+directory lower overlays, including dangling or looping links and links to
+empty or regular files. Parent-directory symlinks remain supported. A directory
+or other nonregular entry, or an inspection error, also refuses with its path
+and cause; regular companions, including a valid WAL or hot journal, remain
+supported. An overlay that was used (its marker remains) but whose database
+is missing or a regular empty file is a lost record: the commit exits 2 with the #96
 text before any recovery.
 
 The commit check also compares the recorded KIND under every digest kind, `none`
@@ -414,8 +416,9 @@ mount's top and directory lowers, the offline overlay, the live mount's own
 database, which must still be the file it opened) is classified again under
 the archive lock; a lost record or one whose database path cannot be resolved
 refuses the recovery with the locator, the archive and any journal left as
-they were. The offline overlay's database may be a symlink to a regular file,
-as the offline gate accepts; a mount's records must be regular files. That
+they were. Every named overlay database and its `-wal`, `-journal`, and `-shm`
+companions are checked again before recovery mutations; offline recovery and
+mount recovery both refuse symlinks with exit 1, including under force. That
 refusal is a refused recovery, also next to a complete journal: a live mount
 is not marked as having a base changed by a failed commit, and the next gate
 still refuses. The restamp after a roll-forward re-checks the record too, and a

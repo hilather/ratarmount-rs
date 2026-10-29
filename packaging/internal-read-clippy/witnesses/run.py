@@ -107,7 +107,7 @@ def main():
             summary["type_paths"] = len(config["disallowed-types"])
     # The existing journal policy is independent of inventory classification,
     # but its configured definitions must remain valid too. Compile references
-    # to all eleven actual repository APIs, including helpers with no native use.
+    # to all fourteen actual repository APIs, including helpers with no native use.
     journal_manifest = HERE / "journal" / "Cargo.toml"
     ordinary = tomllib.loads((HERE.parents[2] / "clippy.toml").read_text())
     journal_paths = {entry["path"] for entry in ordinary["disallowed-methods"]}

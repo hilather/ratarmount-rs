@@ -77,8 +77,8 @@ mod install;
 ))]
 pub use acquire::imp::seams as test_seams;
 pub use acquire::{
-    immutable_uri, open_checked, AcquireError, Acquired, DbId, Expect, NameMode, Refusal,
-    Verification,
+    immutable_uri, open_checked, refuse_symlink, AcquireError, Acquired, DbId, Expect, NameMode,
+    Refusal, Verification,
 };
 pub use elf::{ElfError, SymbolName};
 

@@ -469,7 +469,41 @@ pub(crate) struct Request {
     pub(crate) flags: OpenFlags,
 }
 
-/// Open `path` and prove which inode SQLite acquired.
+/// Recheck a failed nofollow acquisition or metadata read for a named symlink.
+///
+/// Like the writable index opener's refusal check, this inspects names only:
+/// opening and closing an alias could release this process's SQLite locks.
+/// Missing or uninspectable entries do not replace the original failure, and
+/// never prevent inspection of the other literal companion names. Parent
+/// symlinks are permitted; the final component is never resolved.
+pub fn refuse_symlink(path: &Path, flags: OpenFlags) -> rusqlite::Result<()> {
+    if !flags.contains(OpenFlags::SQLITE_OPEN_NOFOLLOW) {
+        return Ok(());
+    }
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let name = Path::new(&name);
+        if std::fs::symlink_metadata(name).is_ok_and(|metadata| metadata.is_symlink()) {
+            let label = if suffix.is_empty() {
+                "database"
+            } else {
+                "database companion"
+            };
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK),
+                Some(format!(
+                    "{label} {} is a symlink; it must be a regular file",
+                    name.display()
+                )),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Open `path` and prove which inode SQLite acquired. Every failure rechecks
+/// the named state with [`refuse_symlink`] before returning its refusal.
 pub fn open_checked(
     path: &Path,
     flags: OpenFlags,
@@ -480,23 +514,31 @@ pub fn open_checked(
         error,
         retained_fd: None,
     };
-    let request = request(path, flags, mode, expect).map_err(refuse)?;
-    #[cfg(windows)]
-    return path_type_only::open(&request, expect);
-    #[cfg(not(windows))]
-    {
-        if let Err(status) = super::install::installed() {
-            return Err(refuse(AcquireError::Unavailable(status)));
+    let acquired = (|| {
+        let request = request(path, flags, mode, expect).map_err(refuse)?;
+        #[cfg(windows)]
+        return path_type_only::open(&request, expect);
+        #[cfg(not(windows))]
+        {
+            if let Err(status) = super::install::installed() {
+                return Err(refuse(AcquireError::Unavailable(status)));
+            }
+            // F6 (r11 S6): the VFS and the two syscall slots still hold what the
+            // installation left; checked before arming, never repaired.
+            if let Err(reason) = super::install::hooks_intact() {
+                return Err(refuse(AcquireError::Unavailable(
+                    super::install::InstallStatus::HooksReplaced(reason),
+                )));
+            }
+            imp::open(&request.name, request.flags, expect)
         }
-        // F6 (r11 S6): the VFS and the two syscall slots still hold what the
-        // installation left; checked before arming, never repaired.
-        if let Err(reason) = super::install::hooks_intact() {
-            return Err(refuse(AcquireError::Unavailable(
-                super::install::InstallStatus::HooksReplaced(reason),
-            )));
+    })();
+    acquired.map_err(|mut refusal| {
+        if let Err(error) = refuse_symlink(path, flags) {
+            refusal.error = AcquireError::Sqlite(error);
         }
-        imp::open(&request.name, request.flags, expect)
-    }
+        refusal
+    })
 }
 
 /// Windows (design §9): no syscall hook, so pathname type checks before and

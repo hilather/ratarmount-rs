@@ -2244,11 +2244,9 @@ fn regression_mount_rename_b_over_a_is_deferred_and_untouched() {
     }
 }
 
-/// Regression (R7-B1): the top record's database is a symlink (a supported
-/// layout). `read_record` treated a non-regular file as "no record", so the
-/// record abstained, `mv B A` with B's own torn journal classified `Own` and
-/// recovery rolled B back. A symlinked or unstatable database is an unreadable
-/// record: Deferred in the classifier and refused by the locked authorizer.
+/// Regression: #239 (R7-B1): a symlinked top database once abstained and
+/// allowed recovery of B's own journal after `mv B A`. Policy now refuses
+/// before journal deferral or authorization, leaving B and its journal intact.
 #[cfg(unix)]
 #[test]
 fn regression_mount_symlinked_overlay_db_defers_recovery() {
@@ -2265,15 +2263,15 @@ fn regression_mount_symlinked_overlay_db_defers_recovery() {
     std::os::unix::fs::symlink(&real, &db).unwrap();
     let (bytes, journal, journal_bytes) = rename_b_over_a(&fx, false);
     let records = records_of(&fx);
-    match classify_mount_journal(&records, &fx.archive).unwrap() {
-        MountJournal::Deferred {
-            force_flag, why, ..
-        } => {
-            assert_eq!(force_flag, "--force-base-mismatch");
-            assert!(why.contains("cannot be read"), "{why}");
-        }
-        other => panic!("symlinked record must defer: {other:?}"),
-    }
+    let error = classify_mount_journal(&records, &fx.archive)
+        .expect_err("named-state policy must not become a forceable deferral");
+    assert!(crate::overlay_db::is_overlay_state_error(&error), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("is a symlink; it must be a regular file"),
+        "{error}"
+    );
     let archive = fx.archive.clone();
     let mut authorize = |h: &ratarmount_compress::commit_journal::PendingJournal,
                          m: &fs::Metadata| {
@@ -2294,14 +2292,14 @@ fn regression_mount_symlinked_overlay_db_defers_recovery() {
     assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
 }
 
-/// Regression (r16 skeptic, R7-D2): A's overlay database is replaced by a
+/// Regression: #239 (r16 skeptic, R7-D2): A's overlay database is replaced by a
 /// directory, then B with its own torn journal is renamed over A.
 /// `read_record` treated a directory at the database path as "no record", so
 /// the top record abstained, the mount classified B's journal `Own` and
 /// recovery rolled B back before `WriteOverlay::open` refused the directory.
-/// Any non-regular file at the database path is an unreadable record: the
-/// classifier defers, the locked authorizer refuses, B and its journal stay
-/// byte-identical and the gate refuses.
+/// Any non-regular file at the database path is a policy refusal before
+/// deferral; the locked authorizer refuses, and B and its journal stay
+/// byte-identical.
 #[cfg(unix)]
 #[test]
 fn regression_mount_directory_at_overlay_db_defers_recovery() {
@@ -2317,15 +2315,15 @@ fn regression_mount_directory_at_overlay_db_defers_recovery() {
     fs::create_dir(&db).unwrap();
     let (bytes, journal, journal_bytes) = rename_b_over_a(&fx, false);
     let records = records_of(&fx);
-    match classify_mount_journal(&records, &fx.archive).unwrap() {
-        MountJournal::Deferred {
-            force_flag, why, ..
-        } => {
-            assert_eq!(force_flag, "--force-base-mismatch");
-            assert!(why.contains("cannot be read"), "{why}");
-        }
-        other => panic!("a directory at the database path must defer: {other:?}"),
-    }
+    let error = classify_mount_journal(&records, &fx.archive)
+        .expect_err("named-state policy must not become a forceable deferral");
+    assert!(crate::overlay_db::is_overlay_state_error(&error), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("is a directory, not a database file"),
+        "{error}"
+    );
     let archive = fx.archive.clone();
     let mut authorize = |h: &ratarmount_compress::commit_journal::PendingJournal,
                          m: &fs::Metadata| {
@@ -5093,7 +5091,7 @@ fn locator(archive: &Path) -> Vec<u8> {
     }
 }
 
-/// Regression (R10-B, #150, r9 Astra v4 #2): a marked overlay whose database
+/// Regression: #239 (R10-B, #150, r9 Astra v4 #2): a marked overlay whose database
 /// is replaced by a symlink that cannot be resolved (`plain-file/missing.sqlite`
 /// gives `ENOTDIR`; also `EACCES`, `ELOOP`, injected `EIO`) next to an archive
 /// with a stale prepare locator and no journal. The followed-`stat` error was
@@ -5165,11 +5163,17 @@ fn regression_stale_prepare_locator_unresolved_target_is_kept() {
                         .unwrap_err();
                     // Regression (#177): this entry returns `OverlayError`, not
                     // `RecoverError`. Wrapping the string as `Refused` made the
-                    // variant assert unable to fail. `cannot be classified` is
-                    // the guard (`check_live` → `unusable`). The locator and
-                    // archive bytes below prove nothing was written.
+                    // variant assert unable to fail. Symlinks now fail the
+                    // strict policy before classification; injected EIO still
+                    // reaches `usable_entry`. State assertions prove no write.
                     assert!(
-                        error.to_string().contains("cannot be classified"),
+                        error
+                            .to_string()
+                            .contains(if matches!(how, Unresolved::Io) {
+                                "cannot be classified"
+                            } else {
+                                "is a symlink; it must be a regular file"
+                            }),
                         "{how:?} live: {error}"
                     );
                     drop(seam);
@@ -5199,7 +5203,7 @@ fn regression_stale_prepare_locator_unresolved_target_is_kept() {
     }
 }
 
-/// Regression (#178, v4 T13a truncation seam): an unresolved overlay database
+/// Regression: #239 (#178, v4 T13a truncation seam): an unresolved overlay database
 /// beside a journal stopped at the archive-truncate hook is refused before
 /// `rollback truncate`. The rollback truncate seam must not run.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -5326,7 +5330,11 @@ fn regression_t13a_unresolved_target_refuses_before_rollback_truncate() {
                     .to_string(),
             };
             assert!(
-                text.contains("cannot be classified"),
+                text.contains(if matches!(how, Unresolved::Io) {
+                    "cannot be classified"
+                } else {
+                    "is a symlink; it must be a regular file"
+                }),
                 "{how:?} {row}: {text}"
             );
             assert!(
@@ -5386,14 +5394,12 @@ fn regression_live_recovery_refuses_a_replaced_or_lost_database() {
     }
 }
 
-/// Regression (R10-B, v4 T8/T13b): a complete journal of A's own commit is
-/// rolled forward, then the restamp finds the record lost after
-/// authorization: the database emptied, replaced by one without a `files`
-/// table (the plain-SQL check inside the restamp transaction), or removed
-/// with its marker. The restamp skipped (an empty record read as
-/// "unrecorded") and the journal was unlinked with the rows naming the
-/// pre-commit stamp. Now `Committed`, the journal is kept, and once the
-/// database is restored recovery finishes and the gate accepts.
+/// Regression: #239 (R10-B, v4 T8/T13b): a complete journal of A's own
+/// commit loses its record after authorization: the database is emptied,
+/// replaced by one without a `files` table, or removed with its marker.
+/// Revalidation before recovery writes refuses with the archive, locator
+/// and journal unchanged. Once the database is restored recovery finishes
+/// and the gate accepts.
 #[cfg(unix)]
 #[test]
 fn regression_restamp_refuses_when_the_record_vanishes_after_authorization() {
@@ -5406,6 +5412,9 @@ fn regression_restamp_refuses_when_the_record_vanishes_after_authorization() {
         fs::copy(&db, &saved).unwrap();
         interrupt_complete(&fx.archive);
         let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+        let archive_before = fs::read(&fx.archive).unwrap();
+        let journal_before = fs::read(&journal).unwrap();
+        let locator_before = locator(&fx.archive);
         let records = records_of(&fx);
         let archive = fx.archive.clone();
         let overlay = fx.overlay.clone();
@@ -5431,9 +5440,20 @@ fn regression_restamp_refuses_when_the_record_vanishes_after_authorization() {
             crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Test(&mut authorize))
                 .unwrap_err();
         assert!(
-            matches!(error, RecoverError::Committed(_)),
+            matches!(error, RecoverError::Refused(_)),
             "{row}: {error:?}"
         );
+        assert_eq!(
+            fs::read(&fx.archive).unwrap(),
+            archive_before,
+            "{row}: archive"
+        );
+        assert_eq!(
+            fs::read(&journal).unwrap(),
+            journal_before,
+            "{row}: journal"
+        );
+        assert_eq!(locator(&fx.archive), locator_before, "{row}: locator");
         assert!(journal.exists(), "{row}: journal kept");
         assert!(
             ratarmount_compress::commit_journal::pending(&fx.archive)
@@ -5628,7 +5648,7 @@ fn lose_db(overlay: &Path, shape: &str) {
     assert!(overlay.join(crate::OVERLAY_MARKER).is_file(), "marker kept");
 }
 
-/// Regression (R10-FIX2, r10 review B2, v4 T5): a mount whose top or
+/// Regression: #239 (R10-FIX2, r10 review B2, v4 T5): a mount whose top or
 /// `--lower`-only record is lost (database deleted, 0-byte, a symlink to a
 /// 0-byte file or to nothing; marker kept) next to B renamed over A with its
 /// own torn or complete journal, or next to a stale prepare locator.
@@ -5674,14 +5694,26 @@ fn regression_mount_lost_overlay_db_defers_recovery() {
                 } else {
                     "--force-stack-mismatch"
                 };
-                match classify_mount_journal(&records, &fx.archive).unwrap() {
-                    MountJournal::Deferred {
+                match classify_mount_journal(&records, &fx.archive) {
+                    Err(error) if shape.starts_with("symlink") => {
+                        assert!(
+                            crate::overlay_db::is_overlay_state_error(&error),
+                            "{what}: {error}"
+                        );
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("is a symlink; it must be a regular file"),
+                            "{what}: {error}"
+                        );
+                    }
+                    Ok(MountJournal::Deferred {
                         why, force_flag, ..
-                    } => {
+                    }) => {
                         assert_eq!(force_flag, flag, "{what}");
                         assert!(why.contains("missing or empty"), "{what}: {why}");
                     }
-                    MountJournal::None if kept.is_none() => {}
+                    Ok(MountJournal::None) if kept.is_none() => {}
                     other => panic!("{what}: {other:?}"),
                 }
                 let db = fx.overlay.join(HIDDEN_DB);
@@ -5700,7 +5732,11 @@ fn regression_mount_lost_overlay_db_defers_recovery() {
                     "{what}: {error:?}"
                 );
                 assert!(
-                    error.to_string().contains("missing or empty"),
+                    error.to_string().contains(if shape.starts_with("symlink") {
+                        "is a symlink; it must be a regular file"
+                    } else {
+                        "missing or empty"
+                    }),
                     "{what}: {error}"
                 );
                 assert!(fs::read(&fx.archive).unwrap() == bytes, "{what}: archive");
@@ -5713,7 +5749,7 @@ fn regression_mount_lost_overlay_db_defers_recovery() {
     }
 }
 
-/// Regression (R10-FIX2, r10 review B2, v4 T7): the offline entry points with
+/// Regression: #239 (R10-FIX2, r10 review B2, v4 T7): the offline entry points with
 /// a lost record (the four shapes, marker kept). `commit_overlay` said "has no
 /// database" for a deleted one or read an empty one through the symlink;
 /// `commit_overlay_raw_dir` recovered B by inode and then refused;
@@ -5791,7 +5827,14 @@ fn regression_lost_record_refuses_before_recovery() {
                     error.to_string()
                 }
             };
-            assert!(error.contains("missing or empty"), "{what}: {error}");
+            assert!(
+                error.contains(if shape.starts_with("symlink") {
+                    "is a symlink; it must be a regular file"
+                } else {
+                    "missing or empty"
+                }),
+                "{what}: {error}"
+            );
             assert!(fs::read(&fx.archive).unwrap() == bytes, "{what}: archive");
             assert_eq!(locator(&fx.archive), before, "{what}: locator");
             if let Some((path, journal_bytes)) = &journal {
@@ -6184,7 +6227,7 @@ fn regression_required_record_read_is_one_snapshot() {
         .unwrap();
 }
 
-/// Regression: #222 mount recovery with a symlinked database and stale prepare
+/// Regression: #239 (#222) mount recovery with a symlinked database and stale prepare
 /// locator must name the next step without changing the archive or record.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
@@ -6220,78 +6263,700 @@ fn regression_mount_symlinked_db_stale_prepare_names_next_step() {
         error.contains("move the database file into place of the link"),
         "{error}"
     );
-    assert!(error.contains("retry the writable mount"), "{error}");
-    assert!(error.contains("no recovery write was made"), "{error}");
+    assert!(error.contains("it must be a regular file"), "{error}");
     assert_eq!(fs::read(&fx.archive).unwrap(), archive_before);
     assert_eq!(locator(&fx.archive), locator_before);
     assert_eq!(fs::read(&target).unwrap(), target_before);
 }
 
-/// Regression (R10-FIX7, r10 skeptic #2): offline recovery read its record
-/// with the mount's strict rule, which refuses a database entry that is a
-/// symlink, although the offline gate (and the classifier) accept a symlink
-/// to a regular database file. An offline commit of such an overlay next to a
-/// stale prepare locator was refused. The offline owner now reads the record
-/// through the symlink: the stale locator is cleared and the commit goes on;
-/// a mount's records keep the strict rule (it still defers).
-#[cfg(unix)]
+/// Regression: #239 offline recovery refuses a symlinked database before
+/// clearing even a stale prepare locator; archive, target and marker stay put.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn regression_offline_recovery_follows_a_symlinked_database() {
+fn regression_offline_recovery_refuses_symlinked_database() {
+    for force in [false, true] {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        let db = fx.overlay.join(HIDDEN_DB);
+        let target = fx.overlay.with_file_name("real.sqlite");
+        fs::rename(&db, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &db).unwrap();
+        stale_prepare(&fx.archive);
+        let before = overlay_239_snapshot(&fx.archive, &fx.overlay, &target);
+        let error = crate::commit_overlay(
+            &fx.overlay,
+            &fx.archive,
+            &archive_token(&fx.archive),
+            &CommitOverlayOptions {
+                yes: true,
+                force_base_mismatch: force,
+                ..Default::default()
+            },
+        )
+        .expect_err("symlink policy cannot be forced")
+        .to_string();
+        assert_239_refusal(&error, &db);
+        assert_eq!(
+            overlay_239_snapshot(&fx.archive, &fx.overlay, &target),
+            before
+        );
+    }
+}
+
+/// Snapshot the archive, external target, database, all overlay entries,
+/// commit journal and locator without following any overlay links.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn overlay_239_snapshot(
+    archive: &Path,
+    overlay: &Path,
+    target: &Path,
+) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    let mut paths = vec![
+        archive.to_path_buf(),
+        target.to_path_buf(),
+        ratarmount_compress::commit_journal::journal_path(archive),
+    ];
+    paths.extend(fs::read_dir(overlay).unwrap().map(|e| e.unwrap().path()));
+    paths.sort();
+    let mut snapshot: Vec<_> = paths
+        .into_iter()
+        .map(|p| {
+            let bytes = match fs::symlink_metadata(&p) {
+                Ok(m) if m.is_symlink() => Some(
+                    fs::read_link(&p)
+                        .unwrap()
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .to_vec(),
+                ),
+                Ok(m) if m.is_file() => Some(fs::read(&p).unwrap()),
+                Ok(_) => Some(b"directory".to_vec()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => panic!("{}: {e}", p.display()),
+            };
+            (p, bytes)
+        })
+        .collect();
+    snapshot.push((PathBuf::from("locator"), Some(locator(archive))));
+    snapshot
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_239_refusal(error: &str, path: &Path) {
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(
+        error.contains("is a symlink; it must be a regular file"),
+        "{error}"
+    );
+}
+
+/// Regression: #239 direct recovery rejects every companion before early
+/// returns or any journal mutation, independently of owner authorization.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_recovery_refuses_symlinked_companions() {
+    let mut failures = Vec::new();
+    for suffix in ["", "-wal", "-journal", "-shm"] {
+        for journal in ["none", "stale", "torn", "complete"] {
+            for owner in [
+                "recorded",
+                "forced",
+                "inode",
+                "raw",
+                "unmarked",
+                "mount top",
+                "mount lower",
+                "admitted lower",
+                "live",
+                "live record only",
+            ] {
+                let what = format!("{suffix} / {journal} / {owner}");
+                let result = std::panic::catch_unwind(|| {
+                    let fx = Fixture::new();
+                    drop(fx.open(BaseDigestRequest::Compute, false));
+                    let token = archive_token(&fx.archive);
+                    match journal {
+                        "stale" => stale_prepare(&fx.archive),
+                        "torn" => interrupt_append(&fx.archive),
+                        "complete" => {
+                            rename_b_over_a(&fx, true);
+                        }
+                        _ => {}
+                    }
+                    let db = fx.overlay.join(HIDDEN_DB);
+                    if matches!(owner, "unmarked" | "raw") {
+                        fs::remove_file(&db).unwrap();
+                        fs::remove_file(fx.overlay.join(crate::OVERLAY_MARKER)).unwrap();
+                    }
+                    let live = owner
+                        .starts_with("live")
+                        .then(|| std::sync::Mutex::new(rusqlite::Connection::open(&db).unwrap()));
+                    let target = fx.overlay.with_file_name("companion-target");
+                    if suffix.is_empty() && db.exists() {
+                        fs::rename(&db, &target).unwrap();
+                    } else {
+                        fs::write(&target, b"").unwrap();
+                    }
+                    let mut linked = db.as_os_str().to_os_string();
+                    linked.push(suffix);
+                    let linked = PathBuf::from(linked);
+                    std::os::unix::fs::symlink(&target, &linked).unwrap();
+                    let before = overlay_239_snapshot(&fx.archive, &fx.overlay, &target);
+                    let records = MountRecords {
+                        top: (owner == "mount top").then(|| fx.overlay.clone()),
+                        lowers: if owner == "mount lower" || owner == "admitted lower" {
+                            vec![fx.overlay.clone()]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    };
+                    let error = if owner == "raw" {
+                        crate::commit_overlay_raw_dir(
+                            &fx.overlay,
+                            &fx.archive,
+                            &CommitOverlayOptions {
+                                yes: true,
+                                ..Default::default()
+                            },
+                        )
+                        .expect_err("raw policy")
+                        .to_string()
+                    } else if let Some(live) = &live {
+                        crate::journal_recovery::recover_journal(
+                            &fx.archive,
+                            if owner == "live record only" {
+                                crate::journal_recovery::Rows::None
+                            } else {
+                                crate::journal_recovery::Rows::Shared {
+                                    db: live,
+                                    dir: &fx.overlay,
+                                    id: crate::overlay_db::file_id(&fs::metadata(&db).unwrap()),
+                                }
+                            },
+                            crate::Owner::Recorded {
+                                base: &token,
+                                archive: &fx.archive,
+                                record: crate::Record::Live(live),
+                            },
+                        )
+                        .expect_err("live policy")
+                        .to_string()
+                    } else {
+                        let who = match owner {
+                            "recorded" => crate::Owner::Recorded {
+                                base: &token,
+                                archive: &fx.archive,
+                                record: crate::Record::Offline(&fx.overlay),
+                            },
+                            "forced" => crate::Owner::Forced,
+                            "mount top" | "mount lower" => crate::Owner::Mount {
+                                records: &records,
+                                member: &fx.archive,
+                            },
+                            "admitted lower" => crate::Owner::AdmittedMount { records: &records },
+                            _ => crate::Owner::Inode,
+                        };
+                        crate::recover_journal_at(
+                            &fx.archive,
+                            (!matches!(owner, "mount lower" | "admitted lower"))
+                                .then_some(db.as_path()),
+                            who,
+                        )
+                        .expect_err("path policy")
+                        .to_string()
+                    };
+                    assert_239_refusal(&error, &linked);
+                    assert_eq!(
+                        overlay_239_snapshot(&fx.archive, &fx.overlay, &target),
+                        before
+                    );
+                });
+                if result.is_err() {
+                    failures.push(what);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "policy failures: {failures:?}");
+}
+
+/// Regression: #239 recovery rechecks named state after stale-P directory
+/// sync and rollback-truncate seams, before the first mutation for every owner.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_recovery_refuses_symlinks_at_write_seams() {
+    use ratarmount_compress::commit_journal::{fault, RecoverError};
+    let mut failures = Vec::new();
+    for seam in ["stale marker directory sync", "rollback truncate"] {
+        for state in ["db", "-wal", "-journal", "-shm"] {
+            for authority in ["forced", "inode", "mount lower"] {
+                let what = format!("{seam} / {state} / {authority}");
+                let result = std::panic::catch_unwind(|| {
+                    let fx = Fixture::new();
+                    drop(fx.open(BaseDigestRequest::Compute, false));
+                    if seam == "stale marker directory sync" {
+                        stale_prepare(&fx.archive);
+                    } else {
+                        interrupt_append(&fx.archive);
+                    }
+                    let db = fx.overlay.join(HIDDEN_DB);
+                    let target = fx.overlay.with_file_name("clear-target");
+                    let mut linked = db.as_os_str().to_os_string();
+                    if state != "db" {
+                        linked.push(state);
+                    }
+                    let linked = PathBuf::from(linked);
+                    let expected = std::rc::Rc::new(std::cell::RefCell::new(None));
+                    let saved = expected.clone();
+                    let (s_db, s_target, s_link, overlay, archive) = (
+                        db.clone(),
+                        target.clone(),
+                        linked.clone(),
+                        fx.overlay.clone(),
+                        fx.archive.clone(),
+                    );
+                    let mut once = Some(move || {
+                        if state == "db" {
+                            fs::rename(&s_db, &s_target).unwrap();
+                        } else {
+                            fs::write(&s_target, b"").unwrap();
+                        }
+                        std::os::unix::fs::symlink(&s_target, &s_link).unwrap();
+                        *saved.borrow_mut() =
+                            Some(overlay_239_snapshot(&archive, &overlay, &s_target));
+                    });
+                    fault::install(move |step| {
+                        if step == seam {
+                            if let Some(plant) = once.take() {
+                                plant();
+                            }
+                        }
+                        Ok(())
+                    });
+                    let records = MountRecords {
+                        lowers: vec![fx.overlay.clone()],
+                        ..Default::default()
+                    };
+                    let owner = match authority {
+                        "forced" => crate::Owner::Forced,
+                        "mount lower" => crate::Owner::Mount {
+                            records: &records,
+                            member: &fx.archive,
+                        },
+                        _ => crate::Owner::Inode,
+                    };
+                    let result = crate::recover_journal_at(
+                        &fx.archive,
+                        (authority != "mount lower").then_some(db.as_path()),
+                        owner,
+                    );
+                    fault::clear();
+                    let error = result.expect_err("policy is rechecked after the seam");
+                    if seam == "stale marker directory sync" {
+                        assert!(matches!(error, RecoverError::Refused(_)), "{error:?}");
+                    } else {
+                        assert!(matches!(error, RecoverError::Journal(_)), "{error:?}");
+                    }
+                    assert_239_refusal(&error.to_string(), &linked);
+                    assert!(
+                        crate::overlay_db::is_overlay_state_error(&error),
+                        "typed policy cause: {error:?}"
+                    );
+                    let expected = expected
+                        .borrow()
+                        .clone()
+                        .expect("pre-write recovery seam ran");
+                    assert_eq!(
+                        overlay_239_snapshot(&fx.archive, &fx.overlay, &target),
+                        expected
+                    );
+                });
+                fault::clear();
+                if result.is_err() {
+                    failures.push(what);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "recovery seam failures: {failures:?}");
+}
+
+/// Regression: #239 a link inserted at the post-unlink cleanup sync seam
+/// must keep the complete locator and report committed bytes truthfully.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_commit_cleanup_refuses_symlink_swaps() {
+    use ratarmount_compress::commit_journal::fault;
+    let mut failures = Vec::new();
+    for state in ["db", "-wal", "-journal", "-shm"] {
+        let result = std::panic::catch_unwind(|| {
+            let fx = Fixture::new();
+            drop(fx.open(BaseDigestRequest::Compute, false));
+            fs::write(fx.overlay.join("added"), b"overlay addition").unwrap();
+            let token = archive_token(&fx.archive);
+            let db = fx.overlay.join(HIDDEN_DB);
+            let target = fx.overlay.with_file_name("cleanup-target");
+            let mut linked = db.as_os_str().to_os_string();
+            if state != "db" {
+                linked.push(state);
+            }
+            let linked = PathBuf::from(linked);
+            let expected = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let saved = expected.clone();
+            let (s_db, s_target, s_link, overlay, archive) = (
+                db,
+                target.clone(),
+                linked.clone(),
+                fx.overlay.clone(),
+                fx.archive.clone(),
+            );
+            let original = fs::read(&fx.archive).unwrap();
+            let mut plant = Some(move || {
+                assert_ne!(fs::read(&archive).unwrap(), original, "already committed");
+                assert!(!ratarmount_compress::commit_journal::journal_path(&archive).exists());
+                assert!(!locator(&archive).is_empty(), "complete locator remains");
+                if state == "db" {
+                    fs::rename(&s_db, &s_target).unwrap();
+                } else {
+                    fs::write(&s_target, b"").unwrap();
+                }
+                std::os::unix::fs::symlink(&s_target, &s_link).unwrap();
+                *saved.borrow_mut() = Some(overlay_239_snapshot(&archive, &overlay, &s_target));
+            });
+            fault::install(move |step| {
+                if step == "commit directory sync" {
+                    return Err(std::io::Error::other("force post-unlink cleanup"));
+                }
+                if step == "cleanup directory sync" {
+                    plant.take().expect("cleanup seam runs once")();
+                }
+                Ok(())
+            });
+            let result = crate::commit_overlay(
+                &fx.overlay,
+                &fx.archive,
+                &token,
+                &CommitOverlayOptions {
+                    yes: true,
+                    mode: crate::CommitMode::Append,
+                    ..Default::default()
+                },
+            );
+            fault::clear();
+            let expected = expected.borrow().clone().expect("cleanup seam reached");
+            let error = result.expect_err("late policy refusal keeps the complete locator");
+            assert!(
+                matches!(error, crate::write_overlay::OverlayError::Committed(_)),
+                "{error:?}"
+            );
+            assert_239_refusal(&error.to_string(), &linked);
+            assert_eq!(
+                overlay_239_snapshot(&fx.archive, &fx.overlay, &target),
+                expected,
+                "no cleanup mutation after named-state refusal"
+            );
+        });
+        fault::clear();
+        if result.is_err() {
+            failures.push(state);
+        }
+    }
+    assert!(failures.is_empty(), "cleanup policy failures: {failures:?}");
+}
+
+/// Regression: #239 same-inode DB links and companion links inserted after
+/// admission must refuse before archive publication, including force/no journal.
+/// Without GNU tar, keep validation and append coverage while skipping copy publication.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_commit_refuses_symlink_swaps() {
     let _process_guard = ratarmount_index::test_process::spawning();
-    if !have_gnu_tar() {
-        eprintln!("skip: GNU tar unavailable");
-        return;
+    use ratarmount_compress::commit_journal::fault;
+    let gnu_tar_available = have_gnu_tar();
+    let mut failures = Vec::new();
+    for state in ["db", "-wal", "-journal", "-shm"] {
+        for seam in ["classified", "recovery", "publication", "staged"] {
+            for mode in [
+                crate::CommitMode::Copy,
+                crate::CommitMode::Append,
+                crate::CommitMode::Auto,
+            ] {
+                if seam == "staged" && mode == crate::CommitMode::Copy {
+                    continue;
+                }
+                if seam == "publication" && mode == crate::CommitMode::Copy && !gnu_tar_available {
+                    eprintln!("skip: GNU tar unavailable for {state} / {seam} / {mode:?}");
+                    continue;
+                }
+                for force in [false, true] {
+                    let what = format!("{state} / {seam} / {mode:?} / force={force}");
+                    let result = std::panic::catch_unwind(|| {
+                        let fx = Fixture::new();
+                        drop(fx.open(BaseDigestRequest::Compute, false));
+                        fs::write(fx.overlay.join("added"), b"overlay addition").unwrap();
+                        let token = archive_token(&fx.archive);
+                        let db = fx.overlay.join(HIDDEN_DB);
+                        let target = fx.overlay.with_file_name("swap-target");
+                        let mut linked = db.as_os_str().to_os_string();
+                        if state != "db" {
+                            linked.push(state);
+                        }
+                        let linked = PathBuf::from(linked);
+                        let before = std::rc::Rc::new(std::cell::RefCell::new(None));
+                        let saved = before.clone();
+                        let (s_db, s_target, s_link, overlay, archive) = (
+                            db.clone(),
+                            target.clone(),
+                            linked.clone(),
+                            fx.overlay.clone(),
+                            fx.archive.clone(),
+                        );
+                        let swap = move || {
+                            if state == "db" {
+                                fs::rename(&s_db, &s_target).unwrap();
+                            } else {
+                                fs::write(&s_target, b"").unwrap();
+                            }
+                            std::os::unix::fs::symlink(&s_target, &s_link).unwrap();
+                            *saved.borrow_mut() =
+                                Some(overlay_239_snapshot(&archive, &overlay, &s_target));
+                        };
+                        if seam == "classified" {
+                            let mut swap = Some(swap);
+                            crate::overlay_db::AFTER_CLASSIFY.with(|h| {
+                                *h.borrow_mut() = Some(Box::new(move |p| {
+                                    if p == db {
+                                        if let Some(swap) = swap.take() {
+                                            swap();
+                                        }
+                                    }
+                                }))
+                            });
+                        } else if seam == "recovery" {
+                            crate::write_overlay::BEFORE_OFFLINE_RECOVERY
+                                .with(|h| *h.borrow_mut() = Some(Box::new(swap)));
+                        } else {
+                            let mut swap = Some(swap);
+                            let point = if seam == "staged" {
+                                "journal fsync"
+                            } else if mode == crate::CommitMode::Copy {
+                                "copy publish"
+                            } else {
+                                "before replace"
+                            };
+                            fault::install(move |step| {
+                                if step == point {
+                                    if let Some(swap) = swap.take() {
+                                        swap();
+                                    }
+                                }
+                                Ok(())
+                            });
+                        }
+                        let result = crate::commit_overlay(
+                            &fx.overlay,
+                            &fx.archive,
+                            &token,
+                            &CommitOverlayOptions {
+                                yes: true,
+                                mode,
+                                force_base_mismatch: force,
+                                ..Default::default()
+                            },
+                        );
+                        fault::clear();
+                        crate::overlay_db::AFTER_CLASSIFY.with(|h| *h.borrow_mut() = None);
+                        crate::write_overlay::BEFORE_OFFLINE_RECOVERY
+                            .with(|h| *h.borrow_mut() = None);
+                        let expected = before.borrow().clone().expect("swap seam reached");
+                        let error = result
+                            .expect_err("must refuse before publication")
+                            .to_string();
+                        assert_239_refusal(&error, &linked);
+                        assert_eq!(
+                            overlay_239_snapshot(&fx.archive, &fx.overlay, &target),
+                            expected,
+                            "before-write preservation"
+                        );
+                    });
+                    fault::clear();
+                    crate::overlay_db::AFTER_CLASSIFY.with(|h| *h.borrow_mut() = None);
+                    crate::write_overlay::BEFORE_OFFLINE_RECOVERY.with(|h| *h.borrow_mut() = None);
+                    if result.is_err() {
+                        failures.push(what);
+                    }
+                }
+            }
+        }
     }
-    let fx = Fixture::new();
-    drop(fx.open(BaseDigestRequest::Compute, false));
-    let db = fx.overlay.join(HIDDEN_DB);
-    let elsewhere = fx.overlay.parent().unwrap().join("db-elsewhere");
-    fs::create_dir(&elsewhere).unwrap();
-    let target = elsewhere.join("overlay.sqlite");
-    fs::rename(&db, &target).unwrap();
-    std::os::unix::fs::symlink(&target, &db).unwrap();
-    stale_prepare(&fx.archive);
-    assert!(!locator(&fx.archive).is_empty(), "a stale locator");
-    // A mount's records keep the strict rule.
-    let records = records_of(&fx);
-    match classify_mount_journal(&records, &fx.archive).unwrap() {
-        MountJournal::None => {}
-        other => panic!("no journal is pending: {other:?}"),
+    assert!(failures.is_empty(), "swap failures: {failures:?}");
+}
+
+/// Regression: #239 classification must keep a late policy refusal typed,
+/// so torn and complete journal branches cannot defer it or suggest force.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_mount_classification_preserves_symlink_policy() {
+    let mut failures = Vec::new();
+    for state in ["db", "-wal", "-journal", "-shm"] {
+        for complete in [false, true] {
+            let result = std::panic::catch_unwind(|| {
+                let fx = Fixture::new();
+                drop(fx.open(BaseDigestRequest::Compute, false));
+                if complete {
+                    interrupt_complete(&fx.archive);
+                } else {
+                    interrupt_append(&fx.archive);
+                }
+                let db = fx.overlay.join(HIDDEN_DB);
+                let target = fx.overlay.with_file_name("classification-target");
+                let mut linked = db.as_os_str().to_os_string();
+                if state != "db" {
+                    linked.push(state);
+                }
+                let linked = PathBuf::from(linked);
+                let expected = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let saved = expected.clone();
+                let (s_db, s_target, s_link, overlay, archive) = (
+                    db.clone(),
+                    target.clone(),
+                    linked.clone(),
+                    fx.overlay.clone(),
+                    fx.archive.clone(),
+                );
+                let mut once = Some(move || {
+                    if state == "db" {
+                        fs::rename(&s_db, &s_target).unwrap();
+                    } else {
+                        fs::write(&s_target, b"").unwrap();
+                    }
+                    std::os::unix::fs::symlink(&s_target, &s_link).unwrap();
+                    *saved.borrow_mut() = Some(overlay_239_snapshot(&archive, &overlay, &s_target));
+                });
+                crate::overlay_db::AFTER_CLASSIFY.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |path| {
+                        if path == db {
+                            if let Some(plant) = once.take() {
+                                plant();
+                            }
+                        }
+                    }))
+                });
+                let result = classify_mount_journal(&records_of(&fx), &fx.archive);
+                crate::overlay_db::AFTER_CLASSIFY.with(|hook| *hook.borrow_mut() = None);
+                let error = result.expect_err("policy is not a forceable journal deferral");
+                assert!(crate::overlay_db::is_overlay_state_error(&error), "{error}");
+                assert_239_refusal(&error.to_string(), &linked);
+                assert_eq!(
+                    overlay_239_snapshot(&fx.archive, &fx.overlay, &target),
+                    expected.borrow().clone().expect("classification seam ran")
+                );
+            });
+            crate::overlay_db::AFTER_CLASSIFY.with(|hook| *hook.borrow_mut() = None);
+            if result.is_err() {
+                failures.push(format!("{state} / complete={complete}"));
+            }
+        }
     }
-    let rows = || {
-        let conn = rusqlite::Connection::open(&target).unwrap();
-        OverlayMeta::from_connection(&conn)
-            .unwrap()
-            .unwrap()
-            .values()
-            .clone()
-    };
-    let before = rows();
-    crate::commit_overlay(
-        &fx.overlay,
-        &fx.archive,
-        &archive_token(&fx.archive),
-        &CommitOverlayOptions {
-            yes: true,
-            ..Default::default()
-        },
-    )
-    .expect("the offline commit reads its record through the symlink");
-    assert!(
-        locator(&fx.archive).is_empty(),
-        "the stale locator is cleared"
-    );
-    assert!(
-        fs::symlink_metadata(&db).unwrap().file_type().is_symlink(),
-        "the database entry is still the symlink"
-    );
-    assert_eq!(rows(), before, "the record is unchanged");
-    crate::overlay_gate::check_commit_base_offline(
-        &fx.overlay,
-        &archive_token(&fx.archive),
-        &fx.archive,
-    )
-    .unwrap();
+    assert!(failures.is_empty(), "classification failures: {failures:?}");
+}
+
+/// Regression: #239 a real zstd replacement must validate overlay state at
+/// publication, before persisting its fully prepared compressed archive.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_zstd_replacement_refuses_symlink_swaps() {
+    offline_zstd_publication_refuses_symlink_swaps(false);
+}
+
+/// Regression: #239 an oversized zstd append must validate its copy fallback
+/// before publication and preserve the typed refusal, prohibiting an Auto retry.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_zstd_oversized_append_refuses_symlink_swaps() {
+    offline_zstd_publication_refuses_symlink_swaps(true);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn offline_zstd_publication_refuses_symlink_swaps(oversized: bool) {
+    for state in ["db", "-wal", "-journal", "-shm"] {
+        for force in [false, true] {
+            let place = Place::new(true);
+            let mode = if oversized {
+                crate::CommitMode::Auto
+            } else {
+                crate::CommitMode::Copy
+            };
+            drop(place.open(&place.overlay, Way::Offline, mode));
+            fs::write(place.overlay.join("added"), vec![b'x'; 8192]).unwrap();
+            let token = place.token();
+            let db = place.overlay.join(HIDDEN_DB);
+            let target = place.root.join("swap-target");
+            let mut linked = db.as_os_str().to_os_string();
+            if state != "db" {
+                linked.push(state);
+            }
+            let linked = PathBuf::from(linked);
+            let expected = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let saved = expected.clone();
+            let steps = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let seen = steps.clone();
+            let (s_target, s_link, overlay, archive) = (
+                target.clone(),
+                linked.clone(),
+                place.overlay.clone(),
+                place.archive.clone(),
+            );
+            fault::install(move |step| {
+                seen.borrow_mut().push(step.to_string());
+                if step == "copy publish" && saved.borrow().is_none() {
+                    if state == "db" {
+                        fs::rename(&db, &s_target).unwrap();
+                    } else {
+                        fs::write(&s_target, b"external target must survive").unwrap();
+                    }
+                    std::os::unix::fs::symlink(&s_target, &s_link).unwrap();
+                    *saved.borrow_mut() = Some(overlay_239_snapshot(&archive, &overlay, &s_target));
+                }
+                Ok(())
+            });
+            // Only the test build lowers the format's u32 size boundary. Both
+            // paths still decode, transform, encode and stage real zstd frames.
+            let result = ratarmount_compress::with_splice_frame_size_limit(
+                if oversized { 4096 } else { u32::MAX },
+                || {
+                    crate::commit_overlay(
+                        &place.overlay,
+                        &place.archive,
+                        &token,
+                        &CommitOverlayOptions {
+                            yes: true,
+                            mode,
+                            force_base_mismatch: force,
+                            ..Default::default()
+                        },
+                    )
+                },
+            );
+            fault::clear();
+            let expected = expected.borrow().clone().expect("copy publication reached");
+            let error = result.expect_err("must refuse before zstd publication");
+            assert_239_refusal(&error.to_string(), &linked);
+            assert!(
+                overlay_239_snapshot(&place.archive, &place.overlay, &target) == expected,
+                "archive, target, overlay, journal and locator must survive: {state}, force={force}"
+            );
+            assert!(crate::overlay_db::is_overlay_state_error(&error), "{error}");
+            let steps = steps.borrow();
+            let count = |point| steps.iter().filter(|step| *step == point).count();
+            assert_eq!(count("copy publish"), 1, "no Auto publication retry");
+            assert_eq!(count("before splice scan"), usize::from(oversized));
+            assert_eq!(count("copy source open"), usize::from(!oversized));
+            assert_eq!(count("before replace"), 0, "copy fallback was selected");
+            assert_eq!(count("journal fsync"), 0, "no journal was written");
+        }
+    }
 }
 
 struct PreparedIdentityFixture {
@@ -6878,5 +7543,196 @@ fn regression_required_marker_observation_is_monotonic() {
             before.1
         );
         assert_eq!(locator(&fx.archive), before.2);
+    }
+}
+
+/// Regression: #239 metadata reads through an already acquired connection
+/// must retain late companion policy errors, including at the forceable gate.
+#[cfg(unix)]
+#[test]
+fn regression_late_companion_held_metadata_read_preserves_policy() {
+    use std::os::unix::ffi::OsStringExt;
+
+    for suffix in ["-journal", "-wal", "-shm"] {
+        for reader in ["meta", "required", "files", "commit gate"] {
+            for non_utf8 in [false, true] {
+                let mut fx = Fixture::new();
+                if non_utf8 {
+                    fx.overlay = fx
+                        ._tmp
+                        .path()
+                        .join(std::ffi::OsString::from_vec(b"overlay-\xff".to_vec()));
+                }
+                match fs::create_dir(&fx.overlay) {
+                    Ok(()) => {}
+                    // APFS refuses non-UTF-8 names; keep the UTF-8 case running.
+                    Err(e)
+                        if cfg!(target_os = "macos")
+                            && non_utf8
+                            && e.raw_os_error() == Some(libc::EILSEQ) =>
+                    {
+                        eprintln!("skip: filesystem rejects non-UTF-8 overlay directory names");
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+                let db = fx.overlay.join(HIDDEN_DB);
+                let conn = rusqlite::Connection::open(&db).unwrap();
+                let mode = if suffix == "-journal" {
+                    "DELETE"
+                } else {
+                    "WAL"
+                };
+                conn.execute_batch(&format!(
+                    "PRAGMA journal_mode={mode}; CREATE TABLE files(path, name, deleted); \
+                 CREATE TABLE meta(key, value)"
+                ))
+                .unwrap();
+                drop(conn);
+                let base = archive_token(&fx.archive);
+                let target = fx._tmp.path().join("companion-target");
+                fs::write(&target, b"nonempty external target").unwrap();
+                let before = (
+                    fs::read(&fx.archive).unwrap(),
+                    fs::read(&db).unwrap(),
+                    fs::read(&target).unwrap(),
+                );
+                let conn = rusqlite::Connection::open_with_flags(
+                    &db,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                )
+                .unwrap();
+                assert_eq!(conn.path().is_none(), non_utf8, "fixture path encoding");
+                let mut companion = db.as_os_str().to_os_string();
+                companion.push(suffix);
+                let companion = PathBuf::from(companion);
+                std::os::unix::fs::symlink(&target, &companion).unwrap();
+                let error = match reader {
+                    "meta" => OverlayMeta::from_connection(&conn).unwrap_err(),
+                    "required" => OverlayMeta::from_connection_required(&conn, true).unwrap_err(),
+                    "files" => crate::overlay_meta::has_files_table(&conn)
+                        .unwrap_err()
+                        .into(),
+                    _ => {
+                        let refusal = crate::overlay_gate::check_commit_base_with(
+                            &conn,
+                            &base,
+                            &fx.archive,
+                            None,
+                            true,
+                        )
+                        .unwrap_err();
+                        assert!(refusal.is_policy(), "{suffix} {reader}: {refusal}");
+                        refusal.into_overlay_error()
+                    }
+                };
+                assert!(
+                    crate::overlay_db::is_overlay_state_error(&error),
+                    "{suffix} {reader}: {error}"
+                );
+                let message = error.to_string();
+                assert!(
+                    message.contains(&companion.display().to_string()),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("is a symlink; it must be a regular file"),
+                    "{message}"
+                );
+                assert!(!message.contains("--force"), "{message}");
+                drop(conn);
+                assert_eq!(fs::read(&fx.archive).unwrap(), before.0);
+                assert_eq!(fs::read(&db).unwrap(), before.1);
+                assert_eq!(fs::read(&target).unwrap(), before.2);
+                assert_eq!(fs::read_link(&companion).unwrap(), target);
+            }
+        }
+    }
+}
+
+/// Regression: #239 a failed metadata read must recheck the original OS path
+/// when SQLite cannot report a non-UTF-8 database name through Connection::path.
+#[cfg(unix)]
+#[test]
+fn regression_late_companion_non_utf8_metadata_read_preserves_policy() {
+    use std::os::unix::ffi::OsStringExt;
+
+    for suffix in ["-journal", "-wal", "-shm"] {
+        for reader in ["read", "commit gate"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let archive = tmp.path().join("base.tar");
+            write_tar(&archive, &[("first", b"first member")]);
+            let base = archive_token(&archive);
+            let overlay = tmp
+                .path()
+                .join(std::ffi::OsString::from_vec(b"overlay-\xff".to_vec()));
+            match fs::create_dir(&overlay) {
+                Ok(()) => {}
+                // APFS refuses the fixture before the policy can inspect it.
+                Err(e) if cfg!(target_os = "macos") && e.raw_os_error() == Some(libc::EILSEQ) => {
+                    eprintln!("skip: filesystem rejects non-UTF-8 overlay directory names");
+                    return;
+                }
+                Err(e) => panic!("{e}"),
+            }
+            let db = overlay.join(HIDDEN_DB);
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let mode = if suffix == "-journal" {
+                "DELETE"
+            } else {
+                "WAL"
+            };
+            conn.execute_batch(&format!(
+                "PRAGMA journal_mode={mode}; CREATE TABLE files(path, name, deleted)"
+            ))
+            .unwrap();
+            assert!(
+                conn.path().is_none(),
+                "fixture exercises the original OS path"
+            );
+            drop(conn);
+            let target = tmp.path().join("companion-target");
+            fs::write(&target, b"nonempty external target").unwrap();
+            let before = (
+                fs::read(&db).unwrap(),
+                fs::read(&target).unwrap(),
+                fs::read(&archive).unwrap(),
+            );
+            let mut companion = db.as_os_str().to_os_string();
+            companion.push(suffix);
+            let companion = PathBuf::from(companion);
+            let at_acquire = companion.clone();
+            let target_at_acquire = target.clone();
+            crate::overlay_db::AFTER_ACQUIRE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |_| {
+                    std::os::unix::fs::symlink(&target_at_acquire, &at_acquire).unwrap();
+                }));
+            });
+            let result = if reader == "read" {
+                OverlayMeta::read_no_recovery_required(&overlay, true).map(|_| ())
+            } else {
+                crate::overlay_gate::check_commit_base_offline(&overlay, &base, &archive)
+                    .map(|_| ())
+                    .map_err(|refusal| refusal.into_overlay_error())
+            };
+            crate::overlay_db::AFTER_ACQUIRE.with(|hook| *hook.borrow_mut() = None);
+            let error = result.unwrap_err();
+            assert!(crate::overlay_db::is_overlay_state_error(&error), "{error}");
+            let message = error.to_string();
+            assert!(
+                message.contains(&companion.display().to_string()),
+                "{message}"
+            );
+            assert!(
+                message.contains("is a symlink; it must be a regular file"),
+                "{message}"
+            );
+            assert!(!message.contains("--force"), "{message}");
+            assert_eq!(fs::read(&db).unwrap(), before.0);
+            assert_eq!(fs::read(&target).unwrap(), before.1);
+            assert_eq!(fs::read(&archive).unwrap(), before.2);
+            assert_eq!(fs::read_link(&companion).unwrap(), target);
+        }
     }
 }

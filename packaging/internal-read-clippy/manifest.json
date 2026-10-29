@@ -10891,9 +10891,9 @@
     },
     {
       "configured_path": "ratarmount_compress::commit_journal::recover_guarded",
-      "item": "ratarmount_compositing::journal_recovery::recover_journal",
+      "item": "ratarmount_compositing::journal_recovery::recover_journal_with_records",
       "journal_exemption": true,
-      "leaf_digest": "02c51d4ea2bd77673e832ff0c82d78d9618136ec75ddeffe9082e7cc1f34721f",
+      "leaf_digest": "e4496c814982fb4e8c868fbbc13febcfab211553ae4e207a66662d0c475e146b",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -10906,10 +10906,10 @@
       "rule_reason": "recover through ratarmount_compositing::recover_journal_at with an Owner"
     },
     {
-      "configured_path": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with",
+      "configured_path": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_guarded",
       "item": "ratarmount_compositing::journal_recovery::replace_committing",
       "journal_exemption": true,
-      "leaf_digest": "f8a7f2e7b35dd7bced4c3e3a94c1bff8da83d78e1c6817298d753198d18bc504",
+      "leaf_digest": "8f1bcf2b5ace804bc9a0185a44c8973212c9f0720b7eed0e35bf1258bddac7c6",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -10918,14 +10918,14 @@
         "default"
       ],
       "reason": "The compositing replacement wrapper supplies the checked base and commit restamp hook",
-      "resolved": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with",
+      "resolved": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_guarded",
       "rule_reason": "use journal_recovery::replace_committing"
     },
     {
-      "configured_path": "ratarmount_compress::splice_zstd_last_frames_append_with",
+      "configured_path": "ratarmount_compress::splice_zstd_last_frames_append_guarded",
       "item": "ratarmount_compositing::journal_recovery::splice_append_committing",
       "journal_exemption": true,
-      "leaf_digest": "084e4606e7359ce94fd7efa837ae72245a0ba57b55f63896d8e60be77792db5f",
+      "leaf_digest": "0aa8056ca164687d0e140446e310f101b6f2585e3d9c5529b54e98fa8b698a42",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -10934,14 +10934,14 @@
         "default"
       ],
       "reason": "The compositing append wrapper supplies the checked base and commit restamp hook",
-      "resolved": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
+      "resolved": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded",
       "rule_reason": "use journal_recovery::splice_append_committing"
     },
     {
-      "configured_path": "ratarmount_compress::splice_zstd_last_frames_replace",
+      "configured_path": "ratarmount_compress::splice_zstd_last_frames_replace_guarded",
       "item": "ratarmount_compositing::journal_recovery::splice_replace_over",
       "journal_exemption": true,
-      "leaf_digest": "97b8e20208e2d17dca891ce9c1c4fc7e69b08d15cd1cd5e78a21cfa3f15f057a",
+      "leaf_digest": "68dbaca19b1befc71296e816e15531f81594f3dd903f97b034196639e43f7a00",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -10950,7 +10950,7 @@
         "default"
       ],
       "reason": "The compositing copy-splice wrapper provides the previously accepted source stamp",
-      "resolved": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace",
+      "resolved": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded",
       "rule_reason": "use journal_recovery::splice_replace_over"
     },
     {
@@ -12687,6 +12687,22 @@
       "rule_reason": "recover through ratarmount_compositing::recover_journal_at with an Owner"
     },
     {
+      "configured_path": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_guarded",
+      "item": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with",
+      "journal_exemption": true,
+      "leaf_digest": "2c66c37cf9acdcb54fbb7536a4dbe8279955fe958e1b04cb6f202f340c1a0419",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The replacement convenience API delegates with the caller pre-write guard",
+      "resolved": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_guarded",
+      "rule_reason": "use journal_recovery::replace_committing"
+    },
+    {
       "configured_path": "std::fs::write",
       "item": "ratarmount_compress::commit_journal::test_marker",
       "leaf_digest": "d59414e0f6869d7f0de52e951ebd2f337bb7642bb2cb5a6f42cbd4cc9b1b1e0e",
@@ -14216,10 +14232,10 @@
       "rule_reason": "use journal_recovery::splice_append_committing"
     },
     {
-      "configured_path": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with",
-      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
+      "configured_path": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_guarded",
+      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded",
       "journal_exemption": true,
-      "leaf_digest": "8dd5b33f12d9b55c5639affc3a4bf95247aab4f0542ac8f2d76d2317e3b699bd",
+      "leaf_digest": "6cc73effb9a968a1d3ec893e5f110e394d429292df6449dd421c6c76db19c810",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -14228,14 +14244,14 @@
         "default"
       ],
       "reason": "The append splice commits its checked suffix through the journal implementation",
-      "resolved": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with",
+      "resolved": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_guarded",
       "rule_reason": "use journal_recovery::replace_committing"
     },
     {
       "configured_path": "ratarmount_compress::commit_journal::guard_copy",
-      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
+      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded",
       "journal_exemption": true,
-      "leaf_digest": "bb617f19dee9893805035b25db922b90875c11a32a1bdb58385785dc03c242c6",
+      "leaf_digest": "f30d699e2d88e8d6cb51054f16c9184acb3bb954d291b36b08bc7d60c948e736",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -14249,7 +14265,7 @@
     },
     {
       "configured_path": "std::fs::File::open",
-      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
+      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded",
       "leaf_digest": "ffe36dbe6ba452a84db204280dfe78f8127ab653d06c86dbedf8cfc333965f69",
       "lint": "clippy::disallowed_methods",
       "metadata": {
@@ -14262,7 +14278,7 @@
         "family": "commit-journal-recovery",
         "id": "IR-B0279-M01",
         "issue": "#196",
-        "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
+        "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded",
         "reason": "zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery"
       },
       "multiplicity": 1,
@@ -14271,13 +14287,13 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0279-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with\",\"disposition\":\"residual\",\"reason\":\"zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery\",\"family\":\"commit-journal-recovery\",\"issue\":\"#196\",\"category\":\"commit-journal-recovery\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0279-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded\",\"disposition\":\"residual\",\"reason\":\"zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery\",\"family\":\"commit-journal-recovery\",\"issue\":\"#196\",\"category\":\"commit-journal-recovery\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
       "resolved": "<std::fs::File>::open",
       "rule_reason": "inventory-op:File::open"
     },
     {
       "configured_path": "tempfile::NamedTempFile::new_in",
-      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
+      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded",
       "leaf_digest": "63bd6f8777ea2dde2f755d07ff554512eb8bfbf5403aa15fa5ef8e7993c60cdd",
       "lint": "clippy::disallowed_methods",
       "metadata": {
@@ -14288,7 +14304,7 @@
         },
         "disposition": "output-owner",
         "id": "IR-B0280-M01",
-        "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
+        "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded",
         "mode_policy": "unchanged-from-e6ca64e",
         "reason": "Preserve this reviewed output acquisition and its existing permissions."
       },
@@ -14298,13 +14314,13 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0280-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0280-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
       "resolved": "<tempfile::file::NamedTempFile<std::fs::File>>::new_in",
       "rule_reason": "inventory-op:tempfile"
     },
     {
       "configured_path": "tempfile::NamedTempFile::new_in",
-      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
+      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded",
       "leaf_digest": "4f7869008e3b8e141d0f01bb4db39c7da5cf667e413566029f3009197e0bd42c",
       "lint": "clippy::disallowed_methods",
       "metadata": {
@@ -14315,7 +14331,7 @@
         },
         "disposition": "output-owner",
         "id": "IR-B0281-M01",
-        "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
+        "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded",
         "mode_policy": "private-staging-then-source-archive-metadata",
         "reason": "Stage the replacement privately; restore accepted archive metadata by fd before publication (#235)."
       },
@@ -14325,15 +14341,47 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0281-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with\",\"disposition\":\"output-owner\",\"mode_policy\":\"private-staging-then-source-archive-metadata\",\"category\":\"output-owner\",\"reason\":\"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).\",\"creation\":{\"policy\":\"private-named-temporary-file\",\"basis\":\"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0281-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded\",\"disposition\":\"output-owner\",\"mode_policy\":\"private-staging-then-source-archive-metadata\",\"category\":\"output-owner\",\"reason\":\"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).\",\"creation\":{\"policy\":\"private-named-temporary-file\",\"basis\":\"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.\"}}",
       "resolved": "<tempfile::file::NamedTempFile<std::fs::File>>::new_in",
       "rule_reason": "inventory-op:tempfile"
     },
     {
-      "configured_path": "ratarmount_compress::commit_journal::guard_copy",
+      "configured_path": "ratarmount_compress::splice_zstd_last_frames_append_guarded",
+      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
+      "journal_exemption": true,
+      "leaf_digest": "3cdc35ce92f76edf11d6cadb3b3e41b56a10c973c8237973a04d0799413363ce",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The append splice convenience API delegates with the caller pre-write guard",
+      "resolved": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded",
+      "rule_reason": "use journal_recovery::splice_append_committing"
+    },
+    {
+      "configured_path": "ratarmount_compress::splice_zstd_last_frames_replace_guarded",
       "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace",
       "journal_exemption": true,
-      "leaf_digest": "bb617f19dee9893805035b25db922b90875c11a32a1bdb58385785dc03c242c6",
+      "leaf_digest": "b6ff8af9527c51c5b90c427bf4df61c1fef60971dedc66fd77950818f24353d6",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The copy splice convenience API delegates with the caller pre-publication guard",
+      "resolved": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded",
+      "rule_reason": "use journal_recovery::splice_replace_over"
+    },
+    {
+      "configured_path": "ratarmount_compress::commit_journal::guard_copy",
+      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded",
+      "journal_exemption": true,
+      "leaf_digest": "f30d699e2d88e8d6cb51054f16c9184acb3bb954d291b36b08bc7d60c948e736",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -14347,7 +14395,7 @@
     },
     {
       "configured_path": "tempfile::NamedTempFile::new_in",
-      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace",
+      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded",
       "leaf_digest": "4f7869008e3b8e141d0f01bb4db39c7da5cf667e413566029f3009197e0bd42c",
       "lint": "clippy::disallowed_methods",
       "metadata": {
@@ -14358,7 +14406,7 @@
         },
         "disposition": "output-owner",
         "id": "IR-B0277-M01",
-        "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace",
+        "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded",
         "mode_policy": "private-staging-then-source-archive-metadata",
         "reason": "Stage the replacement privately; restore accepted archive metadata by fd before publication (#235)."
       },
@@ -14368,13 +14416,13 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0277-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace\",\"disposition\":\"output-owner\",\"mode_policy\":\"private-staging-then-source-archive-metadata\",\"category\":\"output-owner\",\"reason\":\"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).\",\"creation\":{\"policy\":\"private-named-temporary-file\",\"basis\":\"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0277-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded\",\"disposition\":\"output-owner\",\"mode_policy\":\"private-staging-then-source-archive-metadata\",\"category\":\"output-owner\",\"reason\":\"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).\",\"creation\":{\"policy\":\"private-named-temporary-file\",\"basis\":\"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.\"}}",
       "resolved": "<tempfile::file::NamedTempFile<std::fs::File>>::new_in",
       "rule_reason": "inventory-op:tempfile"
     },
     {
       "configured_path": "std::fs::File::open",
-      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace",
+      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded",
       "leaf_digest": "ffe36dbe6ba452a84db204280dfe78f8127ab653d06c86dbedf8cfc333965f69",
       "lint": "clippy::disallowed_methods",
       "metadata": {
@@ -14387,7 +14435,7 @@
         "family": "commit-journal-recovery",
         "id": "IR-B0278-M01",
         "issue": "#196",
-        "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace",
+        "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded",
         "reason": "zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery"
       },
       "multiplicity": 1,
@@ -14396,7 +14444,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0278-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace\",\"disposition\":\"residual\",\"reason\":\"zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery\",\"family\":\"commit-journal-recovery\",\"issue\":\"#196\",\"category\":\"commit-journal-recovery\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0278-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded\",\"disposition\":\"residual\",\"reason\":\"zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery\",\"family\":\"commit-journal-recovery\",\"issue\":\"#196\",\"category\":\"commit-journal-recovery\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
       "resolved": "<std::fs::File>::open",
       "rule_reason": "inventory-op:File::open"
     },
@@ -21202,7 +21250,7 @@
     }
   ],
   "policy": {
-    "configuration": "32de62fa94448b5db0d3ee85f552d341b5512225c4a11dc8dc8dfb3c4aa540ca",
+    "configuration": "c8563f06a352f6688774b8da506600b74f25554e28bc3cc0689b2071d755305b",
     "profiles": "f04aa50122d4ae1f0504b6411c5b47cacf3a97a9e3080e175166f3b744aa4bd8",
     "toolchain": {
       "compiler_revision": "88d9e12ae178fab0fb5cc050a94da85685d449ea",
