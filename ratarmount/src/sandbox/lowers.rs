@@ -467,6 +467,9 @@ pub fn recheck(
     }
     for (i, (lower, record)) in validated.iter().zip(records).enumerate() {
         // A bundle's record names the cache directory the child resolved.
+        // That path is trusted rather than compared: the child is our own
+        // process, and the digest, `sealed_at` and metadata comparison below
+        // still have to match what was validated, read from that directory.
         let same_path = lower.kind == Kind::Bundle || record.path == lower.path;
         if !same_path
             || record.layer_digest != lower.layer_digest()
