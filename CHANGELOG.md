@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changes
+
+- **Sandbox supervisor protocol version 2 with retry-safe request IDs:** a version 2 `new` may carry a `request_id` (`ratarmount sandbox new --request-id ID`; Python `new(..., request_id=...)`). A retry with the same ID and body never starts a second batch: a success replays its stored result byte for byte, an error after a rollback that kept attempts replays its error, a refusal or an error that left nothing runs again, another body is `idempotency_conflict`, and a request cut off by a supervisor restart answers `interrupted`. Records live in the state directory's `requests.jsonl` (synced appends, compaction, a bounded retry window of 65,536 records or 64 MiB) and survive restarts. Version 2 answers in version 2 envelopes and refuses unknown fields on every operation, `shutdown` included; only `new` takes a `request_id`. Version 1 is unchanged byte for byte, pinned by a golden transcript, and the CLI and Python client send exactly the version 1 bytes without a request ID. See [protocol version 2](docs/sandbox.md#protocol-version-2).
+- Sandbox `new`, version 1 included, now redraws an attempt ID that a stored request record names, so a replay never names another request's attempt. This is invisible on the wire except for one new, extremely rare version 1 error: after 16 such reserved draws in a row `new` fails with `io`, "could not allocate a unique attempt ID" (possible only while request records name destroyed IDs).
+- Python sandbox client: leaving a client or attempt context now treats a `not_found` answer to its implicit `destroy` as already destroyed instead of raising, so a replay that names attempts a restart discarded does not fail the cleanup. This is also visible to version 1 users: a context no longer fails when another client destroyed one of its attempts. An explicit `Attempt.destroy()` or `destroy(id=...)` still raises `not_found`.
+
 ### Fixes
 
 - Offline commit and recovery refuse a symlinked overlay database or any `-wal`, `-journal`, or `-shm` companion with exit 1. `--force-base-mismatch` cannot bypass this refusal. Before any write, refusal leaves the archive, symlink targets, database and recovery state unchanged. Writable mounts apply the same companion checks, including links inserted after classification (#239).

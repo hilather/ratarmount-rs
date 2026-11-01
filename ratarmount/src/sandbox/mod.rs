@@ -5,12 +5,17 @@ mod inspection;
 pub(crate) use inspection::start as start_inspection;
 pub(crate) mod process;
 mod protocol;
+mod requests;
+#[cfg(test)]
+mod requests_tests;
 mod run;
 #[cfg(test)]
 mod tests;
 
 use clap::{Parser, Subcommand};
-use protocol::{BaseOptions, Operation, Overlay, Request, Response, VERSION};
+use protocol::{
+    BaseOptions, Op, Operation, OperationV2, Overlay, Request, Response, VERSION, VERSION_2,
+};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -62,6 +67,9 @@ enum Command {
         quota: Option<u64>,
         #[arg(long = "readonly", value_delimiter = ',')]
         readonly_globs: Vec<String>,
+        /// Retry-safe ID (protocol version 2): the same ID and body never start a second batch.
+        #[arg(long)]
+        request_id: Option<String>,
     },
     List {
         #[arg(long)]
@@ -89,7 +97,7 @@ pub fn run(args: &SandboxArgs) -> Result<(), String> {
         return self::run::run(run).map_err(|e| e.to_string());
     }
     let socket = args.socket.as_deref().ok_or("--socket PATH is required")?;
-    let operation = match &args.command {
+    let operation: Op = match &args.command {
         Command::Run(_) => unreachable!("handled before daemon socket lookup"),
         Command::Daemon {
             state_dir,
@@ -112,33 +120,55 @@ pub fn run(args: &SandboxArgs) -> Result<(), String> {
             name: name.clone(),
             source: source.clone(),
             options: serde_json::from_str::<BaseOptions>(options).map_err(|e| e.to_string())?,
-        },
+        }
+        .into(),
+        // Without --request-id `new` sends exactly the v1 bytes.
         Command::New {
             base,
             count,
             overlay,
             quota,
             readonly_globs,
+            request_id: Some(request_id),
+        } => OperationV2::New {
+            base: base.clone(),
+            count: *count,
+            overlay: *overlay,
+            quota: *quota,
+            readonly_globs: readonly_globs.clone(),
+            request_id: Some(request_id.clone()),
+        }
+        .into(),
+        Command::New {
+            base,
+            count,
+            overlay,
+            quota,
+            readonly_globs,
+            request_id: None,
         } => Operation::New {
             base: base.clone(),
             count: *count,
             overlay: *overlay,
             quota: *quota,
             readonly_globs: readonly_globs.clone(),
-        },
-        Command::List { base } => Operation::List { base: base.clone() },
+        }
+        .into(),
+        Command::List { base } => Operation::List { base: base.clone() }.into(),
         Command::Diff { id, git } => Operation::Diff {
             id: id.clone(),
             git: *git,
-        },
-        Command::Stats { id } => Operation::Stats { id: id.clone() },
+        }
+        .into(),
+        Command::Stats { id } => Operation::Stats { id: id.clone() }.into(),
         Command::Destroy { id, base } => Operation::Destroy {
             id: id.clone(),
             base: base.clone(),
-        },
-        Command::Shutdown => Operation::Shutdown,
+        }
+        .into(),
+        Command::Shutdown => Operation::Shutdown.into(),
     };
-    let response = call(socket, operation)?;
+    let response = call(socket, Request::new(operation))?;
     let output = serde_json::to_vec(&response).map_err(|e| e.to_string())?;
     let mut stdout = std::io::stdout().lock();
     stdout
@@ -160,22 +190,19 @@ pub fn error_exit_code(args: &SandboxArgs) -> i32 {
     }
 }
 
-fn call(socket: &std::path::Path, operation: Operation) -> Result<Response, String> {
+fn call(socket: &std::path::Path, request: Request) -> Result<Response, String> {
     let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
     // Includes queued requests and cleanup of a full batch; callers can retry reads,
-    // but must not blindly retry mutations after a transport failure.
+    // but must not blindly retry mutations after a transport failure, except a
+    // `new` retried with the same --request-id and arguments.
     let timeout = Some(Duration::from_secs(3600));
     stream
         .set_read_timeout(timeout)
         .and_then(|_| stream.set_write_timeout(timeout))
         .map_err(|e| e.to_string())?;
-    let mut request = serde_json::to_vec(&Request {
-        version: VERSION,
-        operation,
-    })
-    .map_err(|e| e.to_string())?;
-    request.push(b'\n');
-    stream.write_all(&request).map_err(|e| e.to_string())?;
+    let mut bytes = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes).map_err(|e| e.to_string())?;
     let mut line = Vec::new();
     BufReader::new(stream)
         .take((protocol::MAX_RESPONSE + 1) as u64)
@@ -185,7 +212,9 @@ fn call(socket: &std::path::Path, operation: Operation) -> Result<Response, Stri
         return Err("oversized or incomplete sandbox response".into());
     }
     let response: Response = serde_json::from_slice(&line).map_err(|e| e.to_string())?;
-    if response.version != VERSION {
+    // An older daemon answers a v2 request with a v1 error (unsupported_version).
+    let older_daemon = request.version == VERSION_2 && response.version == VERSION && !response.ok;
+    if response.version != request.version && !older_daemon {
         return Err("unsupported response version".into());
     }
     Ok(response)

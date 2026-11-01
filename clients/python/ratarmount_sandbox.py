@@ -1,8 +1,16 @@
-"""Stdlib-only client for ratarmount sandbox protocol v1 (Python 3.9+).
+"""Stdlib-only client for the ratarmount sandbox protocol (Python 3.9+).
 
-A client context destroys only attempts it created, never the shared daemon.
-Transport failures are not retried: a timed-out mutation may have completed;
-use list() to reconcile before issuing another new().
+Requests use protocol v1, except new(..., request_id=...), which sends
+protocol v2. A client context destroys only attempts it created, never the
+shared daemon. Transport failures are not retried automatically: a timed-out
+mutation may have completed. Retry new() with the same request_id and
+arguments, which never starts a second batch, or use list() to reconcile
+before issuing another new() without one.
+
+A replay returns the original answer, even after a daemon restart discarded
+its attempts; list() shows the current state. Leaving a client or attempt
+context treats a not_found from destroy as already destroyed, so a stale
+replay does not fail the cleanup.
 """
 
 import base64
@@ -10,6 +18,7 @@ import json
 import socket as _socket
 
 _VERSION = 1
+_VERSION_2 = 2
 _MAX_REQUEST = 1024 * 1024
 _MAX_RESPONSE = 64 * 1024 * 1024
 
@@ -49,11 +58,27 @@ class Attempt:
             self._client.destroy(id=self.id)
             self._destroyed = True
 
+    def _destroy_implicitly(self):
+        """destroy(), except that not_found means already destroyed.
+
+        A replay can name attempts that are gone (a daemon restart or another
+        client destroyed them); implicit cleanup must not fail on those.
+        """
+        try:
+            self.destroy()
+        except SandboxError as error:
+            if error.code != "not_found":
+                raise
+            self._destroyed = True
+            owned = self._client._owned.pop(self.id, None)
+            if owned is not None:
+                owned._destroyed = True
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        self.destroy()
+        self._destroy_implicitly()
         return False
 
 
@@ -76,8 +101,8 @@ class RatarmountSandbox:
         self.timeout = timeout
         self._owned = {}
 
-    def _call(self, op, **fields):
-        request = json.dumps(dict(version=_VERSION, op=op, **fields))
+    def _call(self, op, version=_VERSION, **fields):
+        request = json.dumps(dict(version=version, op=op, **fields))
         data = request.encode("utf-8") + b"\n"
         if len(data) > _MAX_REQUEST:
             raise ValueError("sandbox request exceeds 1 MiB")
@@ -91,7 +116,12 @@ class RatarmountSandbox:
             raise SandboxError("protocol", "oversized or incomplete response")
         try:
             response = json.loads(line)
-            if not isinstance(response, dict) or response.get("version") != _VERSION:
+            if not isinstance(response, dict):
+                raise ValueError("unsupported response version")
+            # An older daemon answers a v2 request with a v1 error envelope.
+            older = version == _VERSION_2 and response.get("version") == _VERSION \
+                and response.get("ok") is False
+            if response.get("version") != version and not older:
                 raise ValueError("unsupported response version")
             if response.get("ok") is False:
                 error = response["error"]
@@ -105,9 +135,16 @@ class RatarmountSandbox:
     def create_base(self, name, source, **options):
         return self._call("create_base", name=name, source=str(source), options=options)
 
-    def new(self, base, count=1, overlay="disk", quota=None, readonly_globs=None):
-        data = self._call("new", base=base, count=count, overlay=overlay,
-                          quota=quota, readonly_globs=readonly_globs or [])
+    def new(self, base, count=1, overlay="disk", quota=None, readonly_globs=None, *,
+            request_id=None):
+        """Start attempts; with request_id (protocol v2) a retry with the same
+        ID and arguments returns the stored answer instead of a second batch."""
+        fields = dict(base=base, count=count, overlay=overlay, quota=quota,
+                      readonly_globs=readonly_globs or [])
+        if request_id is None:
+            data = self._call("new", **fields)
+        else:
+            data = self._call("new", version=_VERSION_2, **fields, request_id=request_id)
         attempts = [Attempt(self, item) for item in data]
         self._owned.update((a.id, a) for a in attempts)
         return attempts
@@ -136,7 +173,7 @@ class RatarmountSandbox:
         error = None
         for attempt in list(self._owned.values()):
             try:
-                attempt.destroy()
+                attempt._destroy_implicitly()
             except (SandboxError, OSError) as failure:
                 error = failure
         if error is not None:

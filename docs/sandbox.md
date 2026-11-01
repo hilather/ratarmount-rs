@@ -2257,8 +2257,12 @@ that every format/backend supports strict reuse.
 
 Client commands print the server's JSON response envelope, including server
 errors (exit 1). Local option and transport errors go to stderr.
-`new` also accepts `--overlay disk|tmpfs`, `--quota SIZE`, and repeated
-`--readonly GLOBS`. `--socket` works before or after the subcommand.
+`new` also accepts `--overlay disk|tmpfs`, `--quota SIZE`, repeated
+`--readonly GLOBS`, and `--request-id ID`, which sends the request as protocol
+version 2 so that a retry with the same ID and arguments never starts a second
+batch (see [protocol version 2](#protocol-version-2)). Without `--request-id`,
+`new` sends exactly the version 1 request. `--socket` works before or after the
+subcommand.
 `daemon --timeout SECONDS` sets base-validation and batch-readiness deadlines
 (default 120, range 1–3600). The foreground daemon exits on `shutdown`, SIGINT
 or SIGTERM after destroying its attempts. Base definitions and warmed indexes
@@ -2277,6 +2281,10 @@ for state and locks.
 - Known behaviour: a concurrently spawned child can retain a daemon lock after its guard is dropped until the child execs or exits, normally briefly. `O_CLOEXEC` confines this to the fork-to-exec window; the lock is never released early and the worst case is a spurious "busy" response.
 
 ### Protocol version 1
+
+Version 1 is frozen: its requests and responses keep their bytes, which a
+golden transcript in the test suite pins. New fields go to
+[version 2](#protocol-version-2).
 
 Transport is UTF-8 JSON lines over AF_UNIX/SOCK_STREAM. Every complete request
 line receives one response line, in order on its connection. There are no
@@ -2304,11 +2312,13 @@ are errors. Each request includes integer `version: 1` and an `op` string:
 | `diff` | Required `id`; boolean `git` defaults to false. Returns `{"patch":"..."}` using the in-process diff renderer and the same composed base, including recursive sources and binds. |
 | `stats` | Required `id`. Returns the same integer object as `overlay-stats --json`. |
 | `destroy` | Exactly one of `id` or `base`. Returns `{"destroyed":true}`. A base selector destroys its attempts, retaining its registered definition/indexes. Unknown IDs return `not_found`. |
-| `shutdown` | No additional fields. Destroys all attempts, returns `{"shutdown":true}`, and stops the daemon. If cleanup fails, returns an error and stays available for retry. |
+| `shutdown` | No additional fields. Destroys all attempts, returns `{"shutdown":true}`, and stops the daemon. If cleanup fails, returns an error and stays available for retry. Version 1 ignores extra fields on `shutdown`; version 2 refuses them. |
 
 An attempt is `{id,base,path,overlay_dir,status}`. Paths are absolute host paths;
 `path` is the writable merged mount and `overlay_dir` contains changed content
-and the overlay database. IDs are unique generated directory names. Base names
+and the overlay database. IDs are unique generated directory names; an ID that
+a stored request record names is never drawn again (after 16 such draws in a
+row `new` fails with `io`, "could not allocate a unique attempt ID"). Base names
 start with an ASCII letter or digit, followed by letters, digits, `.`, `_` or
 `-`, at most 128 characters. Source strings accept ordinary ratarmount inputs,
 including Git `repo.git@REV`, OCI URLs and restic snapshots. Relative local
@@ -2347,10 +2357,96 @@ Response envelopes are:
 Stable error codes include `invalid_request`, `unsupported_version`,
 `not_found`, `already_exists`, `capacity`, `in_use`, `unsafe_path`,
 `base_open_failed`, `mount_failed`, `timeout`, `unmount_failed`, `diff_failed`,
-`stats_failed`, `response_too_large`, `unsupported`, and `io`. Messages provide
-context and may change. Validation logs live in `indexes/BASE/prepare.log`;
+`stats_failed`, `response_too_large`, `unsupported`, and `io`; version 2 adds
+`idempotency_conflict` and `interrupted`. Messages provide context and may
+change. Validation logs live in `indexes/BASE/prepare.log`;
 attempt diagnostics live in `attempts/ID/mount.log` until destroy. Failed-batch
 errors include a bounded excerpt of the failing mount's log when available.
+
+### Protocol version 2
+
+Version 2 has the version 1 operations, fields and defaults, and `new` also
+takes a `request_id`. Field defaults never change within version 2; later
+releases only add fields, and a daemon refuses fields it does not know with
+`invalid_request`, so an older daemon fails closed on a newer client.
+
+- **Dispatch.** A request with integer `version: 2` is parsed as version 2 and
+  answered in a version 2 envelope (`{"version":2,"ok":...}`), errors
+  included. Every answer carries its request's version. A line answered before
+  its version is known (over 1 MiB, invalid JSON, or a `version` that is
+  missing or not the integer 1 or 2, such as `"2"` or `2.0`) gets the version 1
+  `invalid_request` or `unsupported_version` envelope. That message still says
+  "version must be 1"; clients key on the code. A daemon from before version 2
+  answers every version 2 request with that `unsupported_version` envelope.
+- **Unknown fields** are refused on every version 2 operation, `shutdown`
+  included (version 1's `shutdown` keeps ignoring them).
+- **Only `new` takes a `request_id`.** `create_base`, `destroy` and the other
+  operations take no request IDs; a `request_id` on them is an unknown field
+  (`invalid_request`).
+- **`request_id`** is a string with the base-name rules: 1–128 characters, an
+  ASCII letter or digit first, then letters, digits, `.`, `_` or `-`. A
+  malformed ID is `invalid_request` and writes nothing. `"request_id": null`
+  is refused (`invalid_request`), never read as "no ID". Without a
+  `request_id`, a version 2 `new` behaves as version 1's.
+
+```json
+{"version":2,"op":"new","base":"task","count":8,"request_id":"task-17-pass-2"}
+```
+
+A `request_id` is bound to the body it first arrived with for as long as its
+record lives, refusals included: another body under the same ID is
+`idempotency_conflict` in every state. A client that changes the body uses a
+new ID. The body is compared by `op_hash`, a SHA-256 over the request without
+`request_id` and without members equal to their defaults, so key order and
+spelled-out defaults do not matter, but the order of `readonly_globs` does.
+
+| Outcome of the first run | A retry with the same ID and body |
+| --- | --- |
+| Success | Gets the stored result, byte for byte; nothing is mounted again. |
+| Refused before any attempt existed (unknown base, `capacity`, a bad glob, no tmpfs, a record over 4 MiB) | Runs again. |
+| Error with nothing left (complete rollback after `spawn_failed`, `mount_failed`, `timeout`, `io`) | Runs again. |
+| Error after a rollback that kept attempts (the message names them) | Gets the stored error. |
+| Cut off by a supervisor restart | Gets `interrupted`: "request was cut off by a supervisor restart before it finished; any attempts it created were discarded; retry with a new request_id". |
+
+A replay returns the original answer, not the current state: after a
+restart, or after a client destroyed the attempts, it still names attempts
+that are gone. Use `list` for the current state, and a new ID after
+`interrupted`. Two clients that send the same ID and body concurrently are
+answered serially: one runs the batch, and the other is answered from its
+record (the stored result or error, or a run of its own after a `retryable`
+outcome).
+
+Records are kept in `requests.jsonl` in the state directory, one synced line
+per state change: each executed or re-executed request with an ID costs two
+synced appends, refusals included. Replays, stored errors, conflicts and the
+refusals below append nothing. The file must be a private (0600), owned
+regular file with one link; it is opened without following symlinks.
+
+- **Bounded retry window.** At most 65,536 records and 64 MiB of them stay
+  live; the oldest finished records are evicted first, and an evicted ID that
+  is retried runs as a new request. A `new` whose stored record would exceed
+  4 MiB is refused with `capacity` before any attempt exists (only reachable
+  with very long state or tmpfs paths). The file is rewritten with only the
+  live records once it is over 8 MiB and more than twice their size.
+- **A log that cannot be written.** If the `running` line cannot be written
+  and synced, the request answers `io` without running. If that line cannot be
+  truncated away either, if the outcome line fails after the batch ran (its
+  attempts stay until `destroy` or a restart), or if a compaction cannot sync
+  the directory after renaming the rewritten file into place, the log stays
+  unavailable until the daemon restarts: requests with a new or retryable
+  `request_id` answer `io` ("request log unavailable since …; restart the
+  daemon"), while replays, stored errors, conflicts and every request without
+  an ID are still served. No path starts a second batch under one ID.
+- **At startup** the daemon syncs the file and its directory, drops a torn last
+  line, resolves every request a restart cut off to `interrupted`, and keeps
+  every other record. Damage before the last line, or a line with another
+  schema, refuses the start with `invalid_request` naming the byte offset.
+- **Version skew.** A daemon from before version 2 ignores `requests.jsonl`. A
+  daemon refuses to start on a log with lines from a later release. To go back
+  to an older daemon, stop the daemon and move `requests.jsonl` aside; every
+  request record is then lost (replays, conflicts and reserved attempt IDs),
+  and a retry of an old ID runs as new, which cannot duplicate live attempts
+  because the restart discarded them all.
 
 ### Lifetime, concurrency and recovery
 
@@ -2413,11 +2509,14 @@ from reconciling an active daemon's attempts. This initial supervisor is Linux
 only; other platforms can use ordinary mounts and offline diff/stats.
 
 A lost connection is not cancellation. A mutation may finish after the client
-times out; clients must reconcile with `list` before retrying `new`. There is
-no request deduplication or automatic retry. Normal shutdown discards attempts;
-collect patches first. Registered bases currently have no API to unregister
-or evict their index cache; remove those state files only with the daemon
-stopped and no attempts left.
+times out. Without a `request_id` there is still no request deduplication or
+automatic retry: reconcile with `list` before retrying `new`. With one, retry
+`new` with the same `request_id` and body; after `interrupted`, use a new ID.
+Normal shutdown discards attempts; collect patches first. Registered bases
+currently have no API to unregister or evict their index cache; remove those
+state files, and `requests.jsonl`, only with the daemon stopped and no
+attempts left (a running daemon keeps appending to a moved `requests.jsonl`
+through its open descriptor).
 
 ### Python client
 
@@ -2446,4 +2545,14 @@ client; it does not shut down the shared daemon or destroy attempts returned
 by `list`. `SandboxError.code` exposes the structured error code. Transport
 errors raise `OSError`/`TimeoutError`; no mutations are retried automatically.
 The default client I/O timeout is 3600 seconds, configurable on construction.
+
+`new(..., request_id="task-17-pass-2")` sends protocol version 2 with that ID,
+so after a timeout the harness can call `new` again with the same ID and
+arguments without starting a second batch; without `request_id` the request
+is the version 1 one. An older daemon's refusal raises
+`SandboxError("unsupported_version")`. A replay can name attempts that are
+already gone (the daemon restarted, or another client destroyed them). Leaving
+a client or attempt context therefore treats a `not_found` answer to its
+implicit `destroy` as already destroyed and raises nothing; an explicit
+`Attempt.destroy()` or `destroy(id=...)` still raises `not_found`.
 See the [SWE-bench recipe](recipes/swe-bench-sandboxes.md).

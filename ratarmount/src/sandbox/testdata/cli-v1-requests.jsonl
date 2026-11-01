@@ -1,0 +1,13 @@
+{"argv":["create-base","task","/srv/base.tar"],"request":"{\"version\":1,\"op\":\"create_base\",\"name\":\"task\",\"source\":\"/srv/base.tar\",\"options\":{\"git_synthetic_head\":false,\"recursive\":false,\"uid\":null,\"gid\":null,\"umask\":null,\"readonly_globs\":[],\"quota\":null,\"passthrough\":null,\"binds\":[],\"allow_other\":false}}\n"}
+{"argv":["create-base","task","/srv/base.tar","--options","{\"quota\":2147483648,\"readonly_globs\":[\"tests/**\"],\"git_synthetic_head\":true,\"binds\":[\"/data=/srv/data.tar\"]}"],"request":"{\"version\":1,\"op\":\"create_base\",\"name\":\"task\",\"source\":\"/srv/base.tar\",\"options\":{\"git_synthetic_head\":true,\"recursive\":false,\"uid\":null,\"gid\":null,\"umask\":null,\"readonly_globs\":[\"tests/**\"],\"quota\":2147483648,\"passthrough\":null,\"binds\":[\"/data=/srv/data.tar\"],\"allow_other\":false}}\n"}
+{"argv":["new","task"],"request":"{\"version\":1,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[]}\n"}
+{"argv":["new","task","--count","8","--overlay","tmpfs","--quota","2G","--readonly","a,b"],"request":"{\"version\":1,\"op\":\"new\",\"base\":\"task\",\"count\":8,\"overlay\":\"tmpfs\",\"quota\":2147483648,\"readonly_globs\":[\"a\",\"b\"]}\n"}
+{"argv":["new","task","--readonly","a","--readonly","b/**"],"request":"{\"version\":1,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[\"a\",\"b/**\"]}\n"}
+{"argv":["list"],"request":"{\"version\":1,\"op\":\"list\",\"base\":null}\n"}
+{"argv":["list","--base","task"],"request":"{\"version\":1,\"op\":\"list\",\"base\":\"task\"}\n"}
+{"argv":["diff","attempt-ABC123"],"request":"{\"version\":1,\"op\":\"diff\",\"id\":\"attempt-ABC123\",\"git\":false}\n"}
+{"argv":["diff","attempt-ABC123","--git"],"request":"{\"version\":1,\"op\":\"diff\",\"id\":\"attempt-ABC123\",\"git\":true}\n"}
+{"argv":["stats","attempt-ABC123"],"request":"{\"version\":1,\"op\":\"stats\",\"id\":\"attempt-ABC123\"}\n"}
+{"argv":["destroy","attempt-ABC123"],"request":"{\"version\":1,\"op\":\"destroy\",\"id\":\"attempt-ABC123\",\"base\":null}\n"}
+{"argv":["destroy","--base","task"],"request":"{\"version\":1,\"op\":\"destroy\",\"id\":null,\"base\":\"task\"}\n"}
+{"argv":["shutdown"],"request":"{\"version\":1,\"op\":\"shutdown\"}\n"}

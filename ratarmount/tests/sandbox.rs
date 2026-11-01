@@ -22,34 +22,54 @@ impl Daemon {
     fn start() -> Self {
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("api.sock");
-        let log = root.path().join("daemon.log");
-        let child = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
-            .args(["sandbox", "daemon", "--socket"])
-            .arg(&socket)
-            .arg("--state-dir")
-            .arg(root.path().join("state"))
-            .args(["--max-attempts", "64", "--timeout", "30"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(fs::File::create(&log).unwrap())
-            .spawn()
-            .unwrap();
+        let child = Self::spawn(root.path(), &socket);
         let mut daemon = Self {
             root: Some(root),
             socket,
             child,
         };
+        daemon.wait_for_socket();
+        daemon
+    }
+
+    fn spawn(root: &Path, socket: &Path) -> Child {
+        Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+            .args(["sandbox", "daemon", "--socket"])
+            .arg(socket)
+            .arg("--state-dir")
+            .arg(root.join("state"))
+            .args(["--max-attempts", "64", "--timeout", "30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(root.join("daemon.log")).unwrap())
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_for_socket(&mut self) {
+        let log = self.root.as_ref().unwrap().path().join("daemon.log");
         let deadline = Instant::now() + Duration::from_secs(10);
-        while UnixStream::connect(&daemon.socket).is_err() {
+        while UnixStream::connect(&self.socket).is_err() {
             assert!(
-                daemon.child.try_wait().unwrap().is_none(),
+                self.child.try_wait().unwrap().is_none(),
                 "{}",
                 fs::read_to_string(&log).unwrap()
             );
             assert!(Instant::now() < deadline, "daemon socket timeout");
             thread::sleep(Duration::from_millis(20));
         }
-        daemon
+    }
+
+    /// Stops the daemon with `shutdown` and starts it again on the same state.
+    fn restart(&mut self) {
+        self.call(json!({"op":"shutdown"}));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "daemon did not stop");
+            thread::sleep(Duration::from_millis(20));
+        }
+        self.child = Self::spawn(self.root.as_ref().unwrap().path(), &self.socket);
+        self.wait_for_socket();
     }
 
     fn call(&self, request: Value) -> Value {
@@ -58,16 +78,40 @@ impl Daemon {
         response["result"].clone()
     }
 
+    /// Sends `request` with its explicit integer `version` of 1 or 2, or 1 when
+    /// it has none, and asserts the answer carries that version. Invalid
+    /// versions are written raw instead, as the protocol test does.
     fn envelope(&self, mut request: Value) -> Value {
-        request["version"] = json!(1);
+        let version = match request.get("version") {
+            None => 1,
+            Some(version) if version.as_u64() == Some(1) || version.as_u64() == Some(2) => {
+                version.as_u64().unwrap()
+            }
+            Some(other) => panic!("envelope sends version 1 or 2, not {other}"),
+        };
+        request["version"] = json!(version);
+        let response = self.send_line(&request.to_string());
+        assert_eq!(response["version"], version, "{response}");
+        response
+    }
+
+    fn send_line(&self, line: &str) -> Value {
         let mut stream = UnixStream::connect(&self.socket).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
-        writeln!(stream, "{request}").unwrap();
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line).unwrap();
-        serde_json::from_str(&line).unwrap()
+        writeln!(stream, "{line}").unwrap();
+        let mut reply = String::new();
+        BufReader::new(stream).read_line(&mut reply).unwrap();
+        serde_json::from_str(&reply).unwrap()
+    }
+
+    fn requests_log(&self) -> PathBuf {
+        self.root
+            .as_ref()
+            .unwrap()
+            .path()
+            .join("state/requests.jsonl")
     }
 
     fn base(&self) {
@@ -250,6 +294,253 @@ fn regression_sandbox_socket_protocol_and_restart() {
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(daemon.call(json!({"op":"list","base":"task"})), json!([]));
+}
+
+const GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/sandbox/testdata/v1-golden.jsonl"
+);
+const MAX_REQUEST: usize = 1024 * 1024;
+
+/// Waits until the daemon has read every byte written to `stream` (Linux
+/// `SIOCOUTQ`: the sender's bytes the peer has not consumed).
+fn wait_consumed(stream: &UnixStream) {
+    use std::os::fd::AsRawFd;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut unread: libc::c_int = 0;
+        // SAFETY: SIOCOUTQ (TIOCOUTQ) writes one int to the pointer.
+        let status = unsafe { libc::ioctl(stream.as_raw_fd(), libc::TIOCOUTQ as _, &mut unread) };
+        assert_eq!(status, 0, "{}", std::io::Error::last_os_error());
+        if unread == 0 {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the daemon stopped reading");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Writes `line` and its newline so that the daemon's read that takes the
+/// line's last byte also takes the newline: everything but that byte first,
+/// then, once the daemon has consumed it, the byte and the newline in one
+/// two-byte write, which no short send can split (Keystone N4, Codex sweep 1).
+fn write_terminated(stream: &mut UnixStream, line: &[u8]) {
+    let (head, last) = line.split_at(line.len() - 1);
+    stream.write_all(head).unwrap();
+    wait_consumed(stream);
+    assert_eq!(stream.write(&[last[0], b'\n']).unwrap(), 2);
+}
+
+/// Regression: the golden's envelope-error replies come from the real `serve`,
+/// not only from the per-line path the unit replay drives (Claude sweep 4 N1).
+#[test]
+fn regression_sandbox_envelope_errors_match_golden_over_socket() {
+    let daemon = Daemon::start();
+    let entries: Vec<Value> = fs::read_to_string(GOLDEN)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let unsupported = entries.iter().find(|e| e["request"] == "{}").unwrap()["response"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut checked = 0;
+    for entry in entries.iter().filter(|e| e["envelope"] == true) {
+        let line = match entry["generated"].as_u64() {
+            Some(size) => vec![b'x'; size as usize],
+            None => entry["request"].as_str().unwrap().as_bytes().to_vec(),
+        };
+        let stream = UnixStream::connect(&daemon.socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        // A terminated oversize line must reach serve's terminated branch, as
+        // in the unit replay, never its unterminated one.
+        write_terminated(reader.get_mut(), &line);
+        let mut reply = String::new();
+        reader.read_line(&mut reply).unwrap();
+        assert_eq!(reply, entry["response"].as_str().unwrap(), "{entry}");
+        // Every terminated line keeps its connection open.
+        reader.get_mut().write_all(b"{}\n").unwrap();
+        let mut next = String::new();
+        reader.read_line(&mut next).unwrap();
+        assert_eq!(next, unsupported);
+        checked += 1;
+    }
+    // {}, version 3, "1", 1.0, malformed JSON, and lines of 1 MiB and 1 MiB + 1.
+    assert_eq!(checked, 7);
+    // Exactly one byte over the limit and unterminated: serve must read all of
+    // it to pass the limit, answers, and closes with nothing unread, so the
+    // client sees a clean EOF however the write is split.
+    let mut stream = UnixStream::connect(&daemon.socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    stream.write_all(&vec![b'x'; MAX_REQUEST + 1]).unwrap();
+    let mut reply = Vec::new();
+    std::io::Read::read_to_end(&mut stream, &mut reply).unwrap();
+    assert_eq!(
+        String::from_utf8(reply).unwrap(),
+        "{\"version\":1,\"ok\":false,\"error\":{\"code\":\"invalid_request\",\"message\":\"request exceeds 1 MiB\"}}\n"
+    );
+}
+
+/// Regression: `Daemon::envelope` really sends version 2: the daemon answers
+/// v2 requests, accepted or refused, in v2 envelopes (old blocker 6).
+#[test]
+fn regression_sandbox_v2_envelopes_over_socket() {
+    let daemon = Daemon::start();
+    assert_eq!(daemon.call(json!({"version":2, "op":"list"})), json!([]));
+    let refused = daemon.envelope(json!({"version":2, "op":"new", "base":"task", "lowers":["l"]}));
+    assert_eq!(refused["error"]["code"], "invalid_request", "{refused}");
+    assert_eq!(daemon.call(json!({"op":"list"})), json!([]));
+}
+
+/// Makes `new` of base `task` fail with `mount_failed` before any FUSE work.
+fn corrupt_prepared_index(daemon: &Daemon) {
+    let cache = daemon
+        .root
+        .as_ref()
+        .unwrap()
+        .path()
+        .join("state/indexes/task");
+    let index = fs::read_dir(&cache)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "sqlite"))
+        .unwrap();
+    fs::write(&index, b"invalid prepared SQLite index").unwrap();
+}
+
+/// The attempt a `mount_failed` message names.
+fn failed_attempt(response: &Value) -> String {
+    assert_eq!(response["error"]["code"], "mount_failed", "{response}");
+    let message = response["error"]["message"].as_str().unwrap();
+    message
+        .strip_prefix("attempt ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap()
+        .to_owned()
+}
+
+/// Regression: a v2 `request_id` over a real socket, without FUSE: refused in
+/// v1; a `retryable` outcome runs again under the same ID and body, another
+/// body conflicts, and the binding survives a restart.
+#[test]
+fn regression_sandbox_v2_request_id_over_socket() {
+    let mut daemon = Daemon::start();
+    daemon.base();
+    corrupt_prepared_index(&daemon);
+    let refused = daemon.envelope(json!({"op":"new", "base":"task", "request_id":"r1"}));
+    assert_eq!(refused["error"]["code"], "invalid_request", "{refused}");
+    let request = json!({"version":2, "op":"new", "base":"task", "request_id":"r1"});
+    let first = failed_attempt(&daemon.envelope(request.clone()));
+    let second = failed_attempt(&daemon.envelope(request.clone()));
+    assert_ne!(first, second, "a retryable record runs again");
+    let other = json!({"version":2, "op":"new", "base":"task", "count":2, "request_id":"r1"});
+    assert_eq!(
+        daemon.envelope(other.clone())["error"]["code"],
+        "idempotency_conflict"
+    );
+    assert_eq!(daemon.call(json!({"op":"list"})), json!([]));
+    daemon.restart();
+    assert_eq!(
+        daemon.envelope(other)["error"]["code"],
+        "idempotency_conflict"
+    );
+    let third = failed_attempt(&daemon.envelope(request));
+    assert!(third != first && third != second);
+    let meta = fs::symlink_metadata(daemon.requests_log()).unwrap();
+    assert!(meta.is_file());
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+}
+
+/// Whether the prepared-index FUSE tests run; with
+/// `RATARMOUNT_REQUIRE_PREPARED_INDEX_FUSE=1` a missing prerequisite fails.
+fn prepared_fuse() -> bool {
+    let required = std::env::var_os("RATARMOUNT_REQUIRE_PREPARED_INDEX_FUSE").as_deref()
+        == Some(std::ffi::OsStr::new("1"));
+    prepared_fuse_check(
+        required,
+        Path::new("/dev/fuse").exists(),
+        Command::new("fusermount3")
+            .arg("--version")
+            .output()
+            .is_ok(),
+    )
+    .expect("required prepared-index FUSE acceptance prerequisite missing")
+}
+
+/// Regression: a `done` request ID replays its result instead of mounting a
+/// second batch, also after a restart that discarded the attempts.
+#[test]
+fn regression_sandbox_v2_request_id_replay_fuse() {
+    if !prepared_fuse() {
+        return;
+    }
+    let mut daemon = Daemon::start();
+    daemon.base();
+    let request = json!({"version":2, "op":"new", "base":"task", "count":2, "request_id":"r2"});
+    let first = daemon.call(request.clone());
+    assert_eq!(first.as_array().unwrap().len(), 2);
+    assert_eq!(daemon.call(request.clone()), first);
+    assert_eq!(
+        daemon.call(json!({"op":"list"})).as_array().unwrap().len(),
+        2
+    );
+    daemon.restart();
+    assert_eq!(daemon.call(request), first);
+    assert_eq!(daemon.call(json!({"op":"list"})), json!([]));
+}
+
+/// Regression: two clients send the same request ID and body while both are
+/// in flight. The serial serve loop (one daemon under `daemon.lock`) runs one
+/// batch; the other client gets its stored result byte for byte (Keystone N1).
+#[test]
+fn regression_sandbox_v2_request_id_in_flight_retry_fuse() {
+    if !prepared_fuse() {
+        return;
+    }
+    let daemon = Daemon::start();
+    daemon.base();
+    let line = r#"{"version":2,"op":"new","base":"task","count":3,"request_id":"inflight"}"#;
+    let streams: Vec<_> = (0..2)
+        .map(|_| {
+            let mut stream = UnixStream::connect(&daemon.socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            writeln!(stream, "{line}").unwrap();
+            stream
+        })
+        .collect();
+    let replies: Vec<String> = streams
+        .into_iter()
+        .map(|stream| {
+            let mut reply = String::new();
+            BufReader::new(stream).read_line(&mut reply).unwrap();
+            reply
+        })
+        .collect();
+    assert_eq!(replies[0], replies[1]);
+    let reply: Value = serde_json::from_str(&replies[0]).unwrap();
+    assert_eq!(reply["version"], 2);
+    assert_eq!(reply["result"].as_array().unwrap().len(), 3, "{reply}");
+    assert_eq!(
+        daemon.call(json!({"op":"list"})).as_array().unwrap().len(),
+        3
+    );
+    // One running and one done line: the second request never ran.
+    let states: Vec<String> = fs::read_to_string(daemon.requests_log())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|record| record["id"] == "inflight")
+        .map(|record| record["t"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(states, ["running", "done"]);
 }
 
 fn mounts(count: usize) {

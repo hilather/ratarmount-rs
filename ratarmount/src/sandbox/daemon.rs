@@ -1,5 +1,6 @@
 use super::process::{self, MountState, Mounter, ProcessMounter};
 use super::protocol::*;
+use super::requests::{self, RequestLog, Status};
 use ratarmount_session::factory;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -297,6 +298,16 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+/// Test-only deterministic attempt IDs: each drawn directory is renamed to the
+/// next queued name, else to the next `attempt-NNNNNN`. The production draw and
+/// its reviewed statement are unchanged.
+#[cfg(test)]
+#[derive(Default)]
+pub struct TestIds {
+    pub queue: std::collections::VecDeque<String>,
+    pub next: u32,
+}
+
 pub struct Supervisor<M: Mounter> {
     pub root: PathBuf,
     pub mounter: M,
@@ -306,8 +317,14 @@ pub struct Supervisor<M: Mounter> {
     max_attempts: usize,
     timeout: Duration,
     pub stopping: bool,
+    pub requests: RequestLog,
+    #[cfg(test)]
+    pub test_ids: Option<TestIds>,
     _lock: File,
 }
+
+/// Consecutive reserved attempt-ID draws before a `new` gives up (§5.6).
+const RESERVED_DRAWS: usize = 16;
 
 impl<M: Mounter> Supervisor<M> {
     pub fn open(root: &Path, max_attempts: usize, timeout: Duration, mounter: M) -> Result<Self> {
@@ -366,6 +383,8 @@ impl<M: Mounter> Supervisor<M> {
                 verify_tmpfs(ram)?;
             }
         }
+        // Refusals of the request log come before reconcile touches attempts.
+        let requests = RequestLog::open(&root, requests::limits())?;
         let mut supervisor = Self {
             root,
             mounter,
@@ -375,10 +394,34 @@ impl<M: Mounter> Supervisor<M> {
             max_attempts,
             timeout,
             stopping: false,
+            requests,
+            #[cfg(test)]
+            test_ids: None,
             _lock: guard,
         };
         supervisor.reconcile()?;
+        // Every attempt is gone now, so a request a restart cut off is resolved.
+        supervisor.requests.resolve_interrupted()?;
         Ok(supervisor)
+    }
+
+    #[cfg(test)]
+    fn test_attempt_dir(&mut self, dir: PathBuf) -> PathBuf {
+        let Some(ids) = &mut self.test_ids else {
+            return dir;
+        };
+        let name = ids.queue.pop_front().unwrap_or_else(|| {
+            ids.next += 1;
+            format!("attempt-{:06}", ids.next)
+        });
+        let renamed = dir.with_file_name(name);
+        assert!(
+            fs::symlink_metadata(&renamed).is_err(),
+            "test attempt ID {} already exists",
+            renamed.display()
+        );
+        fs::rename(&dir, &renamed).unwrap();
+        renamed
     }
 
     fn indexes(&self, base: &str) -> PathBuf {
@@ -443,8 +486,20 @@ impl<M: Mounter> Supervisor<M> {
         }
     }
 
-    pub fn handle(&mut self, operation: Operation) -> Result<Value> {
+    /// Runs a v1 operation, or for a v2 one the same v1 operation; a v2 `new`
+    /// with a `request_id` goes through the request-ID layer (§5.3).
+    pub fn handle(&mut self, operation: impl Into<Op>) -> Result<Value> {
         self.supervise();
+        let operation = match operation.into() {
+            Op::V1(operation) => operation,
+            Op::V2(
+                operation @ OperationV2::New {
+                    request_id: Some(_),
+                    ..
+                },
+            ) => return self.new_with_request_id(operation),
+            Op::V2(operation) => operation.into_v1(),
+        };
         match operation {
             Operation::CreateBase {
                 name,
@@ -485,7 +540,10 @@ impl<M: Mounter> Supervisor<M> {
                 overlay,
                 quota,
                 readonly_globs,
-            } => self.new_attempts(&base, count, overlay, quota, readonly_globs),
+            } => self
+                .new_attempts(&base, count, overlay, quota, readonly_globs, None)
+                .map(|(_, result)| result)
+                .map_err(|failed| failed.error),
             Operation::List { base } => {
                 if let Some(name) = &base {
                     self.base(name)?;
@@ -565,6 +623,91 @@ impl<M: Mounter> Supervisor<M> {
         }
     }
 
+    /// The request-ID layer of a v2 `new` (§5.3), serial under `daemon.lock`.
+    /// An ID is bound to the body it first arrived with for as long as its
+    /// record lives: another body is `idempotency_conflict` in every state,
+    /// `done` and `failed` answer what they stored without doing anything, and
+    /// a `retryable` record or a new ID runs, with `running` logged first.
+    fn new_with_request_id(&mut self, operation: OperationV2) -> Result<Value> {
+        let OperationV2::New {
+            base,
+            count,
+            overlay,
+            quota,
+            readonly_globs,
+            request_id: Some(id),
+        } = &operation
+        else {
+            unreachable!("only a v2 new with a request_id is routed here");
+        };
+        // A malformed ID is refused before anything is recorded.
+        validate_name(id).map_err(|_| {
+            invalid("request_id must start with an ASCII letter or digit, then letters, digits, dot, underscore or hyphen (max 128)")
+        })?;
+        let hash = requests::op_hash(&operation);
+        match self.requests.lookup(id) {
+            Some((_, recorded)) if recorded != hash => {
+                return Err(ApiError::new(
+                    "idempotency_conflict",
+                    "request_id was first used with another request body; use a new request_id",
+                ))
+            }
+            Some((Status::Done | Status::Failed, _)) => return self.requests.stored(id),
+            // A record stays running only while the log is Broken.
+            Some((Status::Running, _)) => return Err(self.requests.unavailable()),
+            Some((Status::Retryable, _)) | None => {}
+        }
+        self.requests.begin(id, &hash)?;
+        let outcome = self.new_attempts(
+            base,
+            *count,
+            *overlay,
+            *quota,
+            readonly_globs.clone(),
+            Some((id, &hash)),
+        );
+        self.requests.finish(id, &hash, outcome)
+    }
+
+    /// Refuses with `capacity`, before any attempt exists, a batch whose future
+    /// `done` line would pass the per-record cap (§5.5 preflight). The line is
+    /// measured by serializing it with the real state and RAM paths and
+    /// placeholder IDs of the drawn IDs' fixed length, so escapes count.
+    fn record_preflight(
+        &self,
+        (id, op_hash): (&str, &str),
+        name: &str,
+        count: usize,
+        ram: Option<&Path>,
+    ) -> Result<()> {
+        const PLACEHOLDER: &str = "attempt-000000";
+        let dir = self.root.join("attempts").join(PLACEHOLDER);
+        let attempt = Attempt {
+            id: PLACEHOLDER.into(),
+            base: name.into(),
+            path: dir.join("mnt"),
+            overlay_dir: ram.map_or_else(|| dir.join("overlay"), |p| p.join(PLACEHOLDER)),
+            status: "ready".into(),
+        };
+        let line = requests::done_line(
+            id,
+            op_hash,
+            &vec![attempt.id.clone(); count],
+            &json!(vec![attempt; count]),
+        );
+        let cap = self.requests.limits().record_bytes();
+        if line.len() as u64 > cap {
+            return Err(ApiError::new(
+                "capacity",
+                format!(
+                    "the request record would take {} bytes, over its {cap}-byte cap; use a smaller count or shorter state and RAM paths",
+                    line.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn base(&self, name: &str) -> Result<&Base> {
         self.bases
             .get(name)
@@ -603,6 +746,10 @@ impl<M: Mounter> Supervisor<M> {
         ))
     }
 
+    /// Starts a batch. With a `request` (its ID and `op_hash`) the future
+    /// `done` line is measured first. Success returns the batch's attempt IDs
+    /// with the result; an error returns the IDs its failed rollback kept, in
+    /// structured form, besides naming them in the unchanged v1 message.
     fn new_attempts(
         &mut self,
         name: &str,
@@ -610,13 +757,15 @@ impl<M: Mounter> Supervisor<M> {
         overlay: Overlay,
         quota: Option<u64>,
         readonly: Vec<String>,
-    ) -> Result<Value> {
+        request: Option<(&str, &str)>,
+    ) -> requests::Outcome {
         let base = self.base(name)?.clone();
         if count == 0 || count > self.max_attempts.saturating_sub(self.attempts.len()) {
             return Err(ApiError::new(
                 "capacity",
                 "count must be positive and fit --max-attempts (including crashed attempts)",
-            ));
+            )
+            .into());
         }
         // Attempt policy can only tighten the base policy.
         let quota = match (base.options.quota, quota) {
@@ -636,6 +785,9 @@ impl<M: Mounter> Supervisor<M> {
             Overlay::Disk => None,
             Overlay::Tmpfs => Some(self.ram_root()?),
         };
+        if let Some(request) = request {
+            self.record_preflight(request, name, count, ram.as_deref())?;
+        }
         let indexes = self.indexes(name);
         let mut ids = Vec::new();
         let deadline = Instant::now() + self.timeout;
@@ -644,15 +796,36 @@ impl<M: Mounter> Supervisor<M> {
                 if Instant::now() >= deadline {
                     return Err(ApiError::new("timeout", "attempt batch startup timed out"));
                 }
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0112-M01","item":"<ratarmount::sandbox::daemon::Supervisor<T0>>::new_attempts","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                )]
-                let dir = tempfile::Builder::new()
-                    .prefix("attempt-")
-                    .permissions(fs::Permissions::from_mode(0o700))
-                    .tempdir_in(self.root.join("attempts"))?
-                    .keep();
+                // tempfile avoids only names present in attempts/; an ID a
+                // request record names is redrawn, so a replay never names
+                // another request's attempt (§5.6).
+                let mut reserved = 0;
+                let dir = loop {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0112-M01","item":"<ratarmount::sandbox::daemon::Supervisor<T0>>::new_attempts","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                    )]
+                    let dir = tempfile::Builder::new()
+                        .prefix("attempt-")
+                        .permissions(fs::Permissions::from_mode(0o700))
+                        .tempdir_in(self.root.join("attempts"))?
+                        .keep();
+                    #[cfg(test)]
+                    let dir = self.test_attempt_dir(dir);
+                    let drawn = dir.file_name().and_then(|name| name.to_str());
+                    if !drawn.is_some_and(|id| self.requests.is_reserved(id)) {
+                        break dir;
+                    }
+                    // Still empty, and never recorded as an attempt.
+                    fs::remove_dir(&dir)?;
+                    reserved += 1;
+                    if reserved == RESERVED_DRAWS {
+                        return Err(ApiError::new(
+                            "io",
+                            "could not allocate a unique attempt ID",
+                        ));
+                    }
+                };
                 let id = dir.file_name().unwrap().to_str().unwrap().to_owned();
                 let attempt = Attempt {
                     id: id.clone(),
@@ -720,9 +893,12 @@ impl<M: Mounter> Supervisor<M> {
                     retained.join(", ")
                 ));
             }
-            return Err(error);
+            return Err(requests::BatchError {
+                error,
+                kept: retained,
+            });
         }
-        result
+        Ok((ids, result?))
     }
 
     pub fn destroy(&mut self, id: &str) -> Result<()> {
@@ -866,18 +1042,43 @@ struct Connection {
     active: Instant,
 }
 
-fn send(stream: &mut UnixStream, response: Response) -> io::Result<()> {
-    let mut bytes = serde_json::to_vec(&response)?;
-    if bytes.len() + 1 > MAX_RESPONSE {
-        bytes = serde_json::to_vec(&Response::from_result(Err(ApiError::new(
-            "response_too_large",
-            "response exceeds 64 MiB; export the diff locally",
-        ))))?;
+/// Answers one request line (§5.2), for `serve` and the tests. A reply sent
+/// before version 1 or 2 is known (a line over 1 MiB, invalid JSON, another
+/// version) is version 1; every other reply carries the request's version.
+pub fn respond<M: Mounter>(supervisor: &mut Supervisor<M>, line: &[u8]) -> Vec<u8> {
+    let (version, result) = if line.len() > MAX_REQUEST {
+        (VERSION, Err(invalid("request exceeds 1 MiB")))
+    } else {
+        match Request::parse(line) {
+            Ok(request) => (request.version, supervisor.handle(request.operation)),
+            Err(rejection) => (rejection.version, Err(rejection.error)),
+        }
+    };
+    encode(&Response::from_result(version, result), MAX_RESPONSE)
+}
+
+/// One response line. A reply over `limit` becomes `response_too_large` with
+/// the reply's own version.
+pub fn encode(response: &Response, limit: usize) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(response).expect("responses serialize to JSON");
+    if bytes.len() + 1 > limit {
+        bytes = serde_json::to_vec(&Response::from_result(
+            response.version,
+            Err(ApiError::new(
+                "response_too_large",
+                "response exceeds 64 MiB; export the diff locally",
+            )),
+        ))
+        .expect("responses serialize to JSON");
     }
     bytes.push(b'\n');
+    bytes
+}
+
+fn send(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let result = stream.write_all(&bytes);
+    let result = stream.write_all(bytes);
     stream.set_nonblocking(true)?;
     result
 }
@@ -932,20 +1133,18 @@ pub fn serve(socket: &Path, root: &Path, limit: usize, timeout: Duration) -> Res
                 Err(_) => return false,
             }
             if let Some(end) = connection.input.iter().position(|c| *c == b'\n') {
-                let result = if end > MAX_REQUEST {
-                    Err(invalid("request exceeds 1 MiB"))
-                } else {
-                    Request::parse(&connection.input[..end])
-                        .and_then(|r| supervisor.handle(r.operation))
-                };
+                let response = respond(&mut supervisor, &connection.input[..end]);
                 connection.input.drain(..=end);
                 connection.active = Instant::now();
-                return send(&mut connection.stream, Response::from_result(result)).is_ok();
+                return send(&mut connection.stream, &response).is_ok();
             }
             if connection.input.len() > MAX_REQUEST {
                 let _ = send(
                     &mut connection.stream,
-                    Response::from_result(Err(invalid("request exceeds 1 MiB"))),
+                    &encode(
+                        &Response::from_result(VERSION, Err(invalid("request exceeds 1 MiB"))),
+                        MAX_RESPONSE,
+                    ),
                 );
                 return false;
             }

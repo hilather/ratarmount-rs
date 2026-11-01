@@ -121,5 +121,6 @@ ratarmount sandbox shutdown --socket "$SANDBOX_SOCKET"
 A supervisor restart discards all attempts. It retains bases and warmed
 indexes. For large teacher passes (for example, 12,000 attempts), process tasks
 in bounded batches and destroy each batch after collecting its patches; the
-attempt limit includes crashed mounts. Do not blindly repeat `new` after a
-client timeout: list and reconcile first.
+attempt limit includes crashed mounts. After a client timeout, retry `new`
+with the same `--request-id` (Python: `request_id=`) and arguments, which
+never starts a second batch; without a request ID, list and reconcile first.
