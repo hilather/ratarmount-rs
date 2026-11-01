@@ -86,7 +86,9 @@ check() {
         *) fail "$f links $d (only $P/lib, /usr/lib, /System allowed)" ;;
       esac
     done
-    minos="$(otool -l "$f" | awk '/LC_BUILD_VERSION/{b=1} b && $1=="minos"{print $2; exit}')"
+    # Read all of otool's output (no early awk exit): an early exit can SIGPIPE
+    # otool and fail a valid dylib under pipefail (test-build-macos-deps-check.sh).
+    minos="$(otool -l "$f" | awk '/LC_BUILD_VERSION/{b=1} b && $1=="minos" && m==""{m=$2} END{print m}')"
     [[ -n "$minos" ]] || fail "$f has no LC_BUILD_VERSION minos"
     python3 -I -c 'import sys; v=lambda s: tuple(map(int, s.split("."))); sys.exit(v(sys.argv[1]) > v(sys.argv[2]))' \
       "$minos" "$MACOSX_DEPLOYMENT_TARGET" || fail "$f minos $minos > $MACOSX_DEPLOYMENT_TARGET"
