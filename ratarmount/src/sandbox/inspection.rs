@@ -1,7 +1,7 @@
 //! Private read-only child channel: SQLite intentionally permits only its owner.
 
 use super::protocol::{Attempt, MAX_RESPONSE};
-use ratarmount_compositing::WriteOverlay;
+use ratarmount_compositing::{LowerLayerRecord, WriteOverlay};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) struct Inspector {
     stop: Arc<AtomicBool>,
@@ -90,17 +90,27 @@ pub(crate) fn start(path: &Path, overlay: &Arc<WriteOverlay>) -> io::Result<Insp
                         .take(64)
                         .read_line(&mut command)
                         .is_err()
-                        || command != "deleted_paths\n"
+                        || !matches!(command.as_str(), "deleted_paths\n" | "lower_layers\n")
                     {
                         continue;
                     }
                     let Some(overlay) = overlay.upgrade() else {
                         break;
                     };
-                    let mut deleted: Vec<_> = overlay.load_tombstone_paths().into_iter().collect();
-                    deleted.sort();
+                    let reply = if command == "deleted_paths\n" {
+                        let mut deleted: Vec<_> =
+                            overlay.load_tombstone_paths().into_iter().collect();
+                        deleted.sort();
+                        serde_json::to_vec(&deleted).ok()
+                    } else {
+                        // The layers this mount composed, through its own connection.
+                        overlay
+                            .meta_value("lower_layers")
+                            .ok()
+                            .map(|layers| layers.unwrap_or_else(|| "[]".into()).into_bytes())
+                    };
                     drop(overlay);
-                    if let Ok(mut reply) = serde_json::to_vec(&deleted) {
+                    if let Some(mut reply) = reply {
                         if reply.len() < MAX_RESPONSE {
                             reply.push(b'\n');
                             let _ = stream.write_all(&reply);
@@ -122,20 +132,58 @@ pub(crate) fn start(path: &Path, overlay: &Arc<WriteOverlay>) -> io::Result<Insp
 }
 
 pub fn deleted_paths(attempt: &Attempt) -> io::Result<Vec<String>> {
+    request(attempt, b"deleted_paths\n", Duration::from_secs(5))
+}
+
+/// The child's recorded `lower_layers` (`[]` when it has none), within
+/// `timeout` (§5.4).
+pub fn lower_layers(attempt: &Attempt, timeout: Duration) -> io::Result<Vec<LowerLayerRecord>> {
+    request(attempt, b"lower_layers\n", timeout)
+}
+
+/// Sends `command` and reads the one-line reply, all within `timeout` from
+/// now: each read gets only the time left, so a reply trickled in small
+/// pieces cannot stretch the exchange past it.
+fn request<T: serde::de::DeserializeOwned>(
+    attempt: &Attempt,
+    command: &[u8],
+    timeout: Duration,
+) -> io::Result<T> {
+    let deadline = Instant::now() + timeout;
+    let left = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "inspection timed out"))
+    };
     let mut stream = UnixStream::connect(socket_path(attempt))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    stream.write_all(b"deleted_paths\n")?;
-    let mut line = Vec::new();
-    BufReader::new(stream)
-        .take((MAX_RESPONSE + 1) as u64)
-        .read_until(b'\n', &mut line)?;
-    if line.len() > MAX_RESPONSE || !line.ends_with(b"\n") {
-        return Err(io::Error::other(
-            "incomplete or oversized inspection response",
-        ));
+    stream.set_write_timeout(Some(left()?))?;
+    stream.write_all(command)?;
+    let mut reply = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let end = loop {
+        stream.set_read_timeout(Some(left()?))?;
+        let n = match stream.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if n == 0 {
+            return Err(io::Error::other("incomplete inspection response"));
+        }
+        let start = reply.len();
+        reply.extend_from_slice(&chunk[..n]);
+        if let Some(at) = reply[start..].iter().position(|&b| b == b'\n') {
+            break start + at + 1;
+        }
+        if reply.len() >= MAX_RESPONSE {
+            return Err(io::Error::other("oversized inspection response"));
+        }
+    };
+    if end > MAX_RESPONSE {
+        return Err(io::Error::other("oversized inspection response"));
     }
-    serde_json::from_slice(&line).map_err(io::Error::other)
+    serde_json::from_slice(&reply[..end]).map_err(io::Error::other)
 }
 
 #[cfg(test)]

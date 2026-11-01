@@ -571,7 +571,9 @@ apply this check.
 Committing a layered stack is unsupported: `--commit-overlay`, on-exit commit,
 a nonzero commit interval, and rolling commits with `--lower` are refused with
 “commit of a layered stack is not supported; flatten first”. RAM tops are
-supported; the sandbox supervisor API does not yet accept lower stacks.
+supported. The sandbox supervisor accepts lower stacks through protocol version
+2 (see [lower stacks](#lower-stacks)), with a stricter stack check than these
+mounts make.
 
 ## Seal and verify
 
@@ -2260,7 +2262,12 @@ errors (exit 1). Local option and transport errors go to stderr.
 `new` also accepts `--overlay disk|tmpfs`, `--quota SIZE`, repeated
 `--readonly GLOBS`, and `--request-id ID`, which sends the request as protocol
 version 2 so that a retry with the same ID and arguments never starts a second
-batch (see [protocol version 2](#protocol-version-2)). Without `--request-id`,
+batch (see [protocol version 2](#protocol-version-2)). Repeated `--lower PATH`
+(bottom first) and `--journal`, with `--journal-exclude GLOB` (repeated),
+`--journal-reads all|first` and `--journal-sync`, also send version 2 (see
+[lower stacks](#lower-stacks) and [journals](#journals)); the three journal
+options need `--journal`. Lower paths are sent unchanged: a relative one is
+refused by the daemon, never resolved by the client. Without these flags,
 `new` sends exactly the version 1 request. `--socket` works before or after the
 subcommand.
 `daemon --timeout SECONDS` sets base-validation and batch-readiness deadlines
@@ -2309,7 +2316,7 @@ are errors. Each request includes integer `version: 1` and an `op` string:
 | `create_base` | Required `name`, `source`; optional `options` object. Validates by opening/indexing without mounting, then durably records and returns `{name,source,options}`. An existing name returns `already_exists`. |
 | `new` | Required `base`; `count` defaults to 1, `overlay` to `"disk"`; optional integer `quota` in bytes and `readonly_globs` string array. Returns an array of attempts only after all mounts are ready. |
 | `list` | Optional `base` filters the attempt array. Status is `"ready"` or `"crashed"` (`"starting"` is internal to setup). An unknown base is an error. |
-| `diff` | Required `id`; boolean `git` defaults to false. Returns `{"patch":"..."}` using the in-process diff renderer and the same composed base, including recursive sources and binds. |
+| `diff` | Required `id`; boolean `git` defaults to false. Returns `{"patch":"..."}` using the in-process diff renderer and the same composed base, including recursive sources and binds, and for an attempt started with version 2 `lowers`, the lowers it mounted. |
 | `stats` | Required `id`. Returns the same integer object as `overlay-stats --json`. |
 | `destroy` | Exactly one of `id` or `base`. Returns `{"destroyed":true}`. A base selector destroys its attempts, retaining its registered definition/indexes. Unknown IDs return `not_found`. |
 | `shutdown` | No additional fields. Destroys all attempts, returns `{"shutdown":true}`, and stops the daemon. If cleanup fails, returns an error and stays available for retry. Version 1 ignores extra fields on `shutdown`; version 2 refuses them. |
@@ -2358,8 +2365,8 @@ Stable error codes include `invalid_request`, `unsupported_version`,
 `not_found`, `already_exists`, `capacity`, `in_use`, `unsafe_path`,
 `base_open_failed`, `mount_failed`, `timeout`, `unmount_failed`, `diff_failed`,
 `stats_failed`, `response_too_large`, `unsupported`, and `io`; version 2 adds
-`idempotency_conflict` and `interrupted`. Messages provide context and may
-change. Validation logs live in `indexes/BASE/prepare.log`;
+`idempotency_conflict`, `interrupted` and `lower_changed`. Messages provide
+context and may change. Validation logs live in `indexes/BASE/prepare.log`;
 attempt diagnostics live in `attempts/ID/mount.log` until destroy. Failed-batch
 errors include a bounded excerpt of the failing mount's log when available.
 
@@ -2387,7 +2394,11 @@ releases only add fields, and a daemon refuses fields it does not know with
   ASCII letter or digit first, then letters, digits, `.`, `_` or `-`. A
   malformed ID is `invalid_request` and writes nothing. `"request_id": null`
   is refused (`invalid_request`), never read as "no ID". Without a
-  `request_id`, a version 2 `new` behaves as version 1's.
+  `request_id`, `lowers` or `journal`, a version 2 `new` behaves as version
+  1's.
+- **`lowers` and `journal`** (`new` only) stack sealed layers under every
+  attempt and record a per-attempt operation journal; see
+  [lower stacks](#lower-stacks) and [journals](#journals).
 
 ```json
 {"version":2,"op":"new","base":"task","count":8,"request_id":"task-17-pass-2"}
@@ -2397,14 +2408,18 @@ A `request_id` is bound to the body it first arrived with for as long as its
 record lives, refusals included: another body under the same ID is
 `idempotency_conflict` in every state. A client that changes the body uses a
 new ID. The body is compared by `op_hash`, a SHA-256 over the request without
-`request_id` and without members equal to their defaults, so key order and
-spelled-out defaults do not matter, but the order of `readonly_globs` does.
+`request_id` and without members equal to their defaults, so key order (also
+inside `journal`) and spelled-out defaults do not matter, but the order of
+`readonly_globs`, `lowers` and `journal.exclude` does. An empty `lowers` is the
+same as none; `journal: {}` is not the same as no journal. Lower paths are
+compared exactly as sent: `/a/b` and `/a/b/` are different bodies, so the
+other spelling under the same ID is `idempotency_conflict`.
 
 | Outcome of the first run | A retry with the same ID and body |
 | --- | --- |
 | Success | Gets the stored result, byte for byte; nothing is mounted again. |
-| Refused before any attempt existed (unknown base, `capacity`, a bad glob, no tmpfs, a record over 4 MiB) | Runs again. |
-| Error with nothing left (complete rollback after `spawn_failed`, `mount_failed`, `timeout`, `io`) | Runs again. |
+| Refused before any attempt existed (unknown base, `capacity`, a bad glob, a refused lower, no tmpfs, a record over 4 MiB) | Runs again. |
+| Error with nothing left (complete rollback after `spawn_failed`, `mount_failed`, `timeout`, `lower_changed`, `io`) | Runs again. |
 | Error after a rollback that kept attempts (the message names them) | Gets the stored error. |
 | Cut off by a supervisor restart | Gets `interrupted`: "request was cut off by a supervisor restart before it finished; any attempts it created were discarded; retry with a new request_id". |
 
@@ -2446,7 +2461,183 @@ regular file with one link; it is opened without following symlinks.
   to an older daemon, stop the daemon and move `requests.jsonl` aside; every
   request record is then lost (replays, conflicts and reserved attempt IDs),
   and a retry of an old ID runs as new, which cannot duplicate live attempts
-  because the restart discarded them all.
+  because the restart discarded them all. An older version 2 daemon refuses a
+  `new` with `lowers` or `journal` as an unknown field, a retry included.
+
+#### Lower stacks
+
+A version 2 `new` may stack sealed layers between the base and every
+attempt's writable top:
+
+```json
+{"version":2,"op":"new","base":"task","count":8,"lowers":["/srv/layers/prepared","/srv/layers/attempt-k.tar.zst"]}
+```
+
+`lowers` is an array of absolute paths, bottom first, of sealed layer
+directories or layer bundles (`overlay pack`); `null` is refused. Each
+attempt's child mounts the base, the lowers and its top, as
+`ratarmount --lower … -w TOP` does; the API never passes
+`--allow-unsealed-lower` or `--force-stack-mismatch`. Results keep the version
+1 attempt shape. A mount's root reports the layers it took in
+`user.ratarmount.layers`. Its `user.ratarmount.stack_digest` is empty while the
+base digest is `pending`, which is the normal state for a prepared archive base
+(workers open its index read-only), so read the stack from `.layers`.
+
+**Validation, before anything exists.** Every refusal below is
+`invalid_request` naming the lower, before any attempt directory, child or RAM
+state exists (so a retry under the same `request_id` runs again):
+
+- **Base:** lowers need a base whose source is an absolute local path or a
+  `git:///` URL, without `binds` and not `recursive`.
+- **List:** at most 32 lowers, each a non-empty, NUL-free absolute path.
+  Relative paths are refused, never resolved against the daemon's working
+  directory.
+- **Place:** no lower may lie inside, or contain, the state directory or the
+  supervisor's RAM directory. The path is resolved one component at a time,
+  and before any name is looked up the path reached so far must lie outside
+  both, so nothing inside them is ever looked up (never through an attempt's
+  mount): a path written below the state directory is refused unresolved,
+  also when a later `..` would leave it again, and so is a path whose
+  symlinks lead into it. The resolved path is then checked again.
+- **Type:** a directory or a regular file (a bundle). Anything else, such as a
+  FIFO, is refused before it is opened.
+- **Directory:** a sealed layer with a valid `layer_digest`. Its metadata is
+  read without rolling back a hot journal: a layer a killed writer left
+  mid-transaction is refused, never repaired.
+- **Bundle:** `meta.json` must name a sealed layer with a valid digest. The
+  child verifies the content against the view beneath the bundle, as for
+  `sandbox run` and plain mounts; a bundle that fails there gives
+  `mount_failed`. The bundles of one request may take at most 1 GiB on disk
+  together, checked from their sizes before any is read, and may decode to at
+  most 1 GiB together, refused as soon as they do (see "Cost" below).
+- **Stack:** each lower records the lowers it was written over
+  (`lower_layers`), and that list must be exactly the lowers requested beneath
+  it, compared by `layer_digest` and never by path (a bundle and the directory
+  it was packed from are the same layer). A layer sealed over `A` is refused
+  without `A`, over another layer, or with its lowers reordered.
+- **Base identity:** every lower must record a comparable base identity,
+  `strong` (an archive base, or a supplied `--base-digest`) or `git-tree` (a
+  Git base), with a well-formed base digest of that kind (`sha256:` and 64
+  lowercase hex digits, or `git-tree:` and the tree id; a missing or malformed
+  one is refused), and all must record the same one. Layers made over a directory
+  base record a `weak` identity unless they were created with
+  `--base-digest sha256:…` (`ratarmount overlay digest-base` prints one); those
+  and `--base-digest none` layers are refused. A lower that records
+  `stack_mismatch_forced_at` or `base_mismatch_forced_at` is refused: its rows
+  do not describe what it was written over.
+- **Child flags:** the child's argv, journal globs included, must pass the
+  mount CLI's own parser.
+
+The child still compares the mounted base with what the bottom lower recorded
+(see [layered overlays](#layered-overlays)). Its refusals arrive as
+`mount_failed` with the mount log excerpt and may name CLI flags the API cannot
+pass, such as `--force-stack-mismatch`. For an archive base, a lower sealed over
+another archive gets the strong-digest message ("lower PATH was sealed against a
+strong base digest …").
+
+**Re-check once mounted.** Between validation and the mount a lower could be
+resealed or swapped. So once every child of the batch is ready, and before
+`new` returns, each child reports the layers it composed over its private
+inspection socket (never through FUSE), and the supervisor reads the metadata
+of every composed layer again: the directory's, or for a bundle the child's
+cache directory's. Both must equal what was validated. Otherwise the batch is
+rolled back and `new` fails with `lower_changed`, naming the attempt and what
+differs (values redacted as `overlay info` prints them); a failed inspection is
+`mount_failed`. The whole re-check runs within
+the batch deadline: an inspection gets only the time left, however its reply
+arrives, and a re-check that completes after the deadline fails with
+`timeout`, rolled back like one that never completes. This catches a resealed or replaced layer, a layer swapped and
+restored around the child's open, and a substituted bundle, including a forced
+re-pack with the same seal pair. Under a `request_id`, `lower_changed` after a
+complete rollback runs again on retry, and after a rollback that kept attempts
+it is stored, like any other error.
+
+**Deliberate limits:**
+- **No protection once a mount is ready.** Sealed lowers are opened immutable
+  and no lock is held on them, so a later edit, unseal or swap is not noticed
+  (`overlay verify` rehashes). Keep lowers unchanged while attempts use them.
+- A payload edited behind a seal keeps its metadata, and a rename that puts
+  another directory at the path exactly between the child's two opens and
+  restores it before the re-check goes unnoticed; both need an actor racing
+  the spawn.
+- The place rule judges a lower while resolving it; the reads that follow
+  use the resolved path by name, so a component swapped for a symlink into the
+  state directory in between, by an actor racing the request, is not caught.
+- The place rule compares paths, so another mount of the state directory or
+  of a directory inside it (a bind mount) is not recognized as one; a lower
+  below such a mount is looked up through it. Do not put lowers below a bind
+  mount of the state directory.
+- The stack check follows the stack a layer was written over. A layer sealed
+  with an explicit `overlay seal --lower LIST` records nothing of that list.
+- **Lower paths are hashed as sent:** `/a/b` and `/a/b/` are different request
+  bodies, so retrying one `request_id` with the other spelling is
+  `idempotency_conflict`.
+- The stack check is the supervisor's: plain `ratarmount --lower` and
+  `sandbox run --lower` do not check a lower's recorded stack.
+
+**Cost.** The supervisor reads every bundle lower to its end while validating
+(`meta.json` is the bundle's last member). It does so inside the serve loop,
+which answers one request at a time, so a large bundle delays every other
+client for as long as it takes to decompress. Two per-request caps bound
+this. The on-disk cap (1 GiB) refuses large files before any is read, but a
+small file can decode to far more, so the stall is bounded by the decoded cap:
+the request's bundles may decode to at most 1 GiB together, and the one that
+goes past it is refused as soon as it does. The stall grows with the bytes the
+request's bundles decode to, up to that cap.
+Each child then copies, hashes and verifies every bundle lower again, into the
+layer cache (`$XDG_CACHE_HOME/ratarmount/layers`, else `~/.cache/…`: the daemon
+needs `XDG_CACHE_HOME` or `HOME`), so `count` 64 over a 1 GiB bundle copies
+about 64 GiB and may reach `--timeout`. For fleets and large layers, pass
+sealed directories (`overlay unpack`) instead of bundles. The re-check once
+mounted asks each child in turn over its inspection socket and reads each
+lower's metadata again for each attempt, inside the batch deadline; at the
+largest batches (`--max-attempts` 4096 with 32 lowers, about 131,000 reads)
+raise `--timeout`.
+
+**`diff`.** `diff` of a layered attempt (version 1 or 2) renders the top
+against the base plus the layers it mounted, after checking that each is still
+sealed with the digest and seal time the re-check recorded (otherwise
+`diff_failed` names the layer). It never rolls back a journal and never
+re-verifies a bundle. An attempt whose re-check never passed (kept by a failed
+rollback) refuses `diff` with `diff_failed`: "lower stack of attempt ID was
+never verified; destroy it".
+
+#### Journals
+
+```json
+{"version":2,"op":"new","base":"task","journal":{"exclude":[".git/**"],"reads":"first","sync":true}}
+```
+
+`journal` records each attempt's [operation journal](#journal) in
+`attempts/ID/journal.jsonl`, the `journal.jsonl` beside the attempt's `path`
+(`<parent of path>/journal.jsonl`); clients never send a path. It lies outside
+the mountpoint and the overlay for disk and tmpfs tops, works with or without
+lowers, and is deleted with the attempt (`destroy`, `shutdown`, a restart), so
+summarize it first. `exclude` takes `--journal-exclude` globs (default none),
+`reads` is `all` (default) or `first`, and `sync` (default false) is
+`--journal-sync`. `journal` must be an object: `null`, an array, a scalar and
+unknown keys are refused; `journal: {}` is a journal with every default.
+`reads` must be one of the two strings (`{"first": null}` is refused). An
+`exclude` glob no argument can carry (one containing NUL, or longer than
+128 KiB) is refused before anything exists, and so are excludes that together
+take more than 512 KiB of the child's arguments (each glob counts 27 bytes
+more on 64-bit Linux: `--journal-exclude=`, its NUL and its pointer). That is
+a quarter of the 2 MiB Linux allows a program's arguments and environment
+under the default 8 MiB stack limit (it allows a quarter of `ulimit -s`); under
+a much smaller stack limit the spawn can still fail once the attempt exists.
+A glob may start with `-`. Mark turns with `ratarmount journal mark PATH
+LABEL` on the attempt's `path`.
+
+**The journal is not crash-durable by default.** The child buffers records and
+writes them out about every 100 ms; if the child or the supervisor is killed
+before unmount, the latest records are lost. Nothing is fsynced unless `sync`
+is true (`--journal-sync`), which fsyncs the file once, at unmount; records not
+yet written are still lost if the child dies before then. Under the
+supervisor the journal never outlives its attempt either way: `destroy`,
+`shutdown` and a restart delete it, and a supervisor that dies takes its
+children with it (they get SIGKILL) before they flush. So `sync` matters only
+to a client that reads the journal of an attempt whose child ended and
+unmounted on its own, before it calls `destroy`.
 
 ### Lifetime, concurrency and recovery
 
@@ -2555,4 +2746,13 @@ already gone (the daemon restarted, or another client destroyed them). Leaving
 a client or attempt context therefore treats a `not_found` answer to its
 implicit `destroy` as already destroyed and raises nothing; an explicit
 `Attempt.destroy()` or `destroy(id=...)` still raises `not_found`.
+
+`new(..., lowers=[...], journal={...})` also sends protocol version 2 (see
+[lower stacks](#lower-stacks) and [journals](#journals)). `lowers` items are
+absolute paths (`str` or `os.PathLike`), sent unchanged: a relative path is
+refused by the daemon, never resolved by the client. `journal` is a mapping
+with optional `exclude`, `reads` and `sync`. An omitted keyword sends no key,
+never `null`. `Attempt.journal_path` is the attempt's journal
+(`<dirname(path)>/journal.jsonl`) for attempts the client created with a
+journal, and `None` otherwise, including for `list()` results.
 See the [SWE-bench recipe](recipes/swe-bench-sandboxes.md).

@@ -45,7 +45,8 @@ const RECORD_BYTES: u64 = 4 << 20;
 /// from `Limits`, so other caps never turn a valid older line into damage
 /// (Keystone N4). A `done` line is at most the per-record cap; the largest
 /// `failed` line (4,096 kept IDs twice and an escaped 8 KiB `mount.log`
-/// excerpt) is about 185 KB.
+/// excerpt) is about 185 KB. R1b's lower re-check messages are cut to the
+/// same 8 KiB (`lowers::MESSAGE_BYTES`).
 pub const LINE_BOUND: u64 = RECORD_BYTES + (512 << 10);
 /// The answer to a retry of a request cut off by a restart (§5.3).
 pub const INTERRUPTED: &str = "request was cut off by a supervisor restart before it finished; any attempts it created were discarded; retry with a new request_id";
@@ -328,7 +329,9 @@ pub fn op_hash(operation: &OperationV2) -> String {
 }
 
 /// The typed default of every defaulted top-level field. Later slices add
-/// their fields here; U5's golden digest holds them to R1a's hashes.
+/// their fields here; U5's golden digest holds them to R1a's hashes. An
+/// absent `journal` is never serialized, and `journal: {}` is not a default:
+/// it spells out every member.
 fn defaults(operation: &OperationV2) -> Vec<(&'static str, Value)> {
     match operation {
         OperationV2::New { .. } => vec![
@@ -336,6 +339,7 @@ fn defaults(operation: &OperationV2) -> Vec<(&'static str, Value)> {
             ("overlay", json!(Overlay::default())),
             ("quota", json!(None::<u64>)),
             ("readonly_globs", json!(Vec::<String>::new())),
+            ("lowers", json!(Vec::<String>::new())),
         ],
         _ => Vec::new(),
     }
@@ -344,7 +348,7 @@ fn defaults(operation: &OperationV2) -> Vec<(&'static str, Value)> {
 /// Object members sorted by their UTF-8 key bytes at every depth, arrays in
 /// order, no whitespace, serde_json's scalar encoding. Sorting here keeps the
 /// hash independent of serde_json's `preserve_order` feature.
-fn canonical(value: &Value, out: &mut Vec<u8>) {
+pub(super) fn canonical(value: &Value, out: &mut Vec<u8>) {
     match value {
         Value::Object(members) => {
             let mut members: Vec<_> = members.iter().collect();

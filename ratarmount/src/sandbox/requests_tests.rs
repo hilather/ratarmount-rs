@@ -124,6 +124,156 @@ fn regression_request_hash_canonical_and_default_free() {
     );
 }
 
+/// Regression (Keystone #4, R1b L1): key order, at the top level and inside
+/// `journal`, never changes `op_hash`; the order of `lowers` and of
+/// `journal.exclude` does, and so does `journal` absent vs `{}`. An empty
+/// `lowers` hashes as absent and `{}` as every default spelled out. R1a's
+/// golden digest is unchanged and a second one pins `lowers` and `journal`.
+/// `null` and unknown members are refused in both versions.
+#[test]
+fn regression_request_hash_nested_lowers_and_journal() {
+    let layered = hash(
+        r#"{"version":2,"op":"new","base":"task","lowers":["/layers/a","/layers/b.tar.zst"],"journal":{"exclude":["x/**"],"reads":"first","sync":true},"request_id":"r"}"#,
+    );
+    for same in [
+        r#"{"journal":{"sync":true,"reads":"first","exclude":["x/**"]},"lowers":["/layers/a","/layers/b.tar.zst"],"base":"task","op":"new","version":2}"#,
+        r#"{"version":2,"journal":{"reads":"first","exclude":["x/**"],"sync":true},"op":"new","request_id":"other","lowers":["/layers/a","/layers/b.tar.zst"],"base":"task","count":1}"#,
+    ] {
+        assert_eq!(hash(same), layered, "{same}");
+    }
+    for other in [
+        r#"{"version":2,"op":"new","base":"task","lowers":["/layers/b.tar.zst","/layers/a"],"journal":{"exclude":["x/**"],"reads":"first","sync":true}}"#,
+        r#"{"version":2,"op":"new","base":"task","lowers":["/layers/a/","/layers/b.tar.zst"],"journal":{"exclude":["x/**"],"reads":"first","sync":true}}"#,
+        r#"{"version":2,"op":"new","base":"task","lowers":["/layers/a","/layers/b.tar.zst"],"journal":{"exclude":["x/**"],"reads":"all","sync":true}}"#,
+        r#"{"version":2,"op":"new","base":"task","lowers":["/layers/a","/layers/b.tar.zst"]}"#,
+    ] {
+        assert_ne!(hash(other), layered, "{other}");
+    }
+    let excludes =
+        hash(r#"{"version":2,"op":"new","base":"task","journal":{"exclude":["a","b"]}}"#);
+    assert_ne!(
+        hash(r#"{"version":2,"op":"new","base":"task","journal":{"exclude":["b","a"]}}"#),
+        excludes
+    );
+    let plain = hash(r#"{"version":2,"op":"new","base":"task"}"#);
+    assert_eq!(
+        hash(r#"{"version":2,"op":"new","base":"task","lowers":[]}"#),
+        plain
+    );
+    let journal = hash(r#"{"version":2,"op":"new","base":"task","journal":{}}"#);
+    assert_ne!(journal, plain);
+    assert_eq!(
+        hash(
+            r#"{"version":2,"op":"new","base":"task","journal":{"exclude":[],"reads":"all","sync":false}}"#
+        ),
+        journal
+    );
+    assert_ne!(
+        hash(r#"{"version":2,"op":"new","base":"task","journal":{"reads":"first"}}"#),
+        journal
+    );
+    // The canonical writer sorts members itself, whatever their order.
+    let mut filled = serde_json::Map::new();
+    filled.insert("z".into(), json!({"y": 1, "b": [2, 1]}));
+    filled.insert("a".into(), json!(null));
+    let mut text = Vec::new();
+    requests::canonical(&Value::Object(filled), &mut text);
+    assert_eq!(text, br#"{"a":null,"z":{"b":[2,1],"y":1}}"#);
+    // R1a's golden digest, and R1b's.
+    assert_eq!(
+        hash(r#"{"version":2,"op":"new","base":"task","request_id":"r"}"#),
+        "sha256:7c90b0d547f54b6b875948f96f3781758eb2820c17b9a32d2a8dd2536ebc135e"
+    );
+    assert_eq!(
+        layered,
+        "sha256:2515151256494fa1f4a8a11de16a36449bb8a69ae0d83fc73932edbb2926c53a"
+    );
+    assert_eq!(
+        layered,
+        format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                br#"{"base":"task","journal":{"exclude":["x/**"],"reads":"first","sync":true},"lowers":["/layers/a","/layers/b.tar.zst"],"op":"new","version":2}"#
+            )
+        )
+    );
+    // `null` is never "absent", and unknown members are refused.
+    for (line, version) in [
+        (r#"{"version":2,"op":"new","base":"t","lowers":null}"#, 2),
+        (r#"{"version":2,"op":"new","base":"t","journal":null}"#, 2),
+        (
+            r#"{"version":2,"op":"new","base":"t","journal":{"x":1}}"#,
+            2,
+        ),
+        (
+            r#"{"version":2,"op":"new","base":"t","journal":{"reads":"some"}}"#,
+            2,
+        ),
+        (
+            r#"{"version":2,"op":"new","base":"t","journal":{"exclude":null}}"#,
+            2,
+        ),
+        (r#"{"version":1,"op":"new","base":"t","lowers":["/l"]}"#, 1),
+        (r#"{"version":1,"op":"new","base":"t","journal":{}}"#, 1),
+    ] {
+        let rejection = Request::parse(line.as_bytes()).unwrap_err();
+        assert_eq!(
+            (rejection.version, rejection.error.code.as_str()),
+            (version, "invalid_request"),
+            "{line}: {}",
+            rejection.error.message
+        );
+    }
+    // Regression (sweep 1): a struct's derived `Deserialize` also takes an
+    // array of its fields, so `journal: []` was a journal with every default.
+    for line in [
+        r#"{"version":2,"op":"new","base":"t","journal":[]}"#,
+        r#"{"version":2,"op":"new","base":"t","journal":[[],"first",true]}"#,
+        r#"{"version":2,"op":"new","base":"t","journal":[["x/**"]]}"#,
+        r#"{"version":2,"op":"new","base":"t","journal":true}"#,
+        r#"{"version":2,"op":"new","base":"t","journal":"first"}"#,
+    ] {
+        let rejection = Request::parse(line.as_bytes()).unwrap_err();
+        assert_eq!(
+            (rejection.version, rejection.error.code.as_str()),
+            (2, "invalid_request"),
+            "{line}"
+        );
+        assert!(
+            rejection
+                .error
+                .message
+                .contains("expected a journal object"),
+            "{line}: {}",
+            rejection.error.message
+        );
+    }
+    // Regression (sweep 4): a derived enum also takes the map form, so
+    // `reads: {"first": null}` was `first`.
+    for line in [
+        r#"{"version":2,"op":"new","base":"t","journal":{"reads":{"first":null}}}"#,
+        r#"{"version":2,"op":"new","base":"t","journal":{"reads":{"all":null}}}"#,
+        r#"{"version":2,"op":"new","base":"t","journal":{"reads":["first"]}}"#,
+    ] {
+        let rejection = Request::parse(line.as_bytes()).unwrap_err();
+        assert_eq!(
+            (rejection.version, rejection.error.code.as_str()),
+            (2, "invalid_request"),
+            "{line}"
+        );
+        assert!(
+            rejection.error.message.contains("expected a string"),
+            "{line}: {}",
+            rejection.error.message
+        );
+    }
+    for reads in ["all", "first"] {
+        let line =
+            format!(r#"{{"version":2,"op":"new","base":"t","journal":{{"reads":"{reads}"}}}}"#);
+        Request::parse(line.as_bytes()).unwrap();
+    }
+}
+
 /// Regression: the same request ID and body never start a second batch, and
 /// the replay's bytes equal the first answer's (source test 2).
 #[test]

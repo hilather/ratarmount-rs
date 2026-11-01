@@ -1,10 +1,10 @@
 """Stdlib-only client for the ratarmount sandbox protocol (Python 3.9+).
 
-Requests use protocol v1, except new(..., request_id=...), which sends
-protocol v2. A client context destroys only attempts it created, never the
-shared daemon. Transport failures are not retried automatically: a timed-out
-mutation may have completed. Retry new() with the same request_id and
-arguments, which never starts a second batch, or use list() to reconcile
+Requests use protocol v1, except new() with request_id, lowers or journal,
+which sends protocol v2. A client context destroys only attempts it created,
+never the shared daemon. Transport failures are not retried automatically: a
+timed-out mutation may have completed. Retry new() with the same request_id
+and arguments, which never starts a second batch, or use list() to reconcile
 before issuing another new() without one.
 
 A replay returns the original answer, even after a daemon restart discarded
@@ -15,6 +15,7 @@ replay does not fail the cleanup.
 
 import base64
 import json
+import os
 import socket as _socket
 
 _VERSION = 1
@@ -32,15 +33,22 @@ class SandboxError(RuntimeError):
 
 
 class Attempt:
-    """An attempt's mount path and overlay, with explicit/context cleanup."""
+    """An attempt's mount path and overlay, with explicit/context cleanup.
 
-    def __init__(self, client, data):
+    journal_path is the attempt's operation journal (<dirname(path)>/journal.jsonl)
+    when this client created it with a journal, else None; it is deleted with
+    the attempt, so summarize it before destroy().
+    """
+
+    def __init__(self, client, data, journal=False):
         self._client = client
         self.id = data["id"]
         self.base = data["base"]
         self.path = data["path"]
         self.overlay_dir = data["overlay_dir"]
         self.status = data["status"]
+        self.journal_path = (os.path.join(os.path.dirname(self.path), "journal.jsonl")
+                             if journal else None)
         self._destroyed = False
 
     def diff(self, git=True):
@@ -136,16 +144,33 @@ class RatarmountSandbox:
         return self._call("create_base", name=name, source=str(source), options=options)
 
     def new(self, base, count=1, overlay="disk", quota=None, readonly_globs=None, *,
-            request_id=None):
-        """Start attempts; with request_id (protocol v2) a retry with the same
-        ID and arguments returns the stored answer instead of a second batch."""
+            request_id=None, lowers=None, journal=None):
+        """Start attempts. Any keyword sends protocol v2, and an omitted one
+        sends no key:
+
+        - request_id: a retry with the same ID and arguments returns the stored
+          answer instead of a second batch.
+        - lowers: sealed layer directories or bundles under every attempt,
+          bottom first; absolute paths (str or os.PathLike), sent unchanged.
+        - journal: a mapping with optional "exclude" (globs), "reads" ("all" or
+          "first") and "sync" (bool); see Attempt.journal_path.
+        """
         fields = dict(base=base, count=count, overlay=overlay, quota=quota,
                       readonly_globs=readonly_globs or [])
-        if request_id is None:
+        if request_id is None and lowers is None and journal is None:
             data = self._call("new", **fields)
         else:
-            data = self._call("new", version=_VERSION_2, **fields, request_id=request_id)
-        attempts = [Attempt(self, item) for item in data]
+            if request_id is not None:
+                fields["request_id"] = request_id
+            if lowers is not None:
+                # One path would be iterated character by character.
+                if isinstance(lowers, (str, bytes, os.PathLike)):
+                    raise TypeError("lowers must be a list of paths, not one path")
+                fields["lowers"] = [os.fspath(lower) for lower in lowers]
+            if journal is not None:
+                fields["journal"] = dict(journal)
+            data = self._call("new", version=_VERSION_2, **fields)
+        attempts = [Attempt(self, item, journal=journal is not None) for item in data]
         self._owned.update((a.id, a) for a in attempts)
         return attempts
 

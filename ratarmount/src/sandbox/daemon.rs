@@ -1,6 +1,8 @@
-use super::process::{self, MountState, Mounter, ProcessMounter};
+use super::lowers;
+use super::process::{self, MountState, Mounter, ProcessMounter, SpawnSpec};
 use super::protocol::*;
 use super::requests::{self, RequestLog, Status};
+use ratarmount_compositing::LowerLayerRecord;
 use ratarmount_session::factory;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -318,6 +320,13 @@ pub struct Supervisor<M: Mounter> {
     timeout: Duration,
     pub stopping: bool,
     pub requests: RequestLog,
+    /// Layered attempts: `None` from before the spawn until the re-check once
+    /// mounted passes (an attempt a failed rollback kept stays `None`), then
+    /// the layers its child composed. Plain attempts have no entry.
+    pub taken_lowers: BTreeMap<String, Option<Vec<LowerLayerRecord>>>,
+    /// Decoded bytes the bundle lowers of one `new` share
+    /// (`lowers::MAX_BUNDLE_DECODED_BYTES`; tests lower it).
+    pub lower_decode_budget: u64,
     #[cfg(test)]
     pub test_ids: Option<TestIds>,
     _lock: File,
@@ -395,6 +404,8 @@ impl<M: Mounter> Supervisor<M> {
             timeout,
             stopping: false,
             requests,
+            taken_lowers: BTreeMap::new(),
+            lower_decode_budget: lowers::MAX_BUNDLE_DECODED_BYTES,
             #[cfg(test)]
             test_ids: None,
             _lock: guard,
@@ -487,7 +498,9 @@ impl<M: Mounter> Supervisor<M> {
     }
 
     /// Runs a v1 operation, or for a v2 one the same v1 operation; a v2 `new`
-    /// with a `request_id` goes through the request-ID layer (§5.3).
+    /// with a `request_id` goes through the request-ID layer (§5.3), and every
+    /// v2 `new` passes its `lowers` and `journal` on: without them, and without
+    /// a `request_id`, it is a v1 `new`.
     pub fn handle(&mut self, operation: impl Into<Op>) -> Result<Value> {
         self.supervise();
         let operation = match operation.into() {
@@ -498,6 +511,30 @@ impl<M: Mounter> Supervisor<M> {
                     ..
                 },
             ) => return self.new_with_request_id(operation),
+            Op::V2(OperationV2::New {
+                base,
+                count,
+                overlay,
+                quota,
+                readonly_globs,
+                request_id: None,
+                lowers,
+                journal,
+            }) => {
+                return self
+                    .new_attempts(
+                        &base,
+                        count,
+                        overlay,
+                        quota,
+                        readonly_globs,
+                        &lowers,
+                        journal.as_ref(),
+                        None,
+                    )
+                    .map(|(_, result)| result)
+                    .map_err(|failed| failed.error)
+            }
             Op::V2(operation) => operation.into_v1(),
         };
         match operation {
@@ -541,7 +578,16 @@ impl<M: Mounter> Supervisor<M> {
                 quota,
                 readonly_globs,
             } => self
-                .new_attempts(&base, count, overlay, quota, readonly_globs, None)
+                .new_attempts(
+                    &base,
+                    count,
+                    overlay,
+                    quota,
+                    readonly_globs,
+                    &[],
+                    None,
+                    None,
+                )
                 .map(|(_, result)| result)
                 .map_err(|failed| failed.error),
             Operation::List { base } => {
@@ -556,16 +602,32 @@ impl<M: Mounter> Supervisor<M> {
             }
             Operation::Diff { id, git } => {
                 let attempt = self.attempt(&id)?.clone();
+                // A layered attempt is rendered against base + lowers, never
+                // against the bare base (§5.5).
+                let layers = match self.taken_lowers.get(&id) {
+                    None => Vec::new(),
+                    Some(None) => {
+                        return Err(ApiError::new(
+                            "diff_failed",
+                            format!("lower stack of attempt {id} was never verified; destroy it"),
+                        ))
+                    }
+                    Some(Some(records)) => lowers::recorded_layers(records)
+                        .map_err(|e| ApiError::new("diff_failed", e))?,
+                };
                 let deleted = self.mounter.deleted_paths(&attempt)?;
                 let base = self.base(&attempt.base)?;
                 let source = open_base(base, &self.indexes(&base.name))?;
+                let composed =
+                    ratarmount_compositing::compose_stack(source.source.clone(), &layers)
+                        .map_err(|e| ApiError::new("diff_failed", e.to_string()))?;
                 let patch = crate::diff::render_source(
                     &crate::diff::DiffArgs {
                         directory: attempt.overlay_dir.clone(),
                         git,
                         ..Default::default()
                     },
-                    source.source.clone(),
+                    composed,
                     deleted,
                 )
                 .map_err(|e| ApiError::new("diff_failed", e))?;
@@ -636,6 +698,8 @@ impl<M: Mounter> Supervisor<M> {
             quota,
             readonly_globs,
             request_id: Some(id),
+            lowers,
+            journal,
         } = &operation
         else {
             unreachable!("only a v2 new with a request_id is routed here");
@@ -664,6 +728,8 @@ impl<M: Mounter> Supervisor<M> {
             *overlay,
             *quota,
             readonly_globs.clone(),
+            lowers,
+            journal.as_ref(),
             Some((id, &hash)),
         );
         self.requests.finish(id, &hash, outcome)
@@ -750,6 +816,9 @@ impl<M: Mounter> Supervisor<M> {
     /// `done` line is measured first. Success returns the batch's attempt IDs
     /// with the result; an error returns the IDs its failed rollback kept, in
     /// structured form, besides naming them in the unchanged v1 message.
+    /// `lowers` are validated before anything exists and re-checked once every
+    /// child is ready (§5.2–§5.4); a `journal` goes to `attempts/ID/journal.jsonl`.
+    #[allow(clippy::too_many_arguments)]
     fn new_attempts(
         &mut self,
         name: &str,
@@ -757,6 +826,8 @@ impl<M: Mounter> Supervisor<M> {
         overlay: Overlay,
         quota: Option<u64>,
         readonly: Vec<String>,
+        lowers: &[String],
+        journal: Option<&JournalSpec>,
         request: Option<(&str, &str)>,
     ) -> requests::Outcome {
         let base = self.base(name)?.clone();
@@ -781,6 +852,58 @@ impl<M: Mounter> Supervisor<M> {
             .collect();
         ratarmount_compositing::ReadOnlyGlobs::with_allow(&readonly, &base.options.allow_globs)
             .map_err(|e| invalid(e.to_string()))?;
+        let indexes = self.indexes(name);
+        // Before the RAM root, any attempt directory or child (§5.2).
+        let layered = if lowers.is_empty() {
+            Vec::new()
+        } else {
+            lowers::validate(
+                &base,
+                lowers,
+                &lowers::Roots {
+                    state: &self.root,
+                    ram: self.ram_root.as_deref(),
+                },
+                self.lower_decode_budget,
+            )?
+        };
+        let lower_paths: Vec<PathBuf> = layered.iter().map(|lower| lower.path.clone()).collect();
+        if !layered.is_empty() || journal.is_some() {
+            // The parser takes these, but no argv can carry them: spawning
+            // the child would fail only once its attempt exists.
+            let unspawnable = journal.and_then(|spec| {
+                spec.exclude
+                    .iter()
+                    .find_map(|glob| process::unspawnable_exclude(glob).map(|why| (glob, why)))
+            });
+            if let Some((glob, why)) = unspawnable {
+                return Err(invalid(format!(
+                    "journal exclude glob {:?} {why}",
+                    lowers::excerpt(glob, lowers::SHOWN_BYTES)
+                ))
+                .into());
+            }
+            let argv = journal.map_or(0, |spec| process::excludes_argv_bytes(&spec.exclude));
+            if argv > process::MAX_EXCLUDE_ARGV_BYTES {
+                return Err(invalid(format!(
+                    "journal exclude globs take {argv} bytes of the child's arguments, more than {}",
+                    process::MAX_EXCLUDE_ARGV_BYTES
+                ))
+                .into());
+            }
+            // The flags the child will get, through the mount CLI's parser.
+            let probe = Path::new("/unused/journal.jsonl");
+            check_spawn_args(
+                &base,
+                &indexes,
+                &SpawnSpec {
+                    quota,
+                    readonly: &readonly,
+                    lowers: &lower_paths,
+                    journal: journal.map(|spec| (probe, spec)),
+                },
+            )?;
+        }
         let ram = match overlay {
             Overlay::Disk => None,
             Overlay::Tmpfs => Some(self.ram_root()?),
@@ -788,7 +911,6 @@ impl<M: Mounter> Supervisor<M> {
         if let Some(request) = request {
             self.record_preflight(request, name, count, ram.as_deref())?;
         }
-        let indexes = self.indexes(name);
         let mut ids = Vec::new();
         let deadline = Instant::now() + self.timeout;
         let result = (|| {
@@ -838,11 +960,25 @@ impl<M: Mounter> Supervisor<M> {
                 };
                 // Record before spawning so partial batches and initialization errors clean up.
                 ids.push(id.clone());
+                if !layered.is_empty() {
+                    self.taken_lowers.insert(id.clone(), None);
+                }
                 self.attempts.insert(id, attempt.clone());
                 private_dir(&attempt.path)?;
                 private_dir(&attempt.overlay_dir)?;
-                self.mounter
-                    .spawn(&base, &indexes, &attempt, quota, &readonly)?;
+                // Outside the mountpoint and the overlay, for disk and tmpfs tops.
+                let journal_path = dir.join("journal.jsonl");
+                self.mounter.spawn(
+                    &base,
+                    &indexes,
+                    &attempt,
+                    &SpawnSpec {
+                        quota,
+                        readonly: &readonly,
+                        lowers: &lower_paths,
+                        journal: journal.map(|spec| (journal_path.as_path(), spec)),
+                    },
+                )?;
             }
             loop {
                 self.supervise();
@@ -875,6 +1011,9 @@ impl<M: Mounter> Supervisor<M> {
                 }
                 thread::sleep(Duration::from_millis(20));
             }
+            if !layered.is_empty() {
+                self.recheck_lowers(&ids, &layered, deadline)?;
+            }
             Ok(json!(ids
                 .iter()
                 .map(|id| &self.attempts[id])
@@ -901,14 +1040,65 @@ impl<M: Mounter> Supervisor<M> {
         Ok((ids, result?))
     }
 
+    /// Re-check once mounted (Keystone #3): after every child of a layered
+    /// batch is ready, each reports the layers it took and what it composed is
+    /// read again; both must equal `layered`, within the batch deadline. A
+    /// step that completes after the deadline is a `timeout` like one that
+    /// does not complete.
+    fn recheck_lowers(
+        &mut self,
+        ids: &[String],
+        layered: &[lowers::Lower],
+        deadline: Instant,
+    ) -> Result<()> {
+        let timed_out = || ApiError::new("timeout", "lower re-check timed out");
+        let in_time = || {
+            if Instant::now() >= deadline {
+                Err(timed_out())
+            } else {
+                Ok(())
+            }
+        };
+        for id in ids {
+            in_time()?;
+            let left = deadline.saturating_duration_since(Instant::now());
+            let attempt = self.attempts[id].clone();
+            let records = self
+                .mounter
+                .lower_layers(&attempt, left.min(Duration::from_secs(5)))
+                .map_err(|error| {
+                    if Instant::now() >= deadline {
+                        timed_out()
+                    } else {
+                        // A reply of the wrong type is quoted by serde.
+                        let message = format!(
+                            "attempt {id}: cannot read the lower layers it mounted: {}",
+                            error.message
+                        );
+                        ApiError::new(
+                            "mount_failed",
+                            lowers::excerpt(&message, lowers::MESSAGE_BYTES),
+                        )
+                    }
+                })?;
+            in_time()?;
+            lowers::recheck(id, layered, &records)?;
+            in_time()?;
+            self.taken_lowers.insert(id.clone(), Some(records));
+        }
+        Ok(())
+    }
+
     pub fn destroy(&mut self, id: &str) -> Result<()> {
         let attempt = self.attempt(id)?.clone();
         self.mounter.cleanup(&attempt.path)?;
         if attempt.overlay_dir.exists() {
             fs::remove_dir_all(&attempt.overlay_dir)?;
         }
+        // The attempt root holds its journal.jsonl too.
         fs::remove_dir_all(attempt.path.parent().expect("attempt root"))?;
         self.attempts.remove(id);
+        self.taken_lowers.remove(id);
         Ok(())
     }
 
@@ -979,6 +1169,21 @@ fn validate_base(base: &Base, indexes: &Path) -> Result<()> {
     if base.source.is_empty() || base.source.contains('\0') {
         return Err(invalid("source must not be empty or contain NUL"));
     }
+    check_spawn_args(
+        base,
+        indexes,
+        &SpawnSpec {
+            quota: base.options.quota,
+            readonly: &base.options.readonly_globs,
+            ..Default::default()
+        },
+    )
+}
+
+/// Parses a child's argv over probe paths with the mount CLI's own parser,
+/// so policy, binds, lowers and journal flags it would refuse are refused
+/// before anything exists.
+fn check_spawn_args(base: &Base, indexes: &Path, spec: &SpawnSpec<'_>) -> Result<()> {
     let attempt = Attempt {
         id: "validate".into(),
         base: base.name.clone(),
@@ -986,16 +1191,10 @@ fn validate_base(base: &Base, indexes: &Path) -> Result<()> {
         overlay_dir: PathBuf::from("/unused/overlay"),
         status: "starting".into(),
     };
-    // Reuse the mount CLI's option validation, including readonly patterns and binds.
-    crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(
-        process::mount_args(
-            base,
-            indexes,
-            &attempt,
-            base.options.quota,
-            &base.options.readonly_globs,
-        ),
-    ))
+    crate::parse_args_from(
+        std::iter::once(OsString::from("ratarmount"))
+            .chain(process::mount_args(base, indexes, &attempt, spec)),
+    )
     .map_err(|e| invalid(e.to_string()))?;
     Ok(())
 }
