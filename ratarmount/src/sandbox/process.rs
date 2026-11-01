@@ -1,6 +1,7 @@
 //! Process and mount operations kept behind a trait for lifecycle tests.
 
-use super::protocol::{ApiError, Attempt, Base};
+use super::protocol::{ApiError, Attempt, Base, JournalReads, JournalSpec};
+use ratarmount_compositing::LowerLayerRecord;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
@@ -22,6 +23,18 @@ pub enum MountState {
     Crashed,
 }
 
+/// What one attempt's child mounts besides the base: its policy, its lower
+/// stack and its operation journal. The empty spec gives the v1 argv.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SpawnSpec<'a> {
+    pub quota: Option<u64>,
+    pub readonly: &'a [String],
+    /// Canonical lower paths, bottom first.
+    pub lowers: &'a [PathBuf],
+    /// The journal file the supervisor chose, and its options.
+    pub journal: Option<(&'a Path, &'a JournalSpec)>,
+}
+
 pub trait Mounter {
     fn prepare(&mut self, base: &Base, indexes: &Path, timeout: Duration) -> Result<()>;
     fn spawn(
@@ -29,11 +42,17 @@ pub trait Mounter {
         base: &Base,
         indexes: &Path,
         attempt: &Attempt,
-        quota: Option<u64>,
-        readonly: &[String],
+        spec: &SpawnSpec<'_>,
     ) -> Result<()>;
     fn poll(&mut self, attempt: &Attempt) -> Result<MountState>;
     fn deleted_paths(&mut self, attempt: &Attempt) -> Result<Option<Vec<String>>>;
+    /// The lower layers a ready child composed, as its own overlay recorded
+    /// them, answered within `timeout`. Never goes through FUSE.
+    fn lower_layers(
+        &mut self,
+        attempt: &Attempt,
+        timeout: Duration,
+    ) -> Result<Vec<LowerLayerRecord>>;
     /// Must leave no mounts below path, and stop/reap any owned child, before success.
     fn cleanup(&mut self, path: &Path) -> Result<()>;
 }
@@ -75,12 +94,48 @@ pub fn base_args(base: &Base, indexes: &Path) -> Vec<OsString> {
     args
 }
 
+/// Longest argument `execve` takes on Linux (`MAX_ARG_STRLEN` with 4 KiB
+/// pages), its terminating NUL included.
+pub const MAX_ARG_BYTES: usize = 128 << 10;
+
+/// One journal exclude glob as one argument: as a separate value, a glob
+/// that starts with `-` would be parsed as another option.
+fn journal_exclude_arg(glob: &str) -> OsString {
+    format!("--journal-exclude={glob}").into()
+}
+
+/// Most bytes the journal exclude arguments may take of the child's argv
+/// together, as `execve` counts them against `ARG_MAX` (2 MiB by default):
+/// each argument, its NUL and its pointer.
+pub const MAX_EXCLUDE_ARGV_BYTES: usize = 512 << 10;
+
+/// What the journal exclude arguments take of the child's argv.
+pub fn excludes_argv_bytes(excludes: &[String]) -> usize {
+    excludes
+        .iter()
+        .map(|glob| journal_exclude_arg(glob).len() + 1 + std::mem::size_of::<*const u8>())
+        .sum()
+}
+
+/// Why no argv can carry the journal exclude `glob`, if none can: spawning
+/// the child would fail only once its attempt exists.
+pub fn unspawnable_exclude(glob: &str) -> Option<String> {
+    if glob.contains('\0') {
+        Some("contains NUL".into())
+    } else if journal_exclude_arg(glob).len() >= MAX_ARG_BYTES {
+        Some(format!(
+            "is longer than one argument may be ({MAX_ARG_BYTES} bytes with its flag and terminating NUL)"
+        ))
+    } else {
+        None
+    }
+}
+
 pub fn mount_args(
     base: &Base,
     indexes: &Path,
     attempt: &Attempt,
-    quota: Option<u64>,
-    readonly: &[String],
+    spec: &SpawnSpec<'_>,
 ) -> Vec<OsString> {
     let mut args = base_args(base, indexes);
     args.push("--no-recreate-index".into());
@@ -89,14 +144,31 @@ pub fn mount_args(
         super::inspection::socket_path(attempt).into_os_string(),
     ]);
     args.extend(["-w".into(), attempt.overlay_dir.as_os_str().to_owned()]);
-    if let Some(quota) = quota {
+    if let Some(quota) = spec.quota {
         args.extend(["--overlay-quota".into(), quota.to_string().into()]);
     }
-    for glob in readonly {
+    for glob in spec.readonly {
         args.extend(["--overlay-readonly".into(), glob.into()]);
     }
     for glob in &base.options.allow_globs {
         args.extend(["--overlay-allow".into(), glob.into()]);
+    }
+    // Validated, sealed lowers only: never --allow-unsealed-lower or
+    // --force-stack-mismatch.
+    for lower in spec.lowers {
+        args.extend(["--lower".into(), lower.as_os_str().to_owned()]);
+    }
+    if let Some((path, journal)) = spec.journal {
+        args.extend(["--journal".into(), path.as_os_str().to_owned()]);
+        for glob in &journal.exclude {
+            args.push(journal_exclude_arg(glob));
+        }
+        if journal.reads == JournalReads::First {
+            args.extend(["--journal-reads".into(), "first".into()]);
+        }
+        if journal.sync {
+            args.push("--journal-sync".into());
+        }
     }
     // Keep the original source positional intact: the child records it as
     // OverlayCreateInfo.base_url when it constructs the write overlay.
@@ -175,8 +247,7 @@ impl Mounter for ProcessMounter {
         base: &Base,
         indexes: &Path,
         attempt: &Attempt,
-        quota: Option<u64>,
-        readonly: &[String],
+        spec: &SpawnSpec<'_>,
     ) -> Result<()> {
         let log = attempt
             .path
@@ -189,7 +260,7 @@ impl Mounter for ProcessMounter {
             reason = r###"internal-read:v1 {"id":"IR-B0115-M01","item":"<ratarmount::sandbox::process::ProcessMounter as ratarmount::sandbox::process::Mounter<ratarmount::sandbox::process::ProcessMounter>>::spawn","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"child stdio setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         command
-            .args(mount_args(base, indexes, attempt, quota, readonly))
+            .args(mount_args(base, indexes, attempt, spec))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(fs::File::create(log)?);
@@ -220,6 +291,14 @@ impl Mounter for ProcessMounter {
         super::inspection::deleted_paths(attempt)
             .map(Some)
             .map_err(Into::into)
+    }
+
+    fn lower_layers(
+        &mut self,
+        attempt: &Attempt,
+        timeout: Duration,
+    ) -> Result<Vec<LowerLayerRecord>> {
+        super::inspection::lower_layers(attempt, timeout).map_err(Into::into)
     }
 
     fn cleanup(&mut self, path: &Path) -> Result<()> {
@@ -405,7 +484,12 @@ mod tests {
             overlay_dir: "/tmp/overlay".into(),
             status: "starting".into(),
         };
-        let args = mount_args(&base, Path::new("/tmp/index"), &attempt, None, &[]);
+        let args = mount_args(
+            &base,
+            Path::new("/tmp/index"),
+            &attempt,
+            &SpawnSpec::default(),
+        );
         let parsed =
             crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(args))
                 .unwrap();

@@ -3,6 +3,9 @@
 mod daemon;
 mod inspection;
 pub(crate) use inspection::start as start_inspection;
+mod lowers;
+#[cfg(test)]
+mod lowers_tests;
 pub(crate) mod process;
 mod protocol;
 mod requests;
@@ -14,7 +17,8 @@ mod tests;
 
 use clap::{Parser, Subcommand};
 use protocol::{
-    BaseOptions, Op, Operation, OperationV2, Overlay, Request, Response, VERSION, VERSION_2,
+    BaseOptions, JournalReads, JournalSpec, Op, Operation, OperationV2, Overlay, Request, Response,
+    VERSION, VERSION_2,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -70,6 +74,21 @@ enum Command {
         /// Retry-safe ID (protocol version 2): the same ID and body never start a second batch.
         #[arg(long)]
         request_id: Option<String>,
+        /// Sealed layer directory or bundle under each attempt (repeatable, bottom first; protocol version 2). Absolute paths only; the path is sent unchanged.
+        #[arg(long = "lower", value_name = "PATH")]
+        lowers: Vec<String>,
+        /// Record each attempt's operation journal in attempts/ID/journal.jsonl (protocol version 2).
+        #[arg(long)]
+        journal: bool,
+        /// Journal exclusion glob, as --journal-exclude of the mount (repeatable).
+        #[arg(long, value_name = "GLOB", requires = "journal")]
+        journal_exclude: Vec<String>,
+        /// Record all coalesced read ranges, or only the first per handle.
+        #[arg(long, value_enum, requires = "journal")]
+        journal_reads: Option<JournalReads>,
+        /// Fsync the journal at unmount.
+        #[arg(long, requires = "journal")]
+        journal_sync: bool,
     },
     List {
         #[arg(long)]
@@ -122,38 +141,49 @@ pub fn run(args: &SandboxArgs) -> Result<(), String> {
             options: serde_json::from_str::<BaseOptions>(options).map_err(|e| e.to_string())?,
         }
         .into(),
-        // Without --request-id `new` sends exactly the v1 bytes.
+        // Without --request-id, --lower and --journal `new` sends exactly
+        // the v1 bytes.
         Command::New {
             base,
             count,
             overlay,
             quota,
             readonly_globs,
-            request_id: Some(request_id),
-        } => OperationV2::New {
-            base: base.clone(),
-            count: *count,
-            overlay: *overlay,
-            quota: *quota,
-            readonly_globs: readonly_globs.clone(),
-            request_id: Some(request_id.clone()),
+            request_id,
+            lowers,
+            journal,
+            journal_exclude,
+            journal_reads,
+            journal_sync,
+        } => {
+            let journal = journal.then(|| JournalSpec {
+                exclude: journal_exclude.clone(),
+                reads: journal_reads.unwrap_or_default(),
+                sync: *journal_sync,
+            });
+            if request_id.is_none() && lowers.is_empty() && journal.is_none() {
+                Operation::New {
+                    base: base.clone(),
+                    count: *count,
+                    overlay: *overlay,
+                    quota: *quota,
+                    readonly_globs: readonly_globs.clone(),
+                }
+                .into()
+            } else {
+                OperationV2::New {
+                    base: base.clone(),
+                    count: *count,
+                    overlay: *overlay,
+                    quota: *quota,
+                    readonly_globs: readonly_globs.clone(),
+                    request_id: request_id.clone(),
+                    lowers: lowers.clone(),
+                    journal,
+                }
+                .into()
+            }
         }
-        .into(),
-        Command::New {
-            base,
-            count,
-            overlay,
-            quota,
-            readonly_globs,
-            request_id: None,
-        } => Operation::New {
-            base: base.clone(),
-            count: *count,
-            overlay: *overlay,
-            quota: *quota,
-            readonly_globs: readonly_globs.clone(),
-        }
-        .into(),
         Command::List { base } => Operation::List { base: base.clone() }.into(),
         Command::Diff { id, git } => Operation::Diff {
             id: id.clone(),

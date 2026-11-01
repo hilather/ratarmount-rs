@@ -1,6 +1,11 @@
 //! Sandbox protocol over a real socket; FUSE tests skip without the device.
 #![cfg(target_os = "linux")]
 
+#[path = "support/token.rs"]
+mod token;
+#[path = "support/unmount.rs"]
+mod unmount;
+
 use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
 use serde_json::{json, Value};
 use std::fs;
@@ -39,6 +44,8 @@ impl Daemon {
             .arg("--state-dir")
             .arg(root.join("state"))
             .args(["--max-attempts", "64", "--timeout", "30"])
+            // Children cache lower bundles here, not in the developer's cache.
+            .env("XDG_CACHE_HOME", root.join("cache"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(fs::File::create(root.join("daemon.log")).unwrap())
@@ -393,7 +400,7 @@ fn regression_sandbox_envelope_errors_match_golden_over_socket() {
 fn regression_sandbox_v2_envelopes_over_socket() {
     let daemon = Daemon::start();
     assert_eq!(daemon.call(json!({"version":2, "op":"list"})), json!([]));
-    let refused = daemon.envelope(json!({"version":2, "op":"new", "base":"task", "lowers":["l"]}));
+    let refused = daemon.envelope(json!({"version":2, "op":"new", "base":"task", "retain":true}));
     assert_eq!(refused["error"]["code"], "invalid_request", "{refused}");
     assert_eq!(daemon.call(json!({"op":"list"})), json!([]));
 }
@@ -929,6 +936,564 @@ fn regression_prepared_index_prepare_finalizes_each_selected_source() {
     strict_no_mount(&base, &cache, &bind);
     assert_eq!(shared_snapshot(&cache), before);
     drop(unrelated);
+}
+
+/// The factory's source of `tar`, opened as the supervisor's base is, with
+/// its index kept in memory (no sidecar beside the tar).
+fn tar_source(tar: &Path) -> ratarmount_session::factory::MountBundle {
+    let mut options = ratarmount_core::OpenOptions {
+        index_in_memory: true,
+        ..Default::default()
+    };
+    ratarmount_session::factory::build_mount_source_with_bindings(
+        &[tar.to_path_buf()],
+        &mut options,
+        false,
+        Default::default(),
+        Default::default(),
+    )
+    .unwrap()
+}
+
+/// A layer sealed over `tar` and `lowers`, built without mounting: created
+/// over the tar's factory source, repaired, and sealed with an archive token
+/// of the tar, so it records the tar's strong digest.
+fn sealed_layer(tar: &Path, dir: &Path, lowers: &[&Path], files: &[(&str, &str)]) {
+    use ratarmount_compositing::{compose_stack, Immutability, LowerLayerRecord, OverlayMeta};
+    let source = tar_source(tar);
+    let layers: Vec<_> = lowers
+        .iter()
+        .map(|path| (path.to_path_buf(), Immutability::Immutable))
+        .collect();
+    let view = compose_stack(source.source.clone(), &layers).unwrap();
+    let records = lowers
+        .iter()
+        .map(|path| {
+            let meta = OverlayMeta::read(path).unwrap().unwrap();
+            LowerLayerRecord {
+                path: path.canonicalize().unwrap(),
+                layer_digest: meta.get("layer_digest").unwrap().into(),
+                sealed_at: meta.get("sealed_at").unwrap().into(),
+            }
+        })
+        .collect();
+    let overlay = token::overlay_over(view.clone(), dir, tar.to_str().unwrap(), records).unwrap();
+    drop(overlay);
+    for (path, content) in files {
+        fs::write(dir.join(path), content).unwrap();
+    }
+    ratarmount_compositing::overlay_fsck::fsck(dir, true).unwrap();
+    let token = token::ClassifiedBaseOver::archive(view.clone(), tar);
+    ratarmount_compositing::overlay_seal::seal(dir, &token, view).unwrap();
+    let meta = OverlayMeta::read(dir).unwrap().unwrap();
+    assert_eq!(meta.get("base_kind"), Some("archive"));
+    assert_eq!(meta.base_digest_kind(), Some("strong"));
+}
+
+/// The layers F1 and F2 use over the tar `Daemon::base()` registers: `A`
+/// over the tar, `B` over `[A]` (disjoint changes), and `B` packed with the
+/// real binary (pack defaults to the recorded base and lowers).
+struct Layers {
+    a: PathBuf,
+    b: PathBuf,
+    bundle: PathBuf,
+}
+
+/// F2's layers, built without mounting (plan §7 F2).
+fn layers(daemon: &Daemon) -> Layers {
+    let root = daemon.root.as_ref().unwrap().path();
+    let tar = root.join("base.tar");
+    let dir = root.join("layers");
+    fs::create_dir(&dir).unwrap();
+    let a = dir.join("a");
+    sealed_layer(&tar, &a, &[], &[("a.txt", "from a\n")]);
+    let b = dir.join("b");
+    sealed_layer(&tar, &b, &[&a], &[("b.txt", "from b\n")]);
+    let bundle = dir.join("b.tar.zst");
+    pack(&b, &bundle);
+    Layers { a, b, bundle }
+}
+
+/// F1's layers, authored by the real binary (plan §7 F1).
+fn authored_layers(daemon: &Daemon) -> Layers {
+    let root = daemon.root.as_ref().unwrap().path();
+    let tar = root.join("base.tar");
+    let dir = root.join("layers");
+    fs::create_dir(&dir).unwrap();
+    let a = dir.join("a");
+    authored_layer(&tar, &a, &[], &[("a.txt", "from a\n")]);
+    let b = dir.join("b");
+    authored_layer(&tar, &b, &[&a], &[("b.txt", "from b\n")]);
+    let bundle = dir.join("b.tar.zst");
+    pack(&b, &bundle);
+    Layers { a, b, bundle }
+}
+
+/// `ratarmount overlay pack DIR BUNDLE`, which defaults to the recorded base
+/// and lowers.
+fn pack(dir: &Path, bundle: &Path) {
+    let packed = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .args(["overlay", "pack"])
+        .arg(dir)
+        .arg(bundle)
+        .output()
+        .unwrap();
+    assert!(packed.status.success(), "{packed:?}");
+}
+
+/// A foreground `-w` mount of the real binary that authors a layer:
+/// `finish` unmounts it and requires a clean exit; a failing test detaches
+/// it and kills the child instead.
+struct Authoring {
+    child: Child,
+    mnt: PathBuf,
+}
+
+impl Authoring {
+    fn finish(mut self) {
+        unmount::unmount_within(&self.mnt, Duration::from_secs(10), "authoring mount").unwrap();
+        let status = self.child.wait().unwrap();
+        assert!(status.success(), "authoring mount exited {status}");
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for Authoring {
+    fn drop(&mut self) {
+        let _ = Command::new("fusermount3")
+            .arg("-uz")
+            .arg(&self.mnt)
+            .status();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A layer authored with the real binary only: `top` is mounted with `-w`
+/// over `tar` and `lowers`, `files` are written through the mount, the mount
+/// is unmounted, and `overlay fsck --repair` and `overlay seal` (which
+/// default to the recorded base and lowers) finish it. So `B`'s
+/// `lower_layers` row is what a mount over `[A]` records.
+fn authored_layer(tar: &Path, top: &Path, lowers: &[&Path], files: &[(&str, &str)]) {
+    let dir = top.parent().unwrap();
+    let home = dir.join("authoring-home");
+    fs::create_dir_all(&home).unwrap();
+    let ratarmount = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+        command
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", home.join("cache"));
+        command
+    };
+    let mnt = dir.join(format!(
+        "{}-mnt",
+        top.file_name().unwrap().to_string_lossy()
+    ));
+    fs::create_dir(&mnt).unwrap();
+    let mut mount = ratarmount();
+    mount.args(["-f", "--passthrough", "off", "--index-file", ":memory:"]);
+    for lower in lowers {
+        mount.arg("--lower").arg(lower);
+    }
+    let child = mount
+        .arg("-w")
+        .arg(top)
+        .arg(tar)
+        .arg(&mnt)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut authoring = Authoring {
+        child,
+        mnt: mnt.clone(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !mnt.join("base.txt").exists() {
+        assert!(
+            authoring.child.try_wait().unwrap().is_none(),
+            "authoring mount exited"
+        );
+        assert!(Instant::now() < deadline, "authoring mount timeout");
+        thread::sleep(Duration::from_millis(50));
+    }
+    for (path, content) in files {
+        fs::write(mnt.join(path), content).unwrap();
+    }
+    authoring.finish();
+    for verb in [&["fsck", "--repair"][..], &["seal"]] {
+        let out = ratarmount()
+            .arg("overlay")
+            .arg(verb[0])
+            .arg(top)
+            .args(&verb[1..])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "overlay {verb:?}: {out:?}");
+    }
+    let meta = ratarmount_compositing::OverlayMeta::read(top)
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.get("base_kind"), Some("archive"));
+    assert_eq!(meta.base_digest_kind(), Some("strong"));
+    // The stack the mount recorded, which the supervisor's stack check reads.
+    let recorded: Vec<Value> = meta
+        .get("lower_layers")
+        .map_or_else(Vec::new, |row| serde_json::from_str(row).unwrap());
+    let recorded: Vec<_> = recorded
+        .iter()
+        .map(|record| record["layer_digest"].as_str().unwrap().to_owned())
+        .collect();
+    let expected: Vec<_> = lowers.iter().map(|lower| layer_digest(lower)).collect();
+    assert_eq!(recorded, expected);
+}
+
+fn layer_digest(dir: &Path) -> String {
+    ratarmount_compositing::OverlayMeta::read(dir)
+        .unwrap()
+        .unwrap()
+        .get("layer_digest")
+        .unwrap()
+        .to_owned()
+}
+
+/// Every file below `dir` and its bytes.
+fn tree_bytes(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(tree_bytes(&path));
+        } else {
+            files.insert(path.clone(), fs::read(&path).unwrap());
+        }
+    }
+    files
+}
+
+fn root_xattr(mount: &Path, name: &str) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(mount.as_os_str().as_bytes()).unwrap();
+    let name = std::ffi::CString::new(name).unwrap();
+    let mut buffer = vec![0u8; 64 * 1024];
+    // SAFETY: both names are NUL-terminated; the buffer outlives the call.
+    let n = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    assert!(n >= 0, "getxattr: {}", std::io::Error::last_os_error());
+    buffer.truncate(n as usize);
+    String::from_utf8(buffer).unwrap()
+}
+
+/// Regression (R1b F1): a v2 `new` over `[A, bundle(B)]` mounts each attempt
+/// on base + A + B, with writes only in its own top; `diff` shows only the
+/// top's changes, against base + lowers (an edit of A's file is a change of
+/// it, not a new file; sweep 2); the mount root names both layers; the lowers
+/// are unchanged. The layers are authored by the real binary (`-w` mounts,
+/// `overlay fsck --repair`, `overlay seal`, `overlay pack`; sweep 3).
+#[test]
+fn regression_sandbox_v2_layered_attempt_fuse() {
+    if !prepared_fuse() {
+        return;
+    }
+    let daemon = Daemon::start();
+    daemon.base();
+    let Layers { a, b, bundle } = authored_layers(&daemon);
+    let (layer_before, bundle_before) = (tree_bytes(&a), fs::read(&bundle).unwrap());
+    let digests = [layer_digest(&a), layer_digest(&b)];
+    let request =
+        json!({"version": 2, "op": "new", "base": "task", "count": 2, "lowers": [a, bundle]});
+    let attempts = daemon.call(request);
+    let attempts = attempts.as_array().unwrap();
+    assert_eq!(attempts.len(), 2);
+    for (i, attempt) in attempts.iter().enumerate() {
+        let path = Path::new(attempt["path"].as_str().unwrap());
+        assert_eq!(fs::read(path.join("base.txt")).unwrap(), b"original\n");
+        assert_eq!(fs::read(path.join("a.txt")).unwrap(), b"from a\n");
+        assert_eq!(fs::read(path.join("b.txt")).unwrap(), b"from b\n");
+        fs::write(path.join(format!("top-{i}.txt")), format!("change-{i}\n")).unwrap();
+        fs::write(path.join("a.txt"), format!("edited by {i}\n")).unwrap();
+        let layers: Value =
+            serde_json::from_str(&root_xattr(path, "user.ratarmount.layers")).unwrap();
+        let taken: Vec<_> = layers
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|layer| layer["layer_digest"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(taken, digests);
+    }
+    for (i, attempt) in attempts.iter().enumerate() {
+        let other = Path::new(attempts[1 - i]["path"].as_str().unwrap());
+        assert!(!other.join(format!("top-{i}.txt")).exists());
+        assert_eq!(
+            fs::read(other.join("a.txt")).unwrap(),
+            format!("edited by {}\n", 1 - i).as_bytes()
+        );
+        assert!(!a.join(format!("top-{i}.txt")).exists());
+        for version in [1, 2] {
+            let diff = daemon
+                .call(json!({"version": version, "op": "diff", "id": attempt["id"], "git": true}));
+            let patch = diff["patch"].as_str().unwrap();
+            assert!(patch.contains(&format!("+change-{i}\n")), "{patch}");
+            // Against the bare base, a.txt would be a new file.
+            assert!(
+                patch.contains(&format!("-from a\n+edited by {i}\n")),
+                "{patch}"
+            );
+            assert_eq!(patch.matches("diff --git").count(), 2, "{patch}");
+        }
+    }
+    daemon.call(json!({"op": "destroy", "base": "task"}));
+    assert_eq!(daemon.call(json!({"op": "list"})), json!([]));
+    assert_eq!(tree_bytes(&a), layer_before);
+    assert_eq!(fs::read(&bundle).unwrap(), bundle_before);
+    assert!(ratarmount_compositing::OverlayMeta::read(&a)
+        .unwrap()
+        .unwrap()
+        .layer_sealed());
+}
+
+/// Regression (R1b F2, old blocker 2): the real daemon refuses a lower whose
+/// recorded prefix is missing, as a bundle and as a directory, before any
+/// attempt exists.
+#[test]
+fn regression_sandbox_v2_lower_prefix_refused_over_socket() {
+    let daemon = Daemon::start();
+    daemon.base();
+    let Layers { b, bundle, .. } = layers(&daemon);
+    for lower in [&bundle, &b] {
+        let reply = daemon.envelope(
+            json!({"version": 2, "op": "new", "base": "task", "count": 2, "lowers": [lower]}),
+        );
+        assert_eq!(reply["error"]["code"], "invalid_request", "{reply}");
+        let message = reply["error"]["message"].as_str().unwrap();
+        assert!(message.contains(lower.to_str().unwrap()), "{message}");
+        assert!(message.contains("was sealed over the lowers"), "{message}");
+    }
+    let attempts = daemon.root.as_ref().unwrap().path().join("state/attempts");
+    assert_eq!(fs::read_dir(attempts).unwrap().count(), 0);
+    assert_eq!(daemon.call(json!({"op": "list"})), json!([]));
+}
+
+/// Regression (R1b F3): a v2 `new` with a journal writes
+/// `attempts/ID/journal.jsonl` naming the attempt's mount; marks and
+/// summaries work on it, excluded paths are not recorded, and `destroy`
+/// removes it.
+#[test]
+fn regression_sandbox_v2_journal_fuse() {
+    if !prepared_fuse() {
+        return;
+    }
+    let daemon = Daemon::start();
+    daemon.base();
+    let attempts = daemon.call(json!({
+        "version": 2, "op": "new", "base": "task",
+        "journal": {"exclude": ["skip/**"], "reads": "first"}
+    }));
+    let path = PathBuf::from(attempts[0]["path"].as_str().unwrap());
+    let journal = path.parent().unwrap().join("journal.jsonl");
+    let header: Value = serde_json::from_str(
+        fs::read_to_string(&journal)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(header["mount"], path.to_str().unwrap(), "{header}");
+    let marked = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .args(["journal", "mark"])
+        .arg(&path)
+        .arg("turn 1")
+        .output()
+        .unwrap();
+    assert!(marked.status.success(), "{marked:?}");
+    assert_eq!(fs::read(path.join("base.txt")).unwrap(), b"original\n");
+    fs::create_dir(path.join("skip")).unwrap();
+    fs::write(path.join("skip/x"), b"excluded\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let summary = loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+            .args(["journal", "summarize"])
+            .arg(&journal)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if summary["reads_by_mark"]["turn 1"]
+            .as_array()
+            .is_some_and(|paths| paths.contains(&json!("base.txt")))
+        {
+            break summary;
+        }
+        assert!(Instant::now() < deadline, "no flushed read: {summary}");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(summary["paths"].get("skip/x").is_none(), "{summary}");
+    for line in fs::read_to_string(&journal).unwrap().lines() {
+        let record: Value = serde_json::from_str(line).unwrap();
+        assert_ne!(record["path"], "skip/x", "{line}");
+    }
+    daemon.call(json!({"op": "destroy", "id": attempts[0]["id"]}));
+    assert!(!journal.exists());
+}
+
+/// Regression (R1b F4): a lower sealed over another tar records that tar's
+/// strong digest; the child refuses it at mount (its strong-digest message),
+/// so `new` is `mount_failed` and the batch is rolled back.
+#[test]
+fn regression_sandbox_v2_lower_other_base_fuse() {
+    if !prepared_fuse() {
+        return;
+    }
+    let daemon = Daemon::start();
+    daemon.base();
+    let root = daemon.root.as_ref().unwrap().path();
+    let other = root.join("other.tar");
+    tiny_tar(&other, b"another base\n");
+    let lower = root.join("other-layer");
+    sealed_layer(&other, &lower, &[], &[("a.txt", "from a\n")]);
+    let reply = daemon.envelope(
+        json!({"version": 2, "op": "new", "base": "task", "count": 2, "lowers": [lower]}),
+    );
+    assert_eq!(reply["error"]["code"], "mount_failed", "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(message.contains("was sealed against"), "{message}");
+    assert!(message.contains(lower.to_str().unwrap()), "{message}");
+    assert_eq!(daemon.call(json!({"op": "list"})), json!([]));
+    assert_eq!(
+        fs::read_dir(root.join("state/attempts")).unwrap().count(),
+        0
+    );
+}
+
+/// R1b timings (Keystone note (a), Risk 1): F1's `new` with `count` 2 and 8
+/// over its small bundle; the supervisor's validation of a bundle with 256 MiB
+/// of payload (refused by the stack check after its full read, so validation
+/// alone) and of the same layer as a sealed directory; and the per-child cost
+/// of that bundle. Prints to stderr: run with `--release` and
+/// `-- --ignored --nocapture`.
+#[test]
+#[ignore = "requires /dev/fuse; benchmark for the R1b PR"]
+fn sandbox_lower_bundle_validation_timing() {
+    if !prepared_fuse() {
+        return;
+    }
+    let daemon = Daemon::start();
+    daemon.base();
+    let root = daemon.root.as_ref().unwrap().path().to_owned();
+    let tar = root.join("base.tar");
+    let Layers { a, bundle, .. } = layers(&daemon);
+    for count in [2, 8] {
+        let request = json!({
+            "version": 2, "op": "new", "base": "task", "count": count, "lowers": [a, bundle]
+        });
+        let started = Instant::now();
+        let attempts = daemon.call(request);
+        let took = started.elapsed();
+        assert_eq!(attempts.as_array().unwrap().len(), count);
+        daemon.call(json!({"op": "destroy", "base": "task"}));
+        eprintln!(
+            "new count {count} over [A, bundle(B)] ({} bytes): {:.3} s",
+            fs::metadata(&bundle).unwrap().len(),
+            took.as_secs_f64()
+        );
+    }
+    // A large layer: 1024 files of 256 KiB of hex text (about 2:1
+    // compressible), sealed over [A] and packed.
+    let big = root.join("layers/big");
+    {
+        use ratarmount_compositing::{compose_stack, Immutability, LowerLayerRecord, OverlayMeta};
+        let source = tar_source(&tar);
+        let view = compose_stack(
+            source.source.clone(),
+            &[(a.clone(), Immutability::Immutable)],
+        )
+        .unwrap();
+        let meta = OverlayMeta::read(&a).unwrap().unwrap();
+        let record = LowerLayerRecord {
+            path: a.canonicalize().unwrap(),
+            layer_digest: meta.get("layer_digest").unwrap().into(),
+            sealed_at: meta.get("sealed_at").unwrap().into(),
+        };
+        let overlay = token::overlay_over(view.clone(), &big, tar.to_str().unwrap(), vec![record]);
+        drop(overlay.unwrap());
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let hex = b"0123456789abcdef";
+        fs::create_dir(big.join("deps")).unwrap();
+        for file in 0..1024 {
+            let mut bytes = Vec::with_capacity(256 << 10);
+            while bytes.len() < 256 << 10 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                for shift in (0..64).step_by(4) {
+                    bytes.push(hex[((state >> shift) & 15) as usize]);
+                }
+            }
+            fs::write(big.join(format!("deps/f{file:04}.txt")), &bytes).unwrap();
+        }
+        ratarmount_compositing::overlay_fsck::fsck(&big, true).unwrap();
+        let token = token::ClassifiedBaseOver::archive(view.clone(), &tar);
+        ratarmount_compositing::overlay_seal::seal(&big, &token, view).unwrap();
+    }
+    let big_bundle = root.join("layers/big.tar.zst");
+    let started = Instant::now();
+    let packed = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .args(["overlay", "pack"])
+        .arg(&big)
+        .arg(&big_bundle)
+        .output()
+        .unwrap();
+    assert!(packed.status.success(), "{packed:?}");
+    eprintln!(
+        "large layer: 1024 x 256 KiB of hex text; bundle {} bytes; pack {:.3} s",
+        fs::metadata(&big_bundle).unwrap().len(),
+        started.elapsed().as_secs_f64()
+    );
+    // Validation alone: [bundle(big)] without its lower A is refused by the
+    // stack check after the supervisor has read the whole bundle.
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        let request = json!({"version": 2, "op": "new", "base": "task", "lowers": [big_bundle]});
+        let started = Instant::now();
+        let reply = daemon.envelope(request);
+        runs.push(started.elapsed().as_secs_f64());
+        assert_eq!(reply["error"]["code"], "invalid_request", "{reply}");
+    }
+    eprintln!("validation of [bundle(large)], refused after its full read: {runs:.3?} s");
+    // The same layer as a sealed directory: validation reads only its database.
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        let request = json!({"version": 2, "op": "new", "base": "task", "lowers": [big]});
+        let started = Instant::now();
+        let reply = daemon.envelope(request);
+        runs.push(started.elapsed().as_secs_f64());
+        assert_eq!(reply["error"]["code"], "invalid_request", "{reply}");
+    }
+    eprintln!("validation of [large] as a sealed directory: {runs:.3?} s");
+    // Per-child cost: each child copies, hashes, extracts and verifies it.
+    for count in [1, 2] {
+        let request = json!({
+            "version": 2, "op": "new", "base": "task", "count": count, "lowers": [a, big_bundle]
+        });
+        let started = Instant::now();
+        let reply = daemon.envelope(request);
+        let took = started.elapsed().as_secs_f64();
+        let status = if reply["ok"] == true {
+            "ok".to_owned()
+        } else {
+            reply["error"].to_string()
+        };
+        eprintln!("new count {count} over [A, bundle(large)]: {took:.3} s ({status})");
+        daemon.call(json!({"op": "destroy", "base": "task"}));
+    }
 }
 
 /// Regression: an unindexed bind must require/finalize no sidecar of its own.

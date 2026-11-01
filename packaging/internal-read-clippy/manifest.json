@@ -518,7 +518,7 @@
     {
       "configured_path": "std::fs::File::create",
       "item": "<ratarmount::sandbox::process::ProcessMounter as ratarmount::sandbox::process::Mounter<ratarmount::sandbox::process::ProcessMounter>>::spawn",
-      "leaf_digest": "effc7e19400e46853c55e69ed266e33ac417c0bc015f44b6a044d777dc82f254",
+      "leaf_digest": "accee71b4c45860563ba889bf3ecff3a1bd871148f54cbcb44117a1cb4b37930",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "runtime-resource-or-descriptor-handoff",

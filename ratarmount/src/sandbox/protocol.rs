@@ -78,12 +78,45 @@ pub enum Operation {
     Shutdown,
 }
 
-/// Version 2: the v1 operations, where `new` also takes a `request_id`.
-/// Fields and defaults are v1's, and they never change within version 2;
-/// later releases only add fields, which an older daemon refuses as unknown.
-/// Only `new` takes a request ID: `create_base`, `destroy` and every other
-/// operation take none, and a `request_id` there is an unknown field
-/// (`invalid_request`).
+/// Which reads the per-attempt operation journal records (`--journal-reads`).
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalReads {
+    #[default]
+    All,
+    First,
+}
+
+/// Only the strings `"all"` and `"first"`: a derived enum also takes the
+/// map form `{"first": null}`.
+impl<'de> Deserialize<'de> for JournalReads {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "all" => Ok(Self::All),
+            "first" => Ok(Self::First),
+            other => Err(serde::de::Error::unknown_variant(other, &["all", "first"])),
+        }
+    }
+}
+
+/// The per-attempt operation journal of a v2 `new` (§5.6). Every member is
+/// always serialized, so `journal: {}` never hashes like an absent journal.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct JournalSpec {
+    /// `--journal-exclude` globs, in order.
+    pub exclude: Vec<String>,
+    pub reads: JournalReads,
+    /// Fsync the journal at unmount (`--journal-sync`).
+    pub sync: bool,
+}
+
+/// Version 2: the v1 operations, where `new` also takes a `request_id`,
+/// `lowers` and a `journal`. Fields and defaults are v1's, and they never
+/// change within version 2; later releases only add fields, which an older
+/// daemon refuses as unknown. Only `new` takes a request ID: `create_base`,
+/// `destroy` and every other operation take none, and a `request_id` there is
+/// an unknown field (`invalid_request`).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperationV2 {
@@ -106,10 +139,22 @@ pub enum OperationV2 {
         /// A string when present: `null` is refused, never read as "no ID".
         #[serde(
             default,
-            deserialize_with = "some_string",
+            deserialize_with = "some",
             skip_serializing_if = "Option::is_none"
         )]
         request_id: Option<String>,
+        /// Sealed layer directories or bundles, bottom first, as sent (an
+        /// array: `null` is refused). Empty means no lower stack.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lowers: Vec<String>,
+        /// An object when present: `null`, an array or a scalar is refused,
+        /// never read as "no journal".
+        #[serde(
+            default,
+            deserialize_with = "journal_object",
+            skip_serializing_if = "Option::is_none"
+        )]
+        journal: Option<JournalSpec>,
     },
     List {
         #[serde(default)]
@@ -136,7 +181,9 @@ pub enum OperationV2 {
 }
 
 impl OperationV2 {
-    /// The same v1 operation; a `request_id` is not part of it.
+    /// The same v1 operation; a `request_id` is not part of it. A `new` with
+    /// `lowers` or a `journal` has no v1 form: the supervisor never converts
+    /// one (§5.1).
     pub fn into_v1(self) -> Operation {
         match self {
             Self::CreateBase {
@@ -155,13 +202,22 @@ impl OperationV2 {
                 quota,
                 readonly_globs,
                 request_id: _,
-            } => Operation::New {
-                base,
-                count,
-                overlay,
-                quota,
-                readonly_globs,
-            },
+                lowers,
+                journal,
+            } => {
+                // `Supervisor::handle` takes every v2 `new` before this.
+                assert!(
+                    lowers.is_empty() && journal.is_none(),
+                    "a layered or journaled new has no v1 form"
+                );
+                Operation::New {
+                    base,
+                    count,
+                    overlay,
+                    quota,
+                    readonly_globs,
+                }
+            }
             Self::List { base } => Operation::List { base },
             Self::Diff { id, git } => Operation::Diff { id, git },
             Self::Stats { id } => Operation::Stats { id },
@@ -175,8 +231,29 @@ pub(super) fn one() -> usize {
     1
 }
 
-fn some_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
-    String::deserialize(deserializer).map(Some)
+/// `Some` of a present member: `null` is refused by `T`, never read as `None`.
+fn some<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+/// A present `journal`, which must be a JSON object: the derived
+/// `Deserialize` of a struct also accepts an array of its fields in order.
+fn journal_object<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<JournalSpec>, D::Error> {
+    struct Object;
+    impl<'de> serde::de::Visitor<'de> for Object {
+        type Value = JournalSpec;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a journal object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<JournalSpec, A::Error> {
+            JournalSpec::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_map(Object).map(Some)
 }
 
 /// An operation of either version. `Request::parse` chooses the variant

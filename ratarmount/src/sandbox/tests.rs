@@ -1,7 +1,8 @@
 use super::*;
 use daemon::{SocketGuard, Supervisor};
-use process::{MountState, Mounter};
+use process::{MountState, Mounter, SpawnSpec};
 use protocol::{ApiError, Attempt, Base};
+use ratarmount_compositing::{LowerLayerRecord, OverlayMeta};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -32,10 +33,78 @@ pub(super) struct FakeState {
     pub(super) marker: bool,
     pub(super) cleaned: Vec<PathBuf>,
     pub(super) policies: Vec<(Option<u64>, Vec<String>)>,
+    /// Every spawn's spec.
+    pub(super) specs: Vec<SpawnRecord>,
+    /// A child's cache: bundle lowers are extracted below it.
+    pub(super) bundle_cache: Option<PathBuf>,
+    /// The lower records each attempt's child took, by attempt path.
+    pub(super) records: BTreeMap<PathBuf, Vec<LowerLayerRecord>>,
+    /// Run once around a child's two opens of its lowers.
+    pub(super) before_capture: Option<Hook>,
+    pub(super) between_capture_and_compose: Option<Hook>,
+    pub(super) after_compose: Option<Hook>,
+    pub(super) fail_lower_layers: bool,
+    pub(super) lower_layer_calls: usize,
+    /// How long `lower_layers` takes to answer, whatever its timeout.
+    pub(super) lower_layers_delay: Option<Duration>,
+    /// Every timeout `lower_layers` was given.
+    pub(super) lower_layer_timeouts: Vec<Duration>,
+}
+
+pub(super) type Hook = Box<dyn FnOnce() + Send>;
+
+/// An owned `SpawnSpec`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SpawnRecord {
+    pub(super) quota: Option<u64>,
+    pub(super) readonly: Vec<String>,
+    pub(super) lowers: Vec<PathBuf>,
+    pub(super) journal: Option<(PathBuf, protocol::JournalSpec)>,
 }
 
 #[derive(Clone, Default)]
 pub(super) struct Fake(pub(super) Arc<Mutex<FakeState>>);
+
+impl Fake {
+    fn run(&self, hook: fn(&mut FakeState) -> &mut Option<Hook>) {
+        let hook = hook(&mut self.0.lock().unwrap()).take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// A child's two opens of its lowers: it captures each lower's metadata
+    /// (a bundle is first extracted into its cache, unverified), then
+    /// composes them, which the Fake does not need to do.
+    fn capture(&self, lowers: &[PathBuf]) -> Result<Vec<LowerLayerRecord>, String> {
+        self.run(|state| &mut state.before_capture);
+        let cache = self.0.lock().unwrap().bundle_cache.clone();
+        let mut records = Vec::new();
+        for lower in lowers {
+            let path = if lower.is_file() {
+                let cache = cache.as_ref().expect("bundle lowers need a bundle cache");
+                let layer = cache.join(format!("layer-{}", fs::read_dir(cache).unwrap().count()));
+                crate::overlay_pack::tests::extract_unverified(lower, &layer)
+                    .map_err(|e| e.to_string())?;
+                layer.canonicalize().unwrap()
+            } else {
+                // As the child does (`LowerStack::open`).
+                lower.canonicalize().map_err(|e| e.to_string())?
+            };
+            let meta = OverlayMeta::read_no_recovery(&path)
+                .map_err(|e| e.to_string())?
+                .ok_or("no overlay metadata")?;
+            records.push(LowerLayerRecord {
+                path,
+                layer_digest: meta.get("layer_digest").unwrap_or("").into(),
+                sealed_at: meta.get("sealed_at").unwrap_or("").into(),
+            });
+        }
+        self.run(|state| &mut state.between_capture_and_compose);
+        self.run(|state| &mut state.after_compose);
+        Ok(records)
+    }
+}
 
 impl Mounter for Fake {
     fn prepare(&mut self, _: &Base, _: &Path, _: Duration) -> Result<(), ApiError> {
@@ -47,8 +116,7 @@ impl Mounter for Fake {
         _: &Base,
         _: &Path,
         attempt: &Attempt,
-        quota: Option<u64>,
-        readonly: &[String],
+        spec: &SpawnSpec<'_>,
     ) -> Result<(), ApiError> {
         let mut state = self.0.lock().unwrap();
         state.spawns += 1;
@@ -58,13 +126,36 @@ impl Mounter for Fake {
         if state.fail_spawn == Some(state.spawns) {
             return Err(ApiError::new("spawn_failed", "injected"));
         }
-        let status = if state.stuck {
+        let mut status = if state.stuck {
             MountState::Starting
         } else {
             MountState::Ready
         };
-        state.mounts.insert(attempt.path.clone(), status);
-        state.policies.push((quota, readonly.into()));
+        state.policies.push((spec.quota, spec.readonly.into()));
+        state.specs.push(SpawnRecord {
+            quota: spec.quota,
+            readonly: spec.readonly.into(),
+            lowers: spec.lowers.into(),
+            journal: spec
+                .journal
+                .map(|(path, journal)| (path.into(), journal.clone())),
+        });
+        drop(state);
+        if !spec.lowers.is_empty() {
+            match self.capture(spec.lowers) {
+                Ok(records) => {
+                    let mut state = self.0.lock().unwrap();
+                    state.records.insert(attempt.path.clone(), records);
+                }
+                // A child that cannot open its lowers exits.
+                Err(_) => status = MountState::Crashed,
+            }
+        }
+        self.0
+            .lock()
+            .unwrap()
+            .mounts
+            .insert(attempt.path.clone(), status);
         Ok(())
     }
     fn poll(&mut self, attempt: &Attempt) -> Result<MountState, ApiError> {
@@ -86,6 +177,30 @@ impl Mounter for Fake {
         } else {
             Ok(Some(Vec::new()))
         }
+    }
+
+    fn lower_layers(
+        &mut self,
+        attempt: &Attempt,
+        timeout: Duration,
+    ) -> Result<Vec<LowerLayerRecord>, ApiError> {
+        let mut state = self.0.lock().unwrap();
+        state.lower_layer_calls += 1;
+        state.lower_layer_timeouts.push(timeout);
+        if state.fail_lower_layers {
+            return Err(ApiError::new("io", "injected"));
+        }
+        let records = state
+            .records
+            .get(&attempt.path)
+            .cloned()
+            .unwrap_or_default();
+        let delay = state.lower_layers_delay;
+        drop(state);
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
+        Ok(records)
     }
 
     fn cleanup(&mut self, path: &Path) -> Result<(), ApiError> {
@@ -465,8 +580,11 @@ fn regression_base_policy_and_mount_options_forwarded() {
         &base,
         Path::new("/index,with-comma"),
         attempt,
-        Some(10),
-        &["tests/**".into()],
+        &SpawnSpec {
+            quota: Some(10),
+            readonly: &["tests/**".into()],
+            ..Default::default()
+        },
     );
     let parsed =
         crate::parse_args_from(std::iter::once(std::ffi::OsString::from("ratarmount")).chain(args))
@@ -800,7 +918,7 @@ fn regression_prepared_index_sandbox_worker_argv() {
         options: BaseOptions::default(),
     };
     let attempt = supervisor.attempts.values().next().unwrap();
-    let args = process::mount_args(base, root.path(), attempt, None, &[]);
+    let args = process::mount_args(base, root.path(), attempt, &SpawnSpec::default());
     let policy = args
         .iter()
         .position(|a| a == "--no-recreate-index")
@@ -822,6 +940,246 @@ fn regression_prepared_index_sandbox_worker_argv() {
     assert!(parsed.no_mount);
     assert!(!parsed.no_recreate_index);
     assert!(parsed.write_overlay.is_none());
+}
+
+/// Regression (R1b L2, skeptic-6 N3): an empty spec keeps the child argv of
+/// R1a's head, literally; a layered spec adds `--lower` per lower, bottom
+/// first, and the journal flags before `--`, never `--allow-unsealed-lower`
+/// or `--force-stack-mismatch`, and the mount CLI parses them back.
+#[test]
+fn regression_supervisor_lower_spawn_args() {
+    use protocol::{JournalReads, JournalSpec};
+    let base = Base {
+        name: "task".into(),
+        source: "/srv/base.tar".into(),
+        options: BaseOptions::default(),
+    };
+    let attempt = Attempt {
+        id: "attempt-1".into(),
+        base: "task".into(),
+        path: "/state/attempts/attempt-1/mnt".into(),
+        overlay_dir: "/state/attempts/attempt-1/overlay".into(),
+        status: "starting".into(),
+    };
+    let indexes = Path::new("/state/indexes/task");
+    let ownership = format!(
+        "noatime,uid={},gid={}",
+        unsafe { libc::geteuid() },
+        unsafe { libc::getegid() }
+    );
+    // The argv of R1a's head, with `policy` and then `extra` before `--`.
+    let argv = |policy: &[&str]| -> Vec<OsString> {
+        let mut argv = vec![
+            "--foreground",
+            "--no-file-versions",
+            "--index-folders",
+            r#"["/state/indexes/task"]"#,
+            "-o",
+            ownership.as_str(),
+            "--no-recreate-index",
+            "--sandbox-inspection-socket",
+            "/state/attempts/attempt-1/inspect.sock",
+            "-w",
+            "/state/attempts/attempt-1/overlay",
+        ];
+        argv.extend(policy);
+        argv.extend(["--", "/srv/base.tar", "/state/attempts/attempt-1/mnt"]);
+        argv.into_iter().map(OsString::from).collect()
+    };
+    let spawn = |spec: &SpawnSpec| process::mount_args(&base, indexes, &attempt, spec);
+    assert_eq!(spawn(&SpawnSpec::default()), argv(&[]));
+    let readonly = ["tests/**".to_owned()];
+    let policy = SpawnSpec {
+        quota: Some(10),
+        readonly: &readonly,
+        ..Default::default()
+    };
+    assert_eq!(
+        spawn(&policy),
+        argv(&["--overlay-quota", "10", "--overlay-readonly", "tests/**"])
+    );
+    let lowers = [
+        PathBuf::from("/layers/a"),
+        PathBuf::from("/layers/b.tar.zst"),
+    ];
+    let journal = JournalSpec {
+        exclude: vec!["x/**".into(), ".git/**".into()],
+        reads: JournalReads::First,
+        sync: true,
+    };
+    let journal_path = Path::new("/state/attempts/attempt-1/journal.jsonl");
+    let args = spawn(&SpawnSpec {
+        lowers: &lowers,
+        journal: Some((journal_path, &journal)),
+        ..policy
+    });
+    assert_eq!(
+        args,
+        argv(&[
+            "--overlay-quota",
+            "10",
+            "--overlay-readonly",
+            "tests/**",
+            "--lower",
+            "/layers/a",
+            "--lower",
+            "/layers/b.tar.zst",
+            "--journal",
+            "/state/attempts/attempt-1/journal.jsonl",
+            "--journal-exclude=x/**",
+            "--journal-exclude=.git/**",
+            "--journal-reads",
+            "first",
+            "--journal-sync",
+        ])
+    );
+    for flag in ["--allow-unsealed-lower", "--force-stack-mismatch"] {
+        assert!(!args.contains(&OsString::from(flag)), "{flag}");
+    }
+    let parsed =
+        crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(args)).unwrap();
+    assert_eq!(parsed.lower, lowers);
+    assert_eq!(parsed.journal.as_deref(), Some(journal_path));
+    assert_eq!(parsed.journal_exclude, journal.exclude);
+    assert_eq!(parsed.journal_reads, "first");
+    assert!(parsed.journal_sync);
+    let (inputs, mountpoint) = crate::split_bound_inputs_mountpoint(&parsed);
+    assert_eq!(inputs, [PathBuf::from("/srv/base.tar")]);
+    assert_eq!(mountpoint, Some(attempt.path.clone()));
+    // The default journal (`reads: all`, no sync, no excludes) adds one flag.
+    let default = JournalSpec::default();
+    let args = spawn(&SpawnSpec {
+        journal: Some((journal_path, &default)),
+        ..Default::default()
+    });
+    assert_eq!(
+        args,
+        argv(&["--journal", "/state/attempts/attempt-1/journal.jsonl"])
+    );
+    let parsed =
+        crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(args)).unwrap();
+    assert_eq!(parsed.journal_reads, "all");
+    assert!(!parsed.journal_sync && parsed.journal_exclude.is_empty());
+    // Regression (sweep 3): as a separate argument, a glob starting with `-`
+    // was parsed as another option ("a value is required").
+    let unusual = JournalSpec {
+        exclude: vec!["-cache/**".into(), "a=b/**".into(), "--x".into()],
+        ..Default::default()
+    };
+    let args = spawn(&SpawnSpec {
+        journal: Some((journal_path, &unusual)),
+        ..Default::default()
+    });
+    assert_eq!(
+        args,
+        argv(&[
+            "--journal",
+            "/state/attempts/attempt-1/journal.jsonl",
+            "--journal-exclude=-cache/**",
+            "--journal-exclude=a=b/**",
+            "--journal-exclude=--x",
+        ])
+    );
+    let parsed =
+        crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(args)).unwrap();
+    assert_eq!(parsed.journal_exclude, unusual.exclude);
+}
+
+/// Regression (R1b L9): a journal goes to `attempts/ID/journal.jsonl`, chosen
+/// by the supervisor, outside the mountpoint and the overlay of disk and
+/// tmpfs tops, with the request's excludes, reads and sync; it needs no
+/// lowers, makes no lower inspection, and goes with `destroy`. An exclude
+/// starting with `-` is accepted (sweep 3: it was refused by the parser).
+#[test]
+fn regression_supervisor_journal_spawn_and_location() {
+    use protocol::{JournalReads, JournalSpec};
+    let request = |overlay: &str| {
+        serde_json::to_vec(&json!({
+            "version": 2,
+            "op": "new",
+            "base": "task",
+            "count": 2,
+            "overlay": overlay,
+            "journal": {"exclude": ["skip/**", ".git/**", "-cache/**"], "reads": "first", "sync": true}
+        }))
+        .unwrap()
+    };
+    let expected = JournalSpec {
+        exclude: vec!["skip/**".into(), ".git/**".into(), "-cache/**".into()],
+        reads: JournalReads::First,
+        sync: true,
+    };
+    let check = |supervisor: &mut Supervisor<Fake>, fake: &Fake, overlay: &str| -> bool {
+        let reply: serde_json::Value =
+            serde_json::from_slice(&daemon::respond(supervisor, &request(overlay))).unwrap();
+        if reply["error"]["code"] == "unsupported" {
+            eprintln!("skip: test temporary directory is not tmpfs: {reply}");
+            return false;
+        }
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["version"], 2);
+        let attempts = reply["result"].as_array().unwrap();
+        let specs = fake.0.lock().unwrap().specs.clone();
+        let specs = &specs[specs.len() - 2..];
+        for (attempt, spec) in attempts.iter().zip(specs) {
+            // Results keep the v1 attempt shape.
+            let keys: Vec<_> = attempt.as_object().unwrap().keys().cloned().collect();
+            assert_eq!(keys, ["base", "id", "overlay_dir", "path", "status"]);
+            let mount = PathBuf::from(attempt["path"].as_str().unwrap());
+            let top = PathBuf::from(attempt["overlay_dir"].as_str().unwrap());
+            let (journal, options) = spec.journal.clone().unwrap();
+            assert_eq!(journal, mount.parent().unwrap().join("journal.jsonl"));
+            assert!(!journal.starts_with(&mount) && !journal.starts_with(&top));
+            assert_eq!(options, expected);
+            assert!(spec.lowers.is_empty());
+            // The child appends it; destroy removes it with the attempt.
+            fs::write(&journal, b"{\"journal\":1}\n").unwrap();
+            let id = attempt["id"].as_str().unwrap();
+            assert!(!supervisor.taken_lowers.contains_key(id));
+            supervisor.destroy(id).unwrap();
+            assert!(!journal.exists());
+            assert!(!mount.parent().unwrap().exists());
+        }
+        assert_eq!(fake.0.lock().unwrap().lower_layer_calls, 0);
+        true
+    };
+    let (_root, mut supervisor, fake) = setup(8);
+    assert!(check(&mut supervisor, &fake, "disk"));
+    // Without a journal the child gets none.
+    supervisor.handle(new(1)).unwrap();
+    assert_eq!(fake.0.lock().unwrap().specs.last().unwrap().journal, None);
+    supervisor.destroy_all().unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        use sha2::{Digest, Sha256};
+        let root = private_tempdir();
+        let ram_parent = private_tempdir();
+        let ram = ram_parent.path().join(format!(
+            "ratarmount-sandbox-{:x}",
+            Sha256::digest(
+                fs::canonicalize(root.path())
+                    .unwrap()
+                    .as_os_str()
+                    .as_encoded_bytes()
+            )
+        ));
+        fs::write(
+            root.path().join("ram-root.json"),
+            serde_json::to_vec(&ram).unwrap(),
+        )
+        .unwrap();
+        let fake = Fake::default();
+        let mut supervisor =
+            Supervisor::open(root.path(), 8, Duration::from_secs(1), fake.clone()).unwrap();
+        supervisor
+            .handle(Operation::CreateBase {
+                name: "task".into(),
+                source: "/fake.tar".into(),
+                options: BaseOptions::default(),
+            })
+            .unwrap();
+        check(&mut supervisor, &fake, "tmpfs");
+    }
 }
 
 /// Regression: a registered base is prepared once across worker batches and reloads.
@@ -1138,8 +1496,9 @@ fn regression_protocol_v2_dispatch_and_envelope_versions() {
             2,
             "invalid_request",
         ),
+        // `retain` is R1c's field, still refused; R1b accepts `lowers`.
         (
-            r#"{"version":2,"op":"new","base":"t","lowers":["l"]}"#,
+            r#"{"version":2,"op":"new","base":"t","retain":true}"#,
             2,
             "invalid_request",
         ),
@@ -1500,6 +1859,58 @@ fn regression_cli_v1_request_bytes_unchanged() {
         "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":2,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"request_id\":\"r\"}\n"
     );
     recorder.finish();
+    // R1b (C1): --lower and --journal send v2; paths go unchanged, a relative
+    // one included (the daemon refuses it).
+    for (argv, line) in [
+        (
+            &[
+                "new",
+                "task",
+                "--lower",
+                "/a",
+                "--lower",
+                "/b",
+                "--journal",
+                "--journal-exclude",
+                "x/**",
+                "--journal-reads",
+                "first",
+                "--journal-sync",
+            ][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"lowers\":[\"/a\",\"/b\"],\"journal\":{\"exclude\":[\"x/**\"],\"reads\":\"first\",\"sync\":true}}\n",
+        ),
+        (
+            &["new", "task", "--journal"][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"journal\":{\"exclude\":[],\"reads\":\"all\",\"sync\":false}}\n",
+        ),
+        (
+            &["new", "task", "--lower", "relative/layer"][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"lowers\":[\"relative/layer\"]}\n",
+        ),
+    ] {
+        let recorder = Recorder::start(vec![
+            b"{\"version\":2,\"ok\":true,\"result\":null}\n".to_vec()
+        ]);
+        run(&recorder.args(argv)).unwrap();
+        assert_eq!(String::from_utf8(recorder.line()).unwrap(), line);
+        recorder.finish();
+    }
+    // The journal options need --journal (as on the mount CLI).
+    for argv in [
+        &["new", "task", "--journal-reads", "first"][..],
+        &["new", "task", "--journal-exclude", "x/**"][..],
+        &["new", "task", "--journal-sync"][..],
+    ] {
+        assert!(
+            SandboxArgs::try_parse_from(
+                ["sandbox", "--socket", "/tmp/sock"]
+                    .into_iter()
+                    .chain(argv.iter().copied())
+            )
+            .is_err(),
+            "{argv:?}"
+        );
+    }
     const FAILED: &str = "request failed (see JSON error)";
     const VERSION_ERROR: &str = "unsupported response version";
     let v1_error = r#"{"version":1,"ok":false,"error":{"code":"unsupported_version","message":"version must be 1"}}"#;
@@ -1557,6 +1968,8 @@ fn regression_cli_v1_request_bytes_unchanged() {
             quota: None,
             readonly_globs: vec![],
             request_id: Some("r".into()),
+            lowers: vec![],
+            journal: None,
         }),
     )
     .unwrap();

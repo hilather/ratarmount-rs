@@ -524,7 +524,7 @@ pub fn pack(
     Ok(digest)
 }
 
-fn valid_digest(digest: &str) -> io::Result<&str> {
+pub(crate) fn valid_digest(digest: &str) -> io::Result<&str> {
     digest
         .strip_prefix("sha256:")
         .filter(|s| {
@@ -549,15 +549,52 @@ thread_local! {
     static DECODED_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// This thread's decoded bytes since the last call, which resets the count.
+#[cfg(test)]
+pub(crate) fn take_decoded_bytes() -> u64 {
+    DECODED_BYTES.with(|c| c.replace(0))
+}
+
+/// Decoded bytes that several bundle scans share: every capped decoder draws
+/// on its budget and fails once the budget is spent. The sandbox supervisor
+/// gives the bundle lowers of one request one budget; other reads have none.
+#[derive(Debug)]
+pub(crate) struct DecodeBudget {
+    total: u64,
+    left: std::cell::Cell<u64>,
+    exceeded: std::cell::Cell<bool>,
+}
+
+impl DecodeBudget {
+    pub(crate) fn new(total: u64) -> std::rc::Rc<Self> {
+        std::rc::Rc::new(Self {
+            total,
+            left: std::cell::Cell::new(total),
+            exceeded: std::cell::Cell::new(false),
+        })
+    }
+
+    pub(crate) fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// Whether a decoder failed because the budget was spent.
+    pub(crate) fn exceeded(&self) -> bool {
+        self.exceeded.get()
+    }
+}
+
 /// Streaming zstd decoder that fails once it has produced more than the
 /// bundle's limits allow: `max_bytes` of payload plus tar framing (a header and
-/// padding per entry and a small constant for PAX records). Nothing is spooled
-/// to disk, so `--max-bytes` stops the work, not only the extraction.
+/// padding per entry and a small constant for PAX records), or more than is
+/// left of its shared budget. Nothing is spooled to disk, so `--max-bytes`
+/// stops the work, not only the extraction.
 struct CappedDecode<R> {
     inner: R,
     decoded: u64,
     max_bytes: u64,
     entries: std::rc::Rc<std::cell::Cell<u64>>,
+    budget: std::rc::Rc<DecodeBudget>,
 }
 
 impl<R: Read> Read for CappedDecode<R> {
@@ -573,22 +610,37 @@ impl<R: Read> Read for CappedDecode<R> {
                 self.max_bytes
             )));
         }
-        let want = buf.len().min(usize::try_from(room).unwrap_or(usize::MAX));
+        // One byte past the budget tells a stream that ends exactly at it
+        // from one that goes on.
+        let left = self.budget.left.get();
+        let want = buf
+            .len()
+            .min(usize::try_from(room.min(left.saturating_add(1))).unwrap_or(usize::MAX));
         let n = self.inner.read(&mut buf[..want])?;
-        self.decoded += n as u64;
         #[cfg(test)]
         DECODED_BYTES.with(|c| c.set(c.get() + n as u64));
+        if n as u64 > left {
+            self.budget.exceeded.set(true);
+            return Err(invalid(format!(
+                "bundles decode to more than {} bytes together",
+                self.budget.total
+            )));
+        }
+        self.budget.left.set(left - n as u64);
+        self.decoded += n as u64;
         Ok(n)
     }
 }
 
 type BundleTar = tar::Archive<CappedDecode<zstd::stream::read::Decoder<'static, BufReader<File>>>>;
 
-/// Open `bundle` as a tar read through the capped streaming decoder. The
-/// returned counter is the number of entries seen, kept by the caller.
+/// Open `bundle` as a tar read through the capped streaming decoder, drawing
+/// on `budget`. The returned counter is the number of entries seen, kept by
+/// the caller.
 fn open_bundle_tar(
     bundle: &Path,
     limits: Limits,
+    budget: std::rc::Rc<DecodeBudget>,
 ) -> io::Result<(BundleTar, std::rc::Rc<std::cell::Cell<u64>>)> {
     let entries = std::rc::Rc::new(std::cell::Cell::new(0));
     #[expect(
@@ -601,6 +653,7 @@ fn open_bundle_tar(
         decoded: 0,
         max_bytes: limits.max_bytes,
         entries: entries.clone(),
+        budget,
     });
     Ok((archive, entries))
 }
@@ -620,8 +673,18 @@ fn read_capped_member(entry: &mut impl Read, what: &str) -> io::Result<Vec<u8>> 
 /// and `bundle.json` are read (each at most 1 MiB) and every other payload is
 /// skipped, never extracted or spooled. The scan is bounded by `limits`, like
 /// extraction, so a hostile bundle cannot make this step do unbounded work.
-fn bundle_meta(bundle: &Path, limits: Limits) -> io::Result<BTreeMap<String, String>> {
-    let (mut archive, seen) = open_bundle_tar(bundle, limits)?;
+pub(crate) fn bundle_meta(bundle: &Path, limits: Limits) -> io::Result<BTreeMap<String, String>> {
+    bundle_meta_within(bundle, limits, &DecodeBudget::new(u64::MAX))
+}
+
+/// [`bundle_meta`], whose decoded bytes are also drawn from `budget`, which
+/// several scans may share.
+pub(crate) fn bundle_meta_within(
+    bundle: &Path,
+    limits: Limits,
+    budget: &std::rc::Rc<DecodeBudget>,
+) -> io::Result<BTreeMap<String, String>> {
+    let (mut archive, seen) = open_bundle_tar(bundle, limits, budget.clone())?;
     let mut layout = None;
     let mut meta_json = None;
     for entry in archive.entries()? {
@@ -1421,7 +1484,8 @@ fn extract_with_limits(bundle: &Path, directory: &Path, limits: Limits) -> io::R
     let mut entries_seen = 0u64;
     let mut remaining = limits.max_bytes;
     let mut files = Vec::new();
-    let (mut archive, entry_counter) = open_bundle_tar(bundle, limits)?;
+    let (mut archive, entry_counter) =
+        open_bundle_tar(bundle, limits, DecodeBudget::new(u64::MAX))?;
     let mut seen = BTreeSet::new();
     let mut directories = BTreeMap::new();
     for entry in archive.entries()? {
@@ -2902,9 +2966,47 @@ pub(crate) mod tests {
         }
     }
 
+    /// Extract `bundle`'s layer into the new directory `directory` and apply
+    /// its sealed modes, without verifying it: the stand-in for the child's
+    /// bundle cache in the supervisor's tests (the child verifies a bundle).
+    pub(crate) fn extract_unverified(bundle: &Path, directory: &Path) -> io::Result<()> {
+        fs::create_dir(directory)?;
+        let recorded = extract_with_limits(bundle, directory, Limits::resolve(None, None)?)?;
+        finalize_stage(directory, recorded)
+    }
+
     /// Re-tar `bundle` with the payload of one member replaced (same seal
     /// metadata, so the bundle stays self-consistent but lies about content).
-    fn retar_with(bundle: &Path, out: &Path, member: &str, payload: &[u8]) {
+    pub(crate) fn retar_with(bundle: &Path, out: &Path, member: &str, payload: &[u8]) {
+        retar(bundle, out, |path, data, _| {
+            if path == member {
+                *data = payload.to_vec();
+            }
+        });
+    }
+
+    /// Re-tar `bundle` with a `padding` member of `zeros` zero bytes before
+    /// `meta.json`, its last member: still a valid bundle (only `layer/`
+    /// members are extracted), a few KiB larger on disk and `zeros` bytes
+    /// longer to decode.
+    pub(crate) fn retar_padded(bundle: &Path, out: &Path, zeros: u64) {
+        retar(bundle, out, |path, _, builder| {
+            if path == "meta.json" {
+                let mut padding = header(0o444, 0, zeros, tar::EntryType::Regular);
+                builder
+                    .append_data(&mut padding, "padding", std::io::repeat(0).take(zeros))
+                    .unwrap();
+            }
+        });
+    }
+
+    /// Re-tar `bundle` member by member: `edit` gets each member's path and
+    /// payload before the member is written, and may append members first.
+    fn retar(
+        bundle: &Path,
+        out: &Path,
+        mut edit: impl FnMut(&str, &mut Vec<u8>, &mut tar::Builder<Vec<u8>>),
+    ) {
         let body = ratarmount_compress::open_seekable_zstd(bundle).unwrap();
         let mut archive = tar::Archive::new(body.open_reader().unwrap());
         let mut builder = tar::Builder::new(Vec::new());
@@ -2925,10 +3027,8 @@ pub(crate) mod tests {
                 .unwrap_or_default();
             let mut data = Vec::new();
             entry.read_to_end(&mut data).unwrap();
-            if path == member {
-                data = payload.to_vec();
-                header.set_size(data.len() as u64);
-            }
+            edit(&path, &mut data, &mut builder);
+            header.set_size(data.len() as u64);
             if !pax.is_empty() {
                 builder
                     .append_pax_extensions(pax.iter().map(|(k, v)| (k.as_str(), v.as_slice())))

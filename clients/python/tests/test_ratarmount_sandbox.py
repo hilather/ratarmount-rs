@@ -1,6 +1,7 @@
 """Regression tests using a local fake daemon; no FUSE or third-party client code."""
 
 import json
+import os
 from pathlib import Path
 import socket
 import sys
@@ -232,6 +233,70 @@ def test_regression_request_id_sends_v2(daemon):
     client.new("task")
     assert requests[-1]["version"] == 1
     assert "request_id" not in requests[-1]
+    client.close()
+
+
+def test_regression_new_lowers_journal_sends_v2(daemon):
+    """Regression: lowers= and journal= send protocol v2, with string paths and
+    the mapping as given; an omitted keyword sends no key (never null), and a
+    new() without keywords keeps the v1 bytes."""
+    client, requests, _ = daemon
+    client.new("task", lowers=[Path("/a"), "/b"], journal={"reads": "first"})
+    assert requests.raw[-1] == (
+        b'{"version": 2, "op": "new", "base": "task", "count": 1, "overlay": "disk", '
+        b'"quota": null, "readonly_globs": [], "lowers": ["/a", "/b"], '
+        b'"journal": {"reads": "first"}}\n'
+    )
+    client.new("task", lowers=["relative/layer"])
+    assert requests[-1]["version"] == 2
+    assert requests[-1]["lowers"] == ["relative/layer"]
+    assert "journal" not in requests[-1] and "request_id" not in requests[-1]
+    client.new("task", journal={})
+    assert requests[-1]["version"] == 2 and requests[-1]["journal"] == {}
+    assert "lowers" not in requests[-1]
+    client.new("task", request_id="r", lowers=["/a"])
+    assert requests.raw[-1] == (
+        b'{"version": 2, "op": "new", "base": "task", "count": 1, "overlay": "disk", '
+        b'"quota": null, "readonly_globs": [], "request_id": "r", "lowers": ["/a"]}\n'
+    )
+    client.new("task")
+    assert requests.raw[-1] == (
+        b'{"version": 1, "op": "new", "base": "task", "count": 1, "overlay": "disk", '
+        b'"quota": null, "readonly_globs": []}\n'
+    )
+    for request in requests:
+        assert request.get("lowers", []) is not None
+        assert request.get("journal", {}) is not None
+    client.close()
+
+
+def test_regression_new_lowers_single_path_is_refused(daemon):
+    """Regression: lowers="/a" (one path, not a list) was sent as one lower per
+    character; it raises TypeError and sends nothing."""
+    client, requests, _ = daemon
+    sent = len(requests)
+    for single in ["/a", b"/a", Path("/a")]:
+        with pytest.raises(TypeError, match="list of paths"):
+            client.new("task", lowers=single)
+    assert len(requests) == sent
+    client.new("task", lowers=("/a",))
+    assert requests[-1]["lowers"] == ["/a"]
+    client.close()
+
+
+def test_regression_attempt_journal_path(daemon):
+    """Regression: Attempt.journal_path is <dirname(path)>/journal.jsonl for
+    attempts this client created with a journal, else None (and for list())."""
+    client, _, _ = daemon
+    journaled = client.new("task", count=2, journal={"exclude": ["skip/**"]})
+    assert journaled[0].journal_path == "/mnt/journal.jsonl"
+    for attempt in journaled:
+        assert attempt.journal_path == os.path.join(os.path.dirname(attempt.path),
+                                                    "journal.jsonl")
+    assert all(a.journal_path is None for a in client.new("task", lowers=["/a"]))
+    assert all(a.journal_path is None for a in client.new("task"))
+    listed = client.list()
+    assert listed and all(a.journal_path is None for a in listed)
     client.close()
 
 
