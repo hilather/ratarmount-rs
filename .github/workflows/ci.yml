@@ -348,7 +348,7 @@ jobs:
   # -------------------------------------------------------------------------
   macos:
     name: macOS (build + test)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     env:
       # Workflow-level RUSTFLAGS=-Dwarnings also applies to *dependencies*.
@@ -436,7 +436,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # Bump when macOS toolchain / macFUSE link env changes.
-          key: macos-14-v3
+          key: macos-15-v1
 
       - name: cargo build (fuse smoke compile)
         # Surface link/build errors before clippy. Emit ::error:: annotations so

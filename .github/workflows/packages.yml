@@ -6,7 +6,7 @@
 #   - Ubuntu 24.04 — arm64 (ubuntu-24.04-arm)
 #   - Rocky Linux 8 — amd64 (container)
 #   - Portable “oldest glibc” tarball — Debian bullseye (glibc 2.31) amd64 + arm64
-#   - macOS arm64 (macos-14); x86_64 deferred (GHA macos-13 capacity)
+#   - macOS arm64 (macos-15); x86_64 deferred (GHA macos-13 capacity)
 #
 # Triggers: tag v*, workflow_dispatch, packaging PR paths
 #
@@ -365,7 +365,7 @@ jobs:
       matrix:
         include:
           - label: macos-arm64
-            runner: macos-14
+            runner: macos-15
             arch_label: arm64
           # Note: macos-13 (x86_64) removed — jobs sat "queued" indefinitely on GHA
           # and blocked Sign & release. Re-add when GitHub offers reliable Intel runners.
@@ -409,7 +409,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: packages-macos-${{ matrix.label }}-v2
+          key: packages-macos-${{ matrix.label }}-v3
 
       - name: Resolve package version
         run: |
