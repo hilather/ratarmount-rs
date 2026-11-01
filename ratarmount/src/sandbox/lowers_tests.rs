@@ -660,10 +660,12 @@ fn regression_supervisor_lower_validation_refusals() {
     );
 
     // Inside the RAM root, once known: refused lexically, so no tmpfs is
-    // needed and the RAM directory is never created.
+    // needed and the RAM directory is never created. `ram-root.json` holds
+    // the canonical path `ram_root` writes (on macOS `/tmp` is a symlink to
+    // `/private/tmp`), as `resolve` compares canonical prefixes.
     let state = private_tempdir();
     let ram_parent = private_tempdir();
-    let ram = ram_parent.path().join(format!(
+    let ram = fs::canonicalize(ram_parent.path()).unwrap().join(format!(
         "ratarmount-sandbox-{:x}",
         <sha2::Sha256 as sha2::Digest>::digest(
             fs::canonicalize(state.path())
@@ -693,6 +695,22 @@ fn regression_supervisor_lower_validation_refusals() {
         &ram_fake,
         &request(&[&inside]),
         &text(&inside),
+    );
+    assert!(
+        message.contains("inside the supervisor's RAM directory"),
+        "{message}"
+    );
+    // The same place reached through a symlink to the RAM root's parent is
+    // refused once the link is followed, before `attempt-x` is looked up.
+    let link_dir = private_tempdir();
+    let link = link_dir.path().join("ram-parent");
+    std::os::unix::fs::symlink(ram_parent.path(), &link).unwrap();
+    let via_link = link.join(ram.file_name().unwrap()).join("attempt-x");
+    let message = refused(
+        &mut ram_supervisor,
+        &ram_fake,
+        &request(&[&via_link]),
+        &text(&via_link),
     );
     assert!(
         message.contains("inside the supervisor's RAM directory"),
