@@ -19,7 +19,7 @@ CI workflow: [`.github/workflows/packages.yml`](https://github.com/hilather/rata
 | Ubuntu 24.04 | `deb` | amd64 + **arm64** | `.deb` + tarball |
 | Rocky Linux 8 | `rpm` (container) | amd64 | `.rpm` + tarball |
 | Portable (Debian bullseye, **glibc 2.31**) | `portable` | amd64 + **arm64** | tarball only |
-| **macOS** | `macos` | **arm64** (`macos-14`) only | tarball only (Intel `macos-13` deferred) |
+| **macOS** | `macos` | **arm64** (`macos-15`) only | tarball only (Intel `macos-13` deferred) |
 
 > **v0.1.0 note:** Ubuntu 20.04 container and Rocky 9 matrix legs are temporarily disabled in CI
 > (apt hang / exit 127). Use the portable glibc 2.31 tarball on older hosts; Rocky 9 packages
@@ -237,7 +237,7 @@ Prefer distro packages or the **portable-glibc2.31** tarball for production unti
 ## CI gates
 
 - **Always (Linux):** `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace` (see `ci.yml`)
-- **Always (macOS):** `macos-14` clippy + `cargo test --workspace`; FUSE smoke best-effort
+- **Always (macOS):** `macos-15` clippy + `cargo test --workspace`; FUSE smoke best-effort
 - **Packages:** `packages.yml` on tags / manual dispatch (includes macOS tarballs)
 - **FUSE harness (Linux):** phase allowlists when Python fixtures are checked out
 
