@@ -84,7 +84,7 @@ cleanup() {
         [[ -d "$mp" ]] || continue
         ratar_unmount "$mp"
     done
-    pkill -f "ratarmount.*$WORKDIR" 2>/dev/null || true
+    pkill -f "ratarmount.*${WORKDIR}(/| |\$)" 2>/dev/null || true
     if [[ "$KEEP_WORK" == "1" ]]; then
         echoerr "Kept $WORKDIR"
     else
@@ -274,7 +274,7 @@ mount_bg() {
     if ! wait_mount "$mp"; then
         echoerr "FAIL mount $bin $archive"
         cat "$log" >&2 || true
-        kill "$pid" 2>/dev/null || true
+        kill_running_jobs "$pid"
         return 1
     fi
     _CUR_MP=$mp
@@ -629,7 +629,7 @@ PY
     done
     if [[ ! -s "$PORTFILE" ]]; then
         echoerr "skip: VECTOR_REMOTE HTTP fixture failed to bind"
-        kill "$HTTP_PID" 2>/dev/null || true
+        kill_running_jobs "$HTTP_PID"
     else
         RPORT=$(cat "$PORTFILE")
         sidecar_get_count() { wc -l <"$COUNTFILE" | tr -d ' '; }
@@ -662,7 +662,7 @@ PY
             echoerr "$tool sidecar GET: first=$((after_first - before)) second=$delta"
             emit "$tool" "remote_sidecar_second_get" "count" "$delta" "n" | tee -a "$CSV_OUT"
         done
-        kill "$HTTP_PID" 2>/dev/null || true
+        kill_running_jobs "$HTTP_PID"
         wait "$HTTP_PID" 2>/dev/null || true
     fi
 fi

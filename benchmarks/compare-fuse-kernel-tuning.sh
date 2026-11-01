@@ -79,7 +79,7 @@ cleanup() {
     [[ -d "$mp" ]] || continue
     ratar_unmount "$mp"
   done
-  pkill -f "ratarmount.*$WORKDIR" 2>/dev/null || true
+  pkill -f "ratarmount.*${WORKDIR}(/| |\$)" 2>/dev/null || true
   if [[ "$KEEP" != "1" ]]; then
     rm -rf "$WORKDIR"
   else
@@ -379,7 +379,7 @@ measure_fuse_config() {
   if ! wait_mount "$mp"; then
     echoerr "  FAIL mount $config"
     tail -30 "$log" >&2 || true
-    kill "$pid" 2>/dev/null || true
+    kill_running_jobs "$pid"
     unmount_mp "$mp"
     rmdir "$mp" 2>/dev/null || true
     csv "fuse" "$config" "mount_fail" "1" "bool" ""

@@ -48,7 +48,7 @@ finish_mount() {
         return 1
     fi
     if [[ -n "$CUR_PID" ]]; then
-        kill "$CUR_PID" 2>/dev/null || true
+        kill_running_jobs "$CUR_PID"
         wait "$CUR_PID" 2>/dev/null || true
     fi
     CUR_PID=''

@@ -131,7 +131,7 @@ while IFS='|' read -r archive member expect password || [[ -n "${archive:-}" ]];
     done
     if [[ $ok -ne 1 ]]; then
         echo "  [fail] mount/member not ready: $member"
-        kill "$pid" 2>/dev/null || true
+        kill_running_jobs "$pid"
         ratar_unmount "$WORKDIR/mnt"
         exit 1
     fi
@@ -140,7 +140,7 @@ while IFS='|' read -r archive member expect password || [[ -n "${archive:-}" ]];
         # Full read of the late member (cat/cmp), not only a 64-byte head.
         if ! cmp -s "$WORKDIR/mnt/$member" "$orig"; then
             echo "  [fail] cmp late member $member (size=$size)"
-            kill "$pid" 2>/dev/null || true
+            kill_running_jobs "$pid"
             ratar_unmount "$WORKDIR/mnt"
             exit 1
         fi
@@ -149,7 +149,7 @@ while IFS='|' read -r archive member expect password || [[ -n "${archive:-}" ]];
         got=$(head -c 64 "$WORKDIR/mnt/$member" 2>/dev/null || true)
         if [[ "$got" != *"$expect"* ]]; then
             echo "  [fail] expected substring '$expect' in head of $member, got: $got"
-            kill "$pid" 2>/dev/null || true
+            kill_running_jobs "$pid"
             ratar_unmount "$WORKDIR/mnt"
             exit 1
         fi
@@ -157,7 +157,7 @@ while IFS='|' read -r archive member expect password || [[ -n "${archive:-}" ]];
     else
         if [[ "$size" -le 0 ]]; then
             echo "  [fail] empty member $member"
-            kill "$pid" 2>/dev/null || true
+            kill_running_jobs "$pid"
             ratar_unmount "$WORKDIR/mnt"
             exit 1
         fi

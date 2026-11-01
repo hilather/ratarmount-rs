@@ -157,6 +157,55 @@ fn process_start(pid: u32) -> Option<String> {
     Some(fields.split_whitespace().nth(19)?.into())
 }
 
+/// Send `signal` to the process `identity` recorded, never to a process that
+/// has since reused its PID; returns whether it was sent. Nothing is sent
+/// without a recorded start time (always the case without `/proc`). On Linux
+/// the pidfd is opened before the start time is compared: a recorded process
+/// cannot come back once its PID is reused, so a match means the pidfd is
+/// that process and the signal cannot reach another one.
+fn signal_recorded(identity: &ProcessIdentity, signal: libc::c_int) -> io::Result<bool> {
+    let (Some(start), Ok(pid @ 1..)) = (identity.start.as_deref(), i32::try_from(identity.pid))
+    else {
+        return Ok(false);
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::io::Errno;
+        use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
+        let named = Signal::from_named_raw(signal)
+            .ok_or_else(|| io::Error::other(format!("unnamed signal {signal}")))?;
+        let Some(pid) = Pid::from_raw(pid) else {
+            return Ok(false);
+        };
+        match pidfd_open(pid, PidfdFlags::empty()) {
+            Ok(pidfd) if process_start(identity.pid).as_deref() == Some(start) => {
+                return match pidfd_send_signal(&pidfd, named) {
+                    Ok(()) => Ok(true),
+                    Err(Errno::SRCH) => Ok(false),
+                    Err(error) => Err(error.into()),
+                };
+            }
+            // Another process has the PID now, or the recorded one exited. EINVAL
+            // (before Linux 6.9) means the PID names a thread, never a recorded
+            // process: records hold process IDs (`Child::id()`).
+            Ok(_) | Err(Errno::SRCH | Errno::INVAL) => return Ok(false),
+            // No pidfds before Linux 5.3: compare and signal by number below.
+            Err(Errno::NOSYS) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if process_start(identity.pid).as_deref() != Some(start) {
+        return Ok(false);
+    }
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        return Ok(true);
+    }
+    match io::Error::last_os_error() {
+        error if error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        error => Err(error),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PidRecord {
     #[serde(flatten)]
@@ -601,11 +650,7 @@ impl Cleanup {
         if let Some(mut child) = self.runtime_child.take() {
             let _ = wait_bounded(&mut child, CLEANUP_TIMEOUT);
         } else if let Some(child) = &self.record.runtime_child {
-            if child.start.is_some() && child.alive() {
-                unsafe {
-                    libc::kill(child.pid as i32, libc::SIGKILL);
-                }
-            }
+            let _ = signal_recorded(child, libc::SIGKILL);
         }
         if had_client {
             // A timeout can fire before `run` has created the container. Reap
@@ -630,19 +675,12 @@ impl Cleanup {
             let _ = wait_bounded(&mut child, CLEANUP_TIMEOUT);
         } else if let Some(child) = &self.record.mount_child {
             // A stale foreground child may still be initializing. Never signal a reused PID.
-            if child.start.is_some() && child.alive() {
-                unsafe {
-                    libc::kill(child.pid as i32, libc::SIGTERM);
-                }
+            if signal_recorded(child, libc::SIGTERM).unwrap_or(false) {
                 let start = Instant::now();
                 while child.alive() && start.elapsed() < CLEANUP_TIMEOUT {
                     std::thread::sleep(POLL);
                 }
-                if child.alive() {
-                    unsafe {
-                        libc::kill(child.pid as i32, libc::SIGKILL);
-                    }
-                }
+                let _ = signal_recorded(child, libc::SIGKILL);
             }
         }
         // Catch a mount that completed while the stale child was being stopped.
@@ -1749,6 +1787,120 @@ mod tests {
             std::thread::sleep(POLL);
         }
         assert!(!child.alive(), "child outlived its killed supervisor");
+    }
+
+    /// Regression: stale-run recovery signals only the process a record names:
+    /// never a live process at the recorded PID with another start time (a
+    /// reused PID), a record without a start time, PID 0 (this process group),
+    /// a PID outside `pid_t`, or a reaped child. `signal_recorded` also opens
+    /// its pidfd before comparing start times, which closes the window between
+    /// the comparison and the signal; no test can force that window.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_run_signal_recorded_requires_the_recorded_identity() {
+        use std::os::unix::process::ExitStatusExt;
+        let _processes = ratarmount_index::test_process::spawning();
+        if !Path::new("/bin/sleep").exists() {
+            eprintln!("skip: /bin/sleep unavailable");
+            return;
+        }
+        let mut child = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let recorded = ProcessIdentity::new(child.id());
+        assert!(recorded.start.is_some());
+        for other in [
+            ProcessIdentity {
+                pid: child.id(),
+                start: Some("0".into()),
+            },
+            ProcessIdentity {
+                pid: child.id(),
+                start: None,
+            },
+            ProcessIdentity {
+                pid: 0,
+                start: recorded.start.clone(),
+            },
+            ProcessIdentity {
+                pid: u32::MAX,
+                start: recorded.start.clone(),
+            },
+        ] {
+            assert!(
+                !signal_recorded(&other, libc::SIGKILL).unwrap(),
+                "{other:?}"
+            );
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a record that does not name the child signalled it"
+        );
+        assert!(signal_recorded(&recorded, libc::SIGTERM).unwrap());
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+        assert!(!signal_recorded(&recorded, libc::SIGKILL).unwrap());
+    }
+
+    /// Regression: stale-run recovery stops the recorded mount child (SIGTERM)
+    /// and runtime client (SIGKILL), and leaves alone live processes that hold
+    /// a recorded PID with another start time (the PID was reused).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_run_stale_recovery_never_signals_a_reused_pid() {
+        use std::os::unix::process::ExitStatusExt;
+        let _processes = ratarmount_index::test_process::spawning();
+        if !Path::new("/bin/sleep").exists() {
+            eprintln!("skip: /bin/sleep unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        fs::write(&runtime, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        for reused in [true, false] {
+            let mut mount = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+            let mut client = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+            let identity = |child: &Child| ProcessIdentity {
+                pid: child.id(),
+                start: if reused {
+                    Some("0".into())
+                } else {
+                    process_start(child.id())
+                },
+            };
+            let top = temp.path().join(format!("top-{reused}"));
+            let pid = pid_path(&top);
+            let record = PidRecord {
+                owner: ProcessIdentity {
+                    pid: 0,
+                    start: None,
+                },
+                mountpoint: temp.path().join(format!("mount-{reused}")),
+                container: "ratarmount-run-stale".into(),
+                runtime: runtime.clone(),
+                mount_child: Some(identity(&mount)),
+                runtime_child: Some(identity(&client)),
+                ram_top: None,
+            };
+            fs::write(&pid, serde_json::to_vec(&record).unwrap()).unwrap();
+            recover(&pid, &top).unwrap();
+            assert!(!pid.exists());
+            if reused {
+                assert!(
+                    mount.try_wait().unwrap().is_none(),
+                    "reused mount PID signalled"
+                );
+                assert!(
+                    client.try_wait().unwrap().is_none(),
+                    "reused client PID signalled"
+                );
+                for mut child in [mount, client] {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                }
+            } else {
+                assert_eq!(mount.wait().unwrap().signal(), Some(libc::SIGTERM));
+                assert_eq!(client.wait().unwrap().signal(), Some(libc::SIGKILL));
+            }
+        }
     }
 
     /// Regression: persisted RAM overlays must preserve DB bytes, modes and symlinks without following them.

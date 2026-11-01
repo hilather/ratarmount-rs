@@ -16,7 +16,7 @@ mkdir -p "$MP" "$OV"
 cleanup() {
     set +e
     ratar_unmount "$MP"
-    [[ -n "${PID:-}" ]] && kill "$PID" 2>/dev/null || true
+    kill_running_jobs "${PID:-}"
     wait "${PID:-}" 2>/dev/null || true
     rm -rf "$WORKDIR" || true
 }
