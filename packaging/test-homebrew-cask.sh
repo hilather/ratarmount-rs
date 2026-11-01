@@ -86,9 +86,9 @@ else
 fi
 
 if grep -qE 'depends_on macos: ">= :sonoma"' "$CASK"; then
-  pass 'depends_on macos >= :sonoma (tarball is built on macos-14)'
+  pass 'depends_on macos >= :sonoma (supported floor; tarball is built on macos-15)'
 else
-  fail 'depends_on macos: ">= :sonoma" required (packages.yml macos-14)'
+  fail 'depends_on macos: ">= :sonoma" required (supported floor; packages.yml macos-15)'
 fi
 
 if grep -qE 'depends_on arch: :arm64' "$CASK"; then

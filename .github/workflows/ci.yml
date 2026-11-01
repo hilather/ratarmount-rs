@@ -511,6 +511,9 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "14.0"
           CARGO_TARGET_DIR: target/macos-deployment-14
         run: |
+          bin="$(cargo test -p ratarmount-index --lib --no-run --message-format=json \
+            | python3 -I -c 'import json, sys; print(next(m["executable"] for m in map(json.loads, sys.stdin) if m.get("reason") == "compiler-artifact" and m.get("executable") and m["package_id"].find("ratarmount-index") >= 0))')"
+          ./test-harness/check-macos-init-offsets.sh "$bin"
           cargo test -p ratarmount-index --lib checked_open
           cargo test -p ratarmount-checked-open-fixture --test dso
 
