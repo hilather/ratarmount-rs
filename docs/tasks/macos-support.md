@@ -1,6 +1,6 @@
 # macOS support — evaluation & task list
 
-**Status:** **First-class on Apple Silicon** — Phase A–D in tree; GHA `macos-14` job exists (`ci.yml` `macos:`); GitHub Release ships signed `ratarmount-*-macos-arm64.tar.gz`. Homebrew **E1 tap cask** shipped (`packaging/homebrew/Casks/ratarmount.rb`). Intel tarball **deferred** (no GHA `macos-13` capacity). Homebrew-core / WinFsp residual.  
+**Status:** **First-class on Apple Silicon** — Phase A–D in tree; GHA `macos-15` job exists (`ci.yml` `macos:`); GitHub Release ships signed `ratarmount-*-macos-arm64.tar.gz`. Homebrew **E1 tap cask** shipped (`packaging/homebrew/Casks/ratarmount.rb`). Intel tarball **deferred** (no GHA `macos-13` capacity). Homebrew-core / WinFsp residual.  
 **Target:** keep Apple Silicon tarballs on release tags; do not re-add Intel until runners exist.  
 **Related:** [`docs/macos.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md) (FUSE install + Tahoe); [`docs/packaging.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md); `.github/workflows/{ci,packages}.yml`.
 
@@ -20,7 +20,7 @@
 | **libarchive** | `pkg-config` in `build.rs` | Need Homebrew `libarchive` (+ `pkg-config`) |
 | **EXT4 / SquashFS MVP** | Shell out to `debugfs` / `unsquashfs` | Tools often missing on Mac; keep soft-skip (already skip-if-absent) |
 | **Packaging** | deb / rpm / portable-glibc tarball + **macOS arm64** tarball on tags; Homebrew tap **cask** | Intel tarball deferred; Homebrew-core out of v1 |
-| **CI** | Linux `check` + **`macos-14` job** (`ci.yml` `macos:`) | Intel `macos-13` deferred |
+| **CI** | Linux `check` + **`macos-15` job** (`ci.yml` `macos:`) | Intel `macos-13` deferred |
 
 **Good news:** Most of the workspace is already *Unix*-shaped, not *Linux*-shaped. Unmount, mount-ready, packaging/CI, harness `ratar_unmount`, and the Homebrew tap **cask** **shipped**. Remaining product leftovers: user must install macFUSE or FUSE-T; Intel tarball and Homebrew-core later.
 
@@ -28,7 +28,7 @@
 
 1. **Always:** compile + unit tests on macOS (link against FUSE headers/libs).
 2. **Mount tests on GHA:** prefer **FUSE-T** (kext-less, NFS/SMB backend) if it works with `fuser` on runners; otherwise gate full FUSE harness as **manual / self-hosted** and keep a small smoke that does not require a live mount.
-3. **Release binaries:** build on `macos-14` (arm64). Intel `macos-13`/`macos-15` tarball **deferred**.
+3. **Release binaries:** build on `macos-15` (arm64). Intel `macos-13`/`macos-15` tarball **deferred**.
 
 ---
 
@@ -211,7 +211,7 @@ Add job `macos` (matrix):
 
 | Label | Runner | Artifact |
 |-------|--------|----------|
-| `macos-arm64` | `macos-14` | `ratarmount-<ver>-macos-arm64.tar.gz` (**shipped**) |
+| `macos-arm64` | `macos-15` | `ratarmount-<ver>-macos-arm64.tar.gz` (**shipped**) |
 | `macos-x86_64` | `macos-13` (Intel) | **Deferred** — GHA macos-13 capacity; do not re-add until runners exist |
 
 Steps:
@@ -246,7 +246,7 @@ Either:
 ### 5.4 Docs
 
 - README: Platforms → Linux + macOS **arm64** first-class; install via tarball or Homebrew tap cask. Intel deferred; Homebrew-core later.  
-- `docs/packaging.md`: macOS matrix is **macos-14 arm64 only**.  
+- `docs/packaging.md`: macOS matrix is **macos-15 arm64 only**.  
 - Short `docs/macos.md`: enable kext (macFUSE), FUSE-T alternative, `PKG_CONFIG_PATH`, known limits (EXT4/SquashFS helpers).
 
 ---
@@ -262,7 +262,7 @@ Use as implementation order. Effort: **S** &lt; 0.5d, **M** 0.5–2d, **L** mult
 | **A1** | Document local Mac build + **FUSE install** (macFUSE / FUSE-T / Tahoe FSKit) in `docs/macos.md` | S | **done** |
 | **A2** | Fix `unmount()` for Darwin (`umount` / `diskutil`) | S | **done** |
 | **A3** | Fix `path_is_fuse` / `wait_until_mounted` for Darwin | M | **done** |
-| **A4** | Verify `cargo build --release` + `cargo test --workspace` on Apple Silicon | M | **done** — CI job exists (`.github/workflows/ci.yml` `macos:` `runs-on: macos-14`) |
+| **A4** | Verify `cargo build --release` + `cargo test --workspace` on Apple Silicon | M | **done** — CI job exists (`.github/workflows/ci.yml` `macos:` `runs-on: macos-15`) |
 | **A5** | libarchive brew path notes + CI env | S | **done** (CI + docs) |
 
 ### Phase B — Behavior + harness
@@ -279,7 +279,7 @@ Use as implementation order. Effort: **S** &lt; 0.5d, **M** 0.5–2d, **L** mult
 
 | ID | Task | Effort | Status |
 |----|------|--------|--------|
-| **C1** | `macos-14` job: brew, clippy, `cargo test` | M | **done** (in `ci.yml`) |
+| **C1** | `macos-15` job: brew, clippy, `cargo test` | M | **done** (in `ci.yml`) |
 | **C2** | Best-effort FUSE smoke (`continue-on-error`) | M | **done** |
 | **C3** | FUSE-T preferred on GHA; document failure modes | S | **done** (workflow + docs) |
 | **C4** | Promote smoke to required after N green runs | S | **pending** |
@@ -289,7 +289,7 @@ Use as implementation order. Effort: **S** &lt; 0.5d, **M** 0.5–2d, **L** mult
 | ID | Task | Effort | Status |
 |----|------|--------|--------|
 | **D1** | `packaging/build-macos-tarball.sh` | S | **done** |
-| **D2** | `packages.yml` matrix arm64 (`macos-14`) | M | **done** (arm64 `[x]`; x86_64 **deferred**, not `[x]` — `macos-13` removed) |
+| **D2** | `packages.yml` matrix arm64 (`macos-15`) | M | **done** (arm64 `[x]`; x86_64 **deferred**, not `[x]` — `macos-13` removed) |
 | **D3** | macOS tarballs in signed-release-bundle + Release | S | **done** (v0.1.24 signed `macos-arm64` asset on GitHub Release) |
 | **D4** | Cosign sign macOS blobs | S | **done** (same release job) |
 | **D5** | packaging docs + release notes + MACOS.txt FUSE install | S | **done** |
@@ -335,7 +335,7 @@ Defer intel matrix, Homebrew-core, and required FUSE smoke until arm64 is solid.
 
 ## 9. Acceptance criteria (Mac support “done” for release notes)
 
-- [x] `cargo test --workspace` on `macos-14` in CI (`.github/workflows/ci.yml` `macos:`)  
+- [x] `cargo test --workspace` on `macos-15` in CI (`.github/workflows/ci.yml` `macos:`)  
 - [x] Tag build produces signed `ratarmount-*-macos-arm64.tar.gz` on GitHub Release (v0.1.24; Intel tarball **deferred**)  
 - [x] Documented install: brew deps + extract binary + mount sample archive (`docs/macos.md`)  
 - [x] `ratarmount -u` uses Darwin unmount path (`umount` / `diskutil`)  

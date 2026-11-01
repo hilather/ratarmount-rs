@@ -7,6 +7,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'packaging/audit_native_exports.py'
+      - 'packaging/build-macos-deps.sh'
       - '.github/workflows/python.yml'
   push:
     branches: [main]
@@ -33,7 +34,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             manylinux: '2_28'
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
             manylinux: 'off'
     runs-on: ${{ matrix.runner }}
@@ -44,12 +45,30 @@ jobs:
           python-version: '3.12'
       - uses: astral-sh/setup-uv@v6
         if: runner.os == 'macOS'
+        with:
+          cache-suffix: ${{ matrix.runner }}
+      # Homebrew's libarchive/xz/lz4 bottles on macos-15 need macOS 15, which
+      # delocate-wheel rejects at the wheel's 14.0 target: build them (and
+      # zstd) from pinned sources instead. See packaging/build-macos-deps.sh.
       - name: macOS build libraries
         if: runner.os == 'macOS'
         run: |
-          brew install pkgconf libarchive
+          brew install pkgconf
           echo "MACOSX_DEPLOYMENT_TARGET=14.0" >> "$GITHUB_ENV"
-          echo "PKG_CONFIG_PATH=$(brew --prefix libarchive)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$HOME/macos-deps/lib/pkgconfig" >> "$GITHUB_ENV"
+      - name: Cache macOS libarchive build
+        if: runner.os == 'macOS'
+        id: macos-deps
+        uses: actions/cache@v4
+        with:
+          path: ~/macos-deps
+          key: macos-deps-${{ matrix.runner }}-arm64-t14.0-libarchive3.8.11-xz5.8.4-lz4-1.10.0-zstd1.5.7-${{ hashFiles('packaging/build-macos-deps.sh') }}
+      - name: Build libarchive, xz, lz4, zstd (cache miss)
+        if: runner.os == 'macOS' && steps.macos-deps.outputs.cache-hit != 'true'
+        run: ./packaging/build-macos-deps.sh build "$HOME/macos-deps"
+      - name: Check macOS libarchive build
+        if: runner.os == 'macOS'
+        run: ./packaging/build-macos-deps.sh check "$HOME/macos-deps"
       - name: Build abi3 wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -140,7 +159,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             python: '3.12'
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
             python: '3.12'
     runs-on: ${{ matrix.runner }}
@@ -150,6 +169,8 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - uses: astral-sh/setup-uv@v6
+        with:
+          cache-suffix: ${{ runner.os == 'macOS' && matrix.runner || '' }}
       - uses: actions/download-artifact@v4
         with:
           name: python-${{ matrix.target }}
