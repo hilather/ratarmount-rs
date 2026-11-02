@@ -343,6 +343,46 @@ fn tensors_manifest_argument_and_duplicate_refusals() {
     );
 }
 
+/// Regression: an invalid standalone pattern must not escape whole-name anchoring.
+#[test]
+fn tensors_manifest_malformed_expert_pattern_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("model.safetensors"),
+        safetensors(&[("prefix.ffn.7.ex.2.gate", "U8", &[1], vec![1])]).bytes,
+    )
+    .unwrap();
+    let output = run(
+        dir.path(),
+        &[
+            "model.safetensors",
+            "--expert-pattern",
+            r"a^)|ffn\.(?P<layer>\d+)\.ex\.(?P<expert>\d+)\.(?P<role>gate)(?:",
+        ],
+    );
+    refusal(&output, "invalid expert pattern");
+    assert!(output.stdout.is_empty());
+}
+
+/// Regression: a positional root array cannot stand in for the named weight_map field.
+#[test]
+fn tensors_manifest_root_array_index_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("s.safetensors"),
+        safetensors(&[("a", "U8", &[1], vec![1])]).bytes,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("model.index.json"),
+        br#"[{"a":"s.safetensors"}]"#,
+    )
+    .unwrap();
+    let output = run(dir.path(), &["model.index.json"]);
+    refusal(&output, "weight_map");
+    assert!(output.stdout.is_empty());
+}
+
 #[test]
 fn tensors_manifest_output_failure_removes_partial_file() {
     let dir = tempfile::tempdir().unwrap();

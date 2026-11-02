@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{elements, gguf::ggml_layout, invalid, parse, Layout, Result, Tensor, MAX_HEADER_SIZE};
 
-const MAX_EXPERTS: u64 = 65_536;
-const MAX_ROWS: usize = 16_777_216;
+pub(crate) const MAX_EXPERTS: u64 = 65_536;
+pub(crate) const MAX_ROWS: usize = 16_777_216;
 const HASH_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Declaration order is the manifest's role sort order.
@@ -63,6 +63,8 @@ pub struct Manifest {
 }
 
 pub fn compile_expert_pattern(pattern: &str) -> Result<ExpertPattern> {
+    // Reject syntax that could close the wrapper and escape whole-name anchoring.
+    Regex::new(pattern).map_err(|e| invalid(format!("invalid expert pattern: {e}")))?;
     let regex = Regex::new(&format!("^(?:{pattern})$"))
         .map_err(|e| invalid(format!("invalid expert pattern: {e}")))?;
     for name in ["layer", "expert", "role"] {
@@ -399,9 +401,41 @@ fn open_input(
     Ok(inputs.len() - 1)
 }
 
-#[derive(Deserialize)]
 struct ShardIndex {
     weight_map: WeightMap,
+}
+
+impl<'de> Deserialize<'de> for ShardIndex {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct IndexVisitor;
+        impl<'de> Visitor<'de> for IndexVisitor {
+            type Value = ShardIndex;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an index object with a weight_map field")
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut weight_map = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "weight_map" {
+                        if weight_map.is_some() {
+                            return Err(serde::de::Error::duplicate_field("weight_map"));
+                        }
+                        weight_map = Some(map.next_value()?);
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(ShardIndex {
+                    weight_map: weight_map
+                        .ok_or_else(|| serde::de::Error::missing_field("weight_map"))?,
+                })
+            }
+        }
+        deserializer.deserialize_map(IndexVisitor)
+    }
 }
 
 struct WeightMap(BTreeMap<String, String>);
@@ -485,7 +519,15 @@ pub(crate) fn hash_rows(
         let mut hash = Sha256::new();
         while left > 0 {
             let n = left.min(buffer.len() as u64) as usize;
-            file.read_exact(&mut buffer[..n]).map_err(context)?;
+            file.read_exact(&mut buffer[..n]).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    context(std::io::Error::other(
+                        "file length changed between parse and hash read",
+                    ))
+                } else {
+                    context(e)
+                }
+            })?;
             hash.update(&buffer[..n]);
             left -= n as u64;
         }

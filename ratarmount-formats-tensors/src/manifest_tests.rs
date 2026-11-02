@@ -375,6 +375,26 @@ fn manifest_merged_expert_count_cap() {
     );
 }
 
+/// Regression: exactly 65,536 merged experts fit within the production limits.
+#[test]
+fn manifest_merged_expert_count_at_limit() {
+    assert_eq!(crate::manifest::MAX_EXPERTS, 65_536);
+    assert_eq!(crate::manifest::MAX_ROWS, 16_777_216);
+    let name = "model.layers.0.mlp.experts.gate_up_proj";
+    let count = 65_536;
+    let m = manifest(&safetensors(
+        json!({name:tensor("U8",&[count,1,1],0,count)}),
+        &vec![1; count as usize],
+    ));
+    assert_eq!(m.rows.len(), count as usize);
+    for (expert, row) in m.rows.iter().enumerate() {
+        assert_eq!(row.expert, Some(expert as u32));
+        assert_eq!(row.role, Role::GateUp);
+        assert_eq!(row.length, 1);
+        assert_eq!(row.offset, m.rows[0].offset + expert as u64);
+    }
+}
+
 /// Regression: total rows fail closed before expanding a tensor beyond the remaining budget.
 #[test]
 fn manifest_total_row_cap() {
@@ -604,6 +624,11 @@ fn manifest_weight_map_consistency_refusals() {
         assert!(build_manifest(&[path], &ManifestOptions::default()).is_err());
     }
     index_refused(
+        br#"{"weight_map":{},"weight_map":{}}"#,
+        &[],
+        "duplicate field `weight_map`",
+    );
+    index_refused(
         br#"{"weight_map":{"a":"s"}}"#,
         &[(
             "s",
@@ -622,6 +647,27 @@ fn manifest_weight_map_consistency_refusals() {
         )],
         "safetensors",
     );
+}
+
+/// Regression: a positional root array cannot substitute for the named weight_map field.
+#[test]
+fn manifest_index_root_array_refused() {
+    index_refused(
+        br#"[{"a":"s.safetensors"}]"#,
+        &[(
+            "s.safetensors",
+            safetensors(json!({"a":tensor("U8",&[1],0,1)}), b"a"),
+        )],
+        "weight_map",
+    );
+}
+
+/// Regression: invalid standalone regex syntax cannot escape the whole-name wrapper.
+#[test]
+fn manifest_expert_pattern_wrapper_escape_refused() {
+    let pattern = r"a^)|ffn\.(?P<layer>\d+)\.ex\.(?P<expert>\d+)\.(?P<role>gate)(?:";
+    let err = compile_expert_pattern(pattern).unwrap_err().to_string();
+    assert!(err.contains("invalid expert pattern"), "{err}");
 }
 
 /// Regression: custom patterns need all groups, participating captures, valid roles and u32 IDs.
@@ -836,6 +882,29 @@ fn manifest_hash_refuses_changed_file_length() {
         assert!(err.contains(path.to_str().unwrap()), "{err}");
         assert!(err.contains("length changed"), "{err}");
     }
+}
+
+/// Regression: an EOF during hash reads reports the file and tensor whose length changed.
+#[test]
+fn manifest_hash_short_read_reports_changed_file_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = safetensors(json!({"weight":tensor("U8",&[3],0,3)}), b"abc");
+    let path = save(&dir, "model", &bytes);
+    let mut reader = File::open(&path).unwrap();
+    let mut rows = manifest(&bytes).rows;
+    // Force the same short read as truncation after the pre-read metadata check,
+    // without relying on a concurrent file mutation winning a race.
+    rows[0].length += 1;
+    let err = crate::manifest::hash_rows(&mut reader, &path, bytes.len() as u64, &mut rows)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(path.to_str().unwrap()), "{err}");
+    assert!(err.contains("tensor weight"), "{err}");
+    assert!(
+        err.contains("file length changed between parse and hash read"),
+        "{err}"
+    );
+    assert!(rows[0].sha256.is_none());
 }
 
 /// Regression: descriptor exhaustion names the shard and explains the open-handle limit.
