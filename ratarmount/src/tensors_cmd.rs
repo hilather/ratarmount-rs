@@ -68,9 +68,9 @@ pub fn run(args: &TensorsArgs) -> Result<()> {
     }
 }
 
-/// Create only after input validation, and remove an incomplete output on every
-/// write, flush or sync error. The closure also supplies a deterministic failure
-/// seam for testing the same helper used by the command.
+/// Create only after input validation, and remove an incomplete output on a
+/// write, flush or sync error only if the path still identifies the created file.
+/// The closure supplies a deterministic failure seam for the command's helper.
 pub(crate) fn write_output(
     path: &Path,
     write: impl FnOnce(&mut dyn Write) -> Result<()>,
@@ -105,12 +105,29 @@ pub(crate) fn write_output(
         file.sync_all()?;
         Ok(())
     })();
-    drop(file);
-    if result.is_err() {
-        let _ = std::fs::remove_file(path);
-    }
     result.map_err(|error: TensorsError| {
-        TensorsError::Invalid(format!("{}: {error}", path.display()))
+        let cleanup = (|| -> io::Result<()> {
+            // Keep the created file open through the comparison and unlink so
+            // its identity cannot be recycled after a rename or replacement.
+            let created = same_file::Handle::from_file(file)?;
+            if !std::fs::metadata(path)?.is_file() {
+                return Err(io::Error::other(
+                    "output path is no longer a regular file; leaving it untouched",
+                ));
+            }
+            let current = same_file::Handle::from_path(path)?;
+            if created != current {
+                return Err(io::Error::other(
+                    "output path was replaced; leaving it untouched",
+                ));
+            }
+            std::fs::remove_file(path)
+        })();
+        let detail = match cleanup {
+            Ok(()) => String::new(),
+            Err(error) => format!("; incomplete output cleanup failed: {error}"),
+        };
+        TensorsError::Invalid(format!("{}: {error}{detail}", path.display()))
     })
 }
 

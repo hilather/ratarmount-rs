@@ -413,6 +413,63 @@ fn tensors_manifest_output_failure_removes_partial_file() {
     assert!(path.is_file());
 }
 
+/// Regression: failed output cleanup must preserve a replacement published by another writer.
+#[test]
+fn tensors_manifest_output_failure_preserves_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("manifest.jsonl");
+    let displaced = dir.path().join("displaced.jsonl");
+    let partial = [b'x'; 20_000];
+    let replacement = [b'y'; 20_000];
+    let error = tensors_cmd::write_output(&path, |out| {
+        out.write_all(&partial)?;
+        out.flush()?;
+        fs::rename(&path, &displaced)?;
+        fs::write(&path, replacement)?;
+        Err(io::Error::other("injected write failure").into())
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("injected write failure"), "{error}");
+    assert!(error.contains("output path was replaced"), "{error}");
+    assert_eq!(fs::read(&path).unwrap(), replacement);
+    assert_eq!(fs::read(&displaced).unwrap(), partial);
+}
+
+/// Regression: an unidentifiable or non-file output path is preserved and cleanup is reported.
+#[test]
+fn tensors_manifest_output_failure_reports_unverified_path() {
+    let dir = tempfile::tempdir().unwrap();
+    for directory in [false, true] {
+        let path = dir.path().join(format!("manifest-{directory}.jsonl"));
+        let displaced = dir.path().join(format!("displaced-{directory}.jsonl"));
+        let error = tensors_cmd::write_output(&path, |out| {
+            out.write_all(b"partial")?;
+            out.flush()?;
+            fs::rename(&path, &displaced)?;
+            if directory {
+                fs::create_dir(&path)?;
+                fs::write(path.join("keep"), b"replacement")?;
+            }
+            Err(io::Error::other("injected write failure").into())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("injected write failure"), "{error}");
+        assert!(
+            error.contains("incomplete output cleanup failed"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&displaced).unwrap(), b"partial");
+        if directory {
+            assert!(error.contains("no longer a regular file"), "{error}");
+            assert_eq!(fs::read(path.join("keep")).unwrap(), b"replacement");
+        } else {
+            assert!(!path.exists());
+        }
+    }
+}
+
 #[test]
 fn tensors_manifest_stdout_flush_failure_exits_two() {
     let dir = tempfile::tempdir().unwrap();

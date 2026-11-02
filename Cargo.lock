@@ -4901,6 +4901,7 @@ dependencies = [
  "ratarmount-smb",
  "rusqlite",
  "rustix",
+ "same-file",
  "serde",
  "serde_json",
  "sha1 0.10.7",

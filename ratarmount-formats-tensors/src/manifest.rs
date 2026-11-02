@@ -65,7 +65,10 @@ pub struct Manifest {
 pub fn compile_expert_pattern(pattern: &str) -> Result<ExpertPattern> {
     // Reject syntax that could close the wrapper and escape whole-name anchoring.
     Regex::new(pattern).map_err(|e| invalid(format!("invalid expert pattern: {e}")))?;
-    let regex = Regex::new(&format!("^(?:{pattern})$"))
+    let regex = Regex::new(&format!(r"\A(?:{pattern})\z"))
+        // A trailing verbose-mode comment can swallow the closing wrapper.
+        // Only add a newline on failure, so ordinary literal newlines are unchanged.
+        .or_else(|_| Regex::new(&format!("\\A(?:{pattern}\n)\\z")))
         .map_err(|e| invalid(format!("invalid expert pattern: {e}")))?;
     for name in ["layer", "expert", "role"] {
         if !regex.capture_names().flatten().any(|n| n == name) {
@@ -179,10 +182,7 @@ fn tensor_rows_inner(
     let mut row = ManifestRow {
         file: file.to_path_buf(),
         tensor: name.clone(),
-        layer: layer_regex
-            .captures(name)
-            .map(|c| number(&c[1]))
-            .transpose()?,
+        layer: None,
         expert: None,
         role: Role::Other,
         format,
@@ -287,6 +287,12 @@ fn tensor_rows_inner(
             }
         }
     };
+    if row.layer.is_none() {
+        row.layer = layer_regex
+            .captures(name)
+            .map(|c| number(&c[1]))
+            .transpose()?;
+    }
     if let Some((n, slice, shape)) = split {
         if tensor.size == 0 || slice == 0 {
             return Err(invalid(

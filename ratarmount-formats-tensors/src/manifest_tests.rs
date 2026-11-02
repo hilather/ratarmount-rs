@@ -670,6 +670,82 @@ fn manifest_expert_pattern_wrapper_escape_refused() {
     assert!(err.contains("invalid expert pattern"), "{err}");
 }
 
+/// Regression: trailing verbose-mode comments must not swallow whole-name anchors.
+#[test]
+fn manifest_expert_pattern_trailing_comment() {
+    let dir = tempfile::tempdir().unwrap();
+    for pattern in [
+        r"(?x)custom\.(?P<layer>\d+)\.(?P<expert>\d+)\.(?P<role>gate|gate_up) # trailing comment",
+        r"(?mx)custom\.(?P<layer>\d+)\.(?P<expert>\d+)\.(?P<role>gate|gate_up) # trailing comment",
+        "custom\\.(?P<layer>\\d+)\\.(?P<expert>\\d+)\\.(?P<role>gate|gate_up)\n",
+    ] {
+        let opts = ManifestOptions {
+            hash: false,
+            expert_pattern: Some(compile_expert_pattern(pattern).unwrap()),
+        };
+        let literal_newline = pattern.ends_with('\n');
+        for (name, role) in [
+            ("custom.2.3.gate", Role::Gate),
+            ("custom.2.3.gate_up", Role::GateUp),
+            ("prefix.custom.2.3.gate", Role::Other),
+            ("custom.2.3.gate.suffix", Role::Other),
+            ("prefix\ncustom.2.3.gate", Role::Other),
+            ("custom.2.3.gate\nsuffix", Role::Other),
+        ] {
+            let name = if literal_newline {
+                format!("{name}\n")
+            } else {
+                name.to_owned()
+            };
+            let path = save(
+                &dir,
+                "model",
+                &safetensors(json!({&name:tensor("U8",&[1],0,1)}), b"a"),
+            );
+            let m = build_manifest(&[path], &opts).unwrap();
+            assert_eq!(m.rows[0].role, role, "{pattern:?}: {name:?}");
+            if role != Role::Other {
+                assert_eq!((m.rows[0].layer, m.rows[0].expert), (Some(2), Some(3)));
+            }
+        }
+    }
+}
+
+/// Regression: explicit expert captures take precedence over an overflowing prefix layer.
+#[test]
+fn manifest_expert_pattern_precedes_fallback_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, pattern) in [
+        (
+            "prefix.layers.4294967296.custom.2.3.gate",
+            Some(r".*\.custom\.(?P<layer>\d+)\.(?P<expert>\d+)\.(?P<role>gate)"),
+        ),
+        (
+            "prefix.layers.4294967296.layers.2.mlp.experts.3.gate_proj.weight",
+            None,
+        ),
+        ("prefix.layers.4294967296.layers.2.mlp.gate.weight", None),
+    ] {
+        let opts = ManifestOptions {
+            hash: false,
+            expert_pattern: pattern.map(|p| compile_expert_pattern(p).unwrap()),
+        };
+        let path = save(
+            &dir,
+            "model",
+            &safetensors(json!({name:tensor("U8",&[1],0,1)}), b"a"),
+        );
+        let m = build_manifest(&[path], &opts).unwrap();
+        assert_eq!(m.rows.len(), 1);
+        assert_eq!(m.rows[0].layer, Some(2));
+        if name.ends_with("mlp.gate.weight") {
+            assert_eq!((m.rows[0].expert, m.rows[0].role), (None, Role::Router));
+        } else {
+            assert_eq!((m.rows[0].expert, m.rows[0].role), (Some(3), Role::Gate));
+        }
+    }
+}
+
 /// Regression: custom patterns need all groups, participating captures, valid roles and u32 IDs.
 #[test]
 fn manifest_expert_pattern_validation() {
@@ -960,6 +1036,8 @@ fn manifest_fixed_layer_capture_overflow() {
     for name in [
         "model.layers.4294967296.mlp.gate.weight",
         "model.layers.4294967296.mlp.experts.0.gate_proj.weight",
+        "model.layers.4294967296.self_attn.q_proj.weight",
+        "model.layers.4294967296.mlp.shared_expert.up_proj.weight",
     ] {
         refused(
             &safetensors(json!({name:tensor("U8",&[1],0,1)}), b"a"),
