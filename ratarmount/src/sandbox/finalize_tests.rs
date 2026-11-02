@@ -1093,6 +1093,89 @@ fn regression_supervisor_status_reads_real_denials() {
     drop(inspector);
 }
 
+/// Regression (PR #251 review round 1, Keystone (2); sweep 1 Codex B1 and
+/// Claude N4): finalize read `erofs_denied` through `ProcessMounter::status`
+/// with a fixed 5 s timeout, so a mount process whose inspection socket
+/// accepted the connection and never answered held the serial serve loop
+/// (`serve` → `respond` → `handle`) for 5 s, whatever `--timeout` said; and
+/// once that socket's backlog was full (a child that stopped accepting, its
+/// earlier connects still queued) the connect itself held it until the
+/// listener closed. The read gets `finalize_wait()`, the smaller of
+/// `--timeout` and 10 s, the connect included; an unanswered read leaves
+/// `erofs_denied` null and the finalize goes on. Each stalled finalize, the
+/// whole `handle` call, takes at most a finalize of the same attempt shape
+/// without a stall plus that wait (and a second of slack), so no other step
+/// waits on the socket. A watchdog closes the listener after a few seconds,
+/// so a regression fails instead of hanging.
+#[test]
+fn regression_supervisor_finalize_stalled_status_socket_holds_at_most_finalize_wait() {
+    if !linux() {
+        return;
+    }
+    let wait = Duration::from_millis(1500);
+    let mut env = Env::with_timeout(wait);
+    env.fake.0.lock().unwrap().process_status = true;
+    let last_read = |env: &Env| {
+        let state = env.fake.0.lock().unwrap();
+        (
+            *state.status_timeouts.last().unwrap(),
+            *state.status_held.last().unwrap(),
+        )
+    };
+    // The baseline: no socket at all, so the read fails at once.
+    let attempt = env.attempt(false);
+    let started = std::time::Instant::now();
+    env.finalize(&attempt.id, false, None).unwrap();
+    let baseline = started.elapsed();
+    for full_backlog in [false, true] {
+        let attempt = env.attempt(false);
+        let path = super::inspection::socket_path(&attempt);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // Backlog 0: the one queued connect fills it.
+        let _queued = full_backlog.then(|| {
+            rustix::net::listen(&listener, 0).unwrap();
+            std::os::unix::net::UnixStream::connect(&path).unwrap()
+        });
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            let _ = finished.recv_timeout(wait + Duration::from_secs(5));
+            drop(listener);
+        });
+        let started = std::time::Instant::now();
+        let report = env.finalize(&attempt.id, false, Some(&attempt.id));
+        let total = started.elapsed();
+        let _ = done.send(());
+        watchdog.join().unwrap();
+        let report = report.unwrap();
+        assert_eq!(report["status"], "finalized", "{report}");
+        assert!(report["erofs_denied"].is_null(), "{report}");
+        let (timeout, held) = last_read(&env);
+        assert_eq!(timeout, wait, "full backlog {full_backlog}");
+        assert!(
+            held >= wait * 8 / 10,
+            "full backlog {full_backlog}: the read waited for the socket: {held:?}"
+        );
+        assert!(
+            held < wait + Duration::from_secs(1),
+            "full backlog {full_backlog}: the read held handle() for {held:?}, past finalize_wait() {wait:?}"
+        );
+        assert!(
+            total < baseline + wait + Duration::from_secs(1),
+            "full backlog {full_backlog}: the finalize held the serve loop for {total:?} (baseline {baseline:?}, finalize_wait() {wait:?})"
+        );
+    }
+    // `--timeout` above 10 s: the read gets 10 s.
+    let mut env = Env::with_timeout(Duration::from_secs(30));
+    env.fake.0.lock().unwrap().erofs_denied = Some(2);
+    let attempt = env.attempt(false);
+    let report = env.finalize(&attempt.id, false, None).unwrap();
+    assert_eq!(report["erofs_denied"], 2);
+    assert_eq!(
+        env.fake.0.lock().unwrap().status_timeouts,
+        [Duration::from_secs(10)]
+    );
+}
+
 /// Regression (R1c-1 T21, sweep 2 Codex B2): a journaled attempt whose mount
 /// process failed at unmount was finalized from a summarizable prefix of its
 /// journal. The kept exit status decides, whatever the status label: 1 or
@@ -2927,6 +3010,7 @@ fn regression_layer_entry_lock_concurrent_hits_wait() {
                         pack: None,
                         manifest: &manifest,
                         journal: None,
+                        before_meta_read: None,
                     },
                     &mut super::finalize::FinalizeProgress::default(),
                 )
@@ -3763,6 +3847,120 @@ fn regression_supervisor_finalize_locked_top_database_is_writers_active() {
     let report = env.finalize(&attempt.id, false, Some("l")).unwrap();
     assert_eq!(report["status"], "finalized", "{report}");
     assert!(sealed(&attempt.overlay_dir));
+}
+
+/// Every entry below `dir`, symlinks unfollowed: its mode and a file's
+/// bytes or a symlink's target.
+fn tree_state(dir: &Path) -> std::collections::BTreeMap<PathBuf, (u32, Vec<u8>)> {
+    let mut entries = std::collections::BTreeMap::new();
+    for child in fs::read_dir(dir).unwrap() {
+        let path = child.unwrap().path();
+        let meta = fs::symlink_metadata(&path).unwrap();
+        let content = if meta.file_type().is_symlink() {
+            fs::read_link(&path)
+                .unwrap()
+                .into_os_string()
+                .into_encoded_bytes()
+        } else if meta.is_dir() {
+            entries.extend(tree_state(&path));
+            Vec::new()
+        } else {
+            fs::read(&path).unwrap()
+        };
+        entries.insert(path, (meta.mode(), content));
+    }
+    entries
+}
+
+/// Regression (PR #251 review round 1, Keystone (4)): `classify_gate_compose`
+/// mapped its metadata read with `io::Error::other`, so a top database that
+/// another connection took after fsck answered `io` instead of
+/// `writers_active`; so did the read after the outputs. Both use `meta_error`
+/// now (the gate's own error is never a busy database: it compares the
+/// metadata already read). Busy at the gate read: `writers_active`, and
+/// nothing changed from that read on (the top is not sealed, its tree is as it
+/// was, no manifest or bundle), the request stays `retryable`, and the same
+/// request ID finalizes once the holder is gone. Busy at the report read
+/// (sealed and packed by then): `writers_active` too, and the retry resumes
+/// without packing again. The stop ran before both reads, so the attempt is
+/// `finalizing`.
+#[test]
+fn regression_supervisor_finalize_busy_database_after_fsck_is_writers_active() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    if !linux() {
+        return;
+    }
+    let mut env = Env::new();
+    for point in ["gate", "report"] {
+        let attempt = env.attempt(false);
+        let root = attempt.path.parent().unwrap().to_path_buf();
+        let db = attempt.overlay_dir.join(ratarmount_compositing::HIDDEN_DB);
+        // The hook takes the database at `point`, after a snapshot of the top.
+        let holder: Rc<RefCell<Option<rusqlite::Connection>>> = Rc::default();
+        let before = Rc::new(RefCell::new(None));
+        let (held, seen, top) = (holder.clone(), before.clone(), attempt.overlay_dir.clone());
+        env.sup.seams.before_meta_read = Some(Box::new(move |at| {
+            if at == point {
+                *seen.borrow_mut() = Some(tree_state(&top));
+                // Sealed by the report read, the database is read-only: open
+                // it writable and restore its mode, as `overlay_seal`'s
+                // busy-unseal test does.
+                let mode = fs::metadata(&db).unwrap().permissions().mode();
+                fs::set_permissions(&db, fs::Permissions::from_mode(mode | 0o200)).unwrap();
+                let conn = rusqlite::Connection::open(&db).unwrap();
+                fs::set_permissions(&db, fs::Permissions::from_mode(mode)).unwrap();
+                conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+                *held.borrow_mut() = Some(conn);
+            }
+        }));
+        let request = format!("busy-{point}");
+        let error = env.finalize(&attempt.id, true, Some(&request)).unwrap_err();
+        assert!(
+            holder.borrow().is_some(),
+            "{point}: the hook took the database"
+        );
+        assert_eq!(error.code, "writers_active", "{point}: {}", error.message);
+        assert!(
+            error.message.contains("its database is busy"),
+            "{point}: {}",
+            error.message
+        );
+        assert_eq!(
+            env.sup.requests.status(&request),
+            Some(super::requests::Status::Retryable),
+            "{point}"
+        );
+        assert_eq!(env.status(&attempt.id), "finalizing", "{point}");
+        let bundle = root.join("bundle.tar.zst");
+        drop(holder.borrow_mut().take());
+        if point == "gate" {
+            assert_eq!(
+                tree_state(&attempt.overlay_dir),
+                before.borrow_mut().take().unwrap(),
+                "nothing changed from the gate read on"
+            );
+            assert!(!sealed(&attempt.overlay_dir));
+            for output in ["manifest.jsonl", "bundle.tar.zst"] {
+                assert!(!root.join(output).exists(), "{output}");
+            }
+            assert!(!env.sup.attempt_state[&attempt.id].finalize.progress.packed);
+        } else {
+            assert!(sealed(&attempt.overlay_dir));
+            assert!(env.sup.attempt_state[&attempt.id].finalize.progress.packed);
+        }
+        let packed = fs::metadata(&bundle)
+            .ok()
+            .map(|m| (m.ino(), m.mtime_nsec()));
+        let report = env.finalize(&attempt.id, true, Some(&request)).unwrap();
+        assert_eq!(report["status"], "finalized", "{point}: {report}");
+        assert_eq!(report["bundle"], json!(bundle), "{point}");
+        assert!(sealed(&attempt.overlay_dir));
+        if let Some(packed) = packed {
+            let again = fs::metadata(&bundle).unwrap();
+            assert_eq!(packed, (again.ino(), again.mtime_nsec()), "packed once");
+        }
+    }
 }
 
 const REAL_MOUNTS_CHILD: &str = "RATARMOUNT_SANDBOX_REAL_MOUNTS_CHILD";

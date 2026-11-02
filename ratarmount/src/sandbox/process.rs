@@ -78,8 +78,9 @@ pub trait Mounter {
     /// the unmount helper's normal unmount only, then up to `wait` for its
     /// child to exit.
     fn stop(&mut self, attempt: &Attempt, wait: Duration) -> Result<StopOutcome>;
-    /// The child's `erofs_denied` count over the inspection socket.
-    fn status(&mut self, attempt: &Attempt) -> Result<u64>;
+    /// The child's `erofs_denied` count over the inspection socket, answered
+    /// within `timeout`.
+    fn status(&mut self, attempt: &Attempt, timeout: Duration) -> Result<u64>;
     /// Whether a recorded child of the attempt is still running.
     fn child_alive(&mut self, attempt: &Attempt) -> bool;
     /// Every mount point of this process's mount namespace.
@@ -469,8 +470,9 @@ impl Mounter for ProcessMounter {
     /// The non-forcing stop (R1c-1 §5.4 Stop): if the attempt's path is
     /// mounted, the helper's normal unmount; the mount table then decides
     /// (still mounted: `Busy` when its last line is the busy error, else
-    /// `Failed`); whether to wait for a child comes from the child registry,
-    /// never from the attempt's status.
+    /// `Failed`, also when the helper succeeded: it unmounted the top one of
+    /// several mounts stacked at the path); whether to wait for a child comes
+    /// from the child registry, never from the attempt's status.
     fn stop(&mut self, attempt: &Attempt, wait: Duration) -> Result<StopOutcome> {
         let path = &attempt.path;
         if self.mounted()?.contains(path) {
@@ -478,6 +480,17 @@ impl Mounter for ProcessMounter {
             if self.mounted()?.contains(path) {
                 return Ok(match status {
                     Some(_) if ratarmount_fuse::is_busy_unmount_error(&last) => StopOutcome::Busy,
+                    Some(status) if status.success() => StopOutcome::Failed {
+                        detail: format!(
+                            "the unmount helper unmounted the top mount at {0}, but {0} is still mounted: more than one mount was stacked there{1}",
+                            path.display(),
+                            if last.is_empty() {
+                                String::new()
+                            } else {
+                                format!("; its last line: {last}")
+                            }
+                        ),
+                    },
                     Some(status) => StopOutcome::Failed {
                         detail: if last.is_empty() {
                             format!("the unmount helper failed ({status})")
@@ -497,8 +510,8 @@ impl Mounter for ProcessMounter {
         Ok(self.wait_child(path, wait)?)
     }
 
-    fn status(&mut self, attempt: &Attempt) -> Result<u64> {
-        super::inspection::status(attempt, Duration::from_secs(5))
+    fn status(&mut self, attempt: &Attempt, timeout: Duration) -> Result<u64> {
+        super::inspection::status(attempt, timeout)
             .map(|status| status.erofs_denied)
             .map_err(|e| {
                 ApiError::new(
@@ -794,7 +807,11 @@ mod tests {
     /// signal. Busy forms (glibc, musl; `(busy)`, `(still busy …)`) are
     /// `Busy`; any other failure, a missing `fusermount3` and a stalled
     /// helper (killed and reaped at its bound) are `Failed`; a child alive
-    /// after the unmount is `Detaching`, also for a crashed attempt.
+    /// after the unmount is `Detaching`, also for a crashed attempt. A helper
+    /// that exits 0 with the path still mounted (it unmounted the top one of
+    /// several mounts stacked there) is `Failed` saying so (PR #251 review
+    /// round 1, Keystone (3); sweep 1 Claude N2): it read "the unmount helper
+    /// failed (exit status: 0)".
     #[test]
     fn regression_supervisor_stop_decides_without_forcing() {
         if !cfg!(target_os = "linux") {
@@ -849,6 +866,39 @@ mod tests {
             let mut mounter = stopper(dir.path(), &body, &path);
             match mounter.stop(&attempt_at(&path, "ready"), Duration::ZERO).unwrap() {
                 StopOutcome::Failed { detail } => assert!(detail.contains(needle), "{detail}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        // The helper succeeds, but the path stays mounted: `Failed`, saying
+        // the helper unmounted only the top one of the mounts stacked at the
+        // path, with its last line when it printed one.
+        for (body, last) in [
+            ("exit 0", None),
+            (
+                "echo 'note: unmounted' >&2\nexit 0",
+                Some("note: unmounted"),
+            ),
+        ] {
+            let mut mounter = stopper(dir.path(), body, &path);
+            match mounter
+                .stop(&attempt_at(&path, "ready"), Duration::ZERO)
+                .unwrap()
+            {
+                StopOutcome::Failed { detail } => {
+                    let top = format!("unmounted the top mount at {}", path.display());
+                    let still = format!("{} is still mounted", path.display());
+                    assert!(detail.contains(&top), "{detail}");
+                    assert!(detail.contains(&still), "{detail}");
+                    assert!(
+                        detail.contains("more than one mount was stacked there"),
+                        "{detail}"
+                    );
+                    assert!(!detail.contains("exit status"), "{detail}");
+                    assert_eq!(detail.contains("its last line"), last.is_some(), "{detail}");
+                    if let Some(last) = last {
+                        assert!(detail.ends_with(last), "{detail}");
+                    }
+                }
                 other => panic!("{other:?}"),
             }
         }
@@ -943,6 +993,70 @@ mod tests {
                     StopOutcome::Stopped { exit: None }
                 );
             }
+        }
+    }
+
+    /// Runs `status` on its own thread and, should it not answer within a
+    /// few seconds (a connect waiting on a full backlog), closes `listener`
+    /// to release it, so a regression fails instead of hanging. Returns the
+    /// answer and how long the read took.
+    fn status_with_watchdog(
+        attempt: &Attempt,
+        timeout: Duration,
+        listener: std::os::unix::net::UnixListener,
+    ) -> (Result<u64>, Duration) {
+        let (done, answered) = std::sync::mpsc::channel();
+        let attempt = attempt.clone();
+        let call = thread::spawn(move || {
+            let started = Instant::now();
+            let answer = ProcessMounter::new(PathBuf::from("/nonexistent/ratarmount"))
+                .status(&attempt, timeout);
+            let _ = done.send(());
+            (answer, started.elapsed())
+        });
+        let _ = answered.recv_timeout(timeout + Duration::from_secs(3));
+        drop(listener);
+        call.join().unwrap()
+    }
+
+    /// Regression (PR #251 review round 1, Keystone (2); sweep 1 Codex B1):
+    /// `status` read the child's `erofs_denied` with a fixed 5 s timeout,
+    /// whatever it was given, and its connect had no bound at all. A socket
+    /// that accepts the connection (its backlog has room) and never answers
+    /// fails the read after about the given timeout: at least 80% of it (the
+    /// read did wait) and less than a second more. On Linux a listener whose
+    /// backlog is full (a child that stopped accepting, its earlier connects
+    /// still queued) made the connect wait until the listener closed; it
+    /// fails within the timeout too. (BSD and macOS refuse such a connect at
+    /// once, so that row is Linux only.)
+    #[test]
+    fn regression_supervisor_status_read_bounded_by_its_timeout() {
+        let timeout = Duration::from_millis(300);
+        for full_backlog in [false, true] {
+            if full_backlog && !cfg!(target_os = "linux") {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let attempt = attempt_at(&dir.path().join("mnt"), "ready");
+            let path = super::super::inspection::socket_path(&attempt);
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            // Backlog 0: the one queued connect fills it.
+            let _queued = full_backlog.then(|| {
+                rustix::net::listen(&listener, 0).unwrap();
+                std::os::unix::net::UnixStream::connect(&path).unwrap()
+            });
+            let (answer, held) = status_with_watchdog(&attempt, timeout, listener);
+            let error = answer.unwrap_err();
+            assert_eq!(error.code, "io", "{}", error.message);
+            assert!(
+                error.message.contains("erofs_denied count of attempt"),
+                "{}",
+                error.message
+            );
+            assert!(
+                held >= timeout * 8 / 10 && held < timeout + Duration::from_secs(1),
+                "full backlog {full_backlog}: held {held:?} for a {timeout:?} timeout"
+            );
         }
     }
 }

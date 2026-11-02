@@ -169,8 +169,8 @@ pub fn status(attempt: &Attempt, timeout: Duration) -> io::Result<Status> {
 }
 
 /// Sends `command` and reads the one-line reply, all within `timeout` from
-/// now: each read gets only the time left, so a reply trickled in small
-/// pieces cannot stretch the exchange past it.
+/// now, the connect included: each step gets only the time left, so a reply
+/// trickled in small pieces cannot stretch the exchange past it.
 fn request<T: serde::de::DeserializeOwned>(
     attempt: &Attempt,
     command: &[u8],
@@ -183,7 +183,7 @@ fn request<T: serde::de::DeserializeOwned>(
             .filter(|left| !left.is_zero())
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "inspection timed out"))
     };
-    let mut stream = UnixStream::connect(socket_path(attempt))?;
+    let mut stream = connect(&socket_path(attempt), &left)?;
     stream.set_write_timeout(Some(left()?))?;
     stream.write_all(command)?;
     let mut reply = Vec::new();
@@ -211,6 +211,39 @@ fn request<T: serde::de::DeserializeOwned>(
         return Err(io::Error::other("oversized inspection response"));
     }
     serde_json::from_slice(&reply[..end]).map_err(io::Error::other)
+}
+
+/// Connects to the inspection socket at `path` within the time `left` gives.
+/// On Linux a connect to a listener whose backlog is full (a child that
+/// stopped accepting, with earlier connects still queued) waits until the
+/// listener accepts or closes, for as long as the socket's send timeout
+/// allows, so that timeout is set before connecting. `FD_CLOEXEC` is set
+/// right after `socket()` because `SOCK_CLOEXEC` does not exist on macOS: the
+/// supervisor's serve thread, the only caller, is also the only thread that
+/// spawns children, so none can inherit the socket in between.
+fn connect(path: &Path, left: &dyn Fn() -> io::Result<Duration>) -> io::Result<UnixStream> {
+    use rustix::net::{sockopt, AddressFamily, SocketAddrUnix, SocketType};
+    let address = SocketAddrUnix::new(path)?;
+    let socket = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+    rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
+    loop {
+        sockopt::set_socket_timeout(&socket, sockopt::Timeout::Send, Some(left()?))?;
+        match rustix::net::connect(&socket, &address) {
+            Ok(()) => return Ok(UnixStream::from(socket)),
+            Err(rustix::io::Errno::INTR) => continue,
+            // The send timeout passed with the backlog still full.
+            Err(rustix::io::Errno::AGAIN) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "inspection timed out: {} accepted no connection",
+                        path.display()
+                    ),
+                ))
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 #[cfg(test)]

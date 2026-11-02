@@ -65,6 +65,14 @@ pub(super) struct FakeState {
     /// `status` answers this count, or fails when `None`.
     pub(super) erofs_denied: Option<u64>,
     pub(super) status_calls: usize,
+    /// Every timeout `status` was given.
+    pub(super) status_timeouts: Vec<Duration>,
+    /// `status` reads the attempt's inspection socket through
+    /// `ProcessMounter::status`, as the daemon does, instead of answering
+    /// `erofs_denied`.
+    pub(super) process_status: bool,
+    /// How long each `process_status` read took.
+    pub(super) status_held: Vec<Duration>,
     /// Children still alive after a `Detaching` stop.
     pub(super) alive: BTreeSet<PathBuf>,
     /// Mount points besides the attempts' own (the durability preflight's
@@ -298,9 +306,18 @@ impl Mounter for Fake {
         Ok(outcome)
     }
 
-    fn status(&mut self, _attempt: &Attempt) -> Result<u64, ApiError> {
+    fn status(&mut self, attempt: &Attempt, timeout: Duration) -> Result<u64, ApiError> {
         let mut state = self.0.lock().unwrap();
         state.status_calls += 1;
+        state.status_timeouts.push(timeout);
+        if state.process_status {
+            drop(state);
+            let started = std::time::Instant::now();
+            let answer = process::ProcessMounter::new(PathBuf::from("/nonexistent/ratarmount"))
+                .status(attempt, timeout);
+            self.0.lock().unwrap().status_held.push(started.elapsed());
+            return answer;
+        }
         state
             .erofs_denied
             .ok_or_else(|| ApiError::new("io", "injected: no status"))

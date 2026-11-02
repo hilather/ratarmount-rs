@@ -1131,6 +1131,8 @@ fn finish(args: &RunArgs, top: &Path, journal: &Path, execution: Execution) -> i
             }),
             manifest: &manifest,
             journal: args.journal.then_some((journal, summary.as_path())),
+            #[cfg(test)]
+            before_meta_read: None,
         },
         &mut super::finalize::FinalizeProgress::default(),
     )?;

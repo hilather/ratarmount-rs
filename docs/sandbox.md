@@ -2584,9 +2584,9 @@ cache directory's. Both must equal what was validated. Otherwise the batch is
 rolled back and `new` fails with `lower_changed`, naming the attempt and what
 differs (values redacted as `overlay info` prints them); a failed inspection is
 `mount_failed`. The whole re-check runs within
-the batch deadline: an inspection gets only the time left, however its reply
-arrives, and a re-check that completes after the deadline fails with
-`timeout`, rolled back like one that never completes. This catches a resealed or replaced layer, a layer swapped and
+the batch deadline: an inspection gets only the time left, connecting
+included, however its reply arrives, and a re-check that completes after the
+deadline fails with `timeout`, rolled back like one that never completes. This catches a resealed or replaced layer, a layer swapped and
 restored around the child's open, and a substituted bundle, including a forced
 re-pack with the same seal pair. Under a `request_id`, `lower_changed` after a
 complete rollback runs again on retry, and after a rollback that kept attempts
@@ -2729,7 +2729,10 @@ up, stopped or recorded.
    Then each lower the attempt took is read again: it must still be sealed with
    the `layer_digest` and `sealed_at` the re-check recorded, else
    `lower_changed`. Then the storage checks of the lowers.
-2. `erofs_denied` is read from the attempt's mount process while it serves.
+2. `erofs_denied` is read from the attempt's mount process while it serves,
+   within the smaller of `--timeout` and 10 s, connecting included. A mount
+   process that does not accept or answer by then leaves the count of an
+   earlier read, or `null`.
 3. **The stop.** If the attempt's `path` is mounted, the supervisor runs its
    unmount helper, `ratarmount -u -- PATH`, which runs a normal
    `fusermount3 -u` and retries it for about a second while the kernel answers
@@ -2740,8 +2743,9 @@ up, stopped or recorded.
      stop every process using it (its container) and retry; nothing was
      changed". The attempt stays mounted and keeps its status.
    - Still mounted after any other failure (no `fusermount3`,
-     `Operation not permitted`, a helper that did not finish within 3 s):
-     `io`, "cannot unmount attempt ID: DETAIL; nothing was changed".
+     `Operation not permitted`, a helper that did not finish within 3 s, or a
+     helper that unmounted only the top one of several mounts stacked at the
+     path): `io`, "cannot unmount attempt ID: DETAIL; nothing was changed".
    - Unmounted: the supervisor waits for the mount process to exit, up to the
      smaller of `--timeout` and 10 s. If it keeps serving (another mount
      namespace, such as a container's copy of the mount, holds it), the answer
@@ -2764,12 +2768,14 @@ up, stopped or recorded.
    is refused with the gate's text (`io`) before anything is sealed, and a base
    that cannot be opened (a pending commit journal on the archive included) is
    `base_open_failed`.
-   An overlay root lock or overlay database still busy after the smaller of
-   `--timeout` and 10 s is `writers_active` ("the overlay of attempt ID is
-   locked or its database is busy (…); retry"). Sealing a top over an archive
-   base whose digest is `pending`, the normal state for a worker (see
-   [lower stacks](#lower-stacks)), first hashes the whole archive, once per
-   attempt, in the serve loop.
+   An overlay root lock still held after the smaller of `--timeout` and 10 s,
+   or an overlay database another process holds when finalize reads the top's
+   metadata, is `writers_active` ("the overlay of attempt ID is locked or its
+   database is busy (…); retry"); a database held while the change set is
+   read for the bundle or the hash answers `io`, and a retry resumes. Sealing
+   a top over an archive base whose digest is `pending`, the normal state for
+   a worker (see [lower stacks](#lower-stacks)), first hashes the whole
+   archive, once per attempt, in the serve loop.
 7. With `pack`, the bundle is written once: a retry never packs again onto its
    own bundle. Then the canonical hash (strict normalization, SHA-256),
    `attempts/ID/manifest.jsonl` and, for a journaled attempt,
@@ -2839,11 +2845,13 @@ process. Once the container stops, a retry seals those writes too, but
 `erofs_denied` keeps the count of the last read while the mount process served,
 so denials the container caused after that read are missing from it. The serve
 loop answers one request at a time: a busy-mount answer holds it for up to 3 s
-(the helper's bound; its busy retries take about 1 s), and the first answer
-whose mount process does not exit after the unmount, or a locked overlay, for
-up to the smaller of `--timeout` and 10 s. On `writers_active`, wait at least
-1 s and back off. `destroy` keeps its own policy: it still unmounts lazily if
-it must and stops the mount process, also for a `finalizing` attempt.
+(the helper's bound; its busy retries take about 1 s), and reading
+`erofs_denied` from a mount process that does not accept or answer, the
+first answer whose mount process does not exit after the unmount, and a
+locked overlay each hold it for up to the smaller of `--timeout` and 10 s. On
+`writers_active`, wait at least 1 s and back off. `destroy` keeps its own
+policy: it still unmounts lazily if it must and stops the mount process, also
+for a `finalizing` attempt.
 
 #### Durability
 

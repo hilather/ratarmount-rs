@@ -66,6 +66,10 @@ pub struct FinalizeTop<'a> {
     pub manifest: &'a Path,
     /// The journal to summarize and the summary to write (overwritten).
     pub journal: Option<(&'a Path, &'a Path)>,
+    /// Test seam: runs before each metadata read after fsck, with its name
+    /// (`"gate"`, then `"report"`).
+    #[cfg(test)]
+    pub before_meta_read: Option<ReadHook>,
 }
 
 /// What a report reads off a finalized top.
@@ -126,8 +130,17 @@ fn check(top: &Path, repair: Repair) -> io::Result<String> {
 fn classify_gate_compose(
     request: &mut FinalizeTop<'_>,
 ) -> io::Result<(ClassifiedBase, Arc<dyn MountSource>)> {
-    let recorded = OverlayMeta::read(request.top).map_err(io::Error::other)?;
+    #[cfg(test)]
+    if let Some(hook) = request.before_meta_read.as_mut() {
+        hook("gate");
+    }
+    let recorded = OverlayMeta::read(request.top).map_err(meta_error)?;
     let base = (request.classify)(recorded.as_ref())?;
+    // The gate's error is its text and is never a busy database, so it stays
+    // `io` (a refusal included): it compares the metadata read above, and the
+    // only database it opens is the base's prepared index, which a read-only
+    // index (the supervisor's) opens immutable, taking no locks, while any
+    // other index's digest-cache read failure is ignored.
     crate::overlay_cmd::gate_base(
         request.top,
         recorded.as_ref(),
@@ -196,8 +209,12 @@ pub fn finalize_top(
         reason = r###"internal-read:v1 {"id":"IR-B0131-M01","item":"ratarmount::sandbox::finalize::finalize_top","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     overlay_changes::write_manifest(&changes, &mut File::create(manifest)?)?;
+    #[cfg(test)]
+    if let Some(hook) = request.before_meta_read.as_mut() {
+        hook("report");
+    }
     let meta = OverlayMeta::read(top)
-        .map_err(io::Error::other)?
+        .map_err(meta_error)?
         .ok_or_else(|| io::Error::other("overlay metadata missing"))?;
     let journal_summary = match request.journal {
         Some((journal, path)) => {
@@ -340,6 +357,9 @@ pub type PathHook = Box<dyn FnOnce(&Path)>;
 /// A test hook given each path it is reached for.
 #[cfg(test)]
 pub type PathsHook = Box<dyn Fn(&Path)>;
+/// A test hook given the name of each metadata read it runs before.
+#[cfg(test)]
+pub type ReadHook = Box<dyn FnMut(&str)>;
 /// Test seams of the supervisor's finalize; each is `#[cfg(test)]`.
 #[cfg(test)]
 #[derive(Default)]
@@ -359,6 +379,8 @@ pub struct Seams {
     pub open_errors: std::collections::BTreeMap<PathBuf, i32>,
     /// Runs once after `finalize_top` returned, before step S.
     pub before_sync: Option<Box<dyn FnOnce()>>,
+    /// `FinalizeTop::before_meta_read` of the next `finalize_top` call.
+    pub before_meta_read: Option<ReadHook>,
     /// Runs once after S took a lower's entry lock, before its re-check.
     pub after_lower_lock: Option<PathHook>,
     /// Runs between a regular file's listing and its open in step S.
@@ -555,9 +577,12 @@ impl<M: Mounter> Supervisor<M> {
         let records = self.recorded_lowers(&id)?;
         let layers = lowers::recorded_layers(&records).map_err(lower_changed)?;
         self.lowers_preflight(records.iter().map(|record| record.path.as_path()))?;
-        // Step 4: `erofs_denied` while the child serves, then the stop.
+        // Step 4: `erofs_denied` while the child serves, within
+        // `finalize_wait()` as the child's exit, the root flock and S's entry
+        // locks are (a child that does not answer holds the serial serve loop
+        // no longer), then the stop.
         if attempt.status != "finalizing" || self.mounter.child_alive(&attempt) {
-            if let Ok(denied) = self.mounter.status(&attempt) {
+            if let Ok(denied) = self.mounter.status(&attempt, self.finalize_wait()) {
                 self.state_mut(&id).finalize.erofs_denied = Some(denied);
             }
         }
@@ -652,6 +677,8 @@ impl<M: Mounter> Supervisor<M> {
                     }),
                     manifest: &manifest,
                     journal: journaled.then_some((journal.as_path(), summary.as_path())),
+                    #[cfg(test)]
+                    before_meta_read: self.seams.before_meta_read.take(),
                 },
                 &mut progress,
             );
