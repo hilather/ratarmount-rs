@@ -23,6 +23,12 @@ fn invalid(message: impl Into<String>) -> ApiError {
     ApiError::new("invalid_request", message)
 }
 
+/// An `io` error that names its step and path: no sandbox error is a bare io
+/// error (Keystone note (1)).
+pub(super) fn io_error(step: &str, path: &Path, error: impl std::fmt::Display) -> ApiError {
+    ApiError::new("io", format!("{step}: {}: {error}", path.display()))
+}
+
 pub fn validate_name(name: &str) -> Result<()> {
     if name.len() > 128
         || !name
@@ -38,7 +44,7 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn private_dir(path: &Path) -> Result<()> {
+pub(super) fn private_dir(path: &Path) -> Result<()> {
     {
         let __inventory_condition_1232 = {
             #[expect(
@@ -314,10 +320,10 @@ pub struct Supervisor<M: Mounter> {
     pub root: PathBuf,
     pub mounter: M,
     pub attempts: BTreeMap<String, Attempt>,
-    bases: BTreeMap<String, Base>,
-    ram_root: Option<PathBuf>,
+    pub(super) bases: BTreeMap<String, Base>,
+    pub(super) ram_root: Option<PathBuf>,
     max_attempts: usize,
-    timeout: Duration,
+    pub(super) timeout: Duration,
     pub stopping: bool,
     pub requests: RequestLog,
     /// Layered attempts: `None` from before the spawn until the re-check once
@@ -327,9 +333,63 @@ pub struct Supervisor<M: Mounter> {
     /// Decoded bytes the bundle lowers of one `new` share
     /// (`lowers::MAX_BUNDLE_DECODED_BYTES`; tests lower it).
     pub lower_decode_budget: u64,
+    /// What R1c-1 keeps per live attempt (§5.7): its instance and plan,
+    /// written before its spawn, and its finalize state. `destroy` removes
+    /// it with the attempt, so an ID drawn again starts clean.
+    pub attempt_state: BTreeMap<String, AttemptState>,
+    /// Keys of the attempt instances (OS-seeded) and a counter that only
+    /// increases: an instance is never derived from an ID, a time or an
+    /// inode number.
+    instance_keys: std::collections::hash_map::RandomState,
+    instance_counter: u64,
+    /// Devices a failed fsync of step S or of the commit poisoned (§5.6):
+    /// every later finalize that would sync anything there answers `io`
+    /// until a restart. Never persisted.
+    pub poisoned: std::collections::BTreeSet<u64>,
+    /// This run's retained attempts (§5.7), by ID.
+    pub retained: BTreeMap<String, super::retained::RetainedEntry>,
+    pub retained_log: super::retained::RetainedLog,
+    /// Names found under `retained/` at start without a live record: kept,
+    /// held and never served.
+    pub bare_retained: std::collections::BTreeSet<String>,
+    /// `--max-retained` (set after `open`; `retained::MAX_RETAINED` by default).
+    pub max_retained: usize,
     #[cfg(test)]
     pub test_ids: Option<TestIds>,
+    #[cfg(test)]
+    pub seams: super::finalize::Seams,
     _lock: File,
+}
+
+/// What the supervisor keeps per live attempt ID (R1c-1 §5.7).
+#[derive(Default)]
+pub struct AttemptState {
+    /// 32 lowercase hex digits drawn at `new`; with the ID it names one
+    /// attempt (ruling 5).
+    pub instance: String,
+    /// Created with `retain`.
+    pub retain: bool,
+    /// Created with a journal (`attempts/ID/journal.jsonl`).
+    pub journal: bool,
+    /// The IDs whose `retained/<ID>/overlay` it took as lowers, in order.
+    pub over: Vec<String>,
+    pub finalize: FinalizeState,
+}
+
+/// A finalize's progress across its tries (§5.4).
+#[derive(Default)]
+pub struct FinalizeState {
+    pub progress: super::finalize::FinalizeProgress,
+    /// The first `bytes_written` measurement.
+    pub bytes_written: Option<u64>,
+    /// The last `erofs_denied` read while the child served.
+    pub erofs_denied: Option<u64>,
+    /// The stop answered `Detaching`: a retry checks the child once.
+    pub detaching: bool,
+    /// The journal-shutdown refusal of step 4b, answered to every retry.
+    pub journal_failure: Option<String>,
+    /// The report of a finalized attempt.
+    pub report: Option<Value>,
 }
 
 /// Consecutive reserved attempt-ID draws before a `new` gives up (§5.6).
@@ -394,6 +454,9 @@ impl<M: Mounter> Supervisor<M> {
         }
         // Refusals of the request log come before reconcile touches attempts.
         let requests = RequestLog::open(&root, requests::limits())?;
+        // Then `retained/` and its log, also before reconcile, which never
+        // enters `retained/` (R1c-1 §5.7; R1c-2's recovery plugs in here).
+        let (retained_log, bare_retained) = Self::open_retained(&root)?;
         let mut supervisor = Self {
             root,
             mounter,
@@ -406,14 +469,79 @@ impl<M: Mounter> Supervisor<M> {
             requests,
             taken_lowers: BTreeMap::new(),
             lower_decode_budget: lowers::MAX_BUNDLE_DECODED_BYTES,
+            attempt_state: BTreeMap::new(),
+            instance_keys: Default::default(),
+            instance_counter: 0,
+            poisoned: Default::default(),
+            retained: BTreeMap::new(),
+            retained_log,
+            bare_retained,
+            max_retained: super::retained::MAX_RETAINED,
             #[cfg(test)]
             test_ids: None,
+            #[cfg(test)]
+            seams: Default::default(),
             _lock: guard,
         };
         supervisor.reconcile()?;
+        // Every attempt is gone now; only a retained attempt's target still
+        // exists: its finalize records stay pinned (approval note (a)). A live
+        // record pins its ID and instance; a bare name every instance.
+        let pins = requests::Pins {
+            targets: supervisor
+                .retained_log
+                .live_ids()
+                .filter_map(|id| supervisor.retained_log.live(id))
+                .map(|record| requests::Target {
+                    id: record.id.clone(),
+                    instance: record.instance.clone(),
+                })
+                .collect(),
+            ids: supervisor.bare_retained.iter().cloned().collect(),
+        };
+        supervisor.requests.set_pins(pins);
         // Every attempt is gone now, so a request a restart cut off is resolved.
         supervisor.requests.resolve_interrupted()?;
         Ok(supervisor)
+    }
+
+    /// A fresh attempt instance (ruling 5): 32 lowercase hex digits from two
+    /// hashes, under the supervisor's OS-seeded keys, of a counter that only
+    /// increases.
+    fn draw_instance(&mut self) -> String {
+        use std::hash::BuildHasher;
+        self.instance_counter += 1;
+        let counter = self.instance_counter;
+        format!(
+            "{:016x}{:016x}",
+            self.instance_keys.hash_one((counter, 0u8)),
+            self.instance_keys.hash_one((counter, 1u8))
+        )
+    }
+
+    /// The target of the live attempt `id`, if it is one.
+    pub(super) fn attempt_target(&self, id: &str) -> Option<requests::Target> {
+        self.attempts.get(id)?;
+        self.attempt_state.get(id).map(|state| requests::Target {
+            id: id.into(),
+            instance: state.instance.clone(),
+        })
+    }
+
+    /// Ruling 7: finalize and retain run on Linux only. `serve` refuses to
+    /// start elsewhere already; this guards in-process callers.
+    pub(super) fn platform_rule(&self) -> Result<()> {
+        #[cfg(test)]
+        let linux = cfg!(target_os = "linux") && !self.seams.not_linux;
+        #[cfg(not(test))]
+        let linux = cfg!(target_os = "linux");
+        if linux {
+            Ok(())
+        } else {
+            Err(invalid(
+                "finalize and retain are supported on Linux only; the sandbox supervisor is Linux only",
+            ))
+        }
     }
 
     #[cfg(test)]
@@ -435,7 +563,7 @@ impl<M: Mounter> Supervisor<M> {
         renamed
     }
 
-    fn indexes(&self, base: &str) -> PathBuf {
+    pub(super) fn indexes(&self, base: &str) -> PathBuf {
         self.root.join("indexes").join(base)
     }
 
@@ -464,7 +592,9 @@ impl<M: Mounter> Supervisor<M> {
                 return Err(invalid("unsafe stale mountpoint"));
             }
             self.mounter.cleanup(&path)?;
-            fs::remove_dir_all(entry.path())?;
+            // Through descriptors: a sealed attempt has no write bits.
+            crate::overlay_pack::remove_tree(&entry.path())
+                .map_err(|e| io_error("reconcile: removing a stale attempt", &entry.path(), e))?;
         }
         if let Some(ram) = &self.ram_root {
             if ram.exists() {
@@ -477,16 +607,20 @@ impl<M: Mounter> Supervisor<M> {
                         .map_err(|_| invalid("invalid RAM attempt name"))?;
                     validate_name(&id)?;
                     private_dir(&entry.path())?;
-                    fs::remove_dir_all(entry.path())?;
+                    crate::overlay_pack::remove_tree(&entry.path()).map_err(|e| {
+                        io_error("reconcile: removing a stale RAM overlay", &entry.path(), e)
+                    })?;
                 }
             }
         }
         Ok(())
     }
 
+    /// Polls `starting` and `ready` attempts only: a `crashed` one stays
+    /// crashed, and `finalizing` and `finalized` ones belong to finalize.
     pub fn supervise(&mut self) {
         for attempt in self.attempts.values_mut() {
-            if attempt.status == "crashed" {
+            if !matches!(attempt.status.as_str(), "starting" | "ready") {
                 continue;
             }
             match self.mounter.poll(attempt) {
@@ -505,6 +639,11 @@ impl<M: Mounter> Supervisor<M> {
         self.supervise();
         let operation = match operation.into() {
             Op::V1(operation) => operation,
+            Op::V2(OperationV2::Finalize {
+                id,
+                pack,
+                request_id,
+            }) => return self.finalize(id, pack, request_id),
             Op::V2(
                 operation @ OperationV2::New {
                     request_id: Some(_),
@@ -520,6 +659,7 @@ impl<M: Mounter> Supervisor<M> {
                 request_id: None,
                 lowers,
                 journal,
+                retain,
             }) => {
                 return self
                     .new_attempts(
@@ -530,11 +670,13 @@ impl<M: Mounter> Supervisor<M> {
                         readonly_globs,
                         &lowers,
                         journal.as_ref(),
+                        retain,
                         None,
                     )
                     .map(|(_, result)| result)
                     .map_err(|failed| failed.error)
             }
+            Op::V2(OperationV2::List { base, all: true }) => return self.list_all(base),
             Op::V2(operation) => operation.into_v1(),
         };
         match operation {
@@ -586,6 +728,7 @@ impl<M: Mounter> Supervisor<M> {
                     readonly_globs,
                     &[],
                     None,
+                    false,
                     None,
                 )
                 .map(|(_, result)| result)
@@ -601,10 +744,10 @@ impl<M: Mounter> Supervisor<M> {
                     .collect::<Vec<_>>()))
             }
             Operation::Diff { id, git } => {
-                let attempt = self.attempt(&id)?.clone();
+                let (attempt, records) = self.served(&id)?;
                 // A layered attempt is rendered against base + lowers, never
                 // against the bare base (§5.5).
-                let layers = match self.taken_lowers.get(&id) {
+                let layers = match records {
                     None => Vec::new(),
                     Some(None) => {
                         return Err(ApiError::new(
@@ -612,15 +755,36 @@ impl<M: Mounter> Supervisor<M> {
                             format!("lower stack of attempt {id} was never verified; destroy it"),
                         ))
                     }
-                    Some(Some(records)) => lowers::recorded_layers(records)
+                    Some(Some(records)) => lowers::recorded_layers(&records)
                         .map_err(|e| ApiError::new("diff_failed", e))?,
                 };
                 let deleted = self.mounter.deleted_paths(&attempt)?;
-                let base = self.base(&attempt.base)?;
-                let source = open_base(base, &self.indexes(&base.name))?;
-                let composed =
-                    ratarmount_compositing::compose_stack(source.source.clone(), &layers)
-                        .map_err(|e| ApiError::new("diff_failed", e.to_string()))?;
+                let base = self.base(&attempt.base)?.clone();
+                let indexes = self.indexes(&base.name);
+                // A finalized or retained attempt is read offline, after its
+                // base was classified and gated (which writes nothing), as
+                // the CLI `diff` gates (R1c-1 §5.7).
+                let (_keep, source) = if matches!(attempt.status.as_str(), "finalized" | "retained")
+                {
+                    let classified = super::finalize::classify_supervised(&base, &indexes)
+                        .map_err(|e| ApiError::new("base_open_failed", e))?;
+                    let recorded =
+                        ratarmount_compositing::OverlayMeta::read_no_recovery(&attempt.overlay_dir)
+                            .map_err(|e| ApiError::new("diff_failed", e.to_string()))?;
+                    crate::overlay_cmd::gate_base(
+                        &attempt.overlay_dir,
+                        recorded.as_ref(),
+                        &classified,
+                        &crate::overlay_cmd::BaseIdentityArgs::default(),
+                    )
+                    .map_err(|e| ApiError::new("diff_failed", e))?;
+                    let source = classified.source();
+                    (Some(classified), source)
+                } else {
+                    (None, open_base(&base, &indexes)?.source)
+                };
+                let composed = ratarmount_compositing::compose_stack(source, &layers)
+                    .map_err(|e| ApiError::new("diff_failed", e.to_string()))?;
                 let patch = crate::diff::render_source(
                     &crate::diff::DiffArgs {
                         directory: attempt.overlay_dir.clone(),
@@ -636,13 +800,20 @@ impl<M: Mounter> Supervisor<M> {
                 Ok(serde_json::Value::Object(response))
             }
             Operation::Stats { id } => {
-                let attempt = self.attempt(&id)?.clone();
+                let (attempt, _) = self.served(&id)?;
                 let stats = if let Some(deleted) = self.mounter.deleted_paths(&attempt)? {
+                    // Named, never a bare io error (Keystone note (1)).
+                    let usage = ratarmount_compositing::OverlayUsage::scan(&attempt.overlay_dir)
+                        .map_err(|e| {
+                            io_error(
+                                &format!("stats of attempt {id}: scanning its overlay"),
+                                &attempt.overlay_dir,
+                                e,
+                            )
+                        })?;
                     crate::overlay_stats::render(
                         ratarmount_compositing::OverlayStats {
-                            usage: ratarmount_compositing::OverlayUsage::scan(
-                                &attempt.overlay_dir,
-                            )?,
+                            usage,
                             files_deleted: deleted.len() as u64,
                         },
                         true,
@@ -700,10 +871,16 @@ impl<M: Mounter> Supervisor<M> {
             request_id: Some(id),
             lowers,
             journal,
+            retain,
         } = &operation
         else {
             unreachable!("only a v2 new with a request_id is routed here");
         };
+        // Ruling 7, before anything is looked up or recorded: it needs only
+        // the request body.
+        if *retain {
+            self.platform_rule()?;
+        }
         // A malformed ID is refused before anything is recorded.
         validate_name(id).map_err(|_| {
             invalid("request_id must start with an ASCII letter or digit, then letters, digits, dot, underscore or hyphen (max 128)")
@@ -730,6 +907,7 @@ impl<M: Mounter> Supervisor<M> {
             readonly_globs.clone(),
             lowers,
             journal.as_ref(),
+            *retain,
             Some((id, &hash)),
         );
         self.requests.finish(id, &hash, outcome)
@@ -774,12 +952,12 @@ impl<M: Mounter> Supervisor<M> {
         Ok(())
     }
 
-    fn base(&self, name: &str) -> Result<&Base> {
+    pub(super) fn base(&self, name: &str) -> Result<&Base> {
         self.bases
             .get(name)
             .ok_or_else(|| ApiError::new("not_found", "unknown base"))
     }
-    fn attempt(&self, id: &str) -> Result<&Attempt> {
+    pub(super) fn attempt(&self, id: &str) -> Result<&Attempt> {
         self.attempts
             .get(id)
             .ok_or_else(|| ApiError::new("not_found", "unknown attempt"))
@@ -828,8 +1006,13 @@ impl<M: Mounter> Supervisor<M> {
         readonly: Vec<String>,
         lowers: &[String],
         journal: Option<&JournalSpec>,
+        retain: bool,
         request: Option<(&str, &str)>,
     ) -> requests::Outcome {
+        if retain {
+            // Ruling 7: before anything is resolved (an ID-less `new`).
+            self.platform_rule()?;
+        }
         let base = self.base(name)?.clone();
         if count == 0 || count > self.max_attempts.saturating_sub(self.attempts.len()) {
             return Err(ApiError::new(
@@ -853,6 +1036,12 @@ impl<M: Mounter> Supervisor<M> {
         ratarmount_compositing::ReadOnlyGlobs::with_allow(&readonly, &base.options.allow_globs)
             .map_err(|e| invalid(e.to_string()))?;
         let indexes = self.indexes(name);
+        // R1c-1 §5.5: the scope, platform and durability rules of `retain`,
+        // before any lower is read, the RAM root, any attempt directory or
+        // child.
+        if retain {
+            self.retain_preflight(&base, overlay, count)?;
+        }
         // Before the RAM root, any attempt directory or child (§5.2).
         let layered = if lowers.is_empty() {
             Vec::new()
@@ -863,10 +1052,17 @@ impl<M: Mounter> Supervisor<M> {
                 &lowers::Roots {
                     state: &self.root,
                     ram: self.ram_root.as_deref(),
+                    retained: Some(&self.retained_lowers()),
                 },
                 self.lower_decode_budget,
             )?
         };
+        // The retained attempts the stack names, by the paths requested
+        // (ruling 3: never by digest).
+        let over = self.over(&layered);
+        if retain {
+            self.retain_lower_preflight(&base, &layered, &over)?;
+        }
         let lower_paths: Vec<PathBuf> = layered.iter().map(|lower| lower.path.clone()).collect();
         if !layered.is_empty() || journal.is_some() {
             // The parser takes these, but no argv can carry them: spawning
@@ -912,6 +1108,7 @@ impl<M: Mounter> Supervisor<M> {
             self.record_preflight(request, name, count, ram.as_deref())?;
         }
         let mut ids = Vec::new();
+        let held = self.held();
         let deadline = Instant::now() + self.timeout;
         let result = (|| {
             for _ in 0..count {
@@ -935,7 +1132,9 @@ impl<M: Mounter> Supervisor<M> {
                     #[cfg(test)]
                     let dir = self.test_attempt_dir(dir);
                     let drawn = dir.file_name().and_then(|name| name.to_str());
-                    if !drawn.is_some_and(|id| self.requests.is_reserved(id)) {
+                    // Also never an ID a retained record or name holds
+                    // (R1c-1 §5.7).
+                    if !drawn.is_some_and(|id| self.requests.is_reserved(id) || held.contains(id)) {
                         break dir;
                     }
                     // Still empty, and never recorded as an attempt.
@@ -963,6 +1162,23 @@ impl<M: Mounter> Supervisor<M> {
                 if !layered.is_empty() {
                     self.taken_lowers.insert(id.clone(), None);
                 }
+                // The attempt's instance and plan, before its spawn; its
+                // finalize records are never evicted while it exists.
+                let instance = self.draw_instance();
+                self.requests.pin(requests::Target {
+                    id: id.clone(),
+                    instance: instance.clone(),
+                });
+                self.attempt_state.insert(
+                    id.clone(),
+                    AttemptState {
+                        instance,
+                        retain,
+                        journal: journal.is_some(),
+                        over: over.clone(),
+                        finalize: Default::default(),
+                    },
+                );
                 self.attempts.insert(id, attempt.clone());
                 private_dir(&attempt.path)?;
                 private_dir(&attempt.overlay_dir)?;
@@ -1090,15 +1306,34 @@ impl<M: Mounter> Supervisor<M> {
     }
 
     pub fn destroy(&mut self, id: &str) -> Result<()> {
+        // A retained attempt, or an ID a retained record holds, is never
+        // destroyed (R1c-1 §5.6).
+        self.refuse_retained_destroy(id)?;
         let attempt = self.attempt(id)?.clone();
         self.mounter.cleanup(&attempt.path)?;
-        if attempt.overlay_dir.exists() {
-            fs::remove_dir_all(&attempt.overlay_dir)?;
+        let root = attempt.path.parent().expect("attempt root");
+        // A RAM overlay lives outside the attempt root. Removal goes through
+        // descriptors: a finalized (sealed) tree has no write bits.
+        if !attempt.overlay_dir.starts_with(root) {
+            crate::overlay_pack::remove_tree(&attempt.overlay_dir).map_err(|e| {
+                io_error(
+                    &format!("destroy of attempt {id}: removing its overlay"),
+                    &attempt.overlay_dir,
+                    e,
+                )
+            })?;
         }
         // The attempt root holds its journal.jsonl too.
-        fs::remove_dir_all(attempt.path.parent().expect("attempt root"))?;
+        crate::overlay_pack::remove_tree(root)
+            .map_err(|e| io_error(&format!("destroy of attempt {id}: removing it"), root, e))?;
         self.attempts.remove(id);
         self.taken_lowers.remove(id);
+        if let Some(state) = self.attempt_state.remove(id) {
+            self.requests.unpin(&requests::Target {
+                id: id.into(),
+                instance: state.instance,
+            });
+        }
         Ok(())
     }
 
@@ -1137,6 +1372,33 @@ fn verify_tmpfs(path: &Path) -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn verify_tmpfs(_path: &Path) -> Result<()> {
     Err(ApiError::new("unsupported", "tmpfs overlays require Linux"))
+}
+
+/// The filesystem type (`fstatfs` `f_type`) of a descriptor, which
+/// finalize's durability rule judges (R1c-1 §5.5, §5.6).
+#[cfg(target_os = "linux")]
+pub(super) fn fs_type(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<i64> {
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: fstatfs fills the zeroed struct for a live descriptor.
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    #[allow(clippy::unnecessary_cast)]
+    Ok(fs_magic(stat.f_type as i64))
+}
+
+/// A filesystem magic from `statfs`'s `f_type`: its low 32 bits. On 32-bit
+/// glibc `f_type` is an `i32`, so a magic with the top bit set (btrfs's
+/// `0x9123683E`) arrives sign-extended. Only the Linux `fs_type` reads it.
+#[allow(dead_code)]
+pub(super) fn fs_magic(raw: i64) -> i64 {
+    i64::from(raw as u32)
+}
+/// Off Linux the type is unknown, which the allowlist refuses (finalize is
+/// Linux only, and refused before this is reached).
+#[cfg(not(target_os = "linux"))]
+pub(super) fn fs_type(_fd: std::os::fd::BorrowedFd<'_>) -> io::Result<i64> {
+    Ok(super::finalize::UNKNOWN_FS)
 }
 
 fn absolute_source(source: &str) -> Result<String> {
@@ -1200,8 +1462,11 @@ fn check_spawn_args(base: &Base, indexes: &Path, spec: &SpawnSpec<'_>) -> Result
 }
 use std::ffi::OsString;
 
-fn open_base(base: &Base, indexes: &Path) -> Result<factory::MountBundle> {
-    let mut options = ratarmount_core::OpenOptions {
+/// The options the supervisor opens a base with, for `diff` and `stats` and
+/// for finalize's classification: the read-only prepared index, no journal
+/// recovery, no GNU incremental decoding.
+pub(super) fn base_open_options(base: &Base, indexes: &Path) -> ratarmount_core::OpenOptions {
+    ratarmount_core::OpenOptions {
         index_folders: vec![indexes.into()],
         write_index: false,
         read_only_index: true,
@@ -1211,7 +1476,11 @@ fn open_base(base: &Base, indexes: &Path) -> Result<factory::MountBundle> {
         recursion_depth: base.options.recursive.then_some(-1),
         gnu_incremental: Some(false),
         ..Default::default()
-    };
+    }
+}
+
+fn open_base(base: &Base, indexes: &Path) -> Result<factory::MountBundle> {
+    let mut options = base_open_options(base, indexes);
     let binds = base
         .options
         .binds
@@ -1282,7 +1551,13 @@ fn send(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-pub fn serve(socket: &Path, root: &Path, limit: usize, timeout: Duration) -> Result<()> {
+pub fn serve(
+    socket: &Path,
+    root: &Path,
+    limit: usize,
+    timeout: Duration,
+    max_retained: usize,
+) -> Result<()> {
     if !cfg!(target_os = "linux") {
         return Err(ApiError::new(
             "unsupported",
@@ -1299,6 +1574,8 @@ pub fn serve(socket: &Path, root: &Path, limit: usize, timeout: Duration) -> Res
         timeout,
         ProcessMounter::new(std::env::current_exe()?),
     )?;
+    // `Supervisor::open`'s signature is R1a's; the cap is set after it.
+    supervisor.max_retained = max_retained;
     crate::overlay_commit::install_term_signal_flag();
     let mut connections: Vec<Connection> = Vec::new();
     while !supervisor.stopping && !crate::overlay_commit::term_requested() {

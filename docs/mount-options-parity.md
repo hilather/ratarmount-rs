@@ -68,7 +68,7 @@ the [N-worker recipe and compatibility limits](sandbox.md#prepare-once-n-writabl
 | `overlay info\|seal\|unseal\|verify\|fsck\|import\|import-upperdir\|pack\|unpack` | no | **added** (offline layer identity, integrity, import and transport) | `[x]` Rust-only |
 | `journal summarize\|mark` | no | **added** (operation summaries and root-xattr turn markers) | `[x]` Rust-only |
 | `sandbox run` | no | **added** (container attempt, cleanup, hash/manifest/journal report; optional seal/pack) | `[x]` Rust-only |
-| `sandbox daemon\|create-base\|new\|list\|diff\|stats\|destroy\|shutdown` | no | **added** (Linux supervisor; Unix socket and pure-Python client) | `[x]` Rust-only |
+| `sandbox daemon\|create-base\|new\|list\|diff\|stats\|finalize\|destroy\|shutdown` | no | **added** (Linux supervisor; Unix socket and pure-Python client; `finalize ID [--pack] [--request-id ID]` stops, seals, hashes and syncs an attempt; `new --retain` keeps finalized attempts in `retained/ID`, `list --all` lists them and `daemon --max-retained N` bounds them) | `[x]` Rust-only |
 | `snapshot GIT_BASE OUT.tar.zst [--with-index]` | no | **added** (deterministic committed tree export and optional mount index) | `[x]` Rust-only |
 | `snapshot add\|list` | no | **added** (external restic CLI wrapper) | `[x]` Rust-only |
 | `corpus MANIFEST MOUNTPOINT` | no | **added** (pinned repository collection) | `[x]` Rust-only |

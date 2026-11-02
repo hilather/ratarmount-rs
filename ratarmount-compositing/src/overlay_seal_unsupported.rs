@@ -43,6 +43,10 @@ impl SealOperation {
         Err(unsupported())
     }
 
+    pub fn acquire_until(_dir: &Path, _deadline: Option<std::time::Instant>) -> io::Result<Self> {
+        Err(unsupported())
+    }
+
     pub fn finish_if_sealed(&self) -> io::Result<Option<SealOutcome>> {
         Err(unsupported())
     }
@@ -80,6 +84,9 @@ mod tests {
             reseal(&record).unwrap_err(),
             unseal(dir.path()).unwrap_err(),
             SealOperation::acquire(dir.path()).err().unwrap(),
+            SealOperation::acquire_until(dir.path(), None)
+                .err()
+                .unwrap(),
             SealOperation.finish_if_sealed().unwrap_err(),
             SealOperation.seal(&base, source).unwrap_err(),
         ];

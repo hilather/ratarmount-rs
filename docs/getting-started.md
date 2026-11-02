@@ -174,7 +174,13 @@ including the safety rules and what happens on a crash, is in
 For a fleet sharing one immutable base/index, the Linux supervisor prepares it
 once at `create-base` and starts independent strict workers at `new --count N`.
 The [prepare-once recipe](sandbox.md#prepare-once-n-writable-workers) also shows
-direct CLI mounts and a remount without preparation.
+direct CLI mounts and a remount without preparation. Once an attempt's
+container has stopped, `sandbox finalize ID` unmounts it, seals and hashes its
+layer, syncs it and prints a report (`--pack` adds a bundle). An attempt
+created with `sandbox new --retain` is then kept in the state directory's
+`retained/ID`, where later attempts of the same daemon run can stack on it.
+[Finalize](sandbox.md#finalize) covers its scope (Linux; local TAR, directory
+and Git bases) and the storage it needs.
 
 A committed Git tree can become a portable base; sealed preparation layers can
 then be shared across independent writable attempts:

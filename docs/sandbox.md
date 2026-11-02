@@ -612,6 +612,15 @@ guard. Commit rechecks `layer_sealed` under the overlay lock before its first
 archive write. A seal that starts during commit waits, then either seals the
 completed base or refuses a changed base with a reopen/retry message.
 
+A sealed layer root's flock is also its entry lock, with three more holders: a
+`--lower` bundle cache hit holds it shared while it checks and verifies the
+cache entry; a cache fill or `overlay unpack` holds it exclusively across its
+rename and mode restore; and the sandbox supervisor's finalize holds it
+exclusively on each lower while it syncs that lower (see
+[durability](#durability)). An `overlay seal` or `unseal` aimed at a cache entry
+or a lower can therefore wait for them. On a cache filesystem without `flock`,
+fills and hits proceed without the lock, as before.
+
 Raw overlay directories (without an overlay database) take the same directory
 lock, including roots with mode `0555`. Seal holds the overlay lock through base
 resolution, digest calculation and publication, and never acquires the archive
@@ -2267,13 +2276,19 @@ batch (see [protocol version 2](#protocol-version-2)). Repeated `--lower PATH`
 `--journal-reads all|first` and `--journal-sync`, also send version 2 (see
 [lower stacks](#lower-stacks) and [journals](#journals)); the three journal
 options need `--journal`. Lower paths are sent unchanged: a relative one is
-refused by the daemon, never resolved by the client. Without these flags,
-`new` sends exactly the version 1 request. `--socket` works before or after the
-subcommand.
+refused by the daemon, never resolved by the client. `--retain` sends version 2
+too (see [retained attempts](#retained-attempts)). Without these flags, `new`
+sends exactly the version 1 request. `finalize ID [--pack] [--request-id ID]`
+(version 2, Linux only) prints the [finalize](#finalize) report, and
+`list --all` sends a version 2 `list` with `all`, which adds this run's retained
+attempts; without `--all`, `list` sends the version 1 request. `--socket` works
+before or after the subcommand.
 `daemon --timeout SECONDS` sets base-validation and batch-readiness deadlines
-(default 120, range 1–3600). The foreground daemon exits on `shutdown`, SIGINT
-or SIGTERM after destroying its attempts. Base definitions and warmed indexes
-remain available for the next daemon run.
+(default 120, range 1–3600); finalize waits for at most the smaller of it and
+10 s. `daemon --max-retained N` bounds retained attempts (default 4096, range
+0–4096; 0 refuses `retain`). The foreground daemon exits on `shutdown`, SIGINT
+or SIGTERM after destroying its attempts; retained attempts stay. Base
+definitions and warmed indexes remain available for the next daemon run.
 
 The state directory must be owned by the daemon user, mode 0700, and must not
 be a symlink. Its parent must already exist. Exclusive locks protect both the
@@ -2315,17 +2330,21 @@ are errors. Each request includes integer `version: 1` and an `op` string:
 | --- | --- |
 | `create_base` | Required `name`, `source`; optional `options` object. Validates by opening/indexing without mounting, then durably records and returns `{name,source,options}`. An existing name returns `already_exists`. |
 | `new` | Required `base`; `count` defaults to 1, `overlay` to `"disk"`; optional integer `quota` in bytes and `readonly_globs` string array. Returns an array of attempts only after all mounts are ready. |
-| `list` | Optional `base` filters the attempt array. Status is `"ready"` or `"crashed"` (`"starting"` is internal to setup). An unknown base is an error. |
-| `diff` | Required `id`; boolean `git` defaults to false. Returns `{"patch":"..."}` using the in-process diff renderer and the same composed base, including recursive sources and binds, and for an attempt started with version 2 `lowers`, the lowers it mounted. |
+| `list` | Optional `base` filters the attempt array. Status is `"ready"` or `"crashed"` (`"starting"` is internal to setup), and for an attempt a version 2 client [finalizes](#finalize), `"finalizing"` (from its unmount until the finalize completes) or `"finalized"`. Retained attempts are not listed (see version 2 `list` with `all`). An unknown base is an error. |
+| `diff` | Required `id`; boolean `git` defaults to false. Returns `{"patch":"..."}` using the in-process diff renderer and the same composed base, including recursive sources and binds, and for an attempt started with version 2 `lowers`, the lowers it mounted. A finalized or retained attempt is read offline after its base was classified and gated: a changed base is `diff_failed`. |
 | `stats` | Required `id`. Returns the same integer object as `overlay-stats --json`. |
-| `destroy` | Exactly one of `id` or `base`. Returns `{"destroyed":true}`. A base selector destroys its attempts, retaining its registered definition/indexes. Unknown IDs return `not_found`. |
-| `shutdown` | No additional fields. Destroys all attempts, returns `{"shutdown":true}`, and stops the daemon. If cleanup fails, returns an error and stays available for retry. Version 1 ignores extra fields on `shutdown`; version 2 refuses them. |
+| `destroy` | Exactly one of `id` or `base`. Returns `{"destroyed":true}`. A base selector destroys its attempts, keeping its registered definition/indexes and its retained attempts. A finalized attempt is destroyed with its bundle, manifest and journal summary. Unknown IDs return `not_found`; a [retained](#retained-attempts) attempt returns `retained`. |
+| `shutdown` | No additional fields. Destroys all attempts (retained attempts stay), returns `{"shutdown":true}`, and stops the daemon. If cleanup fails, returns an error and stays available for retry. Version 1 ignores extra fields on `shutdown`; version 2 refuses them. |
 
 An attempt is `{id,base,path,overlay_dir,status}`. Paths are absolute host paths;
 `path` is the writable merged mount and `overlay_dir` contains changed content
 and the overlay database. IDs are unique generated directory names; an ID that
-a stored request record names is never drawn again (after 16 such draws in a
-row `new` fails with `io`, "could not allocate a unique attempt ID"). Base names
+a stored answer names (a batch's attempts, the attempts a failed batch kept, a
+finalize report) is never drawn again, and neither is an ID a retained attempt
+or its record holds (after 16 such draws in a row `new` fails with `io`, "could
+not allocate a unique attempt ID"). A pending finalize names its attempt by ID
+and instance instead, so its attempt's ID may be drawn again after a `destroy`;
+that finalize never acts on the new attempt. Base names
 start with an ASCII letter or digit, followed by letters, digits, `.`, `_` or
 `-`, at most 128 characters. Source strings accept ordinary ratarmount inputs,
 including Git `repo.git@REV`, OCI URLs and restic snapshots. Relative local
@@ -2365,17 +2384,20 @@ Stable error codes include `invalid_request`, `unsupported_version`,
 `not_found`, `already_exists`, `capacity`, `in_use`, `unsafe_path`,
 `base_open_failed`, `mount_failed`, `timeout`, `unmount_failed`, `diff_failed`,
 `stats_failed`, `response_too_large`, `unsupported`, and `io`; version 2 adds
-`idempotency_conflict`, `interrupted` and `lower_changed`. Messages provide
+`idempotency_conflict`, `interrupted`, `lower_changed`, `writers_active`
+(finalize only) and `retained` (a `destroy` of a retained attempt, version 1
+included). Messages provide
 context and may change. Validation logs live in `indexes/BASE/prepare.log`;
 attempt diagnostics live in `attempts/ID/mount.log` until destroy. Failed-batch
 errors include a bounded excerpt of the failing mount's log when available.
 
 ### Protocol version 2
 
-Version 2 has the version 1 operations, fields and defaults, and `new` also
-takes a `request_id`. Field defaults never change within version 2; later
-releases only add fields, and a daemon refuses fields it does not know with
-`invalid_request`, so an older daemon fails closed on a newer client.
+Version 2 has the version 1 operations, fields and defaults; `new` also takes
+a `request_id`, `lowers`, a `journal` and `retain`, `list` takes `all`, and
+`finalize` exists only in version 2. Field defaults never change within version
+2; later releases only add fields, and a daemon refuses fields it does not know
+with `invalid_request`, so an older daemon fails closed on a newer client.
 
 - **Dispatch.** A request with integer `version: 2` is parsed as version 2 and
   answered in a version 2 envelope (`{"version":2,"ok":...}`), errors
@@ -2387,18 +2409,23 @@ releases only add fields, and a daemon refuses fields it does not know with
   answers every version 2 request with that `unsupported_version` envelope.
 - **Unknown fields** are refused on every version 2 operation, `shutdown`
   included (version 1's `shutdown` keeps ignoring them).
-- **Only `new` takes a `request_id`.** `create_base`, `destroy` and the other
-  operations take no request IDs; a `request_id` on them is an unknown field
-  (`invalid_request`).
+- **Only `new` and `finalize` take a `request_id`.** `create_base`, `destroy`
+  and the other operations take no request IDs; a `request_id` on them is an
+  unknown field (`invalid_request`).
 - **`request_id`** is a string with the base-name rules: 1–128 characters, an
   ASCII letter or digit first, then letters, digits, `.`, `_` or `-`. A
   malformed ID is `invalid_request` and writes nothing. `"request_id": null`
   is refused (`invalid_request`), never read as "no ID". Without a
-  `request_id`, `lowers` or `journal`, a version 2 `new` behaves as version
-  1's.
+  `request_id`, `lowers`, `journal` or `retain`, a version 2 `new` behaves as
+  version 1's.
 - **`lowers` and `journal`** (`new` only) stack sealed layers under every
   attempt and record a per-attempt operation journal; see
   [lower stacks](#lower-stacks) and [journals](#journals).
+- **`finalize` and `retain`** stop, seal and hash an attempt and keep it in
+  `retained/ID` (Linux only); see [finalize](#finalize),
+  [retained attempts](#retained-attempts) and [durability](#durability).
+- **`all`** (`list` only, default false) also lists this run's retained
+  attempts. Without it a version 2 `list` answers exactly as version 1's.
 
 ```json
 {"version":2,"op":"new","base":"task","count":8,"request_id":"task-17-pass-2"}
@@ -2414,6 +2441,8 @@ inside `journal`) and spelled-out defaults do not matter, but the order of
 same as none; `journal: {}` is not the same as no journal. Lower paths are
 compared exactly as sent: `/a/b` and `/a/b/` are different bodies, so the
 other spelling under the same ID is `idempotency_conflict`.
+
+For `new` the outcomes are these; [finalize](#finalize) has its own table.
 
 | Outcome of the first run | A retry with the same ID and body |
 | --- | --- |
@@ -2434,13 +2463,28 @@ outcome).
 Records are kept in `requests.jsonl` in the state directory, one synced line
 per state change: each executed or re-executed request with an ID costs two
 synced appends, refusals included. Replays, stored errors, conflicts and the
-refusals below append nothing. The file must be a private (0600), owned
-regular file with one link; it is opened without following symlinks.
+refusals below append nothing, and neither does a `finalize` refused before it
+names an attempt or retried after its attempt is gone (see [finalize](#finalize)).
+The file must be a private (0600), owned regular file with one link; it is
+opened without following symlinks.
 
 - **Bounded retry window.** At most 65,536 records and 64 MiB of them stay
   live; the oldest finished records are evicted first, and an evicted ID that
-  is retried runs as a new request. A `new` whose stored record would exceed
-  4 MiB is refused with `capacity` before any attempt exists (only reachable
+  is retried runs as a new request. A finalize record is never evicted while
+  the attempt it names exists: a live attempt, or a retained one, also after a
+  restart. When a new line would evict such a record, its line is appended
+  again first, unchanged, which moves it to the end of the window, so a
+  restart replays the file to exactly the records the daemon kept. When the
+  caps cannot be met without evicting one, a request that
+  would add a record (a `new` or `finalize` with a new `request_id`) is refused
+  with `capacity` and appends nothing ("the request log is full of records that
+  may not be evicted (…): finalize records whose attempts still exist, or
+  requests still running; destroy the attempts those finalize requests name,
+  then retry"). Records of destroyed attempts are evicted as before, so a retry
+  of a finalize whose attempt was destroyed long ago may run as a new request. A
+  retained attempt cannot be destroyed in this release, so the finalize records
+  that name it stay. A `new` whose stored record would exceed 4 MiB is refused
+  with `capacity` before any attempt exists (only reachable
   with very long state or tmpfs paths). The file is rewritten with only the
   live records once it is over 8 MiB and more than twice their size.
 - **A log that cannot be written.** If the `running` line cannot be written
@@ -2462,7 +2506,14 @@ regular file with one link; it is opened without following symlinks.
   request record is then lost (replays, conflicts and reserved attempt IDs),
   and a retry of an old ID runs as new, which cannot duplicate live attempts
   because the restart discarded them all. An older version 2 daemon refuses a
-  `new` with `lowers` or `journal` as an unknown field, a retry included.
+  `new` with `lowers` or `journal` as an unknown field, a retry included. A
+  daemon without `finalize` refuses it as an unknown operation, and `retain`
+  and `all` as unknown fields. It also refuses to start on a `requests.jsonl`
+  that holds finalize records (lines with `v: 2`), and cannot remove a sealed
+  (finalized) attempt tree when it restarts. To go back to such a daemon, start
+  this release once and `shutdown` it, which removes every attempt that is not
+  retained, then move `requests.jsonl` aside. The older daemon leaves
+  `retained/` and `retained.jsonl` on disk and does not serve them.
 
 #### Lower stacks
 
@@ -2613,8 +2664,9 @@ never verified; destroy it".
 (`<parent of path>/journal.jsonl`); clients never send a path. It lies outside
 the mountpoint and the overlay for disk and tmpfs tops, works with or without
 lowers, and is deleted with the attempt (`destroy`, `shutdown`, a restart), so
-summarize it first. `exclude` takes `--journal-exclude` globs (default none),
-`reads` is `all` (default) or `first`, and `sync` (default false) is
+summarize it first. A [retained](#retained-attempts) attempt keeps it, in
+`retained/ID/journal.jsonl`. `exclude` takes `--journal-exclude` globs
+(default none), `reads` is `all` (default) or `first`, and `sync` (default false) is
 `--journal-sync`. `journal` must be an object: `null`, an array, a scalar and
 unknown keys are refused; `journal: {}` is a journal with every default.
 `reads` must be one of the two strings (`{"first": null}` is refused). An
@@ -2637,7 +2689,428 @@ supervisor the journal never outlives its attempt either way: `destroy`,
 `shutdown` and a restart delete it, and a supervisor that dies takes its
 children with it (they get SIGKILL) before they flush. So `sync` matters only
 to a client that reads the journal of an attempt whose child ended and
-unmounted on its own, before it calls `destroy`.
+unmounted on its own, before it calls `destroy`. A [finalize](#finalize) makes
+the journal durable with the rest of the attempt.
+
+#### Finalize
+
+```json
+{"version":2,"op":"finalize","id":"attempt-ABC123","pack":true,"request_id":"task-17-final"}
+```
+
+`finalize` stops an attempt, checks, seals and hashes its writable top as a
+layer over the base and the attempt's lowers, optionally packs it, makes
+everything the attempt references durable (see [durability](#durability)) and
+returns a report. `id` is required. `pack` (default false) also writes
+`attempts/ID/bundle.tar.zst`, as `overlay pack` does, including the attempt's
+journal when it has one. `request_id` makes a retry safe (below). The CLI is
+`ratarmount sandbox finalize ID [--pack] [--request-id ID]`, which prints the
+report, or the JSON error with exit status 1. Version 1 has no `finalize`.
+
+**Platform.** The supervisor runs on Linux only (the daemon does not start
+elsewhere); finalize and retain are also refused by the supervisor itself. On
+any other platform a `finalize`, and a `new` with `retain`, answer
+`invalid_request` ("finalize and retain are supported on Linux only; the
+sandbox supervisor is Linux only") before anything is looked up, stopped or
+recorded.
+
+**Scope.** These refusals come before anything is stopped, all
+`invalid_request` unless noted:
+
+- **Base:** the source must be an absolute local path or a `git:///` URL,
+  without `binds` and not `recursive`, as for lowers, and the base must not be
+  registered with `git_synthetic_head` ("register the base without
+  git_synthetic_head to finalize or retain it").
+- **Archive:** a base whose source is a regular file must be a TAR archive,
+  plain or compressed (`.tar.zst`, `.tar.gz`), as the `backendName` of its
+  prepared index says: "base X is indexed by ZipMountSource, not as a TAR
+  archive; finalize and retain support TAR archives only". An index without a
+  backend name (a single compressed file) gives "base X has no TAR index; …",
+  and a missing or unreadable index "base X has no prepared index; …".
+  Directory and Git bases need no index.
+- **Attempt:** one still `starting` ("attempt ID is still starting; finalize it
+  once it is ready"), and a layered attempt whose re-check never passed ("lower
+  stack of attempt ID was never verified; destroy it"). A `crashed` attempt can
+  be finalized. An unknown `id` is `not_found`.
+- **Storage** that the [durability](#durability) rule refuses (also
+  `lower_changed` for a lower whose root has a write bit, and `io` for a
+  filesystem a failed fsync poisoned).
+
+**Steps.** Each try checks what an earlier try already did:
+
+1. The scope checks above and the storage checks of the attempt's own trees.
+   Then each lower the attempt took is read again: it must still be sealed with
+   the `layer_digest` and `sealed_at` the re-check recorded, else
+   `lower_changed`. Then the storage checks of the lowers.
+2. `erofs_denied` is read from the attempt's mount process while it serves.
+3. **The stop.** If the attempt's `path` is mounted, the supervisor runs its
+   unmount helper, `ratarmount -u -- PATH`, which runs a normal
+   `fusermount3 -u` and retries it for about a second while the kernel answers
+   busy. Finalize never unmounts lazily (`-z`), never forces and never signals
+   the mount process. The mount table then decides:
+   - Still mounted, and the helper's last line is the busy error:
+     `writers_active`, "attempt ID is still in use: its mount is busy (EBUSY);
+     stop every process using it (its container) and retry; nothing was
+     changed". The attempt stays mounted and keeps its status.
+   - Still mounted after any other failure (no `fusermount3`,
+     `Operation not permitted`, a helper that did not finish within 3 s):
+     `io`, "cannot unmount attempt ID: DETAIL; nothing was changed".
+   - Unmounted: the supervisor waits for the mount process to exit, up to the
+     smaller of `--timeout` and 10 s. If it keeps serving (another mount
+     namespace, such as a container's copy of the mount, holds it), the answer
+     is `writers_active`: "the mount process of attempt ID has not exited after
+     the unmount; another mount namespace (a container's copy of the mount) may
+     hold the attempt; stop it and retry". A retry after this answer checks the
+     process once and does not wait again.
+
+   From the unmount on, the attempt's status is `finalizing`.
+4. An attempt created with a `journal` finalizes only if its mount process
+   exited with status 0, whatever its status label; otherwise `io`, "the mount
+   process of attempt ID exited with STATUS; its operation journal may be
+   incomplete; destroy the attempt", which every later finalize of it answers
+   too. A missing `attempts/ID/journal.jsonl` is `io` as well.
+5. `bytes_written` is measured; the first measurement is kept.
+6. fsck repairs the top (a top an earlier try sealed is checked read-only) and
+   must find it clean. Then, under the top's overlay root lock, the base is
+   classified, gated against what the top recorded and composed with the
+   lowers, and the top is sealed; finalize takes no archive lock. A changed base
+   is refused with the gate's text (`io`) before anything is sealed, and a base
+   that cannot be opened (a pending commit journal on the archive included) is
+   `base_open_failed`.
+   An overlay root lock or overlay database still busy after the smaller of
+   `--timeout` and 10 s is `writers_active` ("the overlay of attempt ID is
+   locked or its database is busy (…); retry"). Sealing a top over an archive
+   base whose digest is `pending`, the normal state for a worker (see
+   [lower stacks](#lower-stacks)), first hashes the whole archive, once per
+   attempt, in the serve loop.
+7. With `pack`, the bundle is written once: a retry never packs again onto its
+   own bundle. Then the canonical hash (strict normalization, SHA-256),
+   `attempts/ID/manifest.jsonl` and, for a journaled attempt,
+   `attempts/ID/journal.summary.json` (both overwritten by a retry).
+8. The [durability](#durability) step.
+9. The attempt becomes `finalized` and keeps its report, its files and its
+   `--max-attempts` slot until `destroy`. An attempt created with `retain` is
+   committed to `retained/ID` instead (see [retained attempts](#retained-attempts)).
+
+A failure leaves the attempt resumable: fix the cause and finalize again.
+Nothing is undone, and what completed (the seal, the bundle, the first
+`bytes_written`) is kept.
+
+**Report:**
+
+| Field | Value |
+| --- | --- |
+| `status` | `"finalized"`, or `"retained"` for an attempt created with `retain` |
+| `attempt` | `{id,base,path,overlay_dir,status}` with its final paths (`retained/ID/…` once retained) |
+| `patch_hash` | As `sandbox run`'s: the fields of `diff --hash --json`, with strict normalization, SHA-256 and no excludes |
+| `layer_digest`, `sealed_at` | The seal |
+| `stack_digest` | The sealed top's stack digest |
+| `fsck_result` | `"ok"` or `"repaired:N"` |
+| `bytes_written` | The logical overlay payload size after the stop, as for `sandbox run` |
+| `erofs_denied` | The number of writes the read-only rules refused, from the last read while the mount process served; `null` if it was never read |
+| `manifest_path` | `attempts/ID/manifest.jsonl` |
+| `journal_summary` | `{path,files_read,files_read_then_written,files_written_blind}` of `attempts/ID/journal.summary.json`, or `null` without a journal |
+| `bundle` | `attempts/ID/bundle.tar.zst` with `pack`, else `null` |
+
+**Repeating a finalize.** A finalize of a `finalized` attempt runs the
+durability step again and returns the stored report. `pack: true` against a
+report without a bundle is `invalid_request` ("attempt ID was finalized without
+a bundle; run `ratarmount overlay pack` on its layer"), and a lower that changed
+or was removed since (a bundle cache entry a cleaner purged, for example) is
+`lower_changed`. So a repeated finalize is safe without a `request_id`.
+
+**Request IDs.** `finalize` takes a `request_id` like `new`, bound to its body
+(`id` and `pack`): another body is `idempotency_conflict`. The first try
+resolves `id` once, to the attempt with that ID and the random instance the
+attempt got at `new`, and records that target. A retry acts only on the
+recorded attempt and never resolves `id` again:
+
+| At the retry | A retry with the same ID and body |
+| --- | --- |
+| A try returned a report | Gets the stored report, byte for byte; nothing runs, not even the durability step. |
+| The last try failed (`writers_active`, `lower_changed`, `in_use`, `io`, …) and the recorded attempt still exists | Runs again on that attempt and resumes; if another finalize completed it meanwhile, the retry gets that stored report after the durability step. |
+| The recorded attempt is gone (destroyed, or discarded by a restart), also when a new attempt has drawn its ID since | `not_found`: "attempt ID that this request finalizes is gone (destroyed, or discarded by a restart); a retry never acts on another attempt of the same name". Nothing is appended, and every later retry answers the same. |
+| The recorded attempt was retained, and the daemon restarted since | The not-served `invalid_request` of [retained attempts](#retained-attempts); nothing is appended. |
+| A try was cut off by a supervisor restart | `interrupted`: "finalize was cut off by a supervisor restart before it finished; an attempt that was not retained was discarded, and a retained one is kept on disk". |
+
+Every finalize error is retryable, since nothing needs undoing; only a restart
+stores a failure. Two refusals write no record, unlike the "refusals included"
+rule above, because no attempt was targeted: a finalize whose `id` names no
+attempt (`not_found`) and one whose `id` names a retained record this daemon
+does not serve (`invalid_request`). Like a malformed ID and the platform
+refusal, they leave the request ID free. As for `new`, a replay returns the
+original answer, not the current state: a stored report still names an attempt
+that was destroyed since. Finalize records are kept in `requests.jsonl` as lines
+with `v: 2` and a `target` (`{"id":…,"instance":…}`) in every state; `new`
+records keep `v: 1`. A finalize's `done` record reserves its attempt's ID
+while it lives; its other records reserve nothing, because the recorded
+instance already tells a new attempt with the same ID apart.
+
+**`writers_active` and containers.** Finalize an attempt only after its
+container has stopped. `docker run -v` gives the container its own copy of the
+mount, so a premature finalize removes only the host mount: the attempt's
+`path` is gone for the harness, the answer is `writers_active` (the mount
+process has not exited), and the container keeps writing through the mount
+process. Once the container stops, a retry seals those writes too, but
+`erofs_denied` keeps the count of the last read while the mount process served,
+so denials the container caused after that read are missing from it. The serve
+loop answers one request at a time: a busy-mount answer holds it for up to 3 s
+(the helper's bound; its busy retries take about 1 s), and the first answer
+whose mount process does not exit after the unmount, or a locked overlay, for
+up to the smaller of `--timeout` and 10 s. On `writers_active`, wait at least
+1 s and back off. `destroy` keeps its own policy: it still unmounts lazily if
+it must and stops the mount process, also for a `finalizing` attempt.
+
+#### Retained attempts
+
+```json
+{"version":2,"op":"new","base":"task","count":4,"retain":true}
+{"version":2,"op":"list","all":true}
+```
+
+A version 2 `new` with `retain: true` (CLI `sandbox new --retain`, Python
+`new(..., retain=True)`) creates attempts that a successful finalize keeps: it
+commits the attempt into `retained/ID` in the state directory, answers a report
+with `"status":"retained"` and `retained/ID/…` paths, and the attempt leaves the
+attempts map. The commit is durable before it is acknowledged: the
+[durability](#durability) step, then a synced `retained.jsonl` record, then a
+rename of `attempts/ID` to `retained/ID` that never replaces anything, then a
+sync of `retained/` and `attempts/`. Until that last sync has completed, `list`
+with `all` shows the attempt as `finalizing`, it cannot be used as a lower,
+and a finalize of it runs the syncs again.
+
+A `new` with `retain` is refused before the RAM root, any attempt directory or
+any mount process exists, so a retry under the same `request_id` runs again:
+
+- `invalid_request`: a platform other than Linux; a base outside the
+  [finalize](#finalize) scope (binds, `recursive`, a source that is not local,
+  `git_synthetic_head`, an archive that is not TAR); `overlay: "tmpfs"`
+  ("retain needs a disk overlay: a RAM overlay lives outside attempts/ID, so the
+  commit could not move it into retained/"); storage that the
+  [durability](#durability) rule refuses, checked at `new` for `attempts/`,
+  `indexes/BASE/`, each directory lower and each bundle lower's cache directory
+  (or its deepest existing ancestor); and a bundle lower when neither
+  `XDG_CACHE_HOME` nor `HOME` is set.
+- `lower_changed`: a directory lower whose root has a write bit (with the
+  `ratarmount overlay seal` remedy).
+- `capacity`: past `--max-retained` ("retaining N more attempts would pass
+  --max-retained M (K IDs are held by retained records and attempts created
+  with retain)"), and when the attempt's future `retained.jsonl` line would be
+  longer than 64 KiB ("the retained record of this stack would take N bytes,
+  over its 65536-byte bound; use fewer or shorter lower paths").
+- `io`: while `retained.jsonl` cannot be written ("retained log unavailable
+  since …; restart the daemon"). A finalize of an attempt created with `retain`
+  answers the same, before its stop.
+
+`sandbox daemon --max-retained N` (default and maximum 4096; 0 refuses every
+`retain`) bounds the attempt IDs that retained records may hold. Each ID counts
+once: one with a live `retained.jsonl` record, a name under `retained/` without
+one, or a live attempt created with `retain`. A `new` needs room for its whole
+`count`. Retained attempts do not count toward `--max-attempts`.
+
+In the daemon run that retained it, a retained attempt:
+
+- is never destroyed: `destroy {id}` answers `retained` ("attempt ID is
+  retained; retained attempts are never destroyed"), in version 1 too, and
+  `destroy {base}`, `shutdown` and the daemon's exit leave it in place;
+- keeps its ID: no new attempt draws it;
+- is listed only by version 2 `list` with `"all": true` (`sandbox list --all`,
+  Python `list(all=True)`), after the attempts, in ID order and filtered by
+  `base` like them, with status `retained` (`finalizing` until its commit is
+  acknowledged). Version 1 `list`, and version 2 `list` without `all`, answer
+  as before;
+- answers `diff` and `stats` (version 1 included), read offline. `diff` of a
+  `finalized` or retained attempt first classifies and gates its base, so a
+  changed base is `diff_failed` and one that cannot be opened
+  `base_open_failed`;
+- answers `finalize` with its stored report, after the durability step ran
+  again;
+- can be a lower of a later `new` by exactly `<state>/retained/ID/overlay`, the
+  `attempt.overlay_dir` of its report, once its commit is acknowledged.
+  `retained/`, `retained/ID` and `retained/ID/overlay` must each be a real
+  directory, not a symlink, and every other path under the state directory,
+  `retained/ID/bundle.tar.zst` included, stays refused. Then every
+  [lower-stack](#lower-stacks) check applies: a layer retained over a directory
+  base records a `weak` base identity, which lowers refuse, while layers
+  retained over TAR and Git bases branch.
+
+**After a restart.** Retained trees survive a restart, and their IDs stay
+reserved and counted by `--max-retained`, but this release does not serve them:
+`list` omits them; `diff`, `stats` and `finalize` answer `invalid_request`
+("attempt ID has a retained record that this daemon does not serve: it was
+retained before a restart, or its commit did not complete; this release cannot
+serve it"), and so does a `new` that names one as a lower ("lower X: attempt ID
+is not a retained attempt this daemon serves (unknown, retained before a
+restart, or its commit not yet acknowledged)"); `destroy` answers `retained`.
+A later release adds restart recovery. A retain cut off between its
+`retained.jsonl` record and its rename leaves a live record that holds its ID
+and one `--max-retained` slot until then, so with `--max-retained 1` one such
+crash blocks every retain. This release has no operation that removes a
+retained attempt.
+
+**`retained.jsonl`** sits in the state directory beside `retained/` and is
+written like `requests.jsonl`: a private (0600), owned regular file with one
+link, opened without following symlinks, with synced appends and compaction.
+It holds one record per attempt ID. A `retained` line has `v` (1), `id`,
+`instance`, `t`, `base`, `layer_digest`, `sealed_at`, `prefix` (each lower's
+`path`, `layer_digest` and `sealed_at`, a bundle lower by its cache path),
+`over` (the retained attempts the attempt was stacked on, from the lower paths
+requested), `paths` (`overlay` and `bundle`) and the `report`. An `aborted`
+line (`v`, `id`, `t`) ends a record whose rename did not happen. A line is at
+most 64 KiB. At startup the file is synced and replayed: a torn last line is
+dropped, and damage before it, or a line from a later release, refuses the
+start ("moving it aside keeps every retained/ tree; the records restart
+recovery reads are lost"). A name under `retained/` that is not UTF-8 also
+refuses the start.
+
+**Limits:**
+- The operation journal's header (`mount`, `overlay`) and the layer's
+  `journal_path` metadata still name `attempts/ID/…` after the move.
+- A retained attempt's prefix names each bundle lower by its cache entry
+  (under `$XDG_CACHE_HOME/ratarmount/layers`, else
+  `~/.cache/ratarmount/layers`), which is disposable: cache cleaners purge it,
+  and a later finalize of the attempt then answers `lower_changed` (`diff`
+  answers `diff_failed`). Keep those cache entries while the attempt is
+  retained, or build layers meant to be retained as sealed directories with
+  `overlay unpack`.
+- The commit's rename needs a state filesystem with no-replace renames, which
+  ext4, xfs, btrfs and tmpfs have (OpenZFS before 2.2 does not). Without them
+  every retain fails with `io` at the rename, after the whole finalize ("… does
+  not support no-replace renames (use ext4, xfs, btrfs or tmpfs)").
+- For a retained attempt to survive a reboot, keep the state directory, the
+  bundle cache and every lower on persistent filesystems: `$XDG_RUNTIME_DIR`,
+  and often `/tmp`, are tmpfs.
+
+#### Durability
+
+Every finalize, with or without `retain`, makes everything the attempt
+references durable before it answers, each time, also a repeated finalize of a
+`finalized` or retained attempt. Only the replay of a stored `request_id`
+answer runs nothing. The durability step:
+
+1. **Each lower** the attempt's mount process took, bottom first, bundle cache
+   entries included, under the layer's entry lock (its overlay root lock, taken
+   exclusively). The lower's root must have no write bit, the lower must still
+   be sealed with the recorded `layer_digest` and `sealed_at`, and its path must
+   still name the locked directory ("lower X was replaced after its sync
+   started"), else `lower_changed`. Then each directory's files are synced,
+   then its subdirectories the same way, then the directory itself, ending with
+   the lower's root, and then the directory the lower sits in. A file or
+   directory with a write bit stops the step before its sync, also with
+   `lower_changed`: "lower X has a writable PATH, so it is not a completely
+   published or sealed layer; run `ratarmount overlay seal X`, which finishes an
+   interrupted seal or publication by restoring its sentinel and read-only
+   modes, then retry". All entry locks share one wait of up to the smaller of
+   `--timeout` and 10 s; a lock still held then answers `in_use` ("layer X is
+   locked by its publication, a cache hit, or a seal, unseal or commit of it;
+   retry").
+2. **The attempt's own trees:** `attempts/ID` (the overlay and its database,
+   the manifest, the summary, the journal and the bundle), a RAM `overlay_dir`,
+   and the base's prepared state `indexes/BASE/`.
+3. **Their ancestors:** each tree's parent and every directory above it on the
+   parent's filesystem, up to that filesystem's root, deepest first, each once.
+
+Every node is opened without following symlinks and checked on the descriptor
+that is synced: its type and inode must be those its listing showed, its device
+that of its tree's root, and its own filesystem (`fstatfs`) on the allowlist
+below. Symlinks, sockets, FIFOs and device nodes are not opened; their names
+are synced with their directory. Nothing below a tree's root is opened by host
+path, so host path length is no limit. The base is never synced: the caller
+syncs it (keeping it durable is the caller's job). `sandbox run` is excluded
+from this step: it shares finalize's seal and hash code but syncs nothing, its
+reports are unchanged, and a caller that needs its top, lowers or base durable
+syncs them itself.
+
+**Filesystems.** Finalize relies on the fsync of ext2/3/4, xfs and btrfs, and
+on tmpfs, which has no storage to lose. It refuses every other filesystem, for
+every tree and for the directory each tree sits in: overlayfs, whose fsync skips
+files that exist only in a lower layer (Docker's `overlay2` root filesystem
+included: use a volume); FUSE; network filesystems; read-only images
+(squashfs, erofs, iso9660), since nothing syncs the image file behind them; and
+other local filesystems such as ZFS, f2fs and bcachefs. Inside a container,
+keep the state directory, the bundle cache (`$XDG_CACHE_HOME/ratarmount/layers`,
+else `~/.cache/ratarmount/layers`) and every lower on a volume mounted at or
+above the directory that holds them. A lower mounted as its own volume
+(`-v /srv/layers/A:/layers/A`) under an overlayfs root is refused, because its
+parent `/layers` is synced too; mount `-v /srv/layers:/layers` instead.
+
+**Checked before anything stops.** Finalize checks the storage before its stop,
+and a `new` with `retain` before anything starts; a plain attempt on such
+storage learns it only at finalize. Each refusal is `invalid_request` naming
+the path:
+
+- a tree, or the directory it sits in, on a refused filesystem: "PATH is on
+  overlayfs, whose fsync finalize cannot rely on (…); keep the state directory,
+  the bundle cache and every lower, and the directory each one sits in, on
+  ext4, xfs, btrfs or tmpfs (inside a container, a volume mounted at or above
+  that directory)", prefixed for the parent with "the directory P that T sits
+  in, which finalize syncs too:";
+- a tree, or a directory between a tree and its filesystem's root, that the
+  daemon cannot open: "PATH cannot be opened: …", for a directory above a tree
+  followed by "finalize syncs every directory above the state directory, the
+  bundle cache and each lower on the same filesystem, so each must be
+  readable". Each of them must be readable by the daemon user, including a
+  mode-0711 parent, which a `new` with lowers accepts;
+- a mount inside a tree: "PATH has a mount inside it at M; finalize syncs only
+  trees that lie wholly on one filesystem", and a mount below the attempt's own
+  mount point: "M is mounted inside attempt mount point P: unmount M first;
+  finalize never unmounts it for you".
+
+A lower whose root has a write bit is `lower_changed` with the `overlay seal`
+remedy, and a filesystem poisoned earlier (below) is `io`.
+
+**Refused while syncing.** The checks run again on every descriptor that is
+synced. A node on another device than its tree (a mount or a bind-mounted file
+inside the tree, an overlayfs whose layers are on different filesystems, a
+btrfs subvolume nested in a directory lower; "PATH is on device D2, not on the
+filesystem of its tree (device D1); finalize syncs only trees that lie wholly on
+one filesystem, …"), a node on a filesystem off the allowlist, or a node
+replaced while it was synced ("PATH was replaced while it was being synced") is
+`io`, with no report, and nothing is marked poisoned. Every retry answers the
+same until the storage layout is fixed: keep
+each tree wholly on one allowlisted filesystem (no mount or bind-mounted file
+inside a lower, the state directory or the cache, and no btrfs subvolume inside
+a directory lower), or move it to an ext4, xfs, btrfs or tmpfs volume. A nested
+btrfs subvolume has no mount entry, so only this step finds it, after the top
+was sealed. A file or directory the daemon cannot open, and a name that is not
+UTF-8, fail the step with `io` naming it.
+
+**Poisoning.** After an fsync error the kernel may have dropped the data and
+reports the error only once, so the supervisor marks the whole filesystem it
+happened on: every later finalize that would sync anything there answers `io`
+until the daemon restarts ("a sync on the filesystem of PATH failed earlier in
+this daemon run, so its data may be lost; every finalize on it is refused until
+the daemon restarts, and a restart discards every attempt that is not retained;
+check the storage first"), the attempt that met the error included. No error is exempt:
+`EIO`, `ENOSPC` from a full disk (set quotas) and `EROFS` from an ext4 that
+remounted read-only after an error all poison. Check the storage before
+restarting: a restart discards every attempt that was not retained, finalized
+ones included. The marks are not persisted.
+
+**Locks.** The entry lock is the layer root's seal and commit lock (see
+[seal and verify](#seal-and-verify)). A `--lower` bundle cache hit holds it
+shared while it checks and verifies the entry, and a cache fill or
+`overlay unpack` holds it exclusively across its rename and mode restore, so the
+durability step never syncs an entry whose publication is in flight, and a hit
+returns only a completely published entry. A hit refuses an entry whose root is
+writable: "cache entry X is not a completely sealed layer (a fill killed between
+its rename and its mode restore, or an interrupted `overlay unseal`); run
+`ratarmount overlay seal X`, which restores its sentinel and every read-only
+mode, or remove X to refill it". On a cache filesystem without `flock`
+(`ENOSYS`, `ENOLCK`, `EOPNOTSUPP`), fills and hits proceed unlocked as before,
+logged once, and the publication check still runs. Extracting a bundle into the
+cache never syncs; the durability step syncs every cache entry an attempt
+references, also entries an older ratarmount built. A finalize whose cache entry
+another mount is verifying waits (then `in_use`), and a mount process whose hit
+waits behind another daemon's durability step can reach the batch `--timeout`;
+both are retryable. The step holds one entry lock at a time, never while it
+holds the top's.
+
+**Cost.** Every finalize fsyncs every file and directory of the attempt and of
+every lower, cache entries included, and their ancestors, each time. XFS and
+ext4 may flush the device's write cache on every fsync, also for a clean file,
+so a lower with 100,000 files can hold the serial daemon, and every other
+client, for minutes.
 
 ### Lifetime, concurrency and recovery
 
@@ -2654,12 +3127,15 @@ to take zero time. The ignored 64-attempt test reports measured setup/teardown
 milliseconds per attempt on the orchestrator's host.
 
 All children in a batch start before readiness is polled. `--max-attempts`
-(default 256, maximum 4096) caps total retained attempts across bases, including
-crashed attempts, until destroy. Mutating requests and diff/stats execute
-serially; separate clients may connect concurrently. Up to 32 connections are
-retained. Incomplete/idle connections expire after 30 seconds, request lines
-are limited to 1 MiB, response lines to 64 MiB, and stalled response writes to
-5 seconds. Diff/source reads use the existing backend timeouts; the batch
+(default 256, maximum 4096) caps the attempts across bases, crashed and
+finalized ones included, until destroy. Retained attempts do not count toward
+it; `--max-retained` (default 4096, range 0–4096) bounds them instead (see
+[retained attempts](#retained-attempts)). Mutating requests, finalize and
+diff/stats execute serially; separate clients may connect concurrently. Up to
+32 connections are kept open. Incomplete/idle connections expire after 30
+seconds, request lines are limited to 1 MiB, response lines to 64 MiB, and
+stalled response writes to 5 seconds. Diff/source reads use the existing
+backend timeouts; the batch
 readiness timeout does not interrupt an in-process diff. Stop agent writers
 before diff/stats for a consistent result: files and SQLite are separate
 snapshots, and these calls do not pause applications. Live attempts return
@@ -2676,12 +3152,16 @@ socket addresses are not relocated automatically.
 
 A failed/timed-out batch rolls back its own children and directories without
 affecting previous attempts. If unmount fails, directories and attempt records
-are retained, and the error names the IDs for inspection/retry. A crashed mount
-is marked `crashed`; siblings and the supervisor continue. Its disk/RAM overlay
-is retained for inspection until destroy. Destroy tries normal unmount, then
-lazy unmount, and stops/reaps the child if needed. It never deletes backing
-content while a mount remains attached. Shutdown and destroy-by-base can
-partially succeed if one cleanup fails; `list` reports what remains.
+are kept, and the error names the IDs for inspection/retry (its "retained
+attempts" are these kept attempts, not [retained attempts](#retained-attempts)).
+A crashed mount is marked `crashed`; siblings and the supervisor continue. Its
+disk/RAM overlay is kept for inspection until destroy. Destroy tries normal
+unmount, then lazy unmount, and stops/reaps the child if needed; finalize never
+unmounts lazily. It never deletes backing content while a mount remains
+attached. Destroy and the restart cleanup remove an attempt's tree through
+directory descriptors, so they also remove a sealed (read-only) tree, such as a
+finalized attempt's. Shutdown and destroy-by-base can partially succeed if one
+cleanup fails; `list` reports what remains.
 
 RAM overlays use Linux `/dev/shm`, falling back to verified tmpfs at
 `$XDG_RUNTIME_DIR`. The supervisor owns a private directory there and passes
@@ -2691,23 +3171,31 @@ keeps `overlay_dir` known and permits cleanup after child SIGKILL. No RAM is
 reserved; set a quota. State records the RAM location for restart cleanup.
 
 After daemon restart, registered bases and caches survive; **all abandoned
-attempts are unmounted and discarded**, including disk overlays. They are never
-re-adopted. Cleanup must succeed before requests are served. Linux children
-receive SIGKILL if their supervisor dies (including during startup); restart
-then removes disconnected mounts and directories. Persisted process IDs are
-never used to kill processes. An exclusive state lock prevents a second daemon
-from reconciling an active daemon's attempts. This initial supervisor is Linux
-only; other platforms can use ordinary mounts and offline diff/stats.
+attempts are unmounted and discarded**, including disk overlays and finalized
+attempts. They are never re-adopted. Retained attempts survive in `retained/`
+with their IDs, but this release does not serve them after a restart (see
+[retained attempts](#retained-attempts)). Cleanup must succeed before requests
+are served. Linux children receive SIGKILL if their supervisor dies (including
+during startup); restart then removes disconnected mounts and directories.
+Persisted process IDs are never used to kill processes. An exclusive state lock
+prevents a second daemon from reconciling an active daemon's attempts. The
+supervisor runs on Linux only (the daemon does not start elsewhere); finalize
+and retain are also refused by the supervisor itself. Other platforms can use
+ordinary mounts and offline diff/stats.
 
 A lost connection is not cancellation. A mutation may finish after the client
 times out. Without a `request_id` there is still no request deduplication or
-automatic retry: reconcile with `list` before retrying `new`. With one, retry
-`new` with the same `request_id` and body; after `interrupted`, use a new ID.
-Normal shutdown discards attempts; collect patches first. Registered bases
-currently have no API to unregister or evict their index cache; remove those
-state files, and `requests.jsonl`, only with the daemon stopped and no
-attempts left (a running daemon keeps appending to a moved `requests.jsonl`
-through its open descriptor).
+automatic retry: reconcile with `list` before retrying `new` (repeating a
+`finalize` is safe without one). With one, retry `new` or `finalize` with the
+same `request_id` and body; after `interrupted`, use a new ID. Normal shutdown
+discards every attempt that is not retained, finalized ones included; collect
+patches and reports first. Registered bases currently have no API to unregister
+or evict their index cache; remove those state files, and `requests.jsonl`,
+only with the daemon stopped and no attempts left (a running daemon keeps
+appending to a moved `requests.jsonl` through its open descriptor). The state
+directory also holds `retained/` and `retained.jsonl`, and this release has no
+API to remove a retained attempt either (see
+[retained attempts](#retained-attempts)).
 
 ### Python client
 
@@ -2728,8 +3216,9 @@ with RatarmountSandbox("/run/user/1000/ratarmount-sandbox.sock") as client:
 # All attempts created through this client are destroyed, even on exceptions.
 ```
 
-`create_base(name, source, **options)`, `list(base=None)`,
-`destroy(id=... | base=...)`, and `shutdown()` expose the other operations.
+`create_base(name, source, **options)`, `list(base=None, all=False)`,
+`finalize(id, pack=False, request_id=None)`, `destroy(id=... | base=...)`, and
+`shutdown()` expose the other operations.
 An individual `Attempt` is also a context manager; `destroy()` is locally
 idempotent. A client context destroys only attempts created through that
 client; it does not shut down the shared daemon or destroy attempts returned
@@ -2755,4 +3244,22 @@ with optional `exclude`, `reads` and `sync`. An omitted keyword sends no key,
 never `null`. `Attempt.journal_path` is the attempt's journal
 (`<dirname(path)>/journal.jsonl`) for attempts the client created with a
 journal, and `None` otherwise, including for `list()` results.
+
+`finalize(id, pack=False, request_id=None)` and
+`Attempt.finalize(pack=False, request_id=None)` send protocol version 2 and
+return the [finalize](#finalize) report; `new(..., retain=True)` and
+`list(all=True)` send version 2 too (`retain=False` sends no key, and
+`list(all=False)` is the version 1 request). An `Attempt` the client owns takes
+`status`, `path`, `overlay_dir` and, when set, `journal_path` from the report's
+`attempt`, also when `finalize` is called on the client. A finalized attempt
+that was not retained stays owned
+and is destroyed when its context exits, with its bundle, manifest and journal
+summary: copy them out, or create the attempt with `retain=True`. A retained
+attempt is handed off: the client stops owning it, never destroys it, and does
+not own it again when a replayed `new` returns it. A client that did not see
+it retained (another client replaying the `new`) may own it; leaving a context
+treats a `retained` answer to its implicit `destroy` like `not_found`, while an
+explicit `destroy()` of a retained attempt raises `SandboxError("retained")`. On
+`writers_active`, stop the container, wait at least a second and retry with
+backoff.
 See the [SWE-bench recipe](recipes/swe-bench-sandboxes.md).

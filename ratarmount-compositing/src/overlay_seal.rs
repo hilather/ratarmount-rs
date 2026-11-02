@@ -341,8 +341,16 @@ pub struct SealOperation {
 
 impl SealOperation {
     pub fn acquire(dir: &Path) -> io::Result<Self> {
+        Self::acquire_until(dir, None)
+    }
+
+    /// [`acquire`](Self::acquire) bounded by `deadline`: the overlay root
+    /// flock still held by another seal, unseal or commit at the deadline
+    /// answers `WouldBlock`; `None` waits as `acquire` does. For callers that
+    /// must not wait unboundedly (the sandbox supervisor's serial serve loop).
+    pub fn acquire_until(dir: &Path, deadline: Option<std::time::Instant>) -> io::Result<Self> {
         let dir = dir.canonicalize()?;
-        let lock = crate::write_overlay::SealCommitGuard::acquire(&dir)?;
+        let lock = crate::write_overlay::SealCommitGuard::acquire_until(&dir, deadline)?;
         Ok(Self { dir, lock })
     }
 
@@ -2193,5 +2201,56 @@ mod tests {
             verify(&f.dir, f.base.clone()).unwrap().mismatched,
             [".git/config"]
         );
+    }
+
+    /// Regression (R1c-1 T2): the supervisor's finalize must not wait without
+    /// a bound for an overlay root flock held by another seal, unseal or
+    /// commit (its serve loop is serial). `acquire_until` with a deadline
+    /// answers `WouldBlock` within the deadline plus one poll; with `None` it
+    /// waits until the holder releases, as `acquire` does; a free lock is
+    /// taken either way.
+    #[test]
+    fn regression_seal_operation_acquire_until() {
+        use std::time::{Duration, Instant};
+        let f = Fixture::new();
+        // Free: acquired with a deadline, without one, and by `acquire`.
+        drop(SealOperation::acquire_until(&f.dir, Some(Instant::now())).unwrap());
+        drop(SealOperation::acquire_until(&f.dir, None).unwrap());
+        drop(SealOperation::acquire(&f.dir).unwrap());
+        // Held (by the guard every seal, unseal and commit takes).
+        let held = crate::write_overlay::SealCommitGuard::acquire(&f.dir).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let error = SealOperation::acquire_until(&f.dir, Some(deadline))
+            .err()
+            .unwrap();
+        let returned = Instant::now();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        assert!(returned >= deadline, "returned before its deadline");
+        assert!(
+            returned < deadline + Duration::from_secs(2),
+            "returned {:?} after its deadline",
+            returned - deadline
+        );
+        assert!(error.to_string().contains("is locked by a seal"), "{error}");
+        // Unbounded: waits for the holder, as `acquire` does.
+        let dir = f.dir.clone();
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiter = {
+            let released = released.clone();
+            std::thread::spawn(move || {
+                let operation = SealOperation::acquire_until(&dir, None).unwrap();
+                assert!(
+                    released.load(std::sync::atomic::Ordering::SeqCst),
+                    "acquired while the holder kept the lock"
+                );
+                drop(operation);
+                let operation = SealOperation::acquire(&dir).unwrap();
+                drop(operation);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(held);
+        waiter.join().unwrap();
     }
 }

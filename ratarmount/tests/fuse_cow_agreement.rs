@@ -4,13 +4,15 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use ratarmount_compositing::HIDDEN_DB;
+use serde_json::{json, Value};
 
 fn available() -> bool {
     if !Path::new("/dev/fuse").exists() {
@@ -888,4 +890,227 @@ fn pending_archive_digest_then_seal() {
         ratarmount_index::sha256_hex_stream(&mut fs::File::open(&base).unwrap()).unwrap()
     );
     assert_eq!(meta_get(&overlay, "base_digest"), Some(expected));
+}
+
+/// `agree_with` for a layer that is sealed already, as a supervisor finalize
+/// leaves it: `fsck` checks it read-only (`--repair` is refused on a sealed
+/// overlay) and `seal` only reads the recorded digest back. `diff --hash`,
+/// `verify --json`'s `computed` digest, and `pack`/`unpack` plus `verify`
+/// of the restored layer must all give `expected`, which is returned.
+/// `base_args` (the supervisor's `--index-folders`) go to every verb that
+/// opens the base.
+fn agree_sealed(
+    root: &Path,
+    overlay: &Path,
+    cache: &Path,
+    base_args: &[&str],
+    expected: &str,
+    sealed_at: &str,
+) -> String {
+    let (o, p) = (overlay, Path::new);
+    let with_base = |args: &[&Path]| {
+        let mut all = args.to_vec();
+        all.extend(base_args.iter().map(|arg| Path::new(*arg)));
+        run(&all, cache)
+    };
+    let hash = expect(with_base(&[p("diff"), o, p("--hash")]), 0);
+    assert_eq!(hash.trim(), expected);
+    let fsck: Value = serde_json::from_str(&expect(
+        run(&[p("overlay"), p("fsck"), o, p("--json")], cache),
+        0,
+    ))
+    .unwrap();
+    assert_eq!(fsck["result"], "ok", "{fsck}");
+    let repair = run(&[p("overlay"), p("fsck"), o, p("--repair")], cache);
+    assert_eq!(repair.status.code(), Some(2), "{repair:?}");
+    assert!(
+        String::from_utf8_lossy(&repair.stderr).contains("sealed"),
+        "{repair:?}"
+    );
+    assert_eq!(
+        expect(with_base(&[p("diff"), o, p("--hash")]), 0),
+        hash,
+        "diff --hash changed across fsck"
+    );
+    let resealed: Value = serde_json::from_str(&expect(
+        with_base(&[p("overlay"), p("seal"), o, p("--json")]),
+        0,
+    ))
+    .unwrap();
+    assert_eq!(
+        resealed,
+        json!({"layer_digest": expected, "sealed_at": sealed_at})
+    );
+    assert_eq!(
+        expect(with_base(&[p("diff"), o, p("--hash")]), 0),
+        hash,
+        "diff --hash changed across seal"
+    );
+    let verify = |dir: &Path| {
+        let report: Value = serde_json::from_str(&expect(
+            with_base(&[p("overlay"), p("verify"), dir, p("--json")]),
+            0,
+        ))
+        .unwrap();
+        assert_eq!(report["ok"], true, "{report}");
+        assert_eq!(report["recorded"], expected, "{report}");
+        report["computed"].as_str().unwrap().to_owned()
+    };
+    assert_eq!(verify(o), expected);
+    let (bundle, restored) = (root.join("agree.tar.zst"), root.join("agree-restored"));
+    let (bundle, restored) = (bundle.as_path(), restored.as_path());
+    expect(with_base(&[p("overlay"), p("pack"), o, bundle]), 0);
+    assert_eq!(
+        expect(with_base(&[p("overlay"), p("unpack"), bundle, restored]), 0).trim(),
+        expected
+    );
+    assert_eq!(verify(restored), expected);
+    assert_eq!(
+        expect(with_base(&[p("diff"), restored, p("--hash")]), 0),
+        hash
+    );
+    hash.trim().to_string()
+}
+
+/// A `ratarmount sandbox daemon` over `ROOT/state`, shut down when dropped
+/// (its shutdown destroys the attempts it still holds).
+struct SandboxDaemon {
+    child: Child,
+    socket: PathBuf,
+}
+
+impl SandboxDaemon {
+    fn start(root: &Path) -> Self {
+        let socket = root.join("api.sock");
+        let log = root.join("daemon.log");
+        let child = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+            .args(["sandbox", "daemon", "--socket"])
+            .arg(&socket)
+            .arg("--state-dir")
+            .arg(root.join("state"))
+            .args(["--max-attempts", "4", "--timeout", "30"])
+            .env("XDG_CACHE_HOME", root.join("daemon-cache"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let mut daemon = Self { child, socket };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while UnixStream::connect(&daemon.socket).is_err() {
+            assert!(
+                daemon.child.try_wait().unwrap().is_none(),
+                "{}",
+                fs::read_to_string(&log).unwrap()
+            );
+            assert!(Instant::now() < deadline, "daemon socket timeout");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        daemon
+    }
+
+    /// One request line, and the daemon's answer.
+    fn send(&self, request: &Value) -> Value {
+        let mut stream = UnixStream::connect(&self.socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(120)))
+            .unwrap();
+        writeln!(stream, "{request}").unwrap();
+        let mut reply = String::new();
+        BufReader::new(stream).read_line(&mut reply).unwrap();
+        serde_json::from_str(&reply).unwrap()
+    }
+
+    fn call(&self, request: Value) -> Value {
+        let response = self.send(&request);
+        assert_eq!(response["ok"], true, "{response}");
+        response["result"].clone()
+    }
+
+    /// `finalize` until it answers; `writers_active` (a desktop prober such
+    /// as `gvfsd-trash` briefly holding the new mount) is retried with the
+    /// same request for a bounded time, as the docs tell clients to.
+    fn finalize(&self, request: &Value) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let response = self.send(request);
+            if response["ok"] == true {
+                return response["result"].clone();
+            }
+            assert_eq!(response["error"]["code"], "writers_active", "{response}");
+            assert!(Instant::now() < deadline, "attempt stayed busy: {response}");
+            eprintln!("finalize answered writers_active; retrying: {response}");
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+impl Drop for SandboxDaemon {
+    fn drop(&mut self) {
+        if let Ok(mut stream) = UnixStream::connect(&self.socket) {
+            let _ = stream.write_all(b"{\"version\":1,\"op\":\"shutdown\"}\n");
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Regression (R1c-1 F4): a layer the real supervisor finalized (its own
+/// stop, fsck, seal and pack over a prepared TAR base, after an agent's
+/// copy-on-write edits through the attempt's mount) must give the report's
+/// `layer_digest` in `diff --hash`, `fsck`, `seal`, `verify`, `pack` and
+/// `unpack`, and so must the bundle the supervisor packed.
+#[test]
+fn supervisor_finalized_layer() {
+    if !available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _writable = Writable(tmp.path());
+    let root = tmp.path();
+    let cache = root.join("cache");
+    let base = root.join("base.tar");
+    base_tar(&base);
+    // Declared after `_writable`, so it shuts down before the tree is made
+    // writable and removed.
+    let daemon = SandboxDaemon::start(root);
+    daemon.call(json!({"version": 1, "op": "create_base", "name": "task", "source": base}));
+    let attempts = daemon.call(json!({"version": 1, "op": "new", "base": "task"}));
+    let mnt = PathBuf::from(attempts[0]["path"].as_str().unwrap());
+    edit(&mnt);
+    let report = daemon.finalize(&json!({
+        "version": 2, "op": "finalize", "id": attempts[0]["id"], "pack": true,
+        "request_id": "f"
+    }));
+    assert_eq!(report["status"], "finalized", "{report}");
+    let overlay = PathBuf::from(report["attempt"]["overlay_dir"].as_str().unwrap());
+    let digest = report["layer_digest"].as_str().unwrap();
+    let sealed_at = report["sealed_at"].as_str().unwrap();
+    // The copy-on-write rewrite, the new file and the delete.
+    assert_eq!(report["patch_hash"]["files"], 3, "{report}");
+    let indexes = serde_json::to_string(&[root.join("state/indexes/task")]).unwrap();
+    let index_folders = ["--index-folders", indexes.as_str()];
+    let hash = agree_sealed(root, &overlay, &cache, &index_folders, digest, sealed_at);
+    assert_eq!(hash, digest);
+    // The bundle the supervisor packed restores the same layer.
+    let bundle = PathBuf::from(report["bundle"].as_str().unwrap());
+    let restored = root.join("supervisor-restored");
+    let with_folders = |args: &[&Path]| {
+        let mut all = args.to_vec();
+        all.extend(index_folders.iter().map(|arg| Path::new(*arg)));
+        expect(run(&all, &cache), 0)
+    };
+    let p = Path::new;
+    assert_eq!(
+        with_folders(&[p("overlay"), p("unpack"), &bundle, &restored]).trim(),
+        digest
+    );
+    assert_eq!(
+        with_folders(&[p("overlay"), p("verify"), &restored]).trim(),
+        digest
+    );
 }

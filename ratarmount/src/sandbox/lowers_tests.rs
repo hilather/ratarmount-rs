@@ -1334,13 +1334,13 @@ fn regression_supervisor_lower_inspection_reports_records() {
             )
             .unwrap(),
         );
-        let inspector = super::start_inspection(&socket, &overlay).unwrap();
+        let inspector = super::start_inspection(&socket, &overlay, None).unwrap();
         assert_eq!(ask().unwrap(), lowers);
         drop(inspector);
     }
     let overlay =
         Arc::new(crate::base_identity::fixtures::new_overlay(source, root.join("gone")).unwrap());
-    let inspector = super::start_inspection(&socket, &overlay).unwrap();
+    let inspector = super::start_inspection(&socket, &overlay, None).unwrap();
     drop(overlay);
     let started = Instant::now();
     assert!(ask().is_err());

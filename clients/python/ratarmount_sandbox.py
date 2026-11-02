@@ -1,16 +1,26 @@
 """Stdlib-only client for the ratarmount sandbox protocol (Python 3.9+).
 
-Requests use protocol v1, except new() with request_id, lowers or journal,
-which sends protocol v2. A client context destroys only attempts it created,
-never the shared daemon. Transport failures are not retried automatically: a
-timed-out mutation may have completed. Retry new() with the same request_id
-and arguments, which never starts a second batch, or use list() to reconcile
-before issuing another new() without one.
+Requests use protocol v1, except finalize(), list(all=True) and new() with
+request_id, lowers, journal or retain=True, which send protocol v2. A client
+context destroys only attempts it created, never the shared daemon. Transport
+failures are not retried automatically: a timed-out mutation may have
+completed. Retry new() or finalize() with the same request_id and arguments,
+which never acts twice, or use list() to reconcile before issuing another
+new() without one.
+
+finalize() stops an attempt, seals its layer and returns a report. A
+finalized attempt is still destroyed with its context, and its bundle,
+manifest and journal summary with it: copy them out, or create the attempt
+with new(retain=True). Its finalize then moves it to the daemon's
+retained/ID/ directory and hands it off: retained attempts are never
+destroyed, so the client stops owning it, list(all=True) shows it, and
+destroy() of it raises SandboxError with code retained.
 
 A replay returns the original answer, even after a daemon restart discarded
-its attempts; list() shows the current state. Leaving a client or attempt
-context treats a not_found from destroy as already destroyed, so a stale
-replay does not fail the cleanup.
+its attempts or a finalize retained one; list() shows the current state. A
+client never re-owns an attempt it saw retained. Leaving a client or attempt
+context treats destroy's not_found as already destroyed and its retained as
+handed off, so a stale replay does not fail the cleanup.
 """
 
 import base64
@@ -37,7 +47,9 @@ class Attempt:
 
     journal_path is the attempt's operation journal (<dirname(path)>/journal.jsonl)
     when this client created it with a journal, else None; it is deleted with
-    the attempt, so summarize it before destroy().
+    the attempt, so summarize it before destroy(). finalize() takes status,
+    path, overlay_dir and journal_path from its report. Leaving the context of
+    a retained attempt sends no destroy.
     """
 
     def __init__(self, client, data, journal=False):
@@ -61,26 +73,53 @@ class Attempt:
     def stats(self):
         return self._client._call("stats", id=self.id)
 
+    def finalize(self, pack=False, request_id=None):
+        """RatarmountSandbox.finalize() of this attempt; returns the report.
+
+        status, path, overlay_dir and a set journal_path follow the report's
+        attempt (a retained one moves to retained/ID/). Unless retained, the
+        attempt is still destroyed on exit, with its bundle, manifest and
+        summary: copy them out or retain.
+        """
+        report = self._client.finalize(self.id, pack=pack, request_id=request_id)
+        # The client already updated its owned object (maybe this one); idempotent.
+        self._update(report["attempt"])
+        return report
+
+    def _update(self, data):
+        """Take the status and paths of a finalize report's attempt."""
+        self.status, self.path, self.overlay_dir = (
+            data["status"], data["path"], data["overlay_dir"])
+        if self.journal_path is not None:
+            self.journal_path = os.path.join(os.path.dirname(self.path), "journal.jsonl")
+
     def destroy(self):
         if not self._destroyed:
             self._client.destroy(id=self.id)
             self._destroyed = True
 
     def _destroy_implicitly(self):
-        """destroy(), except that not_found means already destroyed.
+        """destroy(), except for attempts that are gone or retained.
 
         A replay can name attempts that are gone (a daemon restart or another
-        client destroyed them); implicit cleanup must not fail on those.
+        client destroyed them: not_found) or retained (destroy answers
+        retained); implicit cleanup must not fail on those, and sends nothing
+        for an attempt known to be retained.
         """
+        if self.status == "retained" or self.id in self._client._retained:
+            self._client._hand_off(self.id)
+            return
         try:
             self.destroy()
         except SandboxError as error:
-            if error.code != "not_found":
+            if error.code not in ("not_found", "retained"):
                 raise
             self._destroyed = True
             owned = self._client._owned.pop(self.id, None)
             if owned is not None:
                 owned._destroyed = True
+            if error.code == "retained":
+                self._client._retained.add(self.id)
 
     def __enter__(self):
         return self
@@ -108,6 +147,7 @@ class RatarmountSandbox:
         self.socket = str(socket)
         self.timeout = timeout
         self._owned = {}
+        self._retained = set()
 
     def _call(self, op, version=_VERSION, **fields):
         request = json.dumps(dict(version=version, op=op, **fields))
@@ -144,9 +184,9 @@ class RatarmountSandbox:
         return self._call("create_base", name=name, source=str(source), options=options)
 
     def new(self, base, count=1, overlay="disk", quota=None, readonly_globs=None, *,
-            request_id=None, lowers=None, journal=None):
-        """Start attempts. Any keyword sends protocol v2, and an omitted one
-        sends no key:
+            request_id=None, lowers=None, journal=None, retain=False):
+        """Start attempts. Any of these keywords sends protocol v2, and an
+        omitted one (or retain=False) sends no key:
 
         - request_id: a retry with the same ID and arguments returns the stored
           answer instead of a second batch.
@@ -154,10 +194,15 @@ class RatarmountSandbox:
           bottom first; absolute paths (str or os.PathLike), sent unchanged.
         - journal: a mapping with optional "exclude" (globs), "reads" ("all" or
           "first") and "sync" (bool); see Attempt.journal_path.
+        - retain: finalize() keeps each attempt in the daemon's retained/ID/
+          directory instead of leaving it to be destroyed; see finalize().
+
+        An attempt this client saw retained is returned but never owned again,
+        so a replay cannot hand it back to this client's cleanup.
         """
         fields = dict(base=base, count=count, overlay=overlay, quota=quota,
                       readonly_globs=readonly_globs or [])
-        if request_id is None and lowers is None and journal is None:
+        if request_id is None and lowers is None and journal is None and not retain:
             data = self._call("new", **fields)
         else:
             if request_id is not None:
@@ -169,13 +214,52 @@ class RatarmountSandbox:
                 fields["lowers"] = [os.fspath(lower) for lower in lowers]
             if journal is not None:
                 fields["journal"] = dict(journal)
+            if retain:
+                fields["retain"] = True
             data = self._call("new", version=_VERSION_2, **fields)
         attempts = [Attempt(self, item, journal=journal is not None) for item in data]
-        self._owned.update((a.id, a) for a in attempts)
+        self._owned.update((a.id, a) for a in attempts if a.id not in self._retained)
         return attempts
 
-    def list(self, base=None):
-        return [Attempt(self, item) for item in self._call("list", base=base)]
+    def list(self, base=None, all=False):
+        """Attempts, of one base if given. all=True sends protocol v2 and also
+        returns the retained attempts (status "retained", or "finalizing" while
+        a retain is not acknowledged); base is then sent only when given."""
+        if not all:
+            return [Attempt(self, item) for item in self._call("list", base=base)]
+        fields = {} if base is None else dict(base=base)
+        fields["all"] = True
+        return [Attempt(self, item) for item in self._call("list", version=_VERSION_2, **fields)]
+
+    def finalize(self, id, pack=False, request_id=None):
+        """Finalize attempt id (protocol v2): stop it, seal its layer and
+        return the report. pack=True also writes a bundle; pack and request_id
+        are sent only when given. An Attempt this client owns takes the
+        report's status and paths, as Attempt.finalize() does.
+
+        writers_active means something still uses the mount: stop it, wait at
+        least a second and retry with backoff. A "finalized" attempt stays
+        owned and is destroyed on exit, with its bundle, manifest and summary:
+        copy them out or retain. A "retained" one is handed off: this client
+        no longer owns it and never destroys it.
+        """
+        fields = dict(id=id)
+        if pack:
+            fields["pack"] = True
+        if request_id is not None:
+            fields["request_id"] = request_id
+        report = self._call("finalize", version=_VERSION_2, **fields)
+        owned = self._owned.get(id)
+        if report["status"] == "retained":
+            self._hand_off(id)
+        if owned is not None:
+            owned._update(report["attempt"])
+        return report
+
+    def _hand_off(self, id):
+        """A retained attempt is the daemon's: never owned or destroyed again."""
+        self._retained.add(id)
+        self._owned.pop(id, None)
 
     def destroy(self, *, id=None, base=None):
         if (id is None) == (base is None):

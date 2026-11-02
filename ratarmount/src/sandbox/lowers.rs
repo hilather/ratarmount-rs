@@ -11,7 +11,7 @@
 use super::protocol::{ApiError, Base};
 use crate::overlay_pack::DecodeBudget;
 use ratarmount_compositing::{redact_meta_values, Immutability, LowerLayerRecord, OverlayMeta};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -107,10 +107,13 @@ impl Lower {
     }
 }
 
-/// The state root and, once it is known, the RAM root.
+/// The state root and, once it is known, the RAM root; and the retained
+/// attempts whose `retained/ID/overlay` may be a lower (R1c-1 §5.7).
 pub struct Roots<'a> {
     pub state: &'a Path,
     pub ram: Option<&'a Path>,
+    /// The acknowledged retained attempts this daemon run serves.
+    pub retained: Option<&'a BTreeSet<String>>,
 }
 
 impl Roots<'_> {
@@ -170,15 +173,27 @@ pub fn validate(
 /// Lowers are supported on the bases the sandbox mounts: one local path or a
 /// local `git:///` URL, without binds or recursion.
 fn check_base(base: &Base) -> Result<(), ApiError> {
+    check_base_for(base, "lowers")
+}
+
+/// The base rule of lowers, finalize and retain (R1c-1 §5.5): one local path
+/// or a local `git:///` URL, without binds or recursion. A refusal names the
+/// `operation` (`lowers`, `finalize` or `retain`).
+pub(crate) fn check_base_for(base: &Base, operation: &str) -> Result<(), ApiError> {
     let name = &base.name;
+    let (subject, needs) = if operation == "lowers" {
+        ("lowers are".to_owned(), "lowers need".to_owned())
+    } else {
+        (format!("{operation} is"), format!("{operation} needs"))
+    };
     if !base.options.binds.is_empty() {
         return Err(invalid(format!(
-            "lowers are not supported on base {name}, which has binds"
+            "{subject} not supported on base {name}, which has binds"
         )));
     }
     if base.options.recursive {
         return Err(invalid(format!(
-            "lowers are not supported on base {name}, which is recursive"
+            "{subject} not supported on base {name}, which is recursive"
         )));
     }
     let git = ratarmount_formats_git::parse_git_url(&base.source)
@@ -187,10 +202,54 @@ fn check_base(base: &Base) -> Result<(), ApiError> {
         .is_some();
     if !git && !Path::new(&base.source).is_absolute() {
         return Err(invalid(format!(
-            "lowers need a local base (an absolute path or a git:/// URL); base {name} is not one"
+            "{needs} a local base (an absolute path or a git:/// URL); base {name} is not one"
         )));
     }
     Ok(())
+}
+
+/// The exception R1b reserved for R1c (R1c-1 §5.7): exactly
+/// `<state>/retained/<ID>/overlay` of an acknowledged retained attempt,
+/// matched lexically before any lookup, with `retained/`, `retained/ID` and
+/// `retained/ID/overlay` each a real directory, never a symlink. Every other
+/// path under `retained/` is refused, naming the form to use.
+fn retained_lower(lower: &str, roots: &Roots<'_>) -> Result<Option<PathBuf>, ApiError> {
+    let dir = roots.state.join("retained");
+    let Ok(rest) = Path::new(lower).strip_prefix(&dir) else {
+        return Ok(None);
+    };
+    let refused = || {
+        invalid(format!(
+            "lower {lower} lies inside the supervisor's state directory; a retained attempt is used as a lower only by its overlay, {}",
+            dir.join("ID").join("overlay").display()
+        ))
+    };
+    let mut parts = rest.components();
+    let (Some(Component::Normal(id)), Some(Component::Normal(overlay)), None) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(refused());
+    };
+    let expected = dir.join(id).join("overlay");
+    if overlay != "overlay" || expected.as_os_str() != lower {
+        return Err(refused());
+    }
+    let id = id.to_str().ok_or_else(refused)?;
+    if !roots.retained.is_some_and(|retained| retained.contains(id)) {
+        return Err(invalid(format!(
+            "lower {lower}: attempt {id} is not a retained attempt this daemon serves (unknown, retained before a restart, or its commit not yet acknowledged)"
+        )));
+    }
+    for path in [dir.clone(), dir.join(id), expected.clone()] {
+        let real = fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
+        if !real {
+            return Err(invalid(format!(
+                "lower {lower}: {} is not a real directory",
+                path.display()
+            )));
+        }
+    }
+    Ok(Some(expected))
 }
 
 /// The list, place and type rules of one lower as sent: its canonical path,
@@ -203,6 +262,9 @@ fn locate(lower: &str, roots: &Roots<'_>) -> Result<(PathBuf, Kind, u64), ApiErr
         return Err(invalid(format!(
             "lower {lower} must be an absolute path; relative paths are refused"
         )));
+    }
+    if let Some(path) = retained_lower(lower, roots)? {
+        return Ok((path, Kind::Directory, 0));
     }
     let path = resolve(lower, roots)?;
     if path.to_str().is_none() {

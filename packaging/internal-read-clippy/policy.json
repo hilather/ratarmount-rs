@@ -530,7 +530,7 @@
       "file": "ratarmount/src/sandbox/daemon.rs",
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
-      "reason": "Reviewed Linux abstract socket liveness and tmpfs validation; non-Linux fallback liveness uses UnixStream and tmpfs is Unsupported."
+      "reason": "Reviewed Linux abstract socket liveness and tmpfs validation; non-Linux fallback liveness uses UnixStream and tmpfs is Unsupported. R1c-1: the finalize filesystem-type probe is a Linux fstatfs on an already open descriptor; elsewhere it answers an unknown type, which the allowlist refuses and no caller reaches because finalize and retain are refused off Linux first."
     },
     {
       "file": "ratarmount/src/sandbox/process.rs",

@@ -124,3 +124,50 @@ in bounded batches and destroy each batch after collecting its patches; the
 attempt limit includes crashed mounts. After a client timeout, retry `new`
 with the same `--request-id` (Python: `request_id=`) and arguments, which
 never starts a second batch; without a request ID, list and reconcile first.
+
+## Finalize, retain or destroy
+
+`destroy`, and leaving a client or attempt context, discards an attempt: its
+mount, its overlay and everything in its `attempts/ID/` directory.
+[`finalize`](../sandbox.md#finalize) (protocol version 2; Python
+`attempt.finalize()`) instead stops the attempt, seals and hashes its layer,
+syncs it and everything it references to disk, and returns a report with
+`patch_hash`, `layer_digest`, `bytes_written`, `erofs_denied`, `manifest_path`
+and, with `pack=True`, a `bundle`. A finalized attempt that was not retained is
+still deleted by `destroy` or the context exit, together with its bundle,
+manifest and journal summary: copy them out first, or retain the attempt.
+
+With `new(..., retain=True)`, a successful finalize keeps the attempt in the
+daemon's `retained/ID/`. Retained attempts are never destroyed (the client
+hands them off instead), and within the same daemon run their
+`report['attempt']['overlay_dir']` (`retained/ID/overlay`) can be passed in
+`lowers` of later attempts, which branch from that state. After a supervisor
+restart they stay on disk, but this release does not serve them. Finalize and
+retain run on Linux only and support local TAR, directory and Git bases;
+branching needs a TAR or Git base. Both refuse a base registered with
+`git_synthetic_head`, as in the example above, so register a separate base
+without it for attempts you finalize.
+
+Finalize an attempt only after its container has exited (the example's
+`subprocess.run` waits for it). With `docker run -v` the container has its own
+copy of the mount, so a premature finalize removes only the host mount and
+answers `writers_active` while the container keeps writing; a retry after the
+container stops seals those writes too. On `writers_active`, wait at least a
+second and back off, retrying with the same `request_id`:
+
+```python
+import time
+from ratarmount_sandbox import SandboxError
+
+def finalize(attempt, request_id, tries=8):
+    for n in range(tries):
+        try:
+            return attempt.finalize(pack=True, request_id=request_id)
+        except SandboxError as error:
+            if error.code != 'writers_active' or n == tries - 1:
+                raise
+            time.sleep(2 ** n)  # 1 s, then backing off
+```
+
+The hidden-tests layer is never routed through the supervisor: grade the
+exported patch with the SWE-bench evaluation harness, as above.

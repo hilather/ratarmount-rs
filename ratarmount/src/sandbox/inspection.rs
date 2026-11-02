@@ -1,7 +1,7 @@
 //! Private read-only child channel: SQLite intentionally permits only its owner.
 
 use super::protocol::{Attempt, MAX_RESPONSE};
-use ratarmount_compositing::{LowerLayerRecord, WriteOverlay};
+use ratarmount_compositing::{LowerLayerRecord, OverlayQuota, WriteOverlay};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -55,7 +55,21 @@ fn configure_accepted_stream(stream: &UnixStream) -> io::Result<()> {
     stream.set_nonblocking(false)
 }
 
-pub(crate) fn start(path: &Path, overlay: &Arc<WriteOverlay>) -> io::Result<Inspector> {
+/// The reply to `status`: one JSON line, which the client decodes as such.
+#[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Status {
+    /// Writes the mount's read-only rules refused (0 without a policy).
+    pub erofs_denied: u64,
+}
+
+/// Serves `deleted_paths`, `lower_layers` and `status` for the mount's
+/// overlay. `quota` is the mount's quota and policy handle, when it has one.
+pub(crate) fn start(
+    path: &Path,
+    overlay: &Arc<WriteOverlay>,
+    quota: Option<Arc<OverlayQuota>>,
+) -> io::Result<Inspector> {
     validate_socket_path(path)?;
     let parent = fs::symlink_metadata(
         path.parent()
@@ -90,7 +104,10 @@ pub(crate) fn start(path: &Path, overlay: &Arc<WriteOverlay>) -> io::Result<Insp
                         .take(64)
                         .read_line(&mut command)
                         .is_err()
-                        || !matches!(command.as_str(), "deleted_paths\n" | "lower_layers\n")
+                        || !matches!(
+                            command.as_str(),
+                            "deleted_paths\n" | "lower_layers\n" | "status\n"
+                        )
                     {
                         continue;
                     }
@@ -102,6 +119,9 @@ pub(crate) fn start(path: &Path, overlay: &Arc<WriteOverlay>) -> io::Result<Insp
                             overlay.load_tombstone_paths().into_iter().collect();
                         deleted.sort();
                         serde_json::to_vec(&deleted).ok()
+                    } else if command == "status\n" {
+                        let erofs_denied = quota.as_ref().map_or(0, |q| q.usage().erofs_denied);
+                        serde_json::to_vec(&Status { erofs_denied }).ok()
                     } else {
                         // The layers this mount composed, through its own connection.
                         overlay
@@ -139,6 +159,13 @@ pub fn deleted_paths(attempt: &Attempt) -> io::Result<Vec<String>> {
 /// `timeout` (§5.4).
 pub fn lower_layers(attempt: &Attempt, timeout: Duration) -> io::Result<Vec<LowerLayerRecord>> {
     request(attempt, b"lower_layers\n", timeout)
+}
+
+/// The child's `erofs_denied` count (R1c-1 §5.4 step 4), within `timeout`.
+/// A child whose overlay was dropped ends the connection without an answer,
+/// which is an error.
+pub fn status(attempt: &Attempt, timeout: Duration) -> io::Result<Status> {
+    request(attempt, b"status\n", timeout)
 }
 
 /// Sends `command` and reads the one-line reply, all within `timeout` from

@@ -545,34 +545,6 @@
       "rule_reason": "inventory-op:File::create"
     },
     {
-      "configured_path": "tempfile::Builder::tempfile_in",
-      "item": "<ratarmount::sandbox::requests::RequestLog>::write_compacted",
-      "leaf_digest": "1e3afa768f67b6062418382936f1b0cb508605deeae9a604105bd3dcc72b7f11",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "request-log-compaction",
-        "creation": {
-          "basis": "tempfile creates the name with O_EXCL, mode 0600 and append inside the 0700 state directory; persist renames it over the log.",
-          "policy": "exclusive-new-file"
-        },
-        "disposition": "output-owner",
-        "id": "IR-E0144-M01",
-        "item": "<ratarmount::sandbox::requests::RequestLog>::write_compacted",
-        "reason": "Stage the compacted sandbox request log beside requests.jsonl before an atomic rename."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "cli-nfsv4",
-        "cli-no-default",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0144-M01\",\"item\":\"<ratarmount::sandbox::requests::RequestLog>::write_compacted\",\"disposition\":\"output-owner\",\"category\":\"request-log-compaction\",\"reason\":\"Stage the compacted sandbox request log beside requests.jsonl before an atomic rename.\",\"creation\":{\"policy\":\"exclusive-new-file\",\"basis\":\"tempfile creates the name with O_EXCL, mode 0600 and append inside the 0700 state directory; persist renames it over the log.\"}}",
-      "resolved": "<tempfile::Builder<'L0,'L1>>::tempfile_in",
-      "rule_reason": "inventory-op:tempfile"
-    },
-    {
       "configured_path": "tempfile::NamedTempFile::new_in",
       "item": "<ratarmount::sandbox::run::Cleanup>::save",
       "leaf_digest": "eb470ab59f58cfc4bb83aa40b78997f3e86bec1c46b68aa5fe9dab4a8a9b744f",
@@ -717,6 +689,34 @@
       "reason": "internal-read:v1 {\"id\":\"IR-E0137-M01\",\"item\":\"<ratarmount::sandbox::run::RunLock>::acquire\",\"disposition\":\"output-owner\",\"category\":\"runtime-lock\",\"reason\":\"Permit creating the sandbox run coordination lock without truncating its inode.\",\"creation\":{\"policy\":\"create-or-open\",\"basis\":\"The lock uses mode 0600 and NOFOLLOW/CLOEXEC, truncate(false), and a nonblocking exclusive flock retained in RunLock.\"}}",
       "resolved": "<std::fs::OpenOptions>::create",
       "rule_reason": "inventory-op:OpenOptions"
+    },
+    {
+      "configured_path": "tempfile::Builder::tempfile_in",
+      "item": "<ratarmount::sandbox::state_log::StateLog<T0>>::write_compacted",
+      "leaf_digest": "2fe8093d71bf670f28be6c3ab780cc35df31b737816528f3d7ec8ff41824d746",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "request-log-compaction",
+        "creation": {
+          "basis": "tempfile creates the name with O_EXCL, mode 0600 and append inside the 0700 state directory; persist renames it over the log.",
+          "policy": "exclusive-new-file"
+        },
+        "disposition": "output-owner",
+        "id": "IR-E0144-M01",
+        "item": "<ratarmount::sandbox::state_log::StateLog<T0>>::write_compacted",
+        "reason": "Stage a compacted sandbox state log (requests.jsonl or retained.jsonl) beside it before an atomic rename."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0144-M01\",\"item\":\"<ratarmount::sandbox::state_log::StateLog<T0>>::write_compacted\",\"disposition\":\"output-owner\",\"category\":\"request-log-compaction\",\"reason\":\"Stage a compacted sandbox state log (requests.jsonl or retained.jsonl) beside it before an atomic rename.\",\"creation\":{\"policy\":\"exclusive-new-file\",\"basis\":\"tempfile creates the name with O_EXCL, mode 0600 and append inside the 0700 state directory; persist renames it over the log.\"}}",
+      "resolved": "<tempfile::Builder<'L0,'L1>>::tempfile_in",
+      "rule_reason": "inventory-op:tempfile"
     },
     {
       "configured_path": "std::os::fd::FromRawFd::from_raw_fd",
@@ -8172,7 +8172,8 @@
         "item": "ratarmount::overlay_pack::openat_admitted",
         "non_mandatory_callers": [
           "append_host",
-          "pack"
+          "pack",
+          "sync_children"
         ],
         "reason": "overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)"
       },
@@ -8184,7 +8185,7 @@
         "cli-no-default",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0047-M01\",\"item\":\"ratarmount::overlay_pack::openat_admitted\",\"disposition\":\"residual\",\"reason\":\"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)\",\"family\":\"payload-admitted-readers\",\"issue\":\"#196\",\"non_mandatory_callers\":[\"append_host\",\"pack\"],\"category\":\"payload-admitted-readers\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0047-M01\",\"item\":\"ratarmount::overlay_pack::openat_admitted\",\"disposition\":\"residual\",\"reason\":\"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)\",\"family\":\"payload-admitted-readers\",\"issue\":\"#196\",\"non_mandatory_callers\":[\"append_host\",\"pack\",\"sync_children\"],\"category\":\"payload-admitted-readers\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
       "resolved": "ratarmount_core::db_inodes::unix::openat_admitted",
       "rule_reason": "inventory-op:openat_admitted"
     },
@@ -8650,6 +8651,64 @@
       "reason": "internal-read:v1 {\"id\":\"IR-B0072-M01\",\"item\":\"ratarmount::overlay_pack::sweep_stale_stages_in\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY handle for a descriptor-relative walk; no file content read\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
       "resolved": "rustix::fs::at::openat",
       "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
+      "item": "ratarmount::overlay_pack::sync_children",
+      "leaf_digest": "55922d2d352061e3dcc58e5392187b4d31d6088629d22f81fb830901725d6dae",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "directory-handle-or-durability",
+        "creation": {
+          "basis": "Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-E0146-M01",
+        "item": "ratarmount::overlay_pack::sync_children",
+        "reason": "O_DIRECTORY handle for a descriptor-relative walk; no file content read"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0146-M01\",\"item\":\"ratarmount::overlay_pack::sync_children\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY handle for a descriptor-relative walk; no file content read\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
+      "configured_path": "ratarmount::overlay_pack::openat_admitted",
+      "item": "ratarmount::overlay_pack::sync_children",
+      "leaf_digest": "2c0f13bbddd4925aaf373ee56413335422ebeeaa087f5766879d63e45a23960f",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "payload-admitted-readers",
+        "creation": {
+          "basis": "Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname.",
+          "policy": "none"
+        },
+        "disposition": "residual",
+        "family": "payload-admitted-readers",
+        "id": "IR-E0147-M01",
+        "issue": "#196",
+        "item": "ratarmount::overlay_pack::sync_children",
+        "reason": "fsync-only descriptor of a file in a tree a finalize syncs; reads no content; creates nothing"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0147-M01\",\"item\":\"ratarmount::overlay_pack::sync_children\",\"disposition\":\"residual\",\"reason\":\"fsync-only descriptor of a file in a tree a finalize syncs; reads no content; creates nothing\",\"family\":\"payload-admitted-readers\",\"issue\":\"#196\",\"category\":\"payload-admitted-readers\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname.\"}}",
+      "resolved": "ratarmount::overlay_pack::openat_admitted",
+      "rule_reason": "inventory-op:openat_admitted"
     },
     {
       "configured_path": "std::fs::File::options",
@@ -9600,6 +9659,92 @@
       "rule_reason": "inventory-op:from_raw_fd"
     },
     {
+      "configured_path": "std::fs::File::create",
+      "item": "ratarmount::sandbox::finalize::finalize_top",
+      "leaf_digest": "468d32189bc6ea7011b28770427f0e891cec6139b7a2b46374bf4b14838bcd5c",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "output-owner",
+        "creation": {
+          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
+          "policy": "unchanged-from-e6ca64e"
+        },
+        "disposition": "output-owner",
+        "id": "IR-B0131-M01",
+        "item": "ratarmount::sandbox::finalize::finalize_top",
+        "mode_policy": "unchanged-from-e6ca64e",
+        "reason": "Preserve this reviewed output acquisition and its existing permissions."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-B0131-M01\",\"item\":\"ratarmount::sandbox::finalize::finalize_top\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
+      "resolved": "<std::fs::File>::create",
+      "rule_reason": "inventory-op:File::create"
+    },
+    {
+      "configured_path": "std::fs::File::open",
+      "item": "ratarmount::sandbox::finalize::finalize_top",
+      "leaf_digest": "49f68d08328395385115c2b96115758381ec6c331afdcf58910aa0212e82dd41",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "structured-control-record",
+        "creation": {
+          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-B0132-M01",
+        "item": "ratarmount::sandbox::finalize::finalize_top",
+        "reason": "operation journal JSONL summarized after the run"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-B0132-M01\",\"item\":\"ratarmount::sandbox::finalize::finalize_top\",\"disposition\":\"out-of-family\",\"category\":\"structured-control-record\",\"reason\":\"operation journal JSONL summarized after the run\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
+      "resolved": "<std::fs::File>::open",
+      "rule_reason": "inventory-op:File::open"
+    },
+    {
+      "configured_path": "std::fs::File::create",
+      "item": "ratarmount::sandbox::finalize::finalize_top",
+      "leaf_digest": "a86382d61f1f0cd8c39bcce6535b4a429a65f523b162b06778d1e3878d25c73a",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "output-owner",
+        "creation": {
+          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
+          "policy": "unchanged-from-e6ca64e"
+        },
+        "disposition": "output-owner",
+        "id": "IR-B0133-M01",
+        "item": "ratarmount::sandbox::finalize::finalize_top",
+        "mode_policy": "unchanged-from-e6ca64e",
+        "reason": "Preserve this reviewed output acquisition and its existing permissions."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-B0133-M01\",\"item\":\"ratarmount::sandbox::finalize::finalize_top\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
+      "resolved": "<std::fs::File>::create",
+      "rule_reason": "inventory-op:File::create"
+    },
+    {
       "configured_path": "std::fs::read",
       "item": "ratarmount::sandbox::process::mountpoints",
       "leaf_digest": "be9b52bfbb22a15f91cf2f3033f0bf30e7aae971b98c35a74926181cd27a05a7",
@@ -9626,146 +9771,6 @@
       "reason": "internal-read:v1 {\"id\":\"IR-B0116-M01\",\"item\":\"ratarmount::sandbox::process::mountpoints\",\"disposition\":\"out-of-family\",\"category\":\"kernel-or-process-introspection\",\"reason\":\"/proc or mount-table introspection\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
       "resolved": "std::fs::read",
       "rule_reason": "inventory-op:fs::read"
-    },
-    {
-      "configured_path": "std::fs::OpenOptions::new",
-      "item": "ratarmount::sandbox::requests::open_checked",
-      "leaf_digest": "215915a0707304838dcec8535ee489c6c578e19a329f1bb168081930d1b5fc35",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "builder-setup",
-        "creation": {
-          "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions.",
-          "policy": "none"
-        },
-        "disposition": "support",
-        "id": "IR-E0143-M01",
-        "item": "ratarmount::sandbox::requests::open_checked",
-        "reason": "Prepare the builder for this item's separately reviewed open/create leaf."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "cli-nfsv4",
-        "cli-no-default",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0143-M01\",\"item\":\"ratarmount::sandbox::requests::open_checked\",\"disposition\":\"support\",\"category\":\"builder-setup\",\"reason\":\"Prepare the builder for this item's separately reviewed open/create leaf.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions.\"}}",
-      "resolved": "<std::fs::OpenOptions>::new",
-      "rule_reason": "inventory-op:OpenOptions"
-    },
-    {
-      "configured_path": "std::fs::OpenOptions::create",
-      "item": "ratarmount::sandbox::requests::open_checked",
-      "leaf_digest": "623030c2ea71fa70f8317f4f051dd97afc3fc1735716ff273cbed74c4abc8b72",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "request-log",
-        "creation": {
-          "basis": "Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor.",
-          "policy": "append-or-create"
-        },
-        "disposition": "output-owner",
-        "id": "IR-E0143-M02",
-        "item": "ratarmount::sandbox::requests::open_checked",
-        "reason": "Permit creating the sandbox request log while preserving an existing log inode."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "cli-nfsv4",
-        "cli-no-default",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0143-M02\",\"item\":\"ratarmount::sandbox::requests::open_checked\",\"disposition\":\"output-owner\",\"category\":\"request-log\",\"reason\":\"Permit creating the sandbox request log while preserving an existing log inode.\",\"creation\":{\"policy\":\"append-or-create\",\"basis\":\"Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor.\"}}",
-      "resolved": "<std::fs::OpenOptions>::create",
-      "rule_reason": "inventory-op:OpenOptions"
-    },
-    {
-      "configured_path": "std::fs::OpenOptions::open",
-      "item": "ratarmount::sandbox::requests::open_checked",
-      "leaf_digest": "ac55648596a48488b3a6218bcf366fa3f0f01891f5f600094543c7006494bb50",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "request-log",
-        "creation": {
-          "basis": "Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor.",
-          "policy": "append-or-create"
-        },
-        "disposition": "output-owner",
-        "id": "IR-E0143-M03",
-        "item": "ratarmount::sandbox::requests::open_checked",
-        "reason": "Open the sandbox request log once per daemon start; compaction keeps its own persisted descriptor."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "cli-nfsv4",
-        "cli-no-default",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0143-M03\",\"item\":\"ratarmount::sandbox::requests::open_checked\",\"disposition\":\"output-owner\",\"category\":\"request-log\",\"reason\":\"Open the sandbox request log once per daemon start; compaction keeps its own persisted descriptor.\",\"creation\":{\"policy\":\"append-or-create\",\"basis\":\"Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor.\"}}",
-      "resolved": "<std::fs::OpenOptions>::open",
-      "rule_reason": "inventory-op:OpenOptions"
-    },
-    {
-      "configured_path": "std::fs::OpenOptions",
-      "item": "ratarmount::sandbox::requests::open_checked",
-      "leaf_digest": "215915a0707304838dcec8535ee489c6c578e19a329f1bb168081930d1b5fc35",
-      "lint": "clippy::disallowed_types",
-      "metadata": {
-        "category": "builder-type-support",
-        "creation": {
-          "basis": "This is a type/import reference; it acquires no file or directory.",
-          "policy": "none"
-        },
-        "disposition": "support",
-        "id": "IR-E0143-T01",
-        "item": "ratarmount::sandbox::requests::open_checked",
-        "reason": "Builder type support: Open the sandbox request log for append."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "cli-nfsv4",
-        "cli-no-default",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0143-T01\",\"item\":\"ratarmount::sandbox::requests::open_checked\",\"disposition\":\"support\",\"category\":\"builder-type-support\",\"reason\":\"Builder type support: Open the sandbox request log for append.\",\"creation\":{\"policy\":\"none\",\"basis\":\"This is a type/import reference; it acquires no file or directory.\"}}",
-      "resolved": "std::fs::OpenOptions",
-      "rule_reason": "inventory-op:OpenOptions"
-    },
-    {
-      "configured_path": "std::fs::File::open",
-      "item": "ratarmount::sandbox::requests::sync_dir",
-      "leaf_digest": "e3ba632fb8749287262536f7fe5f526f5eead8590129cd2546bc49c09118e284",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "directory-handle-or-durability",
-        "creation": {
-          "basis": "Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname.",
-          "policy": "none"
-        },
-        "disposition": "out-of-family",
-        "id": "IR-E0145-M01",
-        "item": "ratarmount::sandbox::requests::sync_dir",
-        "reason": "directory handle opened only to fsync a directory entry"
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "cli-nfsv4",
-        "cli-no-default",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0145-M01\",\"item\":\"ratarmount::sandbox::requests::sync_dir\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"directory handle opened only to fsync a directory entry\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname.\"}}",
-      "resolved": "<std::fs::File>::open",
-      "rule_reason": "inventory-op:File::open"
     },
     {
       "configured_path": "std::fs::OpenOptions",
@@ -9965,92 +9970,6 @@
       "reason": "internal-read:v1 {\"id\":\"IR-B0123-M01\",\"item\":\"ratarmount::sandbox::run::create_run_dir_in\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
       "resolved": "<tempfile::Builder<'L0,'L1>>::tempdir_in",
       "rule_reason": "inventory-op:tempdir"
-    },
-    {
-      "configured_path": "std::fs::File::create",
-      "item": "ratarmount::sandbox::run::finish",
-      "leaf_digest": "8febc49b4401695be37a636ee71e9b16c833a886f01147eee93003c2fe0cf90e",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "output-owner",
-        "creation": {
-          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
-          "policy": "unchanged-from-e6ca64e"
-        },
-        "disposition": "output-owner",
-        "id": "IR-B0131-M01",
-        "item": "ratarmount::sandbox::run::finish",
-        "mode_policy": "unchanged-from-e6ca64e",
-        "reason": "Preserve this reviewed output acquisition and its existing permissions."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "cli-nfsv4",
-        "cli-no-default",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0131-M01\",\"item\":\"ratarmount::sandbox::run::finish\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
-      "resolved": "<std::fs::File>::create",
-      "rule_reason": "inventory-op:File::create"
-    },
-    {
-      "configured_path": "std::fs::File::open",
-      "item": "ratarmount::sandbox::run::finish",
-      "leaf_digest": "49f68d08328395385115c2b96115758381ec6c331afdcf58910aa0212e82dd41",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "structured-control-record",
-        "creation": {
-          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
-          "policy": "none"
-        },
-        "disposition": "out-of-family",
-        "id": "IR-B0132-M01",
-        "item": "ratarmount::sandbox::run::finish",
-        "reason": "operation journal JSONL summarized after the run"
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "cli-nfsv4",
-        "cli-no-default",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0132-M01\",\"item\":\"ratarmount::sandbox::run::finish\",\"disposition\":\"out-of-family\",\"category\":\"structured-control-record\",\"reason\":\"operation journal JSONL summarized after the run\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
-      "resolved": "<std::fs::File>::open",
-      "rule_reason": "inventory-op:File::open"
-    },
-    {
-      "configured_path": "std::fs::File::create",
-      "item": "ratarmount::sandbox::run::finish",
-      "leaf_digest": "9e1a9a674abb3a60e336282dc4968036163b5c61ead41220b9386c0129a7550b",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "output-owner",
-        "creation": {
-          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
-          "policy": "unchanged-from-e6ca64e"
-        },
-        "disposition": "output-owner",
-        "id": "IR-B0133-M01",
-        "item": "ratarmount::sandbox::run::finish",
-        "mode_policy": "unchanged-from-e6ca64e",
-        "reason": "Preserve this reviewed output acquisition and its existing permissions."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "cli-nfsv4",
-        "cli-no-default",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0133-M01\",\"item\":\"ratarmount::sandbox::run::finish\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
-      "resolved": "<std::fs::File>::create",
-      "rule_reason": "inventory-op:File::create"
     },
     {
       "configured_path": "std::fs::read",
@@ -10305,6 +10224,202 @@
       "reason": "internal-read:v1 {\"id\":\"IR-B0121-M01\",\"item\":\"ratarmount::sandbox::run::runtime_control\",\"disposition\":\"out-of-family\",\"category\":\"runtime-resource-or-descriptor-handoff\",\"reason\":\"child stdio setup\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
       "resolved": "<std::fs::File>::try_clone",
       "rule_reason": "inventory-op:try_clone"
+    },
+    {
+      "configured_path": "std::fs::OpenOptions::new",
+      "item": "ratarmount::sandbox::state_log::open_checked",
+      "leaf_digest": "215915a0707304838dcec8535ee489c6c578e19a329f1bb168081930d1b5fc35",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "builder-setup",
+        "creation": {
+          "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions.",
+          "policy": "none"
+        },
+        "disposition": "support",
+        "id": "IR-E0143-M01",
+        "item": "ratarmount::sandbox::state_log::open_checked",
+        "reason": "Prepare the builder for this item's separately reviewed open/create leaf."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0143-M01\",\"item\":\"ratarmount::sandbox::state_log::open_checked\",\"disposition\":\"support\",\"category\":\"builder-setup\",\"reason\":\"Prepare the builder for this item's separately reviewed open/create leaf.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions.\"}}",
+      "resolved": "<std::fs::OpenOptions>::new",
+      "rule_reason": "inventory-op:OpenOptions"
+    },
+    {
+      "configured_path": "std::fs::OpenOptions::create",
+      "item": "ratarmount::sandbox::state_log::open_checked",
+      "leaf_digest": "623030c2ea71fa70f8317f4f051dd97afc3fc1735716ff273cbed74c4abc8b72",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "request-log",
+        "creation": {
+          "basis": "Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor.",
+          "policy": "append-or-create"
+        },
+        "disposition": "output-owner",
+        "id": "IR-E0143-M02",
+        "item": "ratarmount::sandbox::state_log::open_checked",
+        "reason": "Permit creating a sandbox state log (requests.jsonl or retained.jsonl) while preserving an existing log inode."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0143-M02\",\"item\":\"ratarmount::sandbox::state_log::open_checked\",\"disposition\":\"output-owner\",\"category\":\"request-log\",\"reason\":\"Permit creating a sandbox state log (requests.jsonl or retained.jsonl) while preserving an existing log inode.\",\"creation\":{\"policy\":\"append-or-create\",\"basis\":\"Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor.\"}}",
+      "resolved": "<std::fs::OpenOptions>::create",
+      "rule_reason": "inventory-op:OpenOptions"
+    },
+    {
+      "configured_path": "std::fs::OpenOptions::open",
+      "item": "ratarmount::sandbox::state_log::open_checked",
+      "leaf_digest": "ac55648596a48488b3a6218bcf366fa3f0f01891f5f600094543c7006494bb50",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "request-log",
+        "creation": {
+          "basis": "Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor.",
+          "policy": "append-or-create"
+        },
+        "disposition": "output-owner",
+        "id": "IR-E0143-M03",
+        "item": "ratarmount::sandbox::state_log::open_checked",
+        "reason": "Open a sandbox state log (requests.jsonl or retained.jsonl) once per daemon start; compaction keeps its own persisted descriptor."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0143-M03\",\"item\":\"ratarmount::sandbox::state_log::open_checked\",\"disposition\":\"output-owner\",\"category\":\"request-log\",\"reason\":\"Open a sandbox state log (requests.jsonl or retained.jsonl) once per daemon start; compaction keeps its own persisted descriptor.\",\"creation\":{\"policy\":\"append-or-create\",\"basis\":\"Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor.\"}}",
+      "resolved": "<std::fs::OpenOptions>::open",
+      "rule_reason": "inventory-op:OpenOptions"
+    },
+    {
+      "configured_path": "std::fs::OpenOptions",
+      "item": "ratarmount::sandbox::state_log::open_checked",
+      "leaf_digest": "215915a0707304838dcec8535ee489c6c578e19a329f1bb168081930d1b5fc35",
+      "lint": "clippy::disallowed_types",
+      "metadata": {
+        "category": "builder-type-support",
+        "creation": {
+          "basis": "This is a type/import reference; it acquires no file or directory.",
+          "policy": "none"
+        },
+        "disposition": "support",
+        "id": "IR-E0143-T01",
+        "item": "ratarmount::sandbox::state_log::open_checked",
+        "reason": "Builder type support: Open a sandbox state log (requests.jsonl or retained.jsonl) for append."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0143-T01\",\"item\":\"ratarmount::sandbox::state_log::open_checked\",\"disposition\":\"support\",\"category\":\"builder-type-support\",\"reason\":\"Builder type support: Open a sandbox state log (requests.jsonl or retained.jsonl) for append.\",\"creation\":{\"policy\":\"none\",\"basis\":\"This is a type/import reference; it acquires no file or directory.\"}}",
+      "resolved": "std::fs::OpenOptions",
+      "rule_reason": "inventory-op:OpenOptions"
+    },
+    {
+      "configured_path": "std::fs::OpenOptions::open",
+      "item": "ratarmount::sandbox::state_log::open_dir",
+      "leaf_digest": "c4c0d9e208019ab7bb44195605a3762497b141b5a1e3a4debd8fdf7ae1a6b4c6",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "directory-handle-or-durability",
+        "creation": {
+          "basis": "Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-E0145-M01",
+        "item": "ratarmount::sandbox::state_log::open_dir",
+        "reason": "fsync a directory of the state, attempts/, retained/, or the parent or an ancestor of a tree a finalize syncs; O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC handle, no content read"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0145-M01\",\"item\":\"ratarmount::sandbox::state_log::open_dir\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"fsync a directory of the state, attempts/, retained/, or the parent or an ancestor of a tree a finalize syncs; O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC handle, no content read\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname.\"}}",
+      "resolved": "<std::fs::OpenOptions>::open",
+      "rule_reason": "inventory-op:OpenOptions"
+    },
+    {
+      "configured_path": "std::fs::OpenOptions::new",
+      "item": "ratarmount::sandbox::state_log::open_dir",
+      "leaf_digest": "215915a0707304838dcec8535ee489c6c578e19a329f1bb168081930d1b5fc35",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "builder-setup",
+        "creation": {
+          "basis": "Builder construction/setup only; the separate open leaf owns pathname acquisition.",
+          "policy": "none"
+        },
+        "disposition": "support",
+        "id": "IR-E0145-M02",
+        "item": "ratarmount::sandbox::state_log::open_dir",
+        "reason": "Prepare the builder for this item's separately reviewed open leaf."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0145-M02\",\"item\":\"ratarmount::sandbox::state_log::open_dir\",\"disposition\":\"support\",\"category\":\"builder-setup\",\"reason\":\"Prepare the builder for this item's separately reviewed open leaf.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Builder construction/setup only; the separate open leaf owns pathname acquisition.\"}}",
+      "resolved": "<std::fs::OpenOptions>::new",
+      "rule_reason": "inventory-op:OpenOptions"
+    },
+    {
+      "configured_path": "std::fs::OpenOptions",
+      "item": "ratarmount::sandbox::state_log::open_dir",
+      "leaf_digest": "215915a0707304838dcec8535ee489c6c578e19a329f1bb168081930d1b5fc35",
+      "lint": "clippy::disallowed_types",
+      "metadata": {
+        "category": "builder-type-support",
+        "creation": {
+          "basis": "This is a type/import reference; it acquires no file or directory.",
+          "policy": "none"
+        },
+        "disposition": "support",
+        "id": "IR-E0145-T01",
+        "item": "ratarmount::sandbox::state_log::open_dir",
+        "reason": "Builder type support: Open a directory of the sandbox state, or the parent or an ancestor of a tree a finalize syncs, only to fsync it."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0145-T01\",\"item\":\"ratarmount::sandbox::state_log::open_dir\",\"disposition\":\"support\",\"category\":\"builder-type-support\",\"reason\":\"Builder type support: Open a directory of the sandbox state, or the parent or an ancestor of a tree a finalize syncs, only to fsync it.\",\"creation\":{\"policy\":\"none\",\"basis\":\"This is a type/import reference; it acquires no file or directory.\"}}",
+      "resolved": "std::fs::OpenOptions",
+      "rule_reason": "inventory-op:OpenOptions"
     },
     {
       "configured_path": "tempfile::tempfile_in",
@@ -21418,7 +21533,7 @@
     }
   ],
   "policy": {
-    "configuration": "c8563f06a352f6688774b8da506600b74f25554e28bc3cc0689b2071d755305b",
+    "configuration": "774a3a82a7dd1da1285e5ddc21a48b4ca397c774a0889277c99b919637f5b464",
     "profiles": "f04aa50122d4ae1f0504b6411c5b47cacf3a97a9e3080e175166f3b744aa4bd8",
     "toolchain": {
       "compiler_revision": "88d9e12ae178fab0fb5cc050a94da85685d449ea",
