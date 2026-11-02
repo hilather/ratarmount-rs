@@ -48,6 +48,7 @@ zstd = "0.13"
 # today; pin the feature so a later slim-default shrink does not drop L2 here.
 ratarmount-session = { workspace = true, features = ["formats-all"] }
 ratarmount-formats-tar.workspace = true
+ratarmount-formats-tensors.workspace = true
 ratarmount-formats-zip.workspace = true
 ratarmount-formats-ar.workspace = true
 ratarmount-formats-cpio.workspace = true

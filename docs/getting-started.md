@@ -125,9 +125,23 @@ ratarmount --control-interface archive.tar mnt/
 cat 'mnt/.ratarmount-control/search/*.fits'       # quote the glob
 ```
 
+## Describe checkpoint tensors without mounting
+
+```bash
+ratarmount tensors manifest model.safetensors.index.json -o experts.jsonl
+ratarmount tensors manifest model.gguf --hash
+```
+
+The JSONL manifest gives each tensor or merged expert slice its local file,
+absolute byte offset, length, storage format and shape. A safetensors index
+follows `weight_map` across its shards. `--hash` adds a SHA-256 digest per row;
+without it, payload bytes are not read. Inputs must be local regular files,
+and `-o` refuses an existing output. See [Expert manifest](formats-tensors.md#expert-manifest)
+for classification, row ordering and v1 limits.
+
 ## Remote archives and folders
 
-Anything that accepts a path accepts a URL. Only the ranges you read are
+Mount sources accept URLs. Only the ranges you read are
 fetched, and a published index next to the archive is picked up automatically.
 
 ```bash

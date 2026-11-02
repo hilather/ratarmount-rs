@@ -3,7 +3,7 @@ use std::io::{Read, Seek};
 
 use serde_json::{json, Map, Value};
 
-use crate::{checked_add, elements, invalid, Parsed, Result, Tensor, MAX_HEADER_SIZE};
+use crate::{checked_add, elements, invalid, Layout, Parsed, Result, Tensor, MAX_HEADER_SIZE};
 
 /// Arrays above this length retain their type, length and first 16 values.
 pub const ARRAY_SUMMARY_THRESHOLD: u64 = 1024;
@@ -230,6 +230,7 @@ pub(crate) fn parse<R: Read + Seek>(reader: &mut R, size: u64) -> Result<Parsed>
         }
         let absolute = checked_add(data_start, info.offset)?;
         tensors.push(Tensor { name:info.name,offset:absolute,size:len,
+            layout: Layout::Gguf { ty: info.ty, dims: info.dims.clone() },
             sidecar:json!({"format":"gguf","version":version,"ggml_type":info.ty,
                 "ggml_type_name":layout.map(|l| l.0).unwrap_or("UNKNOWN"),"dims":info.dims,
                 "byte_length":len,"data_offset":info.offset,"absolute_file_offset":absolute,
