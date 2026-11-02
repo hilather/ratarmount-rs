@@ -20,7 +20,14 @@ use serde_json::{json, Value};
 use thiserror::Error;
 
 mod gguf;
+mod manifest;
 mod safetensors;
+pub use manifest::{
+    build_manifest, compile_expert_pattern, write_jsonl, ExpertPattern, Manifest, ManifestOptions,
+    ManifestRow, Role,
+};
+#[cfg(test)]
+mod manifest_tests;
 #[cfg(test)]
 mod tests;
 
@@ -62,11 +69,24 @@ fn elements(shape: &[u64]) -> Result<u64> {
     })
 }
 
+pub(crate) enum Layout {
+    Safetensors {
+        dtype: String,
+        shape: Vec<u64>,
+        size_checked: bool,
+    },
+    Gguf {
+        ty: u32,
+        dims: Vec<u64>,
+    },
+}
+
 struct Tensor {
     name: String,
     offset: u64,
     size: u64,
     sidecar: Value,
+    layout: Layout,
 }
 
 struct Parsed {
