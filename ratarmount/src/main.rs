@@ -56,6 +56,7 @@ mod publish_index;
 mod sandbox;
 mod shard;
 mod snapshot;
+mod tensors_cmd;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -598,6 +599,9 @@ struct Args {
     journal_command: Option<journal_cmd::JournalArgs>,
 
     #[arg(skip)]
+    tensors_command: Option<tensors_cmd::TensorsArgs>,
+
+    #[arg(skip)]
     overlay: Option<overlay_cmd::OverlayArgs>,
 
     #[arg(skip)]
@@ -839,6 +843,15 @@ where
         )?;
         let mut args = Args::try_parse_from(&raw[..1])?;
         args.journal_command = Some(journal);
+        return Ok(args);
+    }
+    if raw.get(1).is_some_and(|s| s == "tensors") {
+        let tensors = tensors_cmd::TensorsArgs::try_parse_from(
+            std::iter::once(OsString::from("ratarmount tensors"))
+                .chain(raw.iter().skip(2).cloned()),
+        )?;
+        let mut args = Args::try_parse_from(&raw[..1])?;
+        args.tensors_command = Some(tensors);
         return Ok(args);
     }
     if raw.get(1).is_some_and(|s| s == "overlay") {
@@ -1612,6 +1625,13 @@ fn main() {
     if let Some(journal) = &args.journal_command {
         if let Err(error) = journal_cmd::run(journal) {
             eprintln!("journal: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if let Some(tensors) = &args.tensors_command {
+        if let Err(error) = tensors_cmd::run(tensors) {
+            eprintln!("tensors: {error}");
             std::process::exit(2);
         }
         return;

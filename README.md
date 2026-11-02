@@ -256,6 +256,7 @@ Commands beyond mounting (see `ratarmount COMMAND --help`):
 | `overlay info\|seal\|unseal\|verify\|fsck` | Inspect identity and manage layer integrity |
 | `overlay import\|import-upperdir\|pack\|unpack` | Replay patches or overlayfs upperdirs; transport sealed layers |
 | `journal summarize\|mark` | Summarize operation JSONL or mark an agent turn |
+| `tensors manifest PATH...` | Map local checkpoint tensors and expert slices to file byte ranges ([format and limits](docs/formats-tensors.md#expert-manifest)) |
 | `sandbox run` | Run one container command and finalize its attempt |
 | `sandbox daemon\|create-base\|new\|list\|diff\|stats\|destroy\|shutdown` | Manage attempts through the supervisor API |
 | `snapshot <git> OUT.tar.zst` | Export a deterministic committed Git snapshot, optionally with its index |

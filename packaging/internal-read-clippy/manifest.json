@@ -10773,6 +10773,62 @@
       "rule_reason": "inventory-op:tempdir"
     },
     {
+      "configured_path": "tempfile::Builder::tempfile_in",
+      "item": "ratarmount::tensors_cmd::write_output",
+      "leaf_digest": "56d315f462dbb8f5c1c33c77a4d00bd2fd25c4dd03b3cde3ac8f531fe7fcde5f",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "tensor-manifest-output",
+        "creation": {
+          "basis": "tempfile uses OpenOptions create_new with mode 0600 subject to umask and an unpredictable name; cleanup only removes this temporary path.",
+          "policy": "exclusive-new-file"
+        },
+        "disposition": "output-owner",
+        "id": "IR-R2-OUT-M04",
+        "item": "ratarmount::tensors_cmd::write_output",
+        "reason": "Stage the validated manifest privately beside its requested output before no-clobber hard-link publication."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-R2-OUT-M04\",\"item\":\"ratarmount::tensors_cmd::write_output\",\"disposition\":\"output-owner\",\"category\":\"tensor-manifest-output\",\"reason\":\"Stage the validated manifest privately beside its requested output before no-clobber hard-link publication.\",\"creation\":{\"policy\":\"exclusive-new-file\",\"basis\":\"tempfile uses OpenOptions create_new with mode 0600 subject to umask and an unpredictable name; cleanup only removes this temporary path.\"}}",
+      "resolved": "<tempfile::Builder<'L0,'L1>>::tempfile_in",
+      "rule_reason": "inventory-op:tempfile"
+    },
+    {
+      "configured_path": "std::fs::File::open",
+      "item": "ratarmount::tensors_cmd::write_output",
+      "leaf_digest": "88981e23188d94f9ee230fda0673d99e6dbb5718d5af78dd7c2ff568e7023fab",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "tensor-manifest-output",
+        "creation": {
+          "basis": "Open an existing directory after successful hard-link publication; errors preserve the published output.",
+          "policy": "none"
+        },
+        "disposition": "output-owner",
+        "id": "IR-R2-OUT-M05",
+        "item": "ratarmount::tensors_cmd::write_output",
+        "reason": "Open the manifest output parent only to sync publication and temporary-name removal."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-R2-OUT-M05\",\"item\":\"ratarmount::tensors_cmd::write_output\",\"disposition\":\"output-owner\",\"category\":\"tensor-manifest-output\",\"reason\":\"Open the manifest output parent only to sync publication and temporary-name removal.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Open an existing directory after successful hard-link publication; errors preserve the published output.\"}}",
+      "resolved": "<std::fs::File>::open",
+      "rule_reason": "inventory-op:File::open"
+    },
+    {
       "configured_path": "tempfile::NamedTempFile::new",
       "item": "ratarmount_compositing::automount::try_materialize_split_from_parent",
       "leaf_digest": "a9ae800a7b38a42f629ab07674c5598b785c18b4b78f81de31249a112eafbbd9",
@@ -16183,6 +16239,32 @@
         "default"
       ],
       "reason": "internal-read:v1 {\"id\":\"IR-B0371-M01\",\"item\":\"ratarmount_formats_tensors::looks_like_safetensors\",\"disposition\":\"residual\",\"reason\":\"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes\",\"family\":\"factory-and-format-readers\",\"issue\":\"#196\",\"category\":\"factory-and-format-readers\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
+      "resolved": "<std::fs::File>::open",
+      "rule_reason": "inventory-op:File::open"
+    },
+    {
+      "configured_path": "std::fs::File::open",
+      "item": "ratarmount_formats_tensors::manifest::open_input",
+      "leaf_digest": "5d035bab57c854e7d27013e77d80a5ead791ceaa9aa5ef4e3b50703ff04885d9",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "factory-and-format-readers",
+        "creation": {
+          "basis": "Existing regular input only; no pathname is created",
+          "policy": "none"
+        },
+        "disposition": "residual",
+        "id": "IR-R2-TENSORS-INPUT",
+        "item": "ratarmount_formats_tensors::manifest::open_input",
+        "reason": "Read a user-selected local checkpoint or safetensors index using the same descriptor for identity, parsing and hashing"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-R2-TENSORS-INPUT\",\"item\":\"ratarmount_formats_tensors::manifest::open_input\",\"disposition\":\"residual\",\"category\":\"factory-and-format-readers\",\"reason\":\"Read a user-selected local checkpoint or safetensors index using the same descriptor for identity, parsing and hashing\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing regular input only; no pathname is created\"}}",
       "resolved": "<std::fs::File>::open",
       "rule_reason": "inventory-op:File::open"
     },

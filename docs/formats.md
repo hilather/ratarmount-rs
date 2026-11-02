@@ -100,7 +100,7 @@ record) logs one warning and the index keeps the ISO 9660 directory.
 
 | Format | What you get | Notes |
 |---|---|---|
-| **safetensors** | A directory per model: `model/layers/12/mlp/down_proj/weight` is a file holding that tensor's bytes, with a `.json` sidecar describing dtype, shape and offsets, plus `__metadata__.json` and `__header__.json` at the root | One shard file per mount; `model.safetensors.index.json` is not merged. Opens inside TARs and from `hf://` without copying. [Details](formats-tensors.md) |
+| **safetensors** | A directory per model: `model/layers/12/mlp/down_proj/weight` is a file holding that tensor's bytes, with a `.json` sidecar describing dtype, shape and offsets, plus `__metadata__.json` and `__header__.json` at the root | One shard file per mount; `model.safetensors.index.json` is not merged. The local `tensors manifest` command follows its shards and maps expert byte ranges. Opens inside TARs and from `hf://` without copying. [Details](formats-tensors.md#expert-manifest) |
 | **GGUF** (v2, v3, little-endian) | Same layout; quantized tensors stay quantized | Every metadata key lands in `__metadata__.json` |
 | **WebDataset shards** | Ordinary TAR; samples grouped by key when read through the Python library | Produce them with `ratarmount shard`; publish indexes with `--publish-index`. [Shards](shards.md) |
 | **Parquet, JSONL, images, audio** | Lazy files from any remote; read inside archives with the `ratar://` fsspec protocol | [Python guide](python.md#fsspec) |
@@ -250,7 +250,12 @@ The complete status against the Python original is in the
    [Writing into archives](write-overlay.md#known-limits).
 5. **Platforms.** Linux and macOS on Apple silicon. No Intel macOS package (no
    CI runner), no Windows CLI. The library crates compile on Windows.
-6. **Mount point inside its own folder.** The refusal (exit 2) is a point-in-time
+6. **Tensor manifests.** Local regular files only; no scheme paths, overlapping
+   tensor ranges or GGUF split indexes. Merged unknown GGML types cannot be
+   split. Caps are 65,536 experts per merged tensor and 16,777,216 rows per
+   manifest; [the tensor guide](formats-tensors.md#expert-manifest) covers
+   classification and all v1 refusals.
+7. **Mount point inside its own folder.** The refusal (exit 2) is a point-in-time
    check: a bind created later, mount propagation from another namespace or an ancestor
    rename after mounting are not caught, mount propagation flags are not read (a private
    bind is refused too), and `--corpus` members are not checked.
