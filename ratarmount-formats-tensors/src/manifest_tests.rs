@@ -316,6 +316,46 @@ fn manifest_merged_expert_bad_length_refused() {
     assert!(err.contains("length"), "{err}");
 }
 
+/// Regression: splitter errors include the tensor name once, in the outer context.
+#[test]
+fn manifest_splitter_error_names_tensor_once() {
+    for (name, layout) in [
+        (
+            "blk.0.ffn_up_exps.weight",
+            Layout::Gguf {
+                ty: 999,
+                dims: vec![2, 2, 2],
+            },
+        ),
+        (
+            "model.layers.0.mlp.experts.gate_up_proj",
+            Layout::Safetensors {
+                dtype: "X9".into(),
+                shape: vec![2, 2, 1],
+                size_checked: false,
+            },
+        ),
+    ] {
+        let tensor = Tensor {
+            name: name.into(),
+            offset: 32,
+            size: 3,
+            sidecar: json!({}),
+            layout,
+        };
+        let err = tensor_rows(
+            &tensor,
+            Path::new("fixture"),
+            &ManifestOptions::default(),
+            100,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert_eq!(err.matches(name).count(), 1, "{err}");
+    }
+}
+
 /// Regression: hashes are SHA-256 of independent source ranges, including expert slices.
 #[test]
 fn manifest_hash_matches_sha256_of_ranges() {
@@ -347,7 +387,7 @@ fn manifest_merged_expert_expansion_bound() {
     let name = "model.layers.0.mlp.experts.gate_up_proj";
     refused(
         &safetensors(json!({name:tensor("BF16",&[4294967297,0,1],0,0)}), b""),
-        &[name],
+        &[name, "n_expert 4294967297", "count limit", "65536"],
     );
 }
 

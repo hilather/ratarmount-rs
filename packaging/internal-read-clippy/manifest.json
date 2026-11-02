@@ -10773,48 +10773,20 @@
       "rule_reason": "inventory-op:tempdir"
     },
     {
-      "configured_path": "std::fs::OpenOptions::new",
+      "configured_path": "tempfile::Builder::tempfile_in",
       "item": "ratarmount::tensors_cmd::write_output",
-      "leaf_digest": "489bb20c0c7e4c64f852d45043e4c18e5df3799c8eac502c5cce556e1997dd2d",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "builder-setup",
-        "creation": {
-          "basis": "Builder construction only; the open leaf owns output creation.",
-          "policy": "none"
-        },
-        "disposition": "support",
-        "id": "IR-R2-OUT-M01",
-        "item": "ratarmount::tensors_cmd::write_output",
-        "reason": "Prepare exclusive creation of an explicitly requested manifest output."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "cli-nfsv4",
-        "cli-no-default",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-R2-OUT-M01\",\"item\":\"ratarmount::tensors_cmd::write_output\",\"disposition\":\"support\",\"category\":\"builder-setup\",\"reason\":\"Prepare exclusive creation of an explicitly requested manifest output.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Builder construction only; the open leaf owns output creation.\"}}",
-      "resolved": "<std::fs::OpenOptions>::new",
-      "rule_reason": "inventory-op:OpenOptions"
-    },
-    {
-      "configured_path": "std::fs::OpenOptions::create_new",
-      "item": "ratarmount::tensors_cmd::write_output",
-      "leaf_digest": "e5c6416c2033f4b433f04f4ff3263cddbcc2ed59dd98bc7e9900594f2f969d12",
+      "leaf_digest": "56d315f462dbb8f5c1c33c77a4d00bd2fd25c4dd03b3cde3ac8f531fe7fcde5f",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "tensor-manifest-output",
         "creation": {
-          "basis": "create_new uses exclusive creation with default process permissions and never overwrites an existing path.",
+          "basis": "tempfile uses OpenOptions create_new with mode 0600 subject to umask and an unpredictable name; cleanup only removes this temporary path.",
           "policy": "exclusive-new-file"
         },
         "disposition": "output-owner",
-        "id": "IR-R2-OUT-M02",
+        "id": "IR-R2-OUT-M04",
         "item": "ratarmount::tensors_cmd::write_output",
-        "reason": "Refuse replacing an existing manifest output."
+        "reason": "Stage the validated manifest privately beside its requested output before no-clobber hard-link publication."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -10824,53 +10796,25 @@
         "cli-no-default",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-R2-OUT-M02\",\"item\":\"ratarmount::tensors_cmd::write_output\",\"disposition\":\"output-owner\",\"category\":\"tensor-manifest-output\",\"reason\":\"Refuse replacing an existing manifest output.\",\"creation\":{\"policy\":\"exclusive-new-file\",\"basis\":\"create_new uses exclusive creation with default process permissions and never overwrites an existing path.\"}}",
-      "resolved": "<std::fs::OpenOptions>::create_new",
-      "rule_reason": "inventory-op:OpenOptions"
+      "reason": "internal-read:v1 {\"id\":\"IR-R2-OUT-M04\",\"item\":\"ratarmount::tensors_cmd::write_output\",\"disposition\":\"output-owner\",\"category\":\"tensor-manifest-output\",\"reason\":\"Stage the validated manifest privately beside its requested output before no-clobber hard-link publication.\",\"creation\":{\"policy\":\"exclusive-new-file\",\"basis\":\"tempfile uses OpenOptions create_new with mode 0600 subject to umask and an unpredictable name; cleanup only removes this temporary path.\"}}",
+      "resolved": "<tempfile::Builder<'L0,'L1>>::tempfile_in",
+      "rule_reason": "inventory-op:tempfile"
     },
     {
-      "configured_path": "std::fs::OpenOptions::open",
+      "configured_path": "std::fs::File::open",
       "item": "ratarmount::tensors_cmd::write_output",
-      "leaf_digest": "4f1deb3ac1854d8c956ecec44d91a0d03a7e1c061041713287eee3347e1bc028",
+      "leaf_digest": "88981e23188d94f9ee230fda0673d99e6dbb5718d5af78dd7c2ff568e7023fab",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "tensor-manifest-output",
         "creation": {
-          "basis": "The builder is write-only with create_new; failed writes remove the newly created output.",
-          "policy": "exclusive-new-file"
-        },
-        "disposition": "output-owner",
-        "id": "IR-R2-OUT-M03",
-        "item": "ratarmount::tensors_cmd::write_output",
-        "reason": "Create the manifest output requested with -o after validating all inputs."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "cli-nfsv4",
-        "cli-no-default",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-R2-OUT-M03\",\"item\":\"ratarmount::tensors_cmd::write_output\",\"disposition\":\"output-owner\",\"category\":\"tensor-manifest-output\",\"reason\":\"Create the manifest output requested with -o after validating all inputs.\",\"creation\":{\"policy\":\"exclusive-new-file\",\"basis\":\"The builder is write-only with create_new; failed writes remove the newly created output.\"}}",
-      "resolved": "<std::fs::OpenOptions>::open",
-      "rule_reason": "inventory-op:OpenOptions"
-    },
-    {
-      "configured_path": "std::fs::OpenOptions",
-      "item": "ratarmount::tensors_cmd::write_output",
-      "leaf_digest": "489bb20c0c7e4c64f852d45043e4c18e5df3799c8eac502c5cce556e1997dd2d",
-      "lint": "clippy::disallowed_types",
-      "metadata": {
-        "category": "builder-type-support",
-        "creation": {
-          "basis": "Type reference only; the separately reviewed open leaf creates the output.",
+          "basis": "Open an existing directory after successful hard-link publication; errors preserve the published output.",
           "policy": "none"
         },
-        "disposition": "support",
-        "id": "IR-R2-OUT-T01",
+        "disposition": "output-owner",
+        "id": "IR-R2-OUT-M05",
         "item": "ratarmount::tensors_cmd::write_output",
-        "reason": "OpenOptions builder for the explicit manifest output file."
+        "reason": "Open the manifest output parent only to sync publication and temporary-name removal."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -10880,9 +10824,9 @@
         "cli-no-default",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-R2-OUT-T01\",\"item\":\"ratarmount::tensors_cmd::write_output\",\"disposition\":\"support\",\"category\":\"builder-type-support\",\"reason\":\"OpenOptions builder for the explicit manifest output file.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Type reference only; the separately reviewed open leaf creates the output.\"}}",
-      "resolved": "std::fs::OpenOptions",
-      "rule_reason": "inventory-op:OpenOptions"
+      "reason": "internal-read:v1 {\"id\":\"IR-R2-OUT-M05\",\"item\":\"ratarmount::tensors_cmd::write_output\",\"disposition\":\"output-owner\",\"category\":\"tensor-manifest-output\",\"reason\":\"Open the manifest output parent only to sync publication and temporary-name removal.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Open an existing directory after successful hard-link publication; errors preserve the published output.\"}}",
+      "resolved": "<std::fs::File>::open",
+      "rule_reason": "inventory-op:File::open"
     },
     {
       "configured_path": "tempfile::NamedTempFile::new",

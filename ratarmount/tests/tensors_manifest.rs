@@ -383,6 +383,7 @@ fn tensors_manifest_root_array_index_refused() {
     assert!(output.stdout.is_empty());
 }
 
+/// Regression: failed writes leave neither a partial output nor a staging file.
 #[test]
 fn tensors_manifest_output_failure_removes_partial_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -396,6 +397,7 @@ fn tensors_manifest_output_failure_removes_partial_file() {
         .to_string()
         .contains("injected write failure"));
     assert!(!path.exists());
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 
     // Also exercise run from the included production module, keeping this
     // failure seam in the same targeted integration test as the binary paths.
@@ -411,63 +413,106 @@ fn tensors_manifest_output_failure_removes_partial_file() {
     .unwrap();
     tensors_cmd::run(&args).unwrap();
     assert!(path.is_file());
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
 }
 
-/// Regression: failed output cleanup must preserve a replacement published by another writer.
+/// Regression: cleanup after a failed write must never unlink another writer's output.
 #[test]
 fn tensors_manifest_output_failure_preserves_replacement() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("manifest.jsonl");
-    let displaced = dir.path().join("displaced.jsonl");
     let partial = [b'x'; 20_000];
     let replacement = [b'y'; 20_000];
     let error = tensors_cmd::write_output(&path, |out| {
         out.write_all(&partial)?;
         out.flush()?;
-        fs::rename(&path, &displaced)?;
+        assert!(!path.exists(), "the partial output must remain private");
         fs::write(&path, replacement)?;
         Err(io::Error::other("injected write failure").into())
     })
     .unwrap_err()
     .to_string();
     assert!(error.contains("injected write failure"), "{error}");
-    assert!(error.contains("output path was replaced"), "{error}");
     assert_eq!(fs::read(&path).unwrap(), replacement);
-    assert_eq!(fs::read(&displaced).unwrap(), partial);
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
-/// Regression: an unidentifiable or non-file output path is preserved and cleanup is reported.
+/// Regression: a replacement after writing begins must survive no-clobber publication.
 #[test]
-fn tensors_manifest_output_failure_reports_unverified_path() {
+fn tensors_manifest_output_publish_preserves_replacement() {
     let dir = tempfile::tempdir().unwrap();
-    for directory in [false, true] {
-        let path = dir.path().join(format!("manifest-{directory}.jsonl"));
-        let displaced = dir.path().join(format!("displaced-{directory}.jsonl"));
-        let error = tensors_cmd::write_output(&path, |out| {
-            out.write_all(b"partial")?;
-            out.flush()?;
-            fs::rename(&path, &displaced)?;
-            if directory {
-                fs::create_dir(&path)?;
-                fs::write(path.join("keep"), b"replacement")?;
-            }
-            Err(io::Error::other("injected write failure").into())
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("injected write failure"), "{error}");
-        assert!(
-            error.contains("incomplete output cleanup failed"),
-            "{error}"
+    let path = dir.path().join("manifest.jsonl");
+    let displaced = dir.path().join("displaced.jsonl");
+    fs::write(&path, b"original").unwrap();
+    let error = tensors_cmd::write_output(&path, |out| {
+        out.write_all(b"new manifest")?;
+        out.flush()?;
+        assert_eq!(fs::read(&path)?, b"original");
+        fs::rename(&path, &displaced)?;
+        fs::write(&path, b"replacement")?;
+        Ok(())
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("output was not published"), "{error}");
+    assert_eq!(fs::read(&path).unwrap(), b"replacement");
+    assert_eq!(fs::read(&displaced).unwrap(), b"original");
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+}
+
+/// Regression: an output appearing during the write is refused without any temporary residue.
+#[test]
+fn tensors_manifest_output_publish_refuses_existing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("manifest.jsonl");
+    let error = tensors_cmd::write_output(&path, |out| {
+        out.write_all(b"new manifest")?;
+        assert!(!path.exists());
+        fs::write(&path, b"existing manifest")?;
+        Ok(())
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("output was not published"), "{error}");
+    assert!(error.contains("exist"), "{error}");
+    assert_eq!(fs::read(&path).unwrap(), b"existing manifest");
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+/// Regression: write-only temporary files can be cleaned up without reopening them for reading.
+#[test]
+fn tensors_manifest_output_failure_cleans_write_only_temp() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("manifest.jsonl");
+    let error = tensors_cmd::write_output(&path, |out| {
+        let entries = fs::read_dir(dir.path())?.collect::<io::Result<Vec<_>>>()?;
+        assert_eq!(entries.len(), 1);
+        let temporary = entries[0].path();
+        assert_ne!(temporary, path);
+        assert_eq!(temporary.parent(), path.parent());
+        let initial_mode = rustix::fs::stat(&temporary)
+            .map_err(io::Error::from)?
+            .st_mode
+            & 0o777;
+        assert_eq!(initial_mode & !0o600, 0, "0600 subject to umask");
+        rustix::fs::chmod(&temporary, rustix::fs::Mode::WUSR).map_err(io::Error::from)?;
+        assert_eq!(
+            rustix::fs::stat(&temporary)
+                .map_err(io::Error::from)?
+                .st_mode
+                & 0o777,
+            0o200
         );
-        assert_eq!(fs::read(&displaced).unwrap(), b"partial");
-        if directory {
-            assert!(error.contains("no longer a regular file"), "{error}");
-            assert_eq!(fs::read(path.join("keep")).unwrap(), b"replacement");
-        } else {
-            assert!(!path.exists());
-        }
-    }
+        out.write_all(&[b'x'; 20_000])?;
+        out.flush()?;
+        Err(io::Error::other("injected write-only failure").into())
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("injected write-only failure"), "{error}");
+    assert!(!error.contains("cleanup failed"), "{error}");
+    assert!(!path.exists());
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
 #[test]

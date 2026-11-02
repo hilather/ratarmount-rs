@@ -68,67 +68,74 @@ pub fn run(args: &TensorsArgs) -> Result<()> {
     }
 }
 
-/// Create only after input validation, and remove an incomplete output on a
-/// write, flush or sync error only if the path still identifies the created file.
+/// Stage beside the output, then publish complete, synced bytes without clobbering.
+/// Cleanup only unlinks our private temporary path, never the requested output.
 /// The closure supplies a deterministic failure seam for the command's helper.
 pub(crate) fn write_output(
     path: &Path,
     write: impl FnOnce(&mut dyn Write) -> Result<()>,
 ) -> Result<()> {
-    #[expect(
-        clippy::disallowed_types,
-        reason = r#"internal-read:v1 {"id":"IR-R2-OUT-T01","item":"ratarmount::tensors_cmd::write_output","disposition":"support","category":"builder-type-support","reason":"OpenOptions builder for the explicit manifest output file.","creation":{"policy":"none","basis":"Type reference only; the separately reviewed open leaf creates the output."}}"#
-    )]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = r#"internal-read:v1 {"id":"IR-R2-OUT-M01","item":"ratarmount::tensors_cmd::write_output","disposition":"support","category":"builder-setup","reason":"Prepare exclusive creation of an explicitly requested manifest output.","creation":{"policy":"none","basis":"Builder construction only; the open leaf owns output creation."}}"#
-    )]
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     #[expect(
         clippy::disallowed_methods,
-        reason = r#"internal-read:v1 {"id":"IR-R2-OUT-M02","item":"ratarmount::tensors_cmd::write_output","disposition":"output-owner","category":"tensor-manifest-output","reason":"Refuse replacing an existing manifest output.","creation":{"policy":"exclusive-new-file","basis":"create_new uses exclusive creation with default process permissions and never overwrites an existing path."}}"#
+        reason = r#"internal-read:v1 {"id":"IR-R2-OUT-M04","item":"ratarmount::tensors_cmd::write_output","disposition":"output-owner","category":"tensor-manifest-output","reason":"Stage the validated manifest privately beside its requested output before no-clobber hard-link publication.","creation":{"policy":"exclusive-new-file","basis":"tempfile uses OpenOptions create_new with mode 0600 subject to umask and an unpredictable name; cleanup only removes this temporary path."}}"#
     )]
-    options.create_new(true);
-    #[expect(
-        clippy::disallowed_methods,
-        reason = r#"internal-read:v1 {"id":"IR-R2-OUT-M03","item":"ratarmount::tensors_cmd::write_output","disposition":"output-owner","category":"tensor-manifest-output","reason":"Create the manifest output requested with -o after validating all inputs.","creation":{"policy":"exclusive-new-file","basis":"The builder is write-only with create_new; failed writes remove the newly created output."}}"#
-    )]
-    let mut file = options
-        .open(path)
+    let mut temp = tempfile::Builder::new()
+        .prefix(".ratarmount-tensors-")
+        .rand_bytes(16)
+        .tempfile_in(parent)
         .map_err(|error| output_error(path, error))?;
-    let result = (|| {
-        let mut out = BufWriter::new(&mut file);
+    let result: Result<()> = (|| {
+        let mut out = BufWriter::new(temp.as_file_mut());
         write(&mut out)?;
         out.flush()?;
         drop(out);
-        file.sync_all()?;
+        temp.as_file().sync_all()?;
+        std::fs::hard_link(temp.path(), path).map_err(|error| {
+            TensorsError::Invalid(format!(
+                "output was not published: hard-link publication failed: {error}"
+            ))
+        })?;
         Ok(())
     })();
-    result.map_err(|error: TensorsError| {
-        let cleanup = (|| -> io::Result<()> {
-            // Keep the created file open through the comparison and unlink so
-            // its identity cannot be recycled after a rename or replacement.
-            let created = same_file::Handle::from_file(file)?;
-            if !std::fs::metadata(path)?.is_file() {
-                return Err(io::Error::other(
-                    "output path is no longer a regular file; leaving it untouched",
-                ));
-            }
-            let current = same_file::Handle::from_path(path)?;
-            if created != current {
-                return Err(io::Error::other(
-                    "output path was replaced; leaving it untouched",
-                ));
-            }
-            std::fs::remove_file(path)
-        })();
-        let detail = match cleanup {
-            Ok(()) => String::new(),
-            Err(error) => format!("; incomplete output cleanup failed: {error}"),
-        };
-        TensorsError::Invalid(format!("{}: {error}{detail}", path.display()))
-    })
+    // close removes the private name without reopening it for reading.
+    match (result, temp.close()) {
+        (Err(error), cleanup) => {
+            let detail = match cleanup {
+                Ok(()) => String::new(),
+                Err(error) => format!("; temporary output cleanup failed: {error}"),
+            };
+            return Err(TensorsError::Invalid(format!(
+                "{}: {error}{detail}",
+                path.display()
+            )));
+        }
+        (Ok(()), Err(error)) => {
+            return Err(TensorsError::Invalid(format!(
+                "{}: output was published but temporary output cleanup failed: {error}",
+                path.display()
+            )));
+        }
+        (Ok(()), Ok(())) => {}
+    }
+    // A failure here leaves the complete published output intact, but cannot
+    // promise that publication is durable across a crash.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r#"internal-read:v1 {"id":"IR-R2-OUT-M05","item":"ratarmount::tensors_cmd::write_output","disposition":"output-owner","category":"tensor-manifest-output","reason":"Open the manifest output parent only to sync publication and temporary-name removal.","creation":{"policy":"none","basis":"Open an existing directory after successful hard-link publication; errors preserve the published output."}}"#
+    )]
+    let directory = std::fs::File::open(parent);
+    directory
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            TensorsError::Invalid(format!(
+                "{}: output was published but parent directory sync failed: {error}",
+                path.display()
+            ))
+        })
 }
 
 fn output_error(path: &Path, error: io::Error) -> TensorsError {

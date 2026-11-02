@@ -209,7 +209,7 @@ fn tensor_rows_inner(
                 check_count(n, remaining)?;
                 let (_, block, bytes) = ggml_layout(*ty).ok_or_else(|| {
                     invalid(format!(
-                        "cannot split merged expert tensor {name}: unknown ggml type {ty}"
+                        "cannot split merged expert tensor: unknown ggml type {ty}"
                     ))
                 })?;
                 let slice = mul(dims[1], mul(dims[0] / block, bytes)?)?;
@@ -247,7 +247,10 @@ fn tensor_rows_inner(
                     let n = shape[0];
                     check_count(n, remaining)?;
                     if !tensor.size.is_multiple_of(n) {
-                        return Err(invalid(format!("merged expert tensor {name}: length {} is not a multiple of n_expert {n}", tensor.size)));
+                        return Err(invalid(format!(
+                            "merged expert length {} is not a multiple of n_expert {n}",
+                            tensor.size
+                        )));
                     }
                     let slice = tensor.size / n;
                     if *size_checked {

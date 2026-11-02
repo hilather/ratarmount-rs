@@ -269,7 +269,7 @@ Safetensors uses these rules:
 - Everything else: `Other`, with `expert: null`. SharedExpert and Other rows
   use the same unanchored `layers` extractor for a layer when present.
 
-The default per-expert pattern, wrapped with `^(?:PATTERN)$`, is exactly:
+The default per-expert pattern, anchored with `^` and `$`, is exactly:
 
 ```text
 (?:.*\.)?layers\.(?P<layer>\d+)\.(?:mlp|block_sparse_moe)\.experts\.(?P<expert>\d+)\.(?P<role>gate_proj|up_proj|down_proj|w1|w3|w2)\.weight
@@ -277,10 +277,14 @@ The default per-expert pattern, wrapped with `^(?:PATTERN)$`, is exactly:
 
 `--expert-pattern REGEX` replaces this pattern entirely; it does not replace
 the fused rule or the fixed GGUF rules. It must contain named groups `layer`,
-`expert` and `role`, and is also anchored as `^(?:REGEX)$`. For each match,
-all three groups must participate, both numbers must fit `u32`, and `role`
-must be recognized. An invalid capture refuses the tensor rather than silently
-classifying it as Other. Custom patterns accept these role captures:
+`expert` and `role`, and is anchored as `\A(?:REGEX)\z`. If compiling this
+wrapper fails, compilation retries with a newline before the closing wrapper
+so a trailing verbose-mode comment cannot swallow the wrapper or end anchor.
+The newline is added only on that retry; literal newlines in ordinary patterns
+are unchanged. For each match, all three groups must participate, both numbers
+must fit `u32`, and `role` must be recognized. An invalid capture refuses the
+tensor rather than silently classifying it as Other. Custom patterns accept
+these role captures:
 
 | Role | Captures |
 |---|---|
@@ -364,10 +368,20 @@ refused with an error naming the file and tensor.
 
 ### Output and library API
 
-The default output is buffered stdout. `-o FILE` creates a new file exclusively
-and refuses an existing path. All inputs are validated before creating output;
-write, flush and sync errors are propagated, and a failed file output is removed.
-The output buffer is explicitly flushed before `sync_all`.
+The default output is buffered stdout. After all inputs are validated, `-o FILE`
+creates an unpredictable private temporary file in FILE's parent directory with
+exclusive creation and permissions `0600` (subject to umask) on Unix. It writes
+the manifest, explicitly flushes the output buffer, and calls `sync_all` before
+publishing with `hard_link(temp, FILE)`. Publication refuses an existing path
+and requires a filesystem that supports hard links. Any hard-link error fails
+with an `output was not published` error; there is no rename or copy fallback.
+
+Failures remove only the private temporary file, without reopening it for read
+access; they never remove FILE. After publication, the temporary link is removed
+and the parent directory is opened and synced. A directory open or sync failure
+is reported as an error while the published FILE remains intact, so its
+durability is unconfirmed. Some operating systems do not support opening or
+syncing directories through these APIs and will report that error.
 
 Success exits 0; invalid arguments, input errors and output errors exit 2, with
 `tensors: <error>` on stderr for errors from the command. Stdout write or final
