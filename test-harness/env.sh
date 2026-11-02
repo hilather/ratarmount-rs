@@ -75,6 +75,21 @@ ratar_wait_mounted() {
     return 1
 }
 
+# SIGTERM each given pid that is still a running background job of this shell.
+# Bash reaps a job as soon as it exits, after which its pid may already belong
+# to an unrelated process: a recorded pid is signalled only while `jobs -pr`
+# lists it. Pass `$!` of a simple command or subshell (a pipeline's `$!` is its
+# last process, which `jobs -p` does not list).
+kill_running_jobs() {
+    local running pid
+    running=" $(jobs -pr | tr '\n' ' ') "
+    for pid in "$@"; do
+        if [[ -n "$pid" && "$running" == *" $pid "* ]]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
 # Python fixture root (required unless RATARMOUNT_ALLOW_NO_PY=1, e.g. macOS smoke).
 if [[ -z "${RATARMOUNT_PY_ROOT:-}" ]]; then
     if [[ -d "$ROOT/../ratarmount/tests" ]]; then

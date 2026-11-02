@@ -356,7 +356,9 @@ fn regression_run_stub_kill_removes_sleeping_process_group() {
     // Wait for setsid to create the process group, not just the PID file.
     let pid: i32 = fs::read_to_string(state.join("test"))
         .unwrap()
-        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap()
         .parse()
         .unwrap();
     let start = Instant::now();
@@ -375,6 +377,51 @@ fn regression_run_stub_kill_removes_sleeping_process_group() {
     }
     assert!(!wait(&mut child).success());
     assert!(!state.join("test").exists());
+}
+
+/// Regression: the stub runtime's `kill`/`rm` sent SIGKILL to the process group its state file
+/// named without checking that the recorded leader still ran, so a stale file whose pid was
+/// reused could kill an unrelated group. A group whose leader has another start time (or a
+/// record without one) is left alone, and the stale file is still removed.
+#[test]
+fn regression_run_stub_kill_skips_reused_pid() {
+    use std::os::unix::process::CommandExt;
+    if Command::new("setsid").arg("--version").output().is_err() {
+        eprintln!("skip: setsid unavailable");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    fs::create_dir(&state).unwrap();
+    // A live group led by the recorded pid, but not the process the record describes.
+    let mut unrelated = Command::new("sleep")
+        .arg("60")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    for record in [
+        format!("{} 0\n", unrelated.id()),
+        format!("{}\n", unrelated.id()),
+    ] {
+        for verb in ["kill", "rm"] {
+            fs::write(state.join("test"), &record).unwrap();
+            assert!(Command::new("bash")
+                .arg(stub())
+                .args([verb, "test"])
+                .env("RATARMOUNT_STUB_STATE", &state)
+                .status()
+                .unwrap()
+                .success());
+            assert!(!state.join("test").exists(), "{verb} kept {record:?}");
+        }
+    }
+    let alive = unrelated.try_wait().unwrap().is_none();
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+    assert!(
+        alive,
+        "the stub signalled a group its state file does not describe"
+    );
 }
 
 /// Regression: `sandbox run --top` inside a directory `--base` would change

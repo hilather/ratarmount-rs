@@ -36,7 +36,10 @@ OUT="$HERE/fixtures/overlay-v0.1.35"
 WORK=$(mktemp -d)
 cleanup() {
   fusermount3 -u "$WORK/mnt" 2>/dev/null || true
-  if [ -n "${PID:-}" ]; then kill "$PID" 2>/dev/null || true; fi
+  # Only while still a running job: once reaped, its pid may name another process.
+  if [ -n "${PID:-}" ] && [[ " $(jobs -pr | tr '\n' ' ') " == *" $PID "* ]]; then
+    kill "$PID" 2>/dev/null || true
+  fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT

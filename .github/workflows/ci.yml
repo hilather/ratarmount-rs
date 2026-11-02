@@ -52,6 +52,9 @@ jobs:
       - name: canonical hash reference self-test
         run: python3 -I test-harness/canonical-hash/reference.py --self-test
 
+      - name: harness kill guard self-test
+        run: bash test-harness/test-shell-kill-safety.sh
+
       - name: wheel export audit self-test
         run: python3 -I packaging/audit_native_exports.py --self-test
 

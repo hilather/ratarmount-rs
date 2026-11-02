@@ -17,7 +17,7 @@ MOUNT_PIDS=()
 cleanup() {
     set +e
     for pid in "${MOUNT_PIDS[@]:-}"; do
-        kill "$pid" 2>/dev/null || true
+        kill_running_jobs "$pid"
     done
     for mp in "$WORKDIR"/mnt-*; do
         if [[ -d "$mp" ]]; then
@@ -139,7 +139,7 @@ run_case() {
         echo "  [FAIL] rust mount with python index"
         cat "$WORKDIR/mount-$name.log" || true
         failed=1
-        kill "$mpid" 2>/dev/null || true
+        kill_running_jobs "$mpid"
         return
     fi
 

@@ -32,8 +32,36 @@ def load_script(filename):
     return module
 
 
+def signal_own_group(process, sig):
+    """Signal the process group a test started with start_new_session=True, only while its
+    leader is unreaped: once reaped, its pid may name another process group."""
+    if process.returncode is not None:
+        return
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
 class BenchmarkRegressionTests(unittest.TestCase):
     """Regression: failed/short reads and unavailable tools must not become results."""
+
+    def test_regression_group_cleanup_skips_reaped_leader(self):
+        """Regression: emergency cleanup called os.killpg(process.pid) after communicate() had
+        reaped the helper, when its pid may already name an unrelated process group."""
+        reaped = subprocess.Popen(["true"], start_new_session=True)
+        reaped.wait()
+        with patch.object(os, "killpg") as killpg:
+            signal_own_group(reaped, signal.SIGTERM)
+        killpg.assert_not_called()
+        running = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        try:
+            signal_own_group(running, signal.SIGTERM)
+            self.assertEqual(running.wait(timeout=10), -signal.SIGTERM)
+        finally:
+            if running.returncode is None:
+                running.kill()
+                running.wait()
 
     def test_regression_short_duplicate_and_corrupt_samples_fail(self):
         expected = common.tally([b"a", b"b"])
@@ -385,10 +413,7 @@ class BenchmarkRegressionTests(unittest.TestCase):
                     socket.create_connection(("127.0.0.1", port), timeout=1)
             finally:
                 # Restrict emergency cleanup to this test's own process group.
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                signal_own_group(process, signal.SIGTERM)
                 process.communicate(timeout=10)
 
     @unittest.skipUnless(os.getenv("AI_TEST_NFS") == "1", "skip: set AI_TEST_NFS=1 with CAP_SYS_ADMIN and mount.nfs")

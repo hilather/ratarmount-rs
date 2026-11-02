@@ -14,8 +14,8 @@ mkdir -p "$MP"
 
 cleanup() {
     set +e
-    [[ -n "${SRV_PID:-}" ]] && kill "$SRV_PID" 2>/dev/null || true
-    [[ -n "${MNT_PID:-}" ]] && kill "$MNT_PID" 2>/dev/null || true
+    kill_running_jobs "${SRV_PID:-}"
+    kill_running_jobs "${MNT_PID:-}"
     ratar_unmount "$MP"
     rm -rf "$WORKDIR" || true
 }

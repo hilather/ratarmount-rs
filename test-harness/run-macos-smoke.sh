@@ -38,7 +38,7 @@ MOUNT_PID=""
 cleanup() {
     set +e
     if [[ -n "${MOUNT_PID:-}" ]]; then
-        kill "$MOUNT_PID" 2>/dev/null || true
+        kill_running_jobs "$MOUNT_PID"
         wait "$MOUNT_PID" 2>/dev/null || true
     fi
     ratar_unmount "$MP"
@@ -76,7 +76,7 @@ if [[ "$got" != "hello-ratarmount-macos" ]]; then
 fi
 echo "    tar.gz: OK ($got)"
 
-kill "$MOUNT_PID" 2>/dev/null || true
+kill_running_jobs "$MOUNT_PID"
 wait "$MOUNT_PID" 2>/dev/null || true
 MOUNT_PID=""
 ratar_unmount "$MP"
@@ -99,7 +99,7 @@ if command -v zip >/dev/null 2>&1; then
         exit 1
     fi
     echo "    zip: OK"
-    kill "$MOUNT_PID" 2>/dev/null || true
+    kill_running_jobs "$MOUNT_PID"
     wait "$MOUNT_PID" 2>/dev/null || true
     MOUNT_PID=""
     ratar_unmount "$MP"
@@ -118,7 +118,7 @@ else
     ratar_unmount "$MP"
     echo "    ratarmount -u: fallback ratar_unmount (ok for CI)"
 fi
-kill "$MOUNT_PID" 2>/dev/null || true
+kill_running_jobs "$MOUNT_PID"
 wait "$MOUNT_PID" 2>/dev/null || true
 MOUNT_PID=""
 

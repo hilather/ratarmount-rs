@@ -80,7 +80,7 @@ cleanup() {
     [[ -d "$mp" ]] || continue
     ratar_unmount "$mp" 2>/dev/null || true
   done
-  pkill -f "ratarmount.*$WORKDIR" 2>/dev/null || true
+  pkill -f "ratarmount.*${WORKDIR}(/| |\$)" 2>/dev/null || true
   if [[ "${COMPARE_KEEP:-0}" != "1" ]]; then
     rm -rf "$WORKDIR"
   else
@@ -222,7 +222,7 @@ measure_fuse() {
   if ! wait_mount "$mp"; then
     echoerr "FAIL fuse cold $tool $base"
     tail -30 "$log" >&2 || true
-    kill "$pid" 2>/dev/null || true
+    kill_running_jobs "$pid"
     unmount_mp "$mp"
     rmdir "$mp" 2>/dev/null || true
     echo "$tool;cold;$base;mount_fail;1;bool" >>"$CSV"
