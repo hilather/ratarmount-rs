@@ -112,11 +112,11 @@ pub struct JournalSpec {
 }
 
 /// Version 2: the v1 operations, where `new` also takes a `request_id`,
-/// `lowers` and a `journal`. Fields and defaults are v1's, and they never
-/// change within version 2; later releases only add fields, which an older
-/// daemon refuses as unknown. Only `new` takes a request ID: `create_base`,
-/// `destroy` and every other operation take none, and a `request_id` there is
-/// an unknown field (`invalid_request`).
+/// `lowers` and a `journal`; plus `finalize`. Fields and defaults are v1's,
+/// and they never change within version 2; later releases only add fields,
+/// which an older daemon refuses as unknown. Only `new` and `finalize` take a
+/// request ID: `create_base`, `destroy` and every other operation take none,
+/// and a `request_id` there is an unknown field (`invalid_request`).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperationV2 {
@@ -178,12 +178,30 @@ pub enum OperationV2 {
     /// ignores the remaining keys of an internally tagged unit variant, as
     /// v1's `Shutdown` still does.
     Shutdown {},
+    /// Stop, check, seal, hash and optionally pack an attempt (R1c-1 §5.4);
+    /// retry-safe under `request_id`. Linux only. No v1 form.
+    Finalize {
+        id: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        pack: bool,
+        /// A string when present: `null` is refused, never read as "no ID".
+        #[serde(
+            default,
+            deserialize_with = "some",
+            skip_serializing_if = "Option::is_none"
+        )]
+        request_id: Option<String>,
+    },
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 impl OperationV2 {
     /// The same v1 operation; a `request_id` is not part of it. A `new` with
-    /// `lowers` or a `journal` has no v1 form: the supervisor never converts
-    /// one (§5.1).
+    /// `lowers` or a `journal`, and `finalize`, have no v1 form: the
+    /// supervisor never converts one (§5.1).
     pub fn into_v1(self) -> Operation {
         match self {
             Self::CreateBase {
@@ -223,6 +241,7 @@ impl OperationV2 {
             Self::Stats { id } => Operation::Stats { id },
             Self::Destroy { id, base } => Operation::Destroy { id, base },
             Self::Shutdown {} => Operation::Shutdown,
+            Self::Finalize { .. } => unreachable!("`Supervisor::handle` takes every finalize"),
         }
     }
 }

@@ -57,7 +57,7 @@ fn directory_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
-fn open_root(path: &Path) -> io::Result<OwnedFd> {
+pub(crate) fn open_root(path: &Path) -> io::Result<OwnedFd> {
     Ok({
         #[expect(
             clippy::disallowed_methods,
@@ -79,7 +79,7 @@ fn openat_admitted(dir: &OwnedFd, name: &str, flags: OFlags) -> io::Result<Owned
     {
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0047-M01","item":"ratarmount::overlay_pack::openat_admitted","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","non_mandatory_callers":["append_host","pack"],"category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-B0047-M01","item":"ratarmount::overlay_pack::openat_admitted","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","non_mandatory_callers":["append_host","pack","sync_children"],"category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let __inventory_value_0 = ratarmount_core::db_inodes::openat_admitted(
             Some(dir.as_fd()),
@@ -1429,6 +1429,378 @@ fn seal_directories(fd: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Removes the tree at `path`, sealed (no write bits) or not, through
+/// descriptors only (`remove_contents`), then the root; the root's removal
+/// reports anything left behind (R1c-1 §5.8). A missing tree is gone already.
+pub(crate) fn remove_tree(path: &Path) -> io::Result<()> {
+    let root = match open_root(path) {
+        Ok(root) => root,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    remove_contents(&root);
+    drop(root);
+    fs::remove_dir(path)
+}
+
+/// Test-only record of the entry-lock, publication and sync events, with
+/// absolute paths, across threads: each test filters by its own directory.
+#[cfg(test)]
+pub(crate) mod events {
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record(what: &str, path: &Path) {
+        EVENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(format!("{what} {}", path.display()));
+    }
+
+    /// Every event naming a path under `root`, in order, with `root`
+    /// replaced by `$ROOT`.
+    pub(crate) fn under(root: &Path) -> Vec<String> {
+        let root = root.display().to_string();
+        EVENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|event| event.contains(&root))
+            .map(|event| event.replace(&root, "$ROOT"))
+            .collect()
+    }
+}
+
+/// A test hook given the entry it is reached for.
+#[cfg(test)]
+pub(crate) type EntryHook = std::cell::RefCell<Option<Box<dyn Fn(&Path)>>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs in `publish_layer` after its rename, before its mode restore.
+    pub(crate) static AFTER_PUBLISH_RENAME: EntryHook = const { std::cell::RefCell::new(None) };
+    /// Runs in a cache hit after its publication check, holding the lock.
+    pub(crate) static AFTER_HIT_CHECK: EntryHook = const { std::cell::RefCell::new(None) };
+    /// Makes the mode restore of `publish_layer` fail.
+    pub(crate) static FAIL_PUBLISH_RESTORE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The errno every entry `flock` of this thread fails with.
+    pub(crate) static ENTRY_FLOCK_ERRNO: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// How an entry lock is taken.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryLock {
+    Shared,
+    Exclusive,
+}
+
+/// Whether the entry lock is unavailable on this filesystem: then a fill
+/// and a hit proceed unlocked, as every `--lower` mount did before.
+fn flock_unsupported(error: rustix::io::Errno) -> bool {
+    matches!(
+        error,
+        rustix::io::Errno::NOSYS | rustix::io::Errno::NOLCK | rustix::io::Errno::OPNOTSUPP
+    )
+}
+
+/// Takes the entry lock of a layer root on `root` (its overlay root flock,
+/// which seal, unseal and commit of that layer take too), waiting for it.
+/// A cache filesystem without `flock` proceeds unlocked, logged once.
+fn lock_entry(root: &OwnedFd, path: &Path, how: EntryLock) -> io::Result<()> {
+    use rustix::fs::FlockOperation;
+    let operation = match how {
+        EntryLock::Shared => FlockOperation::LockShared,
+        EntryLock::Exclusive => FlockOperation::LockExclusive,
+    };
+    loop {
+        #[cfg(test)]
+        let injected = ENTRY_FLOCK_ERRNO.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let injected: Option<i32> = None;
+        let result = match injected {
+            Some(errno) => Err(rustix::io::Errno::from_raw_os_error(errno)),
+            None => rustix::fs::flock(root, operation),
+        };
+        match result {
+            Ok(()) => {
+                #[cfg(test)]
+                events::record("lock", path);
+                return Ok(());
+            }
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) if flock_unsupported(error) => {
+                static LOGGED: std::sync::Once = std::sync::Once::new();
+                LOGGED.call_once(|| {
+                    log::warn!(
+                        "the layer cache at {} does not support flock ({error}); cache entries are used without their entry lock",
+                        path.display()
+                    )
+                });
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::Error::from(error).kind(),
+                    format!("cannot lock layer {}: {error}", path.display()),
+                ))
+            }
+        }
+    }
+}
+
+/// The entry lock of the sealed layer at `path` for finalize's step S
+/// (R1c-1 ruling 1+2): an exclusive `flock` on an `open_root` descriptor of
+/// the layer root, which is that layer's overlay root flock, polled until
+/// `deadline` (`WouldBlock` then). Returns the locked descriptor; the lock
+/// lasts as long as it.
+pub(crate) fn lock_layer_entry(path: &Path, deadline: std::time::Instant) -> io::Result<OwnedFd> {
+    use rustix::fs::FlockOperation;
+    let root = open_root(path)?;
+    loop {
+        #[cfg(test)]
+        let injected = ENTRY_FLOCK_ERRNO.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let injected: Option<i32> = None;
+        let result = match injected {
+            Some(errno) => Err(rustix::io::Errno::from_raw_os_error(errno)),
+            None => rustix::fs::flock(&root, FlockOperation::NonBlockingLockExclusive),
+        };
+        match result {
+            Ok(()) => {
+                #[cfg(test)]
+                events::record("lock", path);
+                return Ok(root);
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(rustix::io::Errno::WOULDBLOCK) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "layer {} is locked by its publication, a cache hit, or a seal, unseal or commit of it",
+                        path.display()
+                    ),
+                ))
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::Error::from(error).kind(),
+                    format!("cannot lock layer {}: {error}", path.display()),
+                ))
+            }
+        }
+    }
+}
+
+/// What `sync_tree` checks on each descriptor before its fsync (R1c-1 §5.6,
+/// ruling 6), and the fsync itself, so tests can record and fail it.
+pub(crate) struct SyncChecks<'a> {
+    /// Whether finalize may rely on the fsync of the filesystem a descriptor
+    /// is on (its own `fstatfs`); `Err` says why not.
+    pub filesystem: &'a dyn Fn(std::os::fd::BorrowedFd<'_>, &Path) -> Result<(), String>,
+    /// The device a node reports: its real `st_dev` (tests override it).
+    pub device: &'a dyn Fn(&Path, u64) -> u64,
+    /// Refuse any regular file or directory that carries a write bit (lowers).
+    pub read_only: bool,
+    pub fsync: &'a mut dyn FnMut(std::os::fd::BorrowedFd<'_>, &Path) -> io::Result<()>,
+    /// Runs between a node's listing and its open (tests swap it).
+    #[cfg(test)]
+    pub before_open: Option<&'a dyn Fn(&Path)>,
+}
+
+/// Why `sync_tree` stopped.
+#[derive(Debug)]
+pub(crate) enum SyncError {
+    /// A node's device, type or filesystem is not its tree's (or changed
+    /// under the walk): refused like poisoning, but nothing is poisoned.
+    Mismatch(String),
+    /// A writable node in a tree that must be read-only.
+    Writable(PathBuf),
+    /// A failed fsync on `device`, which may have lost data.
+    Fsync {
+        device: u64,
+        path: PathBuf,
+        error: io::Error,
+    },
+    /// Anything else (a listing, a stat, an open, a name that is not UTF-8).
+    Other(String),
+}
+
+fn other(path: &Path, what: &str, error: impl std::fmt::Display) -> SyncError {
+    SyncError::Other(format!("{}: {what}: {error}", path.display()))
+}
+
+fn device_mismatch(path: &Path, found: u64, expected: u64) -> SyncError {
+    SyncError::Mismatch(format!(
+        "{} is on device {found}, not on the filesystem of its tree (device {expected}); finalize syncs only trees that lie wholly on one filesystem, and an overlayfs whose layers are on different filesystems reports such devices",
+        path.display()
+    ))
+}
+
+/// Checks the descriptor `fd` of the node at `path` that the listing saw as
+/// `listed`, on the tree's device `expected`: the same type and `(dev,
+/// ino)`, the tree's device, an allowed filesystem by its own `fstatfs`, and
+/// no write bit when `read_only`.
+fn check_node(
+    fd: &OwnedFd,
+    path: &Path,
+    listed: &rustix::fs::Stat,
+    expected: u64,
+    checks: &SyncChecks<'_>,
+) -> Result<(), SyncError> {
+    use std::os::fd::AsFd;
+    let stat = ratarmount_compositing::host_stat::fstat_named(fd, path)
+        .map_err(|e| other(path, "cannot stat", e))?;
+    let device = (checks.device)(path, stat.st_dev as u64);
+    if stat.st_mode & libc::S_IFMT != listed.st_mode & libc::S_IFMT
+        || stat.st_ino != listed.st_ino
+        || stat.st_dev != listed.st_dev
+    {
+        return Err(SyncError::Mismatch(format!(
+            "{} was replaced while it was being synced",
+            path.display()
+        )));
+    }
+    if device != expected {
+        return Err(device_mismatch(path, device, expected));
+    }
+    (checks.filesystem)(fd.as_fd(), path).map_err(SyncError::Mismatch)?;
+    if checks.read_only && stat.st_mode & 0o222 != 0 {
+        return Err(SyncError::Writable(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn fsync_node(
+    fd: &OwnedFd,
+    path: &Path,
+    device: u64,
+    checks: &mut SyncChecks<'_>,
+) -> Result<(), SyncError> {
+    use std::os::fd::AsFd;
+    (checks.fsync)(fd.as_fd(), path).map_err(|error| SyncError::Fsync {
+        device,
+        path: path.to_path_buf(),
+        error,
+    })
+}
+
+/// Fsyncs every node of the tree at `path`, whose root `root` the caller
+/// opened (a lower's locked descriptor, or `open_root`), in post-order: each
+/// directory's regular files, then its subdirectories the same way, then the
+/// directory itself, ending with the root (R1c-1 §5.6, ruling 6).
+///
+/// Every node is checked on the descriptor that is synced: directories open
+/// `O_DIRECTORY | O_NOFOLLOW`, regular files through the admitted
+/// `O_NOFOLLOW | O_NONBLOCK` open (so a symlink in a node's place fails with
+/// `ELOOP` and a FIFO opens without blocking, then fails the type check);
+/// each descriptor's `fstat` must show the type and `(dev, ino)` its listing
+/// saw, its device must be the root's, and its own `fstatfs` must be on the
+/// allowlist. Symlinks, sockets, FIFOs and device nodes are only listed
+/// (their device is checked; their names are covered by their directory's
+/// fsync). Nothing below the root is opened by host path.
+pub(crate) fn sync_tree(
+    root: &OwnedFd,
+    path: &Path,
+    checks: &mut SyncChecks<'_>,
+) -> Result<(), SyncError> {
+    use std::os::fd::AsFd;
+    let stat = ratarmount_compositing::host_stat::fstat_named(root, path)
+        .map_err(|e| other(path, "cannot stat", e))?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(SyncError::Other(format!(
+            "{} is not a directory",
+            path.display()
+        )));
+    }
+    let device = (checks.device)(path, stat.st_dev as u64);
+    (checks.filesystem)(root.as_fd(), path).map_err(SyncError::Mismatch)?;
+    if checks.read_only && stat.st_mode & 0o222 != 0 {
+        return Err(SyncError::Writable(path.to_path_buf()));
+    }
+    sync_children(root, path, device, checks)?;
+    fsync_node(root, path, device, checks)
+}
+
+fn sync_children(
+    dir: &OwnedFd,
+    dir_path: &Path,
+    device: u64,
+    checks: &mut SyncChecks<'_>,
+) -> Result<(), SyncError> {
+    let mut names = Vec::new();
+    for entry in Dir::read_from(dir).map_err(|e| other(dir_path, "cannot list", e))? {
+        let entry = entry.map_err(|e| other(dir_path, "cannot list", e))?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        // The admitted open takes a `&str`, as pack's `collect` does.
+        let name = std::str::from_utf8(name).map_err(|_| {
+            SyncError::Other(format!(
+                "{} holds a name that is not UTF-8, which finalize cannot sync",
+                dir_path.display()
+            ))
+        })?;
+        names.push(name.to_owned());
+    }
+    names.sort();
+    let mut directories = Vec::new();
+    for name in names {
+        let path = dir_path.join(&name);
+        let listed = ratarmount_compositing::host_stat::statat(
+            dir,
+            name.as_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|e| other(&path, "cannot stat", e))?;
+        let found = (checks.device)(&path, listed.st_dev as u64);
+        if found != device {
+            return Err(device_mismatch(&path, found, device));
+        }
+        match listed.st_mode & libc::S_IFMT {
+            libc::S_IFREG => {
+                #[cfg(test)]
+                if let Some(hook) = checks.before_open {
+                    hook(&path);
+                }
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0147-M01","item":"ratarmount::overlay_pack::sync_children","disposition":"residual","reason":"fsync-only descriptor of a file in a tree a finalize syncs; reads no content; creates nothing","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname."}}"###
+                )]
+                let file = openat_admitted(dir, &name, regular_flags())
+                    .map_err(|e| other(&path, "cannot open", e))?;
+                check_node(&file, &path, &listed, device, checks)?;
+                fsync_node(&file, &path, device, checks)?;
+            }
+            libc::S_IFDIR => directories.push((name, path, listed)),
+            _ => {}
+        }
+    }
+    for (name, path, listed) in directories {
+        #[cfg(test)]
+        if let Some(hook) = checks.before_open {
+            hook(&path);
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0146-M01","item":"ratarmount::overlay_pack::sync_children","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname."}}"###
+        )]
+        let child = host::openat(dir, name.as_str(), directory_flags(), Mode::empty())
+            .map_err(|e| other(&path, "cannot open", io::Error::from(e)))?;
+        check_node(&child, &path, &listed, device, checks)?;
+        sync_children(&child, &path, device, checks)?;
+        fsync_node(&child, &path, device, checks)?;
+    }
+    Ok(())
+}
+
 /// Modes and mtimes the archive asks for. Extraction creates everything
 /// writable (a killed unpack must leave a tree `rm -rf` can remove) and
 /// `finalize_stage` applies these once every check has passed.
@@ -1784,17 +2156,59 @@ fn unpack_impl(bundle: &Path, directory: &Path, limits: Limits) -> io::Result<Un
 /// permission on a directory to rename it, even within one parent, and the
 /// sealed layer root is read-only. Hold the root by fd so the permission
 /// change follows the renamed inode.
+///
+/// The stage root's entry lock (its overlay root flock) is held exclusively
+/// from before the rename until after the mode restore, so no hit and no
+/// finalize step S sees the entry between the two (R1c-1 ruling 1+2); the
+/// staged root and the published entry are one inode.
 fn publish_layer(layer: &Path, directory: &Path) -> io::Result<()> {
     #[expect(
         clippy::disallowed_methods,
         reason = r###"internal-read:v1 {"id":"IR-B0080-M01","item":"ratarmount::overlay_pack::publish_layer","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let root = host::open(layer, directory_flags(), Mode::empty())?;
+    lock_entry(&root, directory, EntryLock::Exclusive)?;
     let sealed = ratarmount_compositing::host_stat::fstat_named(&root, layer)?.st_mode;
     host::fchmod(&root, Mode::from_raw_mode(sealed | 0o200))?;
     fs::rename(layer, directory)
         .map_err(|e| io::Error::new(e.kind(), format!("publish layer: {e}")))?;
+    #[cfg(test)]
+    {
+        events::record("rename", directory);
+        AFTER_PUBLISH_RENAME.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook(directory);
+            }
+        });
+        if FAIL_PUBLISH_RESTORE.with(std::cell::Cell::get) {
+            return Err(io::Error::other("injected mode restore failure"));
+        }
+    }
     host::fchmod(&root, Mode::from_raw_mode(sealed))?;
+    #[cfg(test)]
+    {
+        events::record("restore", directory);
+        events::record("unlock", directory);
+    }
+    // Closing `root` releases the entry lock.
+    Ok(())
+}
+
+/// The publication check of a cache hit, made under its entry lock: a
+/// completely published (or sealed) layer leaves no write bit on its root.
+/// A writable root is refused, never repaired: a fill killed between its
+/// rename and its mode restore and an interrupted `overlay unseal` look
+/// alike, and only `overlay seal` restores both completely.
+fn check_published(root: &OwnedFd, path: &Path) -> io::Result<()> {
+    let mode = ratarmount_compositing::host_stat::fstat_named(root, path)?.st_mode;
+    if mode & 0o222 != 0 {
+        return Err(invalid(format!(
+            "cache entry {} is not a completely sealed layer (a fill killed between its rename and its mode restore, or an interrupted `overlay unseal`); run `ratarmount overlay seal {}`, which restores its sentinel and every read-only mode, or remove {} to refill it",
+            path.display(),
+            path.display(),
+            path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -1989,21 +2403,40 @@ pub(crate) fn cached_lower_in(
         .expect("checked digest")
         .clone();
     let destination = cache.join(&hex);
+    // A hit holds the entry lock shared from before its checks until it
+    // returns the path: it waits for a publication in flight and for a
+    // finalize's sync, and returns only a completely published entry
+    // (R1c-1 ruling 1+2). Hits of a complete entry run side by side.
     let hit = |destination: &Path| -> io::Result<PathBuf> {
-        let meta = checked_meta(destination)?;
-        if meta.get("layer_digest") != Some(digest.as_str()) || meta.values() != &metadata {
-            return Err(invalid("cached layer does not match the bundle"));
-        }
-        if let Some(key) = marker_key {
-            if marker_dir(cache, &hex).join(key).try_exists()? {
-                return Ok(destination.into());
+        let entry = open_root(destination)?;
+        lock_entry(&entry, destination, EntryLock::Shared)?;
+        check_published(&entry, destination)?;
+        #[cfg(test)]
+        AFTER_HIT_CHECK.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook(destination);
             }
-        }
-        verify_against_view(destination, &view)?;
-        if let Some(key) = marker_key {
-            write_marker(cache, &hex, key)?;
-        }
-        Ok(destination.into())
+        });
+        let checked = (|| {
+            let meta = checked_meta(destination)?;
+            if meta.get("layer_digest") != Some(digest.as_str()) || meta.values() != &metadata {
+                return Err(invalid("cached layer does not match the bundle"));
+            }
+            if let Some(key) = marker_key {
+                if marker_dir(cache, &hex).join(key).try_exists()? {
+                    return Ok(());
+                }
+            }
+            verify_against_view(destination, &view)?;
+            if let Some(key) = marker_key {
+                write_marker(cache, &hex, key)?;
+            }
+            Ok(())
+        })();
+        #[cfg(test)]
+        events::record("hit", destination);
+        // The entry lock is released when `entry` drops, after this.
+        checked.map(|()| destination.into())
     };
     if destination.try_exists()? {
         return hit(&destination);
@@ -2350,6 +2783,12 @@ pub(crate) mod tests {
         conn.execute("UPDATE meta SET value='elsewhere' WHERE key='base_url'", [])
             .unwrap();
         drop(conn);
+        // Read-only again, so the hit's publication check (R1c-1) passes
+        // and the metadata comparison is what refuses.
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o444)).unwrap();
+        for dir in [&entry.join("layer"), &entry] {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o555));
+        }
         let error = cached_lower_in(&bundle, &cache, f.base.clone(), None)
             .unwrap_err()
             .to_string();

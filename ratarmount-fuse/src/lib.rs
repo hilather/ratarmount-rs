@@ -4101,6 +4101,39 @@ fn is_busy_diagnostic(stderr: &str) -> bool {
     end.ends_with(": Device or resource busy") || end.ends_with(": Resource busy")
 }
 
+/// Whether `line`, the last stderr line of `ratarmount -u -- PATH` (the CLI
+/// prints `error unmounting PATH: ` before the error of [`unmount`]), reports a
+/// mount that stayed busy (`EBUSY`) through every retry of `unmount_linux_with`:
+/// the fusermount diagnostic (`: Device or resource busy`, or musl's
+/// `: Resource busy`) followed by ` (busy)` or
+/// ` (still busy after N attempts over ~Xms)`. Read from the end only, so an
+/// echoed path holding those words or a newline cannot fool it. A plain string
+/// function on every platform; the sandbox supervisor classifies its unmount
+/// helper's failure with it.
+pub fn is_busy_unmount_error(line: &str) -> bool {
+    let Some(rest) = line.trim_end().strip_suffix(')') else {
+        return false;
+    };
+    let detail = if let Some(detail) = rest.strip_suffix(" (busy") {
+        detail
+    } else if let Some(at) = rest.rfind(" (still busy after ") {
+        let counts = &rest[at + " (still busy after ".len()..];
+        let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+        let well_formed = counts
+            .split_once(" attempts over ~")
+            .is_some_and(|(attempts, time)| {
+                digits(attempts) && time.strip_suffix("ms").is_some_and(digits)
+            });
+        if !well_formed {
+            return false;
+        }
+        &rest[..at]
+    } else {
+        return false;
+    };
+    detail.ends_with(": Device or resource busy") || detail.ends_with(": Resource busy")
+}
+
 #[cfg(not(target_os = "macos"))]
 fn unmount_linux_with(
     mp: &Path,
@@ -9121,6 +9154,75 @@ mod unmount_retry_tests {
         let msg = e.to_string();
         assert!(msg.contains("Device or resource busy"), "{msg}");
         assert!(msg.contains("still busy after"), "{msg}");
+    }
+
+    /// Regression (R1c-1 T5b, ruling 7): the sandbox supervisor tells a busy
+    /// mount (`writers_active`) from any other unmount failure (`io`) by the
+    /// last stderr line of `ratarmount -u`; that line is this module's
+    /// persistent-busy error as the CLI prints it. Feed the classifier the
+    /// `Display` of `unmount_linux_with`'s own errors, so the format and its
+    /// reader cannot drift apart.
+    #[test]
+    fn regression_unmount_busy_error_line_is_classified() {
+        // The last non-empty line, as the supervisor reads it.
+        let printed = |mp: &str, e: &std::io::Error| {
+            format!("error unmounting {mp}: {e}\n")
+                .lines()
+                .rfind(|line| !line.trim().is_empty())
+                .unwrap()
+                .to_owned()
+        };
+        let once = RetryPolicy {
+            interval: Duration::from_millis(1),
+            deadline: Duration::ZERO,
+        };
+        let odd = "/tmp/x: Device or resource busy (busy)\nmnt";
+        for mp in ["/m", odd] {
+            for strerror in ["Device or resource busy", "Resource busy"] {
+                for retry in [once, fast_retry()] {
+                    let stderr = format!("fusermount3: failed to unmount {mp}: {strerror}\n");
+                    let mut run = |_: &[&OsStr]| Ok(fake_fusermount(1, &stderr));
+                    let e =
+                        unmount_linux_with(Path::new(mp), &["-u"], retry, &mut run, &mut |_| {})
+                            .unwrap_err();
+                    assert_eq!(e.kind(), ErrorKind::ResourceBusy);
+                    let line = printed(mp, &e);
+                    let suffix = if retry.deadline.is_zero() {
+                        line.ends_with(" (busy)")
+                    } else {
+                        line.contains(" (still busy after ")
+                    };
+                    assert!(suffix, "{line}");
+                    assert!(is_busy_unmount_error(&line), "{line}");
+                }
+            }
+            for other in [
+                "Operation not permitted",
+                "Invalid argument",
+                "No such file or directory",
+            ] {
+                let stderr = format!("fusermount3: failed to unmount {mp}: {other}\n");
+                let mut run = |_: &[&OsStr]| Ok(fake_fusermount(1, &stderr));
+                let e =
+                    unmount_linux_with(Path::new(mp), &["-u"], fast_retry(), &mut run, &mut |_| {})
+                        .unwrap_err();
+                let line = printed(mp, &e);
+                assert!(!is_busy_unmount_error(&line), "{line}");
+            }
+        }
+        // A spawn failure (no fusermount3) and malformed suffixes are not busy.
+        assert!(!is_busy_unmount_error(
+            "error unmounting /m: No such file or directory (os error 2)"
+        ));
+        for line in [
+            "x: Device or resource busy (still busy after a attempts over ~5ms)",
+            "x: Device or resource busy (still busy after 2 attempts over ~ms)",
+            "x: Device or resource busy (busy) trailing",
+            "x: Operation not permitted (busy)",
+            "",
+        ] {
+            assert!(!is_busy_unmount_error(line), "{line}");
+        }
     }
 
     /// A runner that cannot spawn fusermount surfaces the spawn error unretried.

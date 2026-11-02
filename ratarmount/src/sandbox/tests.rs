@@ -1,6 +1,6 @@
 use super::*;
 use daemon::{SocketGuard, Supervisor};
-use process::{MountState, Mounter, SpawnSpec};
+use process::{MountState, Mounter, SpawnSpec, StopOutcome};
 use protocol::{ApiError, Attempt, Base};
 use ratarmount_compositing::{LowerLayerRecord, OverlayMeta};
 use serde_json::json;
@@ -37,6 +37,11 @@ pub(super) struct FakeState {
     pub(super) specs: Vec<SpawnRecord>,
     /// A child's cache: bundle lowers are extracted below it.
     pub(super) bundle_cache: Option<PathBuf>,
+    /// Resolve bundle lowers as a real child does, through
+    /// `overlay_pack::cached_lower_in` into this cache over this base view
+    /// (publication, entry lock and hit included), instead of extracting
+    /// them unverified.
+    pub(super) real_cache: Option<(PathBuf, Arc<dyn ratarmount_core::MountSource>)>,
     /// The lower records each attempt's child took, by attempt path.
     pub(super) records: BTreeMap<PathBuf, Vec<LowerLayerRecord>>,
     /// Run once around a child's two opens of its lowers.
@@ -49,6 +54,28 @@ pub(super) struct FakeState {
     pub(super) lower_layers_delay: Option<Duration>,
     /// Every timeout `lower_layers` was given.
     pub(super) lower_layer_timeouts: Vec<Duration>,
+    /// Scripted `stop` answers, consumed one per call; when empty a stop
+    /// unmounts and reports the attempt's kept exit status.
+    pub(super) stop_outcomes: std::collections::VecDeque<StopOutcome>,
+    /// The kept exit status `stop` reports per attempt path (`exit 0` when
+    /// unset; `None` for "never recorded").
+    pub(super) exits: BTreeMap<PathBuf, Option<std::process::ExitStatus>>,
+    /// Every `stop` call: the attempt path and the wait it was given.
+    pub(super) stops: Vec<(PathBuf, Duration)>,
+    /// `status` answers this count, or fails when `None`.
+    pub(super) erofs_denied: Option<u64>,
+    pub(super) status_calls: usize,
+    /// Children still alive after a `Detaching` stop.
+    pub(super) alive: BTreeSet<PathBuf>,
+    /// Mount points besides the attempts' own (the durability preflight's
+    /// mount check).
+    pub(super) extra_mounts: Vec<PathBuf>,
+}
+
+/// An exit status for the Fake (`code` 0..=255).
+pub(super) fn exit(code: i32) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(code << 8)
 }
 
 pub(super) type Hook = Box<dyn FnOnce() + Send>;
@@ -79,9 +106,26 @@ impl Fake {
     fn capture(&self, lowers: &[PathBuf]) -> Result<Vec<LowerLayerRecord>, String> {
         self.run(|state| &mut state.before_capture);
         let cache = self.0.lock().unwrap().bundle_cache.clone();
-        let mut records = Vec::new();
+        let real = self.0.lock().unwrap().real_cache.clone();
+        let mut records: Vec<LowerLayerRecord> = Vec::new();
         for lower in lowers {
-            let path = if lower.is_file() {
+            let path = if let (true, Some((cache, base))) = (lower.is_file(), &real) {
+                let layers: Vec<_> = records
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.path.clone(),
+                            ratarmount_compositing::Immutability::Immutable,
+                        )
+                    })
+                    .collect();
+                let view = ratarmount_compositing::compose_stack(base.clone(), &layers)
+                    .map_err(|e| e.to_string())?;
+                crate::overlay_pack::cached_lower_in(lower, cache, view, None)
+                    .map_err(|e| e.to_string())?
+                    .canonicalize()
+                    .unwrap()
+            } else if lower.is_file() {
                 let cache = cache.as_ref().expect("bundle lowers need a bundle cache");
                 let layer = cache.join(format!("layer-{}", fs::read_dir(cache).unwrap().count()));
                 crate::overlay_pack::tests::extract_unverified(lower, &layer)
@@ -169,7 +213,17 @@ impl Mounter for Fake {
             .copied()
             .unwrap_or(MountState::Crashed))
     }
+    /// `ProcessMounter`'s rule: the socket while the child serves (`starting`,
+    /// `ready`, a `finalizing` attempt whose child is alive), else offline.
     fn deleted_paths(&mut self, attempt: &Attempt) -> Result<Option<Vec<String>>, ApiError> {
+        let serving = match attempt.status.as_str() {
+            "starting" | "ready" => true,
+            "finalizing" => self.0.lock().unwrap().alive.contains(&attempt.path),
+            _ => false,
+        };
+        if !serving {
+            return Ok(None);
+        }
         if self.0.lock().unwrap().inspection {
             super::inspection::deleted_paths(attempt)
                 .map(Some)
@@ -209,8 +263,62 @@ impl Mounter for Fake {
             return Err(ApiError::new("unmount_failed", "injected"));
         }
         state.mounts.remove(path);
+        state.alive.remove(path);
         state.cleaned.push(path.into());
         Ok(())
+    }
+
+    fn stop(&mut self, attempt: &Attempt, wait: Duration) -> Result<StopOutcome, ApiError> {
+        let mut state = self.0.lock().unwrap();
+        state.stops.push((attempt.path.clone(), wait));
+        let outcome = state.stop_outcomes.pop_front().unwrap_or_else(|| {
+            if state.alive.contains(&attempt.path) {
+                StopOutcome::Detaching
+            } else {
+                StopOutcome::Stopped {
+                    exit: state
+                        .exits
+                        .get(&attempt.path)
+                        .copied()
+                        .unwrap_or(Some(exit(0))),
+                }
+            }
+        });
+        match &outcome {
+            StopOutcome::Stopped { .. } => {
+                state.mounts.remove(&attempt.path);
+                state.alive.remove(&attempt.path);
+            }
+            StopOutcome::Detaching => {
+                state.mounts.remove(&attempt.path);
+                state.alive.insert(attempt.path.clone());
+            }
+            StopOutcome::Busy | StopOutcome::Failed { .. } => {}
+        }
+        Ok(outcome)
+    }
+
+    fn status(&mut self, _attempt: &Attempt) -> Result<u64, ApiError> {
+        let mut state = self.0.lock().unwrap();
+        state.status_calls += 1;
+        state
+            .erofs_denied
+            .ok_or_else(|| ApiError::new("io", "injected: no status"))
+    }
+
+    fn child_alive(&mut self, attempt: &Attempt) -> bool {
+        self.0.lock().unwrap().alive.contains(&attempt.path)
+    }
+
+    fn mount_points(&self) -> Result<Vec<PathBuf>, ApiError> {
+        let state = self.0.lock().unwrap();
+        Ok(state
+            .mounts
+            .iter()
+            .filter(|(_, mount)| **mount == MountState::Ready)
+            .map(|(path, _)| path.clone())
+            .chain(state.extra_mounts.iter().cloned())
+            .collect())
     }
 }
 
@@ -753,7 +861,7 @@ fn regression_live_diff_and_stats_do_not_reopen_locked_database() {
     );
     overlay.unlink("/gone").unwrap();
     let inspector =
-        super::start_inspection(&super::inspection::socket_path(&attempt), &overlay).unwrap();
+        super::start_inspection(&super::inspection::socket_path(&attempt), &overlay, None).unwrap();
     fake.0.lock().unwrap().inspection = true;
     fs::create_dir(attempt.overlay_dir.join("repo")).unwrap();
     fs::write(attempt.overlay_dir.join("repo/original"), "edited\n").unwrap();
@@ -1491,14 +1599,23 @@ fn regression_protocol_v2_dispatch_and_envelope_versions() {
             2,
             "invalid_request",
         ),
+        // R1c-1 defines `finalize`: an unknown operation stays refused.
+        (r#"{"version":2,"op":"bogus"}"#, 2, "invalid_request"),
+        // `retain` is still refused (R1c-1's PR B adds it); R1b accepts
+        // `lowers`.
         (
-            r#"{"version":2,"op":"finalize","id":"a"}"#,
+            r#"{"version":2,"op":"new","base":"t","retain":true}"#,
             2,
             "invalid_request",
         ),
-        // `retain` is R1c's field, still refused; R1b accepts `lowers`.
+        // `finalize` takes no field but `id`, `pack` and `request_id`.
         (
-            r#"{"version":2,"op":"new","base":"t","retain":true}"#,
+            r#"{"version":2,"op":"finalize","id":"a","bogus":1}"#,
+            2,
+            "invalid_request",
+        ),
+        (
+            r#"{"version":2,"op":"finalize","id":"a","request_id":null}"#,
             2,
             "invalid_request",
         ),
@@ -1839,8 +1956,9 @@ fn generate_cli_v1_requests() {
 }
 
 /// Regression: every v1 CLI subcommand still sends the baseline bytes;
-/// `new --request-id` sends v2, and `call` accepts only its request's
-/// version, or a v1 error answering v2 (how an older daemon refuses v2).
+/// `new --request-id`, `--lower` and `--journal`, and `finalize`, send v2
+/// (R1b C1, R1c-1 C1a), and `call` accepts only its request's version, or a
+/// v1 error answering v2 (how an older daemon refuses v2).
 #[test]
 fn regression_cli_v1_request_bytes_unchanged() {
     let expected: Vec<serde_json::Value> = fs::read_to_string(CLI_V1_REQUESTS)
@@ -1893,6 +2011,25 @@ fn regression_cli_v1_request_bytes_unchanged() {
         ]);
         run(&recorder.args(argv)).unwrap();
         assert_eq!(String::from_utf8(recorder.line()).unwrap(), line);
+        recorder.finish();
+    }
+    // R1c-1 (C1a): finalize sends v2; the v1 argv above keep their fixture
+    // bytes.
+    for (argv, line) in [
+        (
+            &["finalize", "attempt-a1B2c3", "--pack", "--request-id", "r"][..],
+            "{\"version\":2,\"op\":\"finalize\",\"id\":\"attempt-a1B2c3\",\"pack\":true,\"request_id\":\"r\"}\n",
+        ),
+        (
+            &["finalize", "attempt-a1B2c3"][..],
+            "{\"version\":2,\"op\":\"finalize\",\"id\":\"attempt-a1B2c3\"}\n",
+        ),
+    ] {
+        let recorder = Recorder::start(vec![
+            b"{\"version\":2,\"ok\":true,\"result\":null}\n".to_vec()
+        ]);
+        run(&recorder.args(argv)).unwrap();
+        assert_eq!(String::from_utf8(recorder.line()).unwrap(), line, "{argv:?}");
         recorder.finish();
     }
     // The journal options need --journal (as on the mount CLI).

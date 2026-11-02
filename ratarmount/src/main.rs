@@ -2639,11 +2639,15 @@ fn main() {
     }
 
     let _sandbox_inspector = args.sandbox_inspection_socket.as_ref().map(|path| {
-        sandbox::start_inspection(path, overlay_arc.as_ref().expect("validated write overlay"))
-            .unwrap_or_else(|error| {
-                eprintln!("sandbox inspection: {error}");
-                std::process::exit(1);
-            })
+        sandbox::start_inspection(
+            path,
+            overlay_arc.as_ref().expect("validated write overlay"),
+            overlay_quota.clone(),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("sandbox inspection: {error}");
+            std::process::exit(1);
+        })
     });
 
     let commit_interval = match overlay_commit::parse_interval(&args.commit_overlay_interval) {

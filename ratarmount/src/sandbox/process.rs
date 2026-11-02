@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStringExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,25 @@ pub enum MountState {
     Ready,
     Crashed,
 }
+
+/// What `Mounter::stop` did (R1c-1 §5.4 Stop). It never forces: no lazy
+/// unmount, no force flag and no signal to the FUSE child.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// Unmounted, and the child exited (its kept status) or none was recorded
+    /// (`None`, which a journaled attempt treats as unclean).
+    Stopped { exit: Option<ExitStatus> },
+    /// Still mounted: the unmount helper's last line is the busy error.
+    Busy,
+    /// Unmounted, but the child still serves: another mount of the
+    /// superblock (a container's copy of the mount) keeps it alive.
+    Detaching,
+    /// Still mounted after any other failure; `detail` names it.
+    Failed { detail: String },
+}
+
+/// How long the unmount helper may take (its own busy retries take about 1 s).
+const HELPER_BOUND: Duration = Duration::from_secs(3);
 
 /// What one attempt's child mounts besides the base: its policy, its lower
 /// stack and its operation journal. The empty spec gives the v1 argv.
@@ -55,6 +74,16 @@ pub trait Mounter {
     ) -> Result<Vec<LowerLayerRecord>>;
     /// Must leave no mounts below path, and stop/reap any owned child, before success.
     fn cleanup(&mut self, path: &Path) -> Result<()>;
+    /// Stops a finalizing attempt without forcing anything (R1c-1 §5.4):
+    /// the unmount helper's normal unmount only, then up to `wait` for its
+    /// child to exit.
+    fn stop(&mut self, attempt: &Attempt, wait: Duration) -> Result<StopOutcome>;
+    /// The child's `erofs_denied` count over the inspection socket.
+    fn status(&mut self, attempt: &Attempt) -> Result<u64>;
+    /// Whether a recorded child of the attempt is still running.
+    fn child_alive(&mut self, attempt: &Attempt) -> bool;
+    /// Every mount point of this process's mount namespace.
+    fn mount_points(&self) -> Result<Vec<PathBuf>>;
 }
 
 pub fn base_args(base: &Base, indexes: &Path) -> Vec<OsString> {
@@ -183,6 +212,17 @@ pub fn mount_args(
 pub struct ProcessMounter {
     binary: PathBuf,
     children: BTreeMap<PathBuf, Child>,
+    /// Every reaped child's exit status, by attempt path, from `poll` and
+    /// `stop`, kept until `cleanup`: a finalize reads the status of a child
+    /// `supervise()` reaped earlier (§5.4 step 4b).
+    exits: BTreeMap<PathBuf, ExitStatus>,
+    /// Test seams: the unmount helper `stop` runs instead of the daemon's
+    /// binary, and a file listing the mounted paths (one per line) read
+    /// instead of the mount table.
+    #[cfg(test)]
+    pub helper: Option<PathBuf>,
+    #[cfg(test)]
+    mount_table: Option<PathBuf>,
 }
 
 impl ProcessMounter {
@@ -190,6 +230,97 @@ impl ProcessMounter {
         Self {
             binary,
             children: BTreeMap::new(),
+            exits: BTreeMap::new(),
+            #[cfg(test)]
+            helper: None,
+            #[cfg(test)]
+            mount_table: None,
+        }
+    }
+
+    /// Records `child` as the attempt's mount process (tests stand in a
+    /// child for `spawn`).
+    #[cfg(test)]
+    pub fn adopt(&mut self, path: &Path, child: Child) {
+        self.children.insert(path.into(), child);
+    }
+
+    fn mounted(&self) -> io::Result<Vec<PathBuf>> {
+        #[cfg(test)]
+        if let Some(table) = &self.mount_table {
+            return Ok(fs::read_to_string(table)?
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from)
+                .collect());
+        }
+        mountpoints()
+    }
+
+    /// Runs the unmount helper `<binary> -u -- PATH`, which runs only a
+    /// normal `fusermount3 -u` (busy retries for about 1 s; never `-z`), with
+    /// `RUST_LOG=off` so debug logging cannot fill its stderr pipe. Bounded
+    /// by [`HELPER_BOUND`], killed and reaped there. Returns its status
+    /// (`None` when killed) and its last non-empty stderr line.
+    fn unmount_helper(&self, path: &Path) -> io::Result<(Option<ExitStatus>, String)> {
+        #[cfg(test)]
+        let program = self.helper.as_ref().unwrap_or(&self.binary);
+        #[cfg(not(test))]
+        let program = &self.binary;
+        let mut child = Command::new(program)
+            .args(["-u", "--"])
+            .arg(path)
+            .env("RUST_LOG", "off")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let status = wait_status_bounded(&mut child, HELPER_BOUND)?;
+        let mut stderr = Vec::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            // The helper has exited: read what it wrote, never waiting for a
+            // descendant that may still hold the pipe.
+            use std::io::Read;
+            if let Ok(flags) = rustix::fs::fcntl_getfl(&pipe) {
+                let _ = rustix::fs::fcntl_setfl(&pipe, flags | rustix::fs::OFlags::NONBLOCK);
+            }
+            let mut chunk = [0u8; 4096];
+            while stderr.len() < 64 << 10 {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => stderr.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        }
+        let last = String::from_utf8_lossy(&stderr)
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .unwrap_or("")
+            .to_owned();
+        Ok((status, last))
+    }
+
+    /// After the unmount: whether the recorded child exits within `wait`.
+    fn wait_child(&mut self, path: &Path, wait: Duration) -> io::Result<StopOutcome> {
+        let Some(child) = self.children.get_mut(path) else {
+            return Ok(StopOutcome::Stopped {
+                exit: self.exits.get(path).copied(),
+            });
+        };
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                self.children.remove(path);
+                self.exits.insert(path.into(), status);
+                return Ok(StopOutcome::Stopped { exit: Some(status) });
+            }
+            if Instant::now() >= deadline {
+                return Ok(StopOutcome::Detaching);
+            }
+            thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -273,19 +404,28 @@ impl Mounter for ProcessMounter {
         let Some(child) = self.children.get_mut(&attempt.path) else {
             return Ok(MountState::Crashed);
         };
-        if child.try_wait()?.is_some() {
+        if let Some(status) = child.try_wait()? {
             self.children.remove(&attempt.path);
+            self.exits.insert(attempt.path.clone(), status);
             return Ok(MountState::Crashed);
         }
-        if mountpoints()?.contains(&attempt.path) {
+        if self.mounted()?.contains(&attempt.path) {
             Ok(MountState::Ready)
         } else {
             Ok(MountState::Starting)
         }
     }
 
+    /// Through the inspection socket while the child serves (`starting`,
+    /// `ready`, and a `finalizing` attempt whose child is still alive, which
+    /// holds its overlay database exclusively); offline otherwise (`None`).
     fn deleted_paths(&mut self, attempt: &Attempt) -> Result<Option<Vec<String>>> {
-        if attempt.status == "crashed" {
+        let serving = match attempt.status.as_str() {
+            "starting" | "ready" => true,
+            "finalizing" => self.child_alive(attempt),
+            _ => false,
+        };
+        if !serving {
             return Ok(None);
         }
         super::inspection::deleted_paths(attempt)
@@ -314,6 +454,7 @@ impl Mounter for ProcessMounter {
                 child.wait()?;
             }
         }
+        self.exits.remove(path);
         let mut mounts: Vec<_> = mountpoints()?
             .into_iter()
             .filter(|p| p.starts_with(path))
@@ -323,6 +464,70 @@ impl Mounter for ProcessMounter {
             detach(&self.binary, &mount)?;
         }
         Ok(())
+    }
+
+    /// The non-forcing stop (R1c-1 §5.4 Stop): if the attempt's path is
+    /// mounted, the helper's normal unmount; the mount table then decides
+    /// (still mounted: `Busy` when its last line is the busy error, else
+    /// `Failed`); whether to wait for a child comes from the child registry,
+    /// never from the attempt's status.
+    fn stop(&mut self, attempt: &Attempt, wait: Duration) -> Result<StopOutcome> {
+        let path = &attempt.path;
+        if self.mounted()?.contains(path) {
+            let (status, last) = self.unmount_helper(path)?;
+            if self.mounted()?.contains(path) {
+                return Ok(match status {
+                    Some(_) if ratarmount_fuse::is_busy_unmount_error(&last) => StopOutcome::Busy,
+                    Some(status) => StopOutcome::Failed {
+                        detail: if last.is_empty() {
+                            format!("the unmount helper failed ({status})")
+                        } else {
+                            last
+                        },
+                    },
+                    None => StopOutcome::Failed {
+                        detail: format!(
+                            "the unmount helper did not finish within {} s",
+                            HELPER_BOUND.as_secs()
+                        ),
+                    },
+                });
+            }
+        }
+        Ok(self.wait_child(path, wait)?)
+    }
+
+    fn status(&mut self, attempt: &Attempt) -> Result<u64> {
+        super::inspection::status(attempt, Duration::from_secs(5))
+            .map(|status| status.erofs_denied)
+            .map_err(|e| {
+                ApiError::new(
+                    "io",
+                    format!(
+                        "cannot read the erofs_denied count of attempt {}: {e}",
+                        attempt.id
+                    ),
+                )
+            })
+    }
+
+    fn child_alive(&mut self, attempt: &Attempt) -> bool {
+        let Some(child) = self.children.get_mut(&attempt.path) else {
+            return false;
+        };
+        match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(status)) => {
+                self.children.remove(&attempt.path);
+                self.exits.insert(attempt.path.clone(), status);
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn mount_points(&self) -> Result<Vec<PathBuf>> {
+        Ok(self.mounted()?)
     }
 }
 
@@ -336,15 +541,21 @@ impl Drop for ProcessMounter {
 }
 
 fn wait_bounded(child: &mut Child, timeout: Duration) -> io::Result<bool> {
+    Ok(wait_status_bounded(child, timeout)?.is_some_and(|status| status.success()))
+}
+
+/// Waits up to `timeout` for `child`: its exit status, or `None` once it was
+/// killed and reaped at the bound.
+fn wait_status_bounded(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(status.success()),
+            Ok(Some(status)) => return Ok(Some(status)),
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             result => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return result.map(|_| false);
+                return result.map(|_| None);
             }
         }
     }
@@ -523,6 +734,215 @@ mod tests {
     fn sandbox_waiting_child() {
         if std::env::var_os("RATARMOUNT_SANDBOX_WAITING_CHILD").is_some() {
             thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    /// A `ProcessMounter` whose unmount helper is the script `body` (run as
+    /// `HELPER -u -- PATH`, its argv appended to `argv.log`) and whose mount
+    /// table is the file `mounts`, listing `path`.
+    fn stopper(dir: &Path, body: &str, path: &Path) -> ProcessMounter {
+        use std::os::unix::fs::PermissionsExt;
+        let helper = dir.join("helper.sh");
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf '%s ' \"$@\" >> '{}'\necho >> '{}'\n{body}\n",
+                dir.join("argv.log").display(),
+                dir.join("argv.log").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let table = dir.join("mounts");
+        fs::write(&table, format!("{}\n", path.display())).unwrap();
+        let mut mounter = ProcessMounter::new(PathBuf::from("/nonexistent/ratarmount"));
+        mounter.helper = Some(helper);
+        mounter.mount_table = Some(table);
+        mounter
+    }
+
+    fn attempt_at(path: &Path, status: &str) -> Attempt {
+        Attempt {
+            id: "attempt-000001".into(),
+            base: "task".into(),
+            path: path.into(),
+            overlay_dir: path.with_file_name("overlay"),
+            status: status.into(),
+        }
+    }
+
+    /// A child that records any catchable signal and exits 0 once `stop`
+    /// exists.
+    fn fuse_child(dir: &Path) -> Child {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "trap 'echo signal >> {0}/signals' TERM INT HUP; while [ ! -e {0}/stop ]; do sleep 0.02; done; exit 0",
+                dir.display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// Regression (R1c-1 T5, ruling 7): finalize's stop decides from the
+    /// mount table, the unmount helper's last line and the child registry,
+    /// never from the attempt's status, and never forces: only `-u -- PATH`
+    /// runs (no `-z`, `umount -l` or force flag) and the FUSE child gets no
+    /// signal. Busy forms (glibc, musl; `(busy)`, `(still busy …)`) are
+    /// `Busy`; any other failure, a missing `fusermount3` and a stalled
+    /// helper (killed and reaped at its bound) are `Failed`; a child alive
+    /// after the unmount is `Detaching`, also for a crashed attempt.
+    #[test]
+    fn regression_supervisor_stop_decides_without_forcing() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skip: the sandbox supervisor's finalize is Linux only");
+            return;
+        }
+        let _processes = ratarmount_index::test_process::spawning();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mnt");
+        let line = |detail: &str| {
+            format!(
+                "echo 'error unmounting {0}: fusermount failed for {0}: fusermount3: failed to unmount {0}: {detail}' >&2\nexit 1",
+                path.display()
+            )
+        };
+        // Not mounted, no child.
+        let mut mounter = stopper(dir.path(), "exit 0", &path);
+        fs::write(dir.path().join("mounts"), "").unwrap();
+        assert_eq!(
+            mounter
+                .stop(&attempt_at(&path, "ready"), Duration::ZERO)
+                .unwrap(),
+            StopOutcome::Stopped { exit: None }
+        );
+        // Busy, in each form.
+        for detail in [
+            "Device or resource busy (busy)",
+            "Resource busy (busy)",
+            "Device or resource busy (still busy after 20 attempts over ~1003ms)",
+            "Resource busy (still busy after 3 attempts over ~120ms)",
+        ] {
+            let mut mounter = stopper(dir.path(), &line(detail), &path);
+            assert_eq!(
+                mounter
+                    .stop(&attempt_at(&path, "ready"), Duration::ZERO)
+                    .unwrap(),
+                StopOutcome::Busy,
+                "{detail}"
+            );
+        }
+        // Any other failure, and no fusermount3.
+        for (body, needle) in [
+            (line("Operation not permitted"), "Operation not permitted"),
+            (
+                format!(
+                    "echo 'error unmounting {}: No such file or directory (os error 2)' >&2\nexit 1",
+                    path.display()
+                ),
+                "No such file or directory",
+            ),
+        ] {
+            let mut mounter = stopper(dir.path(), &body, &path);
+            match mounter.stop(&attempt_at(&path, "ready"), Duration::ZERO).unwrap() {
+                StopOutcome::Failed { detail } => assert!(detail.contains(needle), "{detail}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        // A stalled helper: killed and reaped at its bound.
+        let mut mounter = stopper(dir.path(), "exec sleep 30", &path);
+        let started = Instant::now();
+        match mounter
+            .stop(&attempt_at(&path, "ready"), Duration::ZERO)
+            .unwrap()
+        {
+            StopOutcome::Failed { detail } => {
+                assert!(detail.contains("did not finish"), "{detail}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(started.elapsed() < HELPER_BOUND + Duration::from_secs(1));
+        // Unmounted, the child alive: Detaching, also for a crashed attempt;
+        // the child is never signalled and is reaped once it exits.
+        for status in ["ready", "crashed"] {
+            let _ = fs::remove_file(dir.path().join("stop"));
+            let unmount = format!(": > '{}'", dir.path().join("mounts").display());
+            let mut mounter = stopper(dir.path(), &unmount, &path);
+            mounter.adopt(&path, fuse_child(dir.path()));
+            assert_eq!(
+                mounter
+                    .stop(&attempt_at(&path, status), Duration::from_millis(100))
+                    .unwrap(),
+                StopOutcome::Detaching,
+                "{status}"
+            );
+            assert!(mounter.child_alive(&attempt_at(&path, status)));
+            fs::write(dir.path().join("stop"), b"").unwrap();
+            match mounter
+                .stop(&attempt_at(&path, "finalizing"), Duration::from_secs(5))
+                .unwrap()
+            {
+                StopOutcome::Stopped { exit: Some(exit) } => assert!(exit.success()),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(
+            !dir.path().join("signals").exists(),
+            "no signal to the child"
+        );
+        // Only `-u -- PATH`, every time.
+        let argv = fs::read_to_string(dir.path().join("argv.log")).unwrap();
+        for invocation in argv.lines() {
+            assert_eq!(invocation.trim_end(), format!("-u -- {}", path.display()));
+        }
+        assert!(argv.lines().count() >= 8, "{argv}");
+    }
+
+    /// Regression (R1c-1 T5, sweep 2 Codex B2): `poll` dropped a reaped
+    /// child's status, so a journaled attempt whose mount exited 1 could not
+    /// be told from a clean one. Every reaped status is kept, from `poll` and
+    /// from `stop`, until `cleanup`.
+    #[test]
+    fn regression_supervisor_stop_keeps_exit_status() {
+        let _processes = ratarmount_index::test_process::spawning();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mnt");
+        for code in [0, 1] {
+            for reaped_by_poll in [false, true] {
+                let mut mounter = stopper(dir.path(), "exit 0", &path);
+                fs::write(dir.path().join("mounts"), "").unwrap();
+                let child = Command::new("sh")
+                    .args(["-c", &format!("exit {code}")])
+                    .spawn()
+                    .unwrap();
+                mounter.adopt(&path, child);
+                std::thread::sleep(Duration::from_millis(100));
+                let attempt = attempt_at(&path, "ready");
+                if reaped_by_poll {
+                    assert_eq!(mounter.poll(&attempt).unwrap(), MountState::Crashed);
+                }
+                match mounter.stop(&attempt, Duration::from_secs(5)).unwrap() {
+                    StopOutcome::Stopped { exit: Some(exit) } => {
+                        assert_eq!(exit.code(), Some(code), "poll first: {reaped_by_poll}")
+                    }
+                    other => panic!("{other:?}"),
+                }
+                // Kept for a retry, forgotten by cleanup.
+                assert!(matches!(
+                    mounter.stop(&attempt, Duration::ZERO).unwrap(),
+                    StopOutcome::Stopped { exit: Some(_) }
+                ));
+                mounter.mount_table = None;
+                mounter.cleanup(&path).unwrap();
+                mounter.mount_table = Some(dir.path().join("mounts"));
+                assert_eq!(
+                    mounter.stop(&attempt, Duration::ZERO).unwrap(),
+                    StopOutcome::Stopped { exit: None }
+                );
+            }
         }
     }
 }

@@ -244,7 +244,7 @@ fn regression_offline_commit_classification_builds_no_index() {
     assert!(fresh.source().lookup("/f", 0).is_some());
 }
 
-fn write_tar_file(path: &Path) {
+pub(crate) fn write_tar_file(path: &Path) {
     let members = [ratarmount_formats_tar::UstarMember {
         path: "f",
         payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"x" },
@@ -265,7 +265,7 @@ fn write_tar_file(path: &Path) {
 /// finished, marker `D`, journal already gone).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::disallowed_methods)]
-fn crash_commit(archive: &Path, step: &'static str) {
+pub(crate) fn crash_commit(archive: &Path, step: &'static str) {
     use std::io::Write;
     let len = std::fs::metadata(archive).unwrap().len();
     let mut suffix = tempfile::tempfile().unwrap();

@@ -8,9 +8,10 @@ mod unmount;
 
 use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -21,23 +22,32 @@ struct Daemon {
     root: Option<tempfile::TempDir>,
     socket: PathBuf,
     child: Child,
+    /// Added to the daemon's environment, which its mount children and its
+    /// unmount helper inherit.
+    env: Vec<(&'static str, OsString)>,
 }
 
 impl Daemon {
     fn start() -> Self {
+        Self::start_with_env(Vec::new())
+    }
+
+    /// `start` with `env` added to the daemon's environment.
+    fn start_with_env(env: Vec<(&'static str, OsString)>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("api.sock");
-        let child = Self::spawn(root.path(), &socket);
+        let child = Self::spawn(root.path(), &socket, &env);
         let mut daemon = Self {
             root: Some(root),
             socket,
             child,
+            env,
         };
         daemon.wait_for_socket();
         daemon
     }
 
-    fn spawn(root: &Path, socket: &Path) -> Child {
+    fn spawn(root: &Path, socket: &Path, env: &[(&'static str, OsString)]) -> Child {
         Command::new(env!("CARGO_BIN_EXE_ratarmount"))
             .args(["sandbox", "daemon", "--socket"])
             .arg(socket)
@@ -46,6 +56,7 @@ impl Daemon {
             .args(["--max-attempts", "64", "--timeout", "30"])
             // Children cache lower bundles here, not in the developer's cache.
             .env("XDG_CACHE_HOME", root.join("cache"))
+            .envs(env.iter().map(|(key, value)| (*key, value)))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(fs::File::create(root.join("daemon.log")).unwrap())
@@ -75,7 +86,7 @@ impl Daemon {
             assert!(Instant::now() < deadline, "daemon did not stop");
             thread::sleep(Duration::from_millis(20));
         }
-        self.child = Self::spawn(self.root.as_ref().unwrap().path(), &self.socket);
+        self.child = Self::spawn(self.root.as_ref().unwrap().path(), &self.socket, &self.env);
         self.wait_for_socket();
     }
 
@@ -178,6 +189,38 @@ impl Drop for Daemon {
                     "retaining failed test state for cleanup: {}",
                     root.keep().display()
                 );
+            } else {
+                // Sealed layers and bundle cache entries have no write
+                // bits, which TempDir's removal needs.
+                make_writable(root.path());
+            }
+        }
+    }
+}
+
+/// Restores write access under `path` so `TempDir` can remove the sealed
+/// (read-only) trees a test leaves. Runs from a destructor, so it never
+/// panics, and it never descends into another filesystem (a mount that a
+/// failure left behind).
+fn make_writable(path: &Path) {
+    if let Ok(root) = fs::symlink_metadata(path) {
+        make_writable_under(path, root.dev());
+    }
+}
+
+fn make_writable_under(path: &Path, dev: u64) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || meta.dev() != dev {
+        return;
+    }
+    let extra = if meta.is_dir() { 0o700 } else { 0o200 };
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(meta.mode() | extra));
+    if meta.is_dir() {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                make_writable_under(&entry.path(), dev);
             }
         }
     }
@@ -1545,4 +1588,590 @@ fn regression_prepared_index_mixed_tar_and_unindexed_bind() {
         fs::read(candidate).unwrap(),
         b"unrelated candidate must stay untouched"
     );
+}
+
+// ---------------------------------------------------------------------------
+// R1c-1: the supervisor's finalize with the real binary (plan
+// `docs/tasks/plans/localai-r1c1-finalize-retain.md` §7 T5b, F1, F2).
+// ---------------------------------------------------------------------------
+
+/// Writes the executable `/bin/sh` script `dir/name`: it appends one record
+/// to `log` (its name and each argument, every one NUL-terminated, then the
+/// byte 0x1e, so an argument may hold a newline) and then runs `then`.
+fn recording_script(dir: &Path, name: &str, log: &Path, then: &str) {
+    let log = log.to_str().unwrap();
+    assert!(!log.contains('\''), "{log}");
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\0' '{name}' >> '{log}'\n\
+         for arg in \"$@\"; do printf '%s\\0' \"$arg\" >> '{log}'; done\n\
+         printf '\\036' >> '{log}'\n\
+         {then}\n"
+    );
+    let path = dir.join(name);
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The invocations recording scripts appended to `log` from byte `from`
+/// on, each as its program name and arguments.
+fn invocations(log: &Path, from: u64) -> Vec<Vec<String>> {
+    let bytes = match fs::read(log) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => panic!("{}: {e}", log.display()),
+    };
+    bytes[from as usize..]
+        .split(|byte| *byte == 0x1e)
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let mut fields: Vec<String> = record
+                .split(|byte| *byte == 0)
+                .map(|field| String::from_utf8(field.to_vec()).unwrap())
+                .collect();
+            assert_eq!(fields.pop().as_deref(), Some(""), "torn record: {fields:?}");
+            fields
+        })
+        .collect()
+}
+
+fn log_len(log: &Path) -> u64 {
+    fs::metadata(log).map_or(0, |meta| meta.len())
+}
+
+/// `dir` first, then the test process's own `PATH`.
+fn path_with(dir: &Path) -> OsString {
+    let original = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&original)))
+        .unwrap()
+}
+
+/// What a fake `fusermount3` prints for a mount the kernel refuses with
+/// EBUSY (`$2` is the path of `-u PATH`), and for any other refusal.
+const FUSERMOUNT_BUSY: &str =
+    "printf 'fusermount3: failed to unmount %s: Device or resource busy\\n' \"$2\" >&2\nexit 1";
+const FUSERMOUNT_NOT_PERMITTED: &str =
+    "printf 'fusermount3: failed to unmount %s: Operation not permitted\\n' \"$2\" >&2\nexit 1";
+
+/// One run of the supervisor's unmount helper, `ratarmount -u -- TARGET`.
+struct HelperRun {
+    status: std::process::ExitStatus,
+    took: Duration,
+    stderr: String,
+    /// Every recorded `fusermount3`, `fusermount` and `umount` run, in order.
+    calls: Vec<Vec<String>>,
+}
+
+impl HelperRun {
+    /// The line the supervisor classifies: the last non-empty stderr line,
+    /// trimmed (`ProcessMounter::unmount_helper`).
+    fn last_line(&self) -> &str {
+        self.stderr
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .unwrap_or("")
+    }
+}
+
+/// Runs the real helper as the supervisor does (`RUST_LOG=off`, stdin
+/// closed), with a `PATH` whose first directory holds a recording
+/// `fusermount3` that ends with `then`, and recording `fusermount` and
+/// `umount` that fail, so a fallback would show in the record.
+fn run_unmount_helper(target: &Path, then: &str) -> HelperRun {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let log = dir.path().join("calls");
+    recording_script(&bin, "fusermount3", &log, then);
+    recording_script(&bin, "fusermount", &log, "exit 1");
+    recording_script(&bin, "umount", &log, "exit 1");
+    let started = Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .args(["-u", "--"])
+        .arg(target)
+        .env("PATH", path_with(&bin))
+        .env("RUST_LOG", "off")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    HelperRun {
+        status: output.status,
+        took: started.elapsed(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        calls: invocations(&log, 0),
+    }
+}
+
+/// Regression (R1c-1 T5b, ruling 7): the real unmount helper the supervisor
+/// runs to stop an attempt must never force: a busy mount is retried about
+/// 1 s with exactly `fusermount3 -u PATH` (no `-z`, no force flag, no
+/// `fusermount` or `umount` fallback) and ends in the busy error that
+/// `is_busy_unmount_error` classifies from the last stderr line; any other
+/// refusal is one try and not busy, also when the path echoes the busy text.
+#[test]
+fn regression_supervisor_stop_real_helper_policy() {
+    if !Path::new("/bin/sh").exists() {
+        eprintln!("skip: the recording fusermount3 needs /bin/sh");
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let plain = scratch.path().join("mnt");
+    // The diagnostic's own words and a newline inside the echoed path: the
+    // words end an earlier stderr line, or sit inside the last one.
+    let odd = scratch
+        .path()
+        .join("x: Device or resource busy (busy)\ntail");
+    let odd_last = scratch.path().join("y\nz: Device or resource busy (busy)");
+    for target in [&plain, &odd, &odd_last] {
+        let shown = target.to_str().unwrap();
+        let expected: Vec<String> = vec!["fusermount3".into(), "-u".into(), shown.into()];
+        let busy = run_unmount_helper(target, FUSERMOUNT_BUSY);
+        assert_eq!(busy.status.code(), Some(1), "{shown:?}: {}", busy.stderr);
+        assert!(busy.calls.len() >= 2, "{shown:?}: {:?}", busy.calls);
+        assert!(
+            busy.calls.iter().all(|call| call == &expected),
+            "{shown:?}: {:?}",
+            busy.calls
+        );
+        assert!(busy.took < Duration::from_secs(3), "{:?}", busy.took);
+        let last = busy.last_line();
+        assert!(
+            last.contains(&format!(
+                "(still busy after {} attempts over ~",
+                busy.calls.len()
+            )),
+            "{last}"
+        );
+        assert!(ratarmount_fuse::is_busy_unmount_error(last), "{last}");
+        let refused = run_unmount_helper(target, FUSERMOUNT_NOT_PERMITTED);
+        assert_eq!(
+            refused.status.code(),
+            Some(1),
+            "{shown:?}: {}",
+            refused.stderr
+        );
+        assert_eq!(refused.calls, std::slice::from_ref(&expected));
+        let last = refused.last_line();
+        assert!(last.ends_with(": Operation not permitted"), "{last}");
+        assert!(!ratarmount_fuse::is_busy_unmount_error(last), "{last}");
+        if target == &odd {
+            // The echoed path ended earlier lines with the busy words; only
+            // the last line, the real diagnostic, decides.
+            assert!(
+                refused
+                    .stderr
+                    .lines()
+                    .any(ratarmount_fuse::is_busy_unmount_error),
+                "{}",
+                refused.stderr
+            );
+        }
+        if target == &odd_last {
+            // The words are on the last line itself, before its real end.
+            assert!(last.contains(": Device or resource busy (busy)"), "{last}");
+        }
+        eprintln!(
+            "{shown:?}: busy: {} tries in {:?}; not permitted: 1 try",
+            busy.calls.len(),
+            busy.took
+        );
+    }
+}
+
+/// Sends a v2 `finalize` until it answers. `writers_active` is retried with
+/// the same request for a bounded time, as the docs tell clients to: a
+/// desktop prober (`gvfsd-trash`) can hold a new mount past the helper's own
+/// busy retries. Any other refusal fails.
+fn finalize_done(daemon: &Daemon, request: &Value, mnt: &Path) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = daemon.envelope(request.clone());
+        if response["ok"] == true {
+            return response["result"].clone();
+        }
+        assert_eq!(response["error"]["code"], "writers_active", "{response}");
+        assert!(Instant::now() < deadline, "attempt stayed busy: {response}");
+        eprintln!("finalize answered writers_active; retrying: {response}");
+        unmount::log_holders(mnt);
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// `root/layers/a` over `tar`, authored by the real binary (F1, F3).
+fn authored_a(root: &Path, tar: &Path) -> PathBuf {
+    let dir = root.join("layers");
+    fs::create_dir(&dir).unwrap();
+    let a = dir.join("a");
+    authored_layer(tar, &a, &[], &[("a.txt", "from a\n")]);
+    a
+}
+
+/// `ratarmount ARGS` with HOME and the cache under `home`.
+fn cli_output(home: &Path, args: &[&Path]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .env("HOME", home)
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// [`cli_output`]'s stdout, once its exit status is `code`.
+fn cli(home: &Path, args: &[&Path], code: i32) -> String {
+    let out = cli_output(home, args);
+    assert_eq!(
+        out.status.code(),
+        Some(code),
+        "ratarmount {args:?}: {out:?}"
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn sha256_of(path: &Path) -> String {
+    format!(
+        "sha256:{}",
+        ratarmount_index::sha256_hex_stream(&mut fs::File::open(path).unwrap()).unwrap()
+    )
+}
+
+/// Regression (R1c-1 F1): a layered, journaled attempt finalized by the real
+/// supervisor must report the sealed layer every offline verb computes:
+/// `patch_hash.files` counts only the top's file, `layer_digest` is `overlay
+/// verify --json`'s `computed` digest over the worker's index folder and
+/// `diff --hash`'s, a repeated `overlay seal` only reads it back, and the
+/// journal counts are `journal summarize --json`'s.
+#[test]
+fn regression_sandbox_v2_finalize_layered_fuse() {
+    if !prepared_fuse() {
+        return;
+    }
+    let daemon = Daemon::start();
+    daemon.base();
+    let root = daemon.root.as_ref().unwrap().path().to_path_buf();
+    let tar = root.join("base.tar");
+    let a = authored_a(&root, &tar);
+    let attempts = daemon.call(json!({
+        "version": 2, "op": "new", "base": "task", "lowers": [a], "journal": {}
+    }));
+    let id = attempts[0]["id"].as_str().unwrap().to_owned();
+    let mnt = PathBuf::from(attempts[0]["path"].as_str().unwrap());
+    let overlay = PathBuf::from(attempts[0]["overlay_dir"].as_str().unwrap());
+    let dir = mnt.parent().unwrap().to_path_buf();
+    // The agent reads the base and the lower and writes one new file.
+    assert_eq!(fs::read(mnt.join("base.txt")).unwrap(), b"original\n");
+    assert_eq!(fs::read(mnt.join("a.txt")).unwrap(), b"from a\n");
+    let payload = b"written by the agent\n";
+    fs::write(mnt.join("agent.txt"), payload).unwrap();
+    let report = finalize_done(
+        &daemon,
+        &json!({"version": 2, "op": "finalize", "id": id, "pack": true, "request_id": "f"}),
+        &mnt,
+    );
+    assert_eq!(report["status"], "finalized", "{report}");
+    assert_eq!(
+        report["attempt"],
+        json!({"id": id, "base": "task", "path": mnt, "overlay_dir": overlay, "status": "finalized"})
+    );
+    let digest = report["layer_digest"].as_str().unwrap();
+    let sealed_at = report["sealed_at"].as_str().unwrap();
+    assert!(digest.starts_with("sha256:"), "{report}");
+    assert!(!sealed_at.is_empty(), "{report}");
+    let patch_hash = &report["patch_hash"];
+    // Only the top's file: A's file and the base are beneath the layer.
+    assert_eq!(patch_hash["files"], 1, "{report}");
+    assert!(patch_hash["patch"].as_str().unwrap().starts_with("sha256:"));
+    assert_eq!(patch_hash["normalize"], "strict");
+    assert_eq!(patch_hash["algo"], "sha256");
+    assert_eq!(patch_hash["excludes"], json!([]));
+    assert_eq!(patch_hash["sealed"], true);
+    assert_eq!(patch_hash["stack"], report["stack_digest"]);
+    // The seal resolved the worker's `pending` base digest by hashing the tar.
+    assert_eq!(patch_hash["base"], json!(sha256_of(&tar)), "{report}");
+    assert_eq!(patch_hash["base_pending"], false);
+    assert_eq!(patch_hash["base_digest_state"], "present");
+    assert_eq!(report["fsck_result"], "ok", "{report}");
+    assert_eq!(report["bytes_written"], payload.len(), "{report}");
+    assert_eq!(report["erofs_denied"], 0, "{report}");
+    assert_eq!(report["manifest_path"], json!(dir.join("manifest.jsonl")));
+    assert_eq!(report["bundle"], json!(dir.join("bundle.tar.zst")));
+    assert!(dir.join("bundle.tar.zst").is_file());
+    let manifest: Vec<Value> = fs::read_to_string(dir.join("manifest.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(manifest.len(), 1, "{manifest:?}");
+    assert_eq!(manifest[0]["path"], "agent.txt", "{manifest:?}");
+    // The layer itself: sealed over the base and A.
+    let meta = ratarmount_compositing::OverlayMeta::read_no_recovery(&overlay)
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.get("layer_digest"), Some(digest));
+    assert_eq!(meta.get("sealed_at"), Some(sealed_at));
+    assert_eq!(meta.stack_digest(), report["stack_digest"].as_str());
+    let lowers = meta.lower_layers().unwrap();
+    assert_eq!(lowers.len(), 1, "{lowers:?}");
+    assert_eq!(lowers[0].path, a.canonicalize().unwrap());
+    assert_eq!(lowers[0].layer_digest, layer_digest(&a));
+    // Every offline verb computes the reported digest, with the worker's
+    // index folder (`--index-folders`, as `process::base_args` spells it).
+    let home = root.join("cli-home");
+    let indexes = serde_json::to_string(&[root.join("state/indexes/task")]).unwrap();
+    let (o, p) = (overlay.as_path(), Path::new);
+    let folders = p(indexes.as_str());
+    let verified: Value = serde_json::from_str(&cli(
+        &home,
+        &[
+            p("overlay"),
+            p("--index-folders"),
+            folders,
+            p("verify"),
+            o,
+            p("--json"),
+        ],
+        0,
+    ))
+    .unwrap();
+    assert_eq!(verified["ok"], true, "{verified}");
+    assert_eq!(verified["computed"], digest, "{verified}");
+    assert_eq!(verified["recorded"], digest, "{verified}");
+    assert_eq!(verified["base_ok"], true, "{verified}");
+    let hash = cli(
+        &home,
+        &[p("diff"), o, p("--hash"), p("--index-folders"), folders],
+        0,
+    );
+    assert_eq!(hash.trim(), digest);
+    // A repeated seal is a consistency read: the recorded values, nothing
+    // in the layer changed.
+    let before = tree_bytes(o);
+    let resealed: Value = serde_json::from_str(&cli(
+        &home,
+        &[
+            p("overlay"),
+            p("--index-folders"),
+            folders,
+            p("seal"),
+            o,
+            p("--json"),
+        ],
+        0,
+    ))
+    .unwrap();
+    assert_eq!(
+        resealed,
+        json!({"layer_digest": digest, "sealed_at": sealed_at})
+    );
+    assert_eq!(tree_bytes(o), before, "a repeated seal changed the layer");
+    // The journal summary is `journal summarize --json`'s.
+    let journal = dir.join("journal.jsonl");
+    let summary: Value = serde_json::from_str(&cli(
+        &home,
+        &[p("journal"), p("summarize"), journal.as_path(), p("--json")],
+        0,
+    ))
+    .unwrap();
+    let count = |key: &str| summary[key].as_array().unwrap().len();
+    assert_eq!(
+        report["journal_summary"],
+        json!({
+            "path": dir.join("journal.summary.json"),
+            "files_read": count("files_read"),
+            "files_read_then_written": count("files_read_then_written"),
+            "files_written_blind": count("files_written_blind"),
+        })
+    );
+    assert!(
+        summary["files_written_blind"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("agent.txt")),
+        "{summary}"
+    );
+    let written: Value =
+        serde_json::from_slice(&fs::read(dir.join("journal.summary.json")).unwrap()).unwrap();
+    assert_eq!(written, summary);
+}
+
+/// Whether `path` is a mount point in `/proc/self/mountinfo` (its fifth
+/// field, octal escapes decoded).
+fn in_mountinfo(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    fn unescape(field: &[u8]) -> Vec<u8> {
+        let mut decoded = Vec::new();
+        let mut i = 0;
+        while i < field.len() {
+            let octal = |b: &u8| (b'0'..=b'7').contains(b);
+            if field[i] == b'\\' && i + 3 < field.len() && field[i + 1..i + 4].iter().all(octal) {
+                let digit = |at: usize| u32::from(field[at] - b'0');
+                decoded.push((digit(i + 1) * 64 + digit(i + 2) * 8 + digit(i + 3)) as u8);
+                i += 4;
+            } else {
+                decoded.push(field[i]);
+                i += 1;
+            }
+        }
+        decoded
+    }
+    fs::read("/proc/self/mountinfo")
+        .unwrap()
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| line.split(|byte| *byte == b' ').nth(4))
+        .any(|field| unescape(field) == path.as_os_str().as_bytes())
+}
+
+/// The overlay's `meta` rows, read without a lock (`immutable=1`). A serving
+/// child holds its overlay database in SQLite's exclusive locking mode
+/// (`write_overlay.rs`, `LOCKING_MODE = EXCLUSIVE`), which refuses every
+/// other reader, `overlay info` and `OverlayMeta` included; the database
+/// keeps a rollback journal, so every committed row is in its main file.
+fn meta_unlocked(overlay: &Path) -> std::collections::BTreeMap<String, String> {
+    use rusqlite::OpenFlags;
+    let db = overlay.join(ratarmount_compositing::HIDDEN_DB);
+    let uri = format!("file:{}?immutable=1", db.to_str().unwrap());
+    let conn = rusqlite::Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .unwrap();
+    let mut rows = conn.prepare("SELECT key, value FROM meta").unwrap();
+    let meta = rows
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    meta
+}
+
+/// The states `requests.jsonl` recorded for request `id`, in order.
+fn request_states(daemon: &Daemon, id: &str) -> Vec<String> {
+    fs::read_to_string(daemon.requests_log())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|record| record["id"] == id)
+        .map(|record| record["t"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Regression (R1c-1 F2, ruling 7): a finalize of an attempt whose mount a
+/// process still uses must answer `writers_active` from the real helper's
+/// real EBUSY, with only non-forcing `-u` unmounts, leaving the attempt
+/// mounted, `ready`, unsealed and readable by its holder; once the holder
+/// exits, the same request ID finalizes.
+#[test]
+fn regression_sandbox_v2_finalize_writers_active_fuse() {
+    use std::io::{Read, Seek, SeekFrom};
+    if !prepared_fuse() {
+        return;
+    }
+    // Every fusermount3 the daemon, its mount children and its unmount
+    // helper run is recorded, then the real one runs (found by absolute path
+    // before PATH is overridden), so mounting still works.
+    let original = std::env::var_os("PATH").unwrap_or_default();
+    let real = std::env::split_paths(&original)
+        .map(|dir| dir.join("fusermount3"))
+        .find(|path| path.is_file())
+        .expect("fusermount3 on PATH");
+    let real = real.to_str().unwrap();
+    assert!(!real.contains('\''), "{real}");
+    let wrapper = tempfile::tempdir().unwrap();
+    let bin = wrapper.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let log = wrapper.path().join("fusermount3.log");
+    recording_script(&bin, "fusermount3", &log, &format!("exec '{real}' \"$@\""));
+    let daemon = Daemon::start_with_env(vec![("PATH", path_with(&bin))]);
+    daemon.base();
+    let attempts = daemon.call(json!({"op": "new", "base": "task"}));
+    let id = attempts[0]["id"].as_str().unwrap().to_owned();
+    let mnt = PathBuf::from(attempts[0]["path"].as_str().unwrap());
+    let overlay = PathBuf::from(attempts[0]["overlay_dir"].as_str().unwrap());
+    fs::write(mnt.join("agent.txt"), b"agent\n").unwrap();
+    // A writer (an agent's container) still holds a file in the mount.
+    let mut holder = fs::File::open(mnt.join("base.txt")).unwrap();
+    let request = json!({"version": 2, "op": "finalize", "id": id, "request_id": "f"});
+    let unmount = vec![
+        "fusermount3".to_owned(),
+        "-u".into(),
+        mnt.to_str().unwrap().into(),
+    ];
+    let from = log_len(&log);
+    let refused = daemon.envelope(request.clone());
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["error"]["code"], "writers_active", "{refused}");
+    // The real helper's busy retries, each a plain `-u`: no `-z`, no force
+    // flag, nothing but the attempt's own mount point.
+    let calls = invocations(&log, from);
+    assert!(calls.len() >= 2, "{calls:?}");
+    assert!(calls.iter().all(|call| call == &unmount), "{calls:?}");
+    eprintln!(
+        "writers_active after {} `fusermount3 -u` tries",
+        calls.len()
+    );
+    // Nothing was detached, stopped or sealed.
+    assert!(in_mountinfo(&mnt), "{} is no longer mounted", mnt.display());
+    let listed = daemon.call(json!({"op": "list"}));
+    let entry = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["id"] == id.as_str())
+        .unwrap();
+    assert_eq!(entry["status"], "ready", "{listed}");
+    // The child still holds its overlay database, so `overlay info` cannot
+    // read it; the unlocked read shows no seal row.
+    let home = wrapper.path().join("cli-home");
+    let (o, p) = (overlay.as_path(), Path::new);
+    let info = cli_output(&home, &[p("overlay"), p("info"), o, p("--json")]);
+    assert_eq!(info.status.code(), Some(1), "{info:?}");
+    assert!(
+        String::from_utf8_lossy(&info.stderr).contains("is in use by another ratarmount process"),
+        "{info:?}"
+    );
+    let meta = meta_unlocked(&overlay);
+    assert!(meta.contains_key("format_version"), "{meta:?}");
+    assert!(!meta.contains_key("sealed_at"), "{meta:?}");
+    assert!(!meta.contains_key("layer_digest"), "{meta:?}");
+    assert!(!overlay.join(".ratarmount-sealed").exists());
+    assert_ne!(
+        fs::metadata(&overlay).unwrap().permissions().mode() & 0o200,
+        0
+    );
+    // The holder still reads its open file through the mount, and the mount
+    // still serves new opens.
+    let mut content = String::new();
+    holder.seek(SeekFrom::Start(0)).unwrap();
+    holder.read_to_string(&mut content).unwrap();
+    assert_eq!(content, "original\n");
+    assert_eq!(fs::read(mnt.join("agent.txt")).unwrap(), b"agent\n");
+    // Once the holder exits, the same request ID finalizes.
+    drop(holder);
+    let from = log_len(&log);
+    let report = finalize_done(&daemon, &request, &mnt);
+    assert_eq!(report["status"], "finalized", "{report}");
+    let calls = invocations(&log, from);
+    assert!(calls.contains(&unmount), "{calls:?}");
+    assert!(!in_mountinfo(&mnt));
+    // `done`: the stored report answers without running anything.
+    let from = log_len(&log);
+    assert_eq!(daemon.call(request), report);
+    assert_eq!(log_len(&log), from);
+    let states = request_states(&daemon, "f");
+    assert_eq!(states[..2], ["running", "retryable"], "{states:?}");
+    assert_eq!(
+        states.last().map(String::as_str),
+        Some("done"),
+        "{states:?}"
+    );
+    // Sealed now: `overlay info` reads the seal rows, and the unlocked
+    // reader agrees with it.
+    let info: Value =
+        serde_json::from_str(&cli(&home, &[p("overlay"), p("info"), o, p("--json")], 0)).unwrap();
+    assert_eq!(info["sealed_at"], report["sealed_at"], "{info}");
+    assert_eq!(info["layer_digest"], report["layer_digest"], "{info}");
+    let meta = meta_unlocked(&overlay);
+    assert_eq!(json!(meta["sealed_at"]), report["sealed_at"]);
+    assert_eq!(json!(meta["layer_digest"]), report["layer_digest"]);
 }

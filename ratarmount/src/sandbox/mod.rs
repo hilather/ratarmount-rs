@@ -1,6 +1,9 @@
 //! A local supervisor; each attempt owns a foreground ratarmount child.
 
 mod daemon;
+mod finalize;
+#[cfg(test)]
+mod finalize_tests;
 mod inspection;
 pub(crate) use inspection::start as start_inspection;
 mod lowers;
@@ -12,6 +15,7 @@ mod requests;
 #[cfg(test)]
 mod requests_tests;
 mod run;
+mod state_log;
 #[cfg(test)]
 mod tests;
 
@@ -89,6 +93,21 @@ enum Command {
         /// Fsync the journal at unmount.
         #[arg(long, requires = "journal")]
         journal_sync: bool,
+    },
+    /// Stop, check, seal and hash an attempt, optionally packing it (protocol version 2; Linux only).
+    ///
+    /// Unmounts the attempt with a normal unmount (never lazy or forced), fscks, seals and hashes its layer, syncs everything it references, and prints the JSON report. A busy mount answers writers_active: stop the processes using it (its container) and retry after at least a second, backing off.
+    #[command(
+        after_help = "Example: ratarmount sandbox --socket api.sock finalize attempt-a1B2c3 --pack --request-id run-17-final\n\nExit status:\n  0  Finalized; stdout is the JSON report.\n  1  Refused or failed (see the JSON error: writers_active, lower_changed,\n     invalid_request, not_found, io, ...); retry writers_active."
+    )]
+    Finalize {
+        id: String,
+        /// Also pack the layer into attempts/ID/bundle.tar.zst.
+        #[arg(long)]
+        pack: bool,
+        /// Retry-safe ID: the same ID and body act only on the attempt the first try resolved.
+        #[arg(long)]
+        request_id: Option<String>,
     },
     List {
         #[arg(long)]
@@ -184,6 +203,16 @@ pub fn run(args: &SandboxArgs) -> Result<(), String> {
                 .into()
             }
         }
+        Command::Finalize {
+            id,
+            pack,
+            request_id,
+        } => OperationV2::Finalize {
+            id: id.clone(),
+            pack: *pack,
+            request_id: request_id.clone(),
+        }
+        .into(),
         Command::List { base } => Operation::List { base: base.clone() }.into(),
         Command::Diff { id, git } => Operation::Diff {
             id: id.clone(),
@@ -224,7 +253,7 @@ fn call(socket: &std::path::Path, request: Request) -> Result<Response, String> 
     let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
     // Includes queued requests and cleanup of a full batch; callers can retry reads,
     // but must not blindly retry mutations after a transport failure, except a
-    // `new` retried with the same --request-id and arguments.
+    // `new` or `finalize` retried with the same --request-id and arguments.
     let timeout = Some(Duration::from_secs(3600));
     stream
         .set_read_timeout(timeout)
