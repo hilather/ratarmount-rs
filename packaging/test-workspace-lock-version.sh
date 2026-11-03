@@ -97,19 +97,19 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.36"
+version = "0.1.37"
 """
 
 stale_lock = """[[package]]
 name = "ratarmount"
-version = "0.1.35"
+version = "0.1.36"
 
 [[package]]
 name = "ratarmount-core"
-version = "0.1.35"
+version = "0.1.36"
 """
 
-fresh_lock = stale_lock.replace("0.1.35", "0.1.36")
+fresh_lock = stale_lock.replace("0.1.36", "0.1.37")
 
 try:
     assert_lock_matches(good_toml, stale_lock, "synthetic stale lock")
