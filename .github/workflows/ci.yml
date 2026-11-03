@@ -46,6 +46,9 @@ jobs:
       - name: workspace lock version matches Cargo.toml
         run: bash packaging/test-workspace-lock-version.sh
 
+      - name: zstd advisory floors
+        run: bash packaging/test-zstd-advisory-floor.sh
+
       - name: portable deps allowlist self-test
         run: bash packaging/test-portable-deps-selftest.sh
 
