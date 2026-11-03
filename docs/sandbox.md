@@ -2746,6 +2746,9 @@ up, stopped or recorded.
      `Operation not permitted`, a helper that did not finish within 3 s, or a
      helper that unmounted only the top one of several mounts stacked at the
      path): `io`, "cannot unmount attempt ID: DETAIL; nothing was changed".
+     When the helper did unmount the top one of several stacked mounts, the
+     answer ends instead "; the top mount was removed, but the attempt is
+     still mounted and keeps its status".
    - Unmounted: the supervisor waits for the mount process to exit, up to the
      smaller of `--timeout` and 10 s. If it keeps serving (another mount
      namespace, such as a container's copy of the mount, holds it), the answer

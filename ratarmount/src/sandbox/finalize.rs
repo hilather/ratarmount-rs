@@ -601,11 +601,19 @@ impl<M: Mounter> Supervisor<M> {
                     "attempt {id} is still in use: its mount is busy (EBUSY); stop every process using it (its container) and retry; nothing was changed"
                 )))
             }
-            StopOutcome::Failed { detail } => {
+            StopOutcome::Failed {
+                detail,
+                top_removed,
+            } => {
+                let outcome = if top_removed {
+                    "the top mount was removed, but the attempt is still mounted and keeps its status"
+                } else {
+                    "nothing was changed"
+                };
                 return Err(ApiError::new(
                     "io",
-                    format!("cannot unmount attempt {id}: {detail}; nothing was changed"),
-                ))
+                    format!("cannot unmount attempt {id}: {detail}; {outcome}"),
+                ));
             }
             StopOutcome::Detaching => {
                 self.set_status(&id, "finalizing");

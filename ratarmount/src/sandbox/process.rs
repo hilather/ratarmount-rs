@@ -36,7 +36,9 @@ pub enum StopOutcome {
     /// superblock (a container's copy of the mount) keeps it alive.
     Detaching,
     /// Still mounted after any other failure; `detail` names it.
-    Failed { detail: String },
+    /// `top_removed`: the helper succeeded and unmounted the top one of
+    /// several mounts stacked at the path, so the mount table did change.
+    Failed { detail: String, top_removed: bool },
 }
 
 /// How long the unmount helper may take (its own busy retries take about 1 s).
@@ -490,6 +492,7 @@ impl Mounter for ProcessMounter {
                                 format!("; its last line: {last}")
                             }
                         ),
+                        top_removed: true,
                     },
                     Some(status) => StopOutcome::Failed {
                         detail: if last.is_empty() {
@@ -497,12 +500,14 @@ impl Mounter for ProcessMounter {
                         } else {
                             last
                         },
+                        top_removed: false,
                     },
                     None => StopOutcome::Failed {
                         detail: format!(
                             "the unmount helper did not finish within {} s",
                             HELPER_BOUND.as_secs()
                         ),
+                        top_removed: false,
                     },
                 });
             }
@@ -865,7 +870,10 @@ mod tests {
         ] {
             let mut mounter = stopper(dir.path(), &body, &path);
             match mounter.stop(&attempt_at(&path, "ready"), Duration::ZERO).unwrap() {
-                StopOutcome::Failed { detail } => assert!(detail.contains(needle), "{detail}"),
+                StopOutcome::Failed { detail, top_removed } => {
+                    assert!(detail.contains(needle), "{detail}");
+                    assert!(!top_removed);
+                }
                 other => panic!("{other:?}"),
             }
         }
@@ -884,7 +892,11 @@ mod tests {
                 .stop(&attempt_at(&path, "ready"), Duration::ZERO)
                 .unwrap()
             {
-                StopOutcome::Failed { detail } => {
+                StopOutcome::Failed {
+                    detail,
+                    top_removed,
+                } => {
+                    assert!(top_removed);
                     let top = format!("unmounted the top mount at {}", path.display());
                     let still = format!("{} is still mounted", path.display());
                     assert!(detail.contains(&top), "{detail}");
@@ -909,8 +921,12 @@ mod tests {
             .stop(&attempt_at(&path, "ready"), Duration::ZERO)
             .unwrap()
         {
-            StopOutcome::Failed { detail } => {
-                assert!(detail.contains("did not finish"), "{detail}")
+            StopOutcome::Failed {
+                detail,
+                top_removed,
+            } => {
+                assert!(detail.contains("did not finish"), "{detail}");
+                assert!(!top_removed);
             }
             other => panic!("{other:?}"),
         }

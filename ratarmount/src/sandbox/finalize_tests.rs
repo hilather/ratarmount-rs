@@ -284,6 +284,32 @@ fn regression_supervisor_finalize_request_id_idempotent() {
         env.sup.requests.status("r1"),
         Some(super::requests::Status::Retryable)
     );
+    // Failed: the answer's suffix says what actually changed.
+    for (top_removed, suffix) in [
+        (false, "nothing was changed"),
+        (
+            true,
+            "the top mount was removed, but the attempt is still mounted and keeps its status",
+        ),
+    ] {
+        env.fake
+            .0
+            .lock()
+            .unwrap()
+            .stop_outcomes
+            .push_back(StopOutcome::Failed {
+                detail: "DETAIL".into(),
+                top_removed,
+            });
+        let error = env.finalize(&id, false, Some("r1")).unwrap_err();
+        assert_eq!(error.code, "io");
+        assert_eq!(
+            error.message,
+            format!("cannot unmount attempt {id}: DETAIL; {suffix}")
+        );
+        assert_eq!(env.status(&id), "ready");
+        assert!(!sealed(&attempt.overlay_dir));
+    }
     // Detaching: unmounted, the child still serves.
     env.fake
         .0
