@@ -9397,11 +9397,21 @@ enum TarZstPathClass {
     LastWindow,
 }
 
+/// Synthetic implied parents, nested-as-directory entries and dumpdir
+/// whiteouts are not archive members, even when they carry an offset (#254).
 fn tar_offsetheaders_in(fi: &FileInfo) -> impl Iterator<Item = u64> + '_ {
     fi.userdata.iter().filter_map(|u| match u {
-        UserData::Tar(t) => t.offsetheader,
+        UserData::Tar(t) if !t.isgenerated => t.offsetheader,
         _ => None,
     })
+}
+
+fn is_implied_tar_entry(fi: &FileInfo) -> bool {
+    let mut entries = fi.userdata.iter().filter_map(|u| match u {
+        UserData::Tar(t) => Some(t),
+        _ => None,
+    });
+    entries.next().is_some_and(|t| t.isgenerated) && entries.all(|t| t.isgenerated)
 }
 
 fn lookup_version(base: &dyn MountSource, path: &str, i: i32) -> Option<FileInfo> {
@@ -9428,20 +9438,25 @@ fn archive_lookup_path(rel: &str) -> String {
 fn all_tar_offsetheaders(base: &dyn MountSource, path: &str) -> Result<Vec<u64>> {
     let path = archive_lookup_path(path);
     let mut out = Vec::new();
+    let mut is_implied = true;
     // Walk `.versions/{i}` until miss. Do not stop at `versions()` — AutoMount
     // (and similar wrappers) report 1 even when FileVersionLayer exposes more.
     const MAX_VERSION_WALK: i32 = 1024;
     for i in 1..=MAX_VERSION_WALK {
         match base.lookup(&format!("{path}.versions/{i}"), 0) {
-            Some(fi) => out.extend(tar_offsetheaders_in(&fi)),
+            Some(fi) => {
+                is_implied &= is_implied_tar_entry(&fi);
+                out.extend(tar_offsetheaders_in(&fi));
+            }
             None => break,
         }
     }
     let nver = base.versions(&path);
     if nver == 0 && out.is_empty() {
         if let Some(fi) = base.lookup(&path, 0) {
+            is_implied &= is_implied_tar_entry(&fi);
             out.extend(tar_offsetheaders_in(&fi));
-            if out.is_empty() {
+            if out.is_empty() && !is_implied {
                 return Err(cannot_classify_err(&path));
             }
         }
@@ -9449,15 +9464,19 @@ fn all_tar_offsetheaders(base: &dyn MountSource, path: &str) -> Result<Vec<u64>>
     }
     for i in 1..=nver {
         if let Some(fi) = lookup_version(base, &path, i as i32) {
+            is_implied &= is_implied_tar_entry(&fi);
             out.extend(tar_offsetheaders_in(&fi));
         }
     }
     if let Some(fi) = base.lookup(&path, 0) {
+        is_implied &= is_implied_tar_entry(&fi);
         out.extend(tar_offsetheaders_in(&fi));
     }
     out.sort_unstable();
     out.dedup();
-    if out.is_empty() {
+    // A generated-only path exists in the index but has no member to rewrite.
+    // Missing provenance on any visited entry must still fail classification.
+    if out.is_empty() && !is_implied {
         return Err(cannot_classify_err(&path));
     }
     Ok(out)

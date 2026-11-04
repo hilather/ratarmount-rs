@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixes
+
+- Live and offline overlay commits treat implied TAR parent directories as having no archive member: permission changes append a directory entry, and deleting an implied directory no longer fails with a missing suffix member. Successful live commits clear its pending metadata; persistent interval failures warn at occurrences 2, 4, 8, ... after the first error. (#254; legacy-sidecar follow-up: #255)
+
 ## 0.1.37
 
 ### Changes
