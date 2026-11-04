@@ -85,6 +85,10 @@ pub trait Mounter {
     fn status(&mut self, attempt: &Attempt, timeout: Duration) -> Result<u64>;
     /// Whether a recorded child of the attempt is still running.
     fn child_alive(&mut self, attempt: &Attempt) -> bool;
+    /// Forgets the attempt's child entry and kept exit status (the child has
+    /// exited); unmounts and signals nothing. Called when a retained
+    /// attempt's tree moved, so no entry outlives its path.
+    fn forget_child(&mut self, path: &Path);
     /// Every mount point of this process's mount namespace.
     fn mount_points(&self) -> Result<Vec<PathBuf>>;
 }
@@ -544,6 +548,11 @@ impl Mounter for ProcessMounter {
         }
     }
 
+    fn forget_child(&mut self, path: &Path) {
+        self.children.remove(path);
+        self.exits.remove(path);
+    }
+
     fn mount_points(&self) -> Result<Vec<PathBuf>> {
         Ok(self.mounted()?)
     }
@@ -654,6 +663,31 @@ pub fn mountpoints() -> io::Result<Vec<PathBuf>> {
         io::ErrorKind::Unsupported,
         "sandbox mounts require Linux or macOS",
     ))
+}
+
+/// A blocking Unix stream socket with CLOEXEC. `SOCK_CLOEXEC` is taken
+/// atomically at `socket()` on Linux, where it exists; on macOS `FD_CLOEXEC`
+/// is set right after `socket()` because no `SOCK_CLOEXEC` exists: the
+/// supervisor's serve thread, the only caller, is also the only thread that
+/// spawns children, so none can inherit the socket in between.
+pub(crate) fn stream_socket() -> io::Result<rustix::fd::OwnedFd> {
+    use rustix::net::{AddressFamily, SocketType};
+    #[cfg(target_os = "linux")]
+    {
+        rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            rustix::net::SocketFlags::CLOEXEC,
+            None,
+        )
+        .map_err(Into::into)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let socket = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+        rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
+        Ok(socket)
+    }
 }
 
 /// Decode the `\ooo` octal escapes of one mountinfo path field, bytewise.

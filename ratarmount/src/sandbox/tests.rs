@@ -75,6 +75,9 @@ pub(super) struct FakeState {
     pub(super) status_held: Vec<Duration>,
     /// Children still alive after a `Detaching` stop.
     pub(super) alive: BTreeSet<PathBuf>,
+    /// Every mount point `forget_child` dropped (R1c-1: the retained
+    /// attempt's mount table entry, removed when its tree is renamed).
+    pub(super) forgotten: Vec<PathBuf>,
     /// Mount points besides the attempts' own (the durability preflight's
     /// mount check).
     pub(super) extra_mounts: Vec<PathBuf>,
@@ -325,6 +328,12 @@ impl Mounter for Fake {
 
     fn child_alive(&mut self, attempt: &Attempt) -> bool {
         self.0.lock().unwrap().alive.contains(&attempt.path)
+    }
+
+    fn forget_child(&mut self, path: &Path) {
+        let mut state = self.0.lock().unwrap();
+        state.forgotten.push(path.into());
+        state.alive.remove(path);
     }
 
     fn mount_points(&self) -> Result<Vec<PathBuf>, ApiError> {
@@ -1616,12 +1625,11 @@ fn regression_protocol_v2_dispatch_and_envelope_versions() {
             2,
             "invalid_request",
         ),
-        // R1c-1 defines `finalize`: an unknown operation stays refused.
+        // R1c-1 defines `finalize` and `retain`: an unknown operation and
+        // an unknown `new` field stay refused.
         (r#"{"version":2,"op":"bogus"}"#, 2, "invalid_request"),
-        // `retain` is still refused (R1c-1's PR B adds it); R1b accepts
-        // `lowers`.
         (
-            r#"{"version":2,"op":"new","base":"t","retain":true}"#,
+            r#"{"version":2,"op":"new","base":"t","bogus":1}"#,
             2,
             "invalid_request",
         ),
@@ -1973,9 +1981,10 @@ fn generate_cli_v1_requests() {
 }
 
 /// Regression: every v1 CLI subcommand still sends the baseline bytes;
-/// `new --request-id`, `--lower` and `--journal`, and `finalize`, send v2
-/// (R1b C1, R1c-1 C1a), and `call` accepts only its request's version, or a
-/// v1 error answering v2 (how an older daemon refuses v2).
+/// `new --request-id`, `--lower`, `--journal` and `--retain`, `finalize` and
+/// `list --all` send v2 (R1b C1, R1c-1 C1), and `call` accepts only its
+/// request's version, or a v1 error answering v2 (how an older daemon refuses
+/// v2).
 #[test]
 fn regression_cli_v1_request_bytes_unchanged() {
     let expected: Vec<serde_json::Value> = fs::read_to_string(CLI_V1_REQUESTS)
@@ -2030,9 +2039,13 @@ fn regression_cli_v1_request_bytes_unchanged() {
         assert_eq!(String::from_utf8(recorder.line()).unwrap(), line);
         recorder.finish();
     }
-    // R1c-1 (C1a): finalize sends v2; the v1 argv above keep their fixture
-    // bytes.
+    // R1c-1 (C1): --retain, finalize and list --all send v2; the v1 argv
+    // above keep their fixture bytes.
     for (argv, line) in [
+        (
+            &["new", "task", "--retain"][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"retain\":true}\n",
+        ),
         (
             &["finalize", "attempt-a1B2c3", "--pack", "--request-id", "r"][..],
             "{\"version\":2,\"op\":\"finalize\",\"id\":\"attempt-a1B2c3\",\"pack\":true,\"request_id\":\"r\"}\n",
@@ -2040,6 +2053,10 @@ fn regression_cli_v1_request_bytes_unchanged() {
         (
             &["finalize", "attempt-a1B2c3"][..],
             "{\"version\":2,\"op\":\"finalize\",\"id\":\"attempt-a1B2c3\"}\n",
+        ),
+        (
+            &["list", "--all"][..],
+            "{\"version\":2,\"op\":\"list\",\"base\":null,\"all\":true}\n",
         ),
     ] {
         let recorder = Recorder::start(vec![
@@ -2124,6 +2141,7 @@ fn regression_cli_v1_request_bytes_unchanged() {
             request_id: Some("r".into()),
             lowers: vec![],
             journal: None,
+            retain: false,
         }),
     )
     .unwrap();

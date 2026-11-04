@@ -142,7 +142,7 @@ pub struct Target {
 }
 
 /// Whether `instance` is an attempt instance: 32 lowercase hex digits.
-fn is_instance(instance: &str) -> bool {
+pub(super) fn is_instance(instance: &str) -> bool {
     instance.len() == 32
         && instance
             .bytes()
@@ -176,7 +176,7 @@ impl Subject {
 
 /// The answer to a retry of a finalize a restart cut off.
 pub const FINALIZE_INTERRUPTED: &str =
-    "finalize was cut off by a supervisor restart before it finished; the restart discarded its attempt";
+    "finalize was cut off by a supervisor restart before it finished; an attempt that was not retained was discarded, and a retained one is kept on disk";
 
 #[derive(Serialize)]
 struct LineOut<'a> {
@@ -400,6 +400,7 @@ fn defaults(operation: &OperationV2) -> Vec<(&'static str, Value)> {
             ("quota", json!(None::<u64>)),
             ("readonly_globs", json!(Vec::<String>::new())),
             ("lowers", json!(Vec::<String>::new())),
+            ("retain", json!(false)),
         ],
         OperationV2::Finalize { .. } => vec![("pack", json!(false))],
         _ => Vec::new(),
@@ -461,15 +462,29 @@ pub struct RequestRecords {
     live_bytes: u64,
     reserved: HashMap<String, usize>,
     limits: Limits,
-    /// The finalize targets that still exist (Keystone approval note (a)): a
-    /// finalize record whose target is pinned is never evicted. The
-    /// supervisor pins every attempt it records, by ID and instance, until
-    /// `destroy`. A restart discards every attempt, so a log opens with none.
+    /// `None` from open until the supervisor knows which targets exist.
     /// Only the running log consults pins (admission and [`make_room`]);
     /// replay never does, so it evicts exactly what the run evicted.
     ///
     /// [`make_room`]: StateLog::make_room
-    pins: HashSet<Target>,
+    pins: Option<Pins>,
+}
+
+/// The finalize targets that still exist (Keystone approval note (a)): a
+/// finalize record whose target is pinned is never evicted. The supervisor
+/// pins every attempt it records, by ID and instance, until `destroy`;
+/// retained attempts stay pinned. `ids` pins every instance of an ID: a name
+/// under `retained/` whose instance no record names.
+#[derive(Clone, Debug, Default)]
+pub struct Pins {
+    pub targets: HashSet<Target>,
+    pub ids: HashSet<String>,
+}
+
+impl Pins {
+    fn holds(&self, target: &Target) -> bool {
+        self.targets.contains(target) || self.ids.contains(&target.id)
+    }
 }
 
 /// `requests.jsonl` through the state-log engine.
@@ -484,15 +499,16 @@ impl RequestRecords {
             live_bytes: 0,
             reserved: HashMap::new(),
             limits,
-            pins: HashSet::new(),
+            pins: None,
         }
     }
 
-    /// Whether `record` is a finalize record whose target is pinned.
+    /// Whether `record` is a finalize record whose target is pinned (every
+    /// finalize record while the pins are unknown).
     fn pinned(&self, record: &Record) -> bool {
         match &record.subject {
             Subject::New => false,
-            Subject::Finalize(target) => self.pins.contains(target),
+            Subject::Finalize(target) => self.pins.as_ref().is_none_or(|pins| pins.holds(target)),
         }
     }
 
@@ -709,12 +725,25 @@ impl StateLog<RequestRecords> {
     /// Pins `target`: its finalize records are never evicted until
     /// [`unpin`](Self::unpin) (approval note (a)).
     pub fn pin(&mut self, target: Target) {
-        self.records.pins.insert(target);
+        self.records
+            .pins
+            .get_or_insert_with(Pins::default)
+            .targets
+            .insert(target);
     }
 
     /// Unpins `target`, whose attempt is gone; its records become evictable.
     pub fn unpin(&mut self, target: &Target) {
-        self.records.pins.remove(target);
+        if let Some(pins) = &mut self.records.pins {
+            pins.targets.remove(target);
+        }
+    }
+
+    /// The targets that exist after a restart, replacing every pin. Replay
+    /// already evicted exactly what the run evicted, so nothing is evicted
+    /// here.
+    pub fn set_pins(&mut self, pins: Pins) {
+        self.records.pins = Some(pins);
     }
 
     /// Before a line of `bytes` for `id` is written (approval note (a)):

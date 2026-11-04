@@ -400,6 +400,41 @@ fn regression_run_fuse_timeout_unmounts() {
     );
 }
 
+/// Regression (Keystone note 7): the fsck `sandbox run` runs after the
+/// mount's stderr was redirected to its tempfile repairs a `tombstone_content`
+/// finding, and the repair still reaches the report's `fsck_result`.
+#[test]
+fn regression_run_fuse_fsck_repair_reaches_report() {
+    if !available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let stdout = tempfile::tempfile().unwrap();
+    let mut child = fixture
+        .command(&[], "rm input; echo done > done; sleep 5")
+        .stdout(stdout.try_clone().unwrap())
+        .spawn()
+        .unwrap();
+    // `done` exists only after the `rm` RPC finished, so the tombstone row
+    // hiding the base's `input` is committed.
+    wait_for_content(&fixture.top.join("done"), b"done\n", &mut child);
+    // Host-side content under a committed tombstone row (tombstone_content).
+    fs::write(fixture.top.join("input"), b"i\n").unwrap();
+    assert!(wait(&mut child).success());
+    use std::io::{Read, Seek};
+    let mut stdout = stdout;
+    stdout.rewind().unwrap();
+    let mut bytes = Vec::new();
+    stdout.read_to_end(&mut bytes).unwrap();
+    let report: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(report["exit_code"], 0, "{report}");
+    assert_eq!(
+        report["fsck_result"],
+        json!("repaired:1"),
+        "fsck's repair after the stderr redirect must reach the report: {report}"
+    );
+}
+
 #[test]
 fn regression_run_fuse_sigkill_next_run_recovers_stale_mount() {
     if !available() {

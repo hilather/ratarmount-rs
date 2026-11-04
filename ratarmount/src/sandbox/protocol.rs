@@ -112,8 +112,9 @@ pub struct JournalSpec {
 }
 
 /// Version 2: the v1 operations, where `new` also takes a `request_id`,
-/// `lowers` and a `journal`; plus `finalize`. Fields and defaults are v1's,
-/// and they never change within version 2; later releases only add fields,
+/// `lowers`, a `journal` and `retain`, and `list` takes `all`; plus
+/// `finalize`. Fields and defaults are v1's, and they never change within
+/// version 2; later releases only add fields,
 /// which an older daemon refuses as unknown. Only `new` and `finalize` take a
 /// request ID: `create_base`, `destroy` and every other operation take none,
 /// and a `request_id` there is an unknown field (`invalid_request`).
@@ -155,10 +156,18 @@ pub enum OperationV2 {
             skip_serializing_if = "Option::is_none"
         )]
         journal: Option<JournalSpec>,
+        /// Keep each attempt in `retained/ID` once a `finalize` succeeds
+        /// (R1c-1 §5.6). Linux only, TAR, directory and `git:///` bases only.
+        #[serde(default, skip_serializing_if = "is_false")]
+        retain: bool,
     },
     List {
         #[serde(default)]
         base: Option<String>,
+        /// Also list this run's retained attempts, after the attempts map.
+        /// Without it the answer is exactly v1 `list`'s.
+        #[serde(default, skip_serializing_if = "is_false")]
+        all: bool,
     },
     Diff {
         id: String,
@@ -200,8 +209,8 @@ fn is_false(value: &bool) -> bool {
 
 impl OperationV2 {
     /// The same v1 operation; a `request_id` is not part of it. A `new` with
-    /// `lowers` or a `journal`, and `finalize`, have no v1 form: the
-    /// supervisor never converts one (§5.1).
+    /// `lowers`, a `journal` or `retain`, a `list` with `all` and `finalize`
+    /// have no v1 form: the supervisor never converts one (§5.1).
     pub fn into_v1(self) -> Operation {
         match self {
             Self::CreateBase {
@@ -222,11 +231,12 @@ impl OperationV2 {
                 request_id: _,
                 lowers,
                 journal,
+                retain,
             } => {
                 // `Supervisor::handle` takes every v2 `new` before this.
                 assert!(
-                    lowers.is_empty() && journal.is_none(),
-                    "a layered or journaled new has no v1 form"
+                    lowers.is_empty() && journal.is_none() && !retain,
+                    "a layered, journaled or retained new has no v1 form"
                 );
                 Operation::New {
                     base,
@@ -236,7 +246,11 @@ impl OperationV2 {
                     readonly_globs,
                 }
             }
-            Self::List { base } => Operation::List { base },
+            Self::List { base, all } => {
+                // `Supervisor::handle` takes a v2 `list` before this.
+                assert!(!all, "a list of retained attempts has no v1 form");
+                Operation::List { base }
+            }
             Self::Diff { id, git } => Operation::Diff { id, git },
             Self::Stats { id } => Operation::Stats { id },
             Self::Destroy { id, base } => Operation::Destroy { id, base },

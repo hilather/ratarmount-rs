@@ -325,7 +325,7 @@ fn poisoned_error(path: &Path) -> ApiError {
     ApiError::new(
         "io",
         format!(
-            "a sync on the filesystem of {} failed earlier in this daemon run, so its data may be lost; every finalize on it is refused until the daemon restarts, and a restart discards every attempt; check the storage first",
+            "a sync on the filesystem of {} failed earlier in this daemon run, so its data may be lost; every finalize on it is refused until the daemon restarts, and a restart discards every attempt that is not retained; check the storage first",
             path.display()
         ),
     )
@@ -335,7 +335,7 @@ fn fsync_failed(path: &Path, error: &io::Error) -> ApiError {
     ApiError::new(
         "io",
         format!(
-            "cannot sync {}: {error}; its filesystem may have lost data, so every finalize on it is refused until the daemon restarts, and a restart discards every attempt; check the storage first",
+            "cannot sync {}: {error}; its filesystem may have lost data, so every finalize on it is refused until the daemon restarts, and a restart discards every attempt that is not retained; check the storage first",
             path.display()
         ),
     )
@@ -360,6 +360,9 @@ pub type PathsHook = Box<dyn Fn(&Path)>;
 /// A test hook given the name of each metadata read it runs before.
 #[cfg(test)]
 pub type ReadHook = Box<dyn FnMut(&str)>;
+/// A test hook given each commit point's name.
+#[cfg(test)]
+pub type PointHook = Box<dyn FnMut(&str)>;
 /// Test seams of the supervisor's finalize; each is `#[cfg(test)]`.
 #[cfg(test)]
 #[derive(Default)]
@@ -375,8 +378,11 @@ pub struct Seams {
     /// An errno the fsync of a path fails with.
     pub fsync_errors: std::collections::BTreeMap<PathBuf, i32>,
     /// An errno the directory open of a path fails with (step S's lower
-    /// parents and chain directories).
+    /// parents and chain directories, and R4).
     pub open_errors: std::collections::BTreeMap<PathBuf, i32>,
+    /// The bundle cache root the retain preflight reads (else from the
+    /// environment, which parallel tests share).
+    pub cache_root: Option<PathBuf>,
     /// Runs once after `finalize_top` returned, before step S.
     pub before_sync: Option<Box<dyn FnOnce()>>,
     /// `FinalizeTop::before_meta_read` of the next `finalize_top` call.
@@ -385,8 +391,11 @@ pub struct Seams {
     pub after_lower_lock: Option<PathHook>,
     /// Runs between a regular file's listing and its open in step S.
     pub before_open: Option<PathsHook>,
-    /// Every fsync of step S, with its path, in order.
+    /// Every fsync of step S and the commit, with its path, in order.
     pub syncs: Vec<PathBuf>,
+    /// Runs at each commit point (`after_sync`, `after_record`,
+    /// `after_rename`, `after_acknowledge`).
+    pub commit_points: Option<PointHook>,
 }
 
 /// One tree the durability rule judges: its root and, for the attempt's
@@ -395,6 +404,9 @@ struct Tree<'a> {
     path: &'a Path,
     lower: bool,
     mnt: Option<&'a Path>,
+    /// Refuse a mount strictly below the root (not for `attempts/` at a
+    /// `new` with `retain`, which holds the live attempts' mount points).
+    mounts: bool,
 }
 
 /// Classifies the supervisor's base for finalize (§5.4 step 6) and the gated
@@ -420,21 +432,38 @@ pub(super) fn classify_supervised(
     ClassifiedBase::open(&mut opener)
 }
 
+/// Which operation a scope refusal names.
+#[derive(Clone, Copy)]
+pub(super) enum Scope {
+    Finalize,
+    Retain,
+}
+
+impl Scope {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Finalize => "finalize",
+            Self::Retain => "retain",
+        }
+    }
+}
+
 /// The base and archive rules of the scope preflight (§5.5, ruling 4): a
 /// local base without binds or recursion and without `git_synthetic_head`;
 /// a regular-file source must be a TAR archive by its prepared index's
 /// `backendName`. Directory and Git sources need no index.
-fn scope_preflight(base: &Base, indexes: &Path) -> ApiResult<()> {
+pub(super) fn scope_preflight(base: &Base, indexes: &Path, scope: Scope) -> ApiResult<()> {
     let name = &base.name;
-    lowers::check_base_for(base, "finalize")?;
+    lowers::check_base_for(base, scope.name())?;
     if base.options.git_synthetic_head {
         return Err(invalid(format!(
-            "base {name} has git_synthetic_head, which finalize does not support; register the base without git_synthetic_head to finalize it"
+            "base {name} has git_synthetic_head, which {} does not support; register the base without git_synthetic_head to finalize or retain it",
+            scope.name()
         )));
     }
     let source = Path::new(&base.source);
     if fs::metadata(source).is_ok_and(|meta| meta.is_file()) {
-        let tar_only = "finalize supports TAR archives only";
+        let tar_only = "finalize and retain support TAR archives only";
         let index = match ratarmount_index::resolve_prepared_index_location(
             source,
             None,
@@ -529,17 +558,45 @@ impl<M: Mounter> Supervisor<M> {
             .finish_finalize(&request_id, &hash, &target, outcome)
     }
 
-    /// Step 1 without a stored target: the attempts map; an ID that names
-    /// no attempt is `not_found`.
+    /// Step 1 without a stored target: the attempts map, then the retained
+    /// map. An ID a retained record holds that names neither is not served;
+    /// an ID that names nothing is `not_found`.
     fn resolve_target(&self, id: &str) -> ApiResult<Target> {
-        self.attempt_target(id)
-            .ok_or_else(|| ApiError::new("not_found", "unknown attempt"))
+        if let Some(target) = self.attempt_target(id) {
+            return Ok(target);
+        }
+        if let Some(target) = self.retained_target(id) {
+            return Ok(target);
+        }
+        if self.held().contains(id) {
+            return Err(self.not_served(id));
+        }
+        Err(ApiError::new("not_found", "unknown attempt"))
     }
 
     /// A stored target must still name its attempt, by ID and instance.
     fn check_stored_target(&self, target: &Target) -> ApiResult<()> {
-        if self.attempt_target(&target.id).as_ref() == Some(target) {
+        if self.attempt_target(&target.id).as_ref() == Some(target)
+            || self.retained_target(&target.id).as_ref() == Some(target)
+        {
             return Ok(());
+        }
+        // Kept in `retained/` but not served (it was retained, and the
+        // daemon restarted since): the not-served answer, never "gone". A
+        // metadata read that fails is the check's own error, not absence.
+        let kept = self.kept_unserved(target).map_err(|error| {
+            let error = meta_error(error);
+            if error.kind() == io::ErrorKind::WouldBlock {
+                writers_active(format!(
+                    "the overlay of attempt {} is locked or its database is busy ({error}); retry",
+                    target.id
+                ))
+            } else {
+                ApiError::new("io", format!("finalize of attempt {}: {error}", target.id))
+            }
+        })?;
+        if kept {
+            return Err(self.not_served(&target.id));
         }
         Err(ApiError::new(
             "not_found",
@@ -552,6 +609,9 @@ impl<M: Mounter> Supervisor<M> {
 
     /// Steps 1 (the fast path) to 8 on a resolved target.
     fn finalize_target(&mut self, target: &Target, pack: bool) -> ApiResult<Value> {
+        if self.retained_target(&target.id).is_some() {
+            return self.finalize_retained(target, pack);
+        }
         let id = target.id.clone();
         let attempt = self.attempt(&id)?.clone();
         match attempt.status.as_str() {
@@ -571,8 +631,16 @@ impl<M: Mounter> Supervisor<M> {
         let root = attempt.path.parent().expect("attempt root").to_path_buf();
         // Step 2: the scope preflight, then the durability preflight's half
         // for the state trees.
-        scope_preflight(&base, &indexes)?;
-        self.durability_preflight(&self.state_trees(&attempt, &root, &indexes))?;
+        scope_preflight(&base, &indexes, Scope::Finalize)?;
+        if self.attempt_state[&id].retain {
+            self.retain_finalize_preflight(&attempt)?;
+        }
+        self.durability_preflight(&self.state_trees(
+            &attempt,
+            &root,
+            &indexes,
+            Some(&attempt.path),
+        ))?;
         // Step 3: the recorded lowers, re-read; then the preflight's lower half.
         let records = self.recorded_lowers(&id)?;
         let layers = lowers::recorded_layers(&records).map_err(lower_changed)?;
@@ -736,6 +804,9 @@ impl<M: Mounter> Supervisor<M> {
                 .clone()
                 .or_else(|| state.finalize.progress.packed.then(|| bundle.clone())),
         });
+        if self.attempt_state[&id].retain {
+            return self.commit_retained(target, &attempt, report, &records);
+        }
         self.set_status(&id, "finalized");
         self.state_mut(&id).finalize.report = Some(report.clone());
         Ok(report)
@@ -762,7 +833,7 @@ impl<M: Mounter> Supervisor<M> {
         let root = attempt.path.parent().expect("attempt root").to_path_buf();
         let records = self.recorded_lowers(id)?;
         lowers::recorded_layers(&records).map_err(lower_changed)?;
-        self.durability_preflight(&self.state_trees(&attempt, &root, &indexes))?;
+        self.durability_preflight(&self.state_trees(&attempt, &root, &indexes, None))?;
         self.lowers_preflight(records.iter().map(|record| record.path.as_path()))?;
         self.sync_step(&attempt, &root, &indexes, &records)?;
         Ok(report)
@@ -792,31 +863,36 @@ impl<M: Mounter> Supervisor<M> {
         }
     }
 
-    /// The attempt's own trees: its root (with the mount point the stop
-    /// removes), a RAM `overlay_dir` outside it, and the base's prepared
-    /// state `indexes/<base>/`.
+    /// The attempt's own trees: its root (`mnt` is the mount point a stop
+    /// removes; `None` where no stop runs, on the retained fast path and in
+    /// S), a RAM `overlay_dir` outside it, and the base's prepared state
+    /// `indexes/<base>/`.
     fn state_trees<'a>(
         &self,
         attempt: &'a Attempt,
         root: &'a Path,
         indexes: &'a Path,
+        mnt: Option<&'a Path>,
     ) -> Vec<Tree<'a>> {
         let mut trees = vec![Tree {
             path: root,
             lower: false,
-            mnt: Some(&attempt.path),
+            mnt,
+            mounts: true,
         }];
         if !attempt.overlay_dir.starts_with(root) {
             trees.push(Tree {
                 path: &attempt.overlay_dir,
                 lower: false,
                 mnt: None,
+                mounts: true,
             });
         }
         trees.push(Tree {
             path: indexes,
             lower: false,
             mnt: None,
+            mounts: true,
         });
         trees
     }
@@ -893,9 +969,39 @@ impl<M: Mounter> Supervisor<M> {
                 path,
                 lower: true,
                 mnt: None,
+                mounts: true,
             })
             .collect();
         self.durability_preflight(&trees)
+    }
+
+    /// The durability preflight of a `new` with `retain` for a directory
+    /// that is not yet a tree (`attempts/`, `indexes/<base>/`, a bundle
+    /// cache directory): its type, chain and devices. `mounts` is §5.5's
+    /// mount check; it cannot run on `attempts/`, which holds the running
+    /// attempts' `attempts/ID/mnt` mounts (the mount rule excepts a tree's
+    /// own `mnt`, not its siblings').
+    pub(super) fn retain_trees_preflight(&self, dir: &Path, mounts: bool) -> ApiResult<()> {
+        self.durability_preflight(&[Tree {
+            path: dir,
+            lower: false,
+            mnt: None,
+            mounts,
+        }])
+    }
+
+    /// The durability preflight of a retained entry's fast path: its tree
+    /// (no stop runs for it, so `retained/ID/mnt` is no mount exception),
+    /// the base's prepared state and its lowers.
+    pub(super) fn retained_trees_preflight(
+        &self,
+        attempt: &Attempt,
+        root: &Path,
+        indexes: &Path,
+        records: &[LowerLayerRecord],
+    ) -> ApiResult<()> {
+        self.durability_preflight(&self.state_trees(attempt, root, indexes, None))?;
+        self.lowers_preflight(records.iter().map(|record| record.path.as_path()))
     }
 
     /// The durability preflight (§5.5, ruling 6), before anything stops or
@@ -944,7 +1050,7 @@ impl<M: Mounter> Supervisor<M> {
                     return Err(poisoned_error(&dir));
                 }
             }
-            for mount in &mounts {
+            for mount in mounts.iter().filter(|_| tree.mounts) {
                 if !mount.starts_with(path) || mount == path {
                     continue;
                 }
@@ -1013,7 +1119,7 @@ impl<M: Mounter> Supervisor<M> {
         let deadline = Instant::now() + self.finalize_wait();
         let mut roots: Vec<PathBuf> = records.iter().map(|r| r.path.clone()).collect();
         let own: Vec<PathBuf> = self
-            .state_trees(attempt, root, indexes)
+            .state_trees(attempt, root, indexes, None)
             .into_iter()
             .map(|tree| tree.path.to_path_buf())
             .collect();
@@ -1137,6 +1243,7 @@ impl<M: Mounter> Supervisor<M> {
         path: &Path,
         lower: Option<&Path>,
     ) -> ApiResult<()> {
+        #[cfg(test)]
         let mut synced = Vec::new();
         let result = {
             let filesystem = |fd: BorrowedFd<'_>, path: &Path| -> std::result::Result<(), String> {
@@ -1152,11 +1259,16 @@ impl<M: Mounter> Supervisor<M> {
             let device = |path: &Path, real: u64| self.device_override(path, real);
             let mut fsync = |fd: BorrowedFd<'_>, path: &Path| -> io::Result<()> {
                 #[cfg(test)]
-                if let Some(errno) = self.seams.fsync_errors.get(path) {
-                    return Err(io::Error::from_raw_os_error(*errno));
+                {
+                    if let Some(errno) = self.seams.fsync_errors.get(path) {
+                        return Err(io::Error::from_raw_os_error(*errno));
+                    }
                 }
                 rustix::fs::fsync(fd)?;
+                #[cfg(test)]
                 synced.push(path.to_path_buf());
+                #[cfg(not(test))]
+                let _ = path;
                 Ok(())
             };
             #[cfg(test)]
@@ -1174,6 +1286,7 @@ impl<M: Mounter> Supervisor<M> {
                 },
             )
         };
+        #[cfg(test)]
         self.record_syncs(synced);
         result.map_err(|error| match error {
             crate::overlay_pack::SyncError::Writable(node) => {
@@ -1195,7 +1308,7 @@ impl<M: Mounter> Supervisor<M> {
     /// The engine's directory open for S's lower parents and chains, then its checks
     /// on the descriptor (a directory, not on a poisoned device, on an
     /// allowlisted filesystem) and its fsync; a failed fsync poisons.
-    fn sync_dir_strict(&mut self, dir: &Path) -> ApiResult<()> {
+    pub(super) fn sync_dir_strict(&mut self, dir: &Path) -> ApiResult<()> {
         #[cfg(test)]
         if let Some(errno) = self.seams.open_errors.get(dir) {
             return Err(io_error(
@@ -1228,20 +1341,16 @@ impl<M: Mounter> Supervisor<M> {
             self.poisoned.insert(device);
             return Err(fsync_failed(dir, &error));
         }
+        #[cfg(test)]
         self.record_syncs(vec![dir.to_path_buf()]);
         Ok(())
     }
 
-    fn record_syncs(&mut self, _synced: Vec<PathBuf>) {
-        #[cfg(test)]
-        {
-            for path in &_synced {
-                crate::overlay_pack::events::record(
-                    &format!("fsync @{}", self.root.display()),
-                    path,
-                );
-            }
-            self.seams.syncs.extend(_synced);
+    #[cfg(test)]
+    fn record_syncs(&mut self, synced: Vec<PathBuf>) {
+        for path in &synced {
+            crate::overlay_pack::events::record(&format!("fsync @{}", self.root.display()), path);
         }
+        self.seams.syncs.extend(synced);
     }
 }
