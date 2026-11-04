@@ -152,24 +152,35 @@ pub fn spawn_signal_fuse_unmount(mp: PathBuf) {
         .expect("fuse signal unmount thread");
 }
 
-/// Logs a failure once per distinct message. A commit refused because the
-/// base changed is retried on every tick; the same refusal every second would
-/// flood the log, while a new observed stamp is new information.
+/// Logs the first failure at error level and warns on power-of-two occurrences.
+/// A commit refusal is retried every tick; persistent failures need reminders
+/// without flooding the log, while a changed message starts a new sequence.
 #[derive(Default)]
-struct RepeatedFailure(Option<String>);
+struct RepeatedFailure {
+    message: Option<String>,
+    occurrences: u64,
+}
 
 impl RepeatedFailure {
     /// `true` when `message` differs from the previous failure.
     fn is_new(&mut self, message: &str) -> bool {
-        let new = self.0.as_deref() != Some(message);
+        let new = self.message.as_deref() != Some(message);
         if new {
-            self.0 = Some(message.to_owned());
+            self.message = Some(message.to_owned());
+            self.occurrences = 1;
+        } else {
+            self.occurrences = self.occurrences.saturating_add(1);
         }
         new
     }
 
+    fn should_warn(&self) -> bool {
+        self.occurrences > 1 && self.occurrences.is_power_of_two()
+    }
+
     fn clear(&mut self) {
-        self.0 = None;
+        self.message = None;
+        self.occurrences = 0;
     }
 }
 
@@ -353,6 +364,11 @@ pub fn spawn_interval_commits(
                         let message = e.to_string();
                         if failures.is_new(&message) {
                             log::error!("interval overlay commit failed: {message}");
+                        } else if failures.should_warn() {
+                            log::warn!(
+                                "interval overlay commit failed again (occurrence {}): {message}",
+                                failures.occurrences
+                            );
                         } else {
                             log::debug!("interval overlay commit failed again: {message}");
                         }
@@ -1669,9 +1685,8 @@ pub(crate) fn term_flag_test_lock() -> &'static std::sync::Mutex<()> {
 
 #[cfg(test)]
 mod tests {
-    /// A refused interval commit is retried every tick; it logs once per
-    /// distinct message (a new observed stamp is new information) and again
-    /// after a success.
+    /// A refused interval commit is retried every tick; its first error is
+    /// reported again after a changed message or a success.
     #[test]
     fn regression_interval_refusal_logs_once_per_distinct_message() {
         let mut failures = RepeatedFailure::default();
@@ -1680,6 +1695,39 @@ mod tests {
         assert!(failures.is_new("base mismatch: size=2"));
         failures.clear();
         assert!(failures.is_new("base mismatch: size=2"));
+    }
+
+    /// Regression: repeated interval failures must remain visible with warnings
+    /// at occurrences 2, 4, 8, ... and restart after a changed message or success.
+    #[test]
+    fn regression_254_interval_repeat_warn_schedule() {
+        let mut failures = RepeatedFailure::default();
+        assert!(!failures.should_warn());
+        for occurrence in 1..=17 {
+            assert_eq!(failures.is_new("base mismatch: size=1"), occurrence == 1);
+            assert_eq!(failures.occurrences, occurrence);
+            assert_eq!(
+                failures.should_warn(),
+                matches!(occurrence, 2 | 4 | 8 | 16),
+                "occurrence {occurrence}"
+            );
+        }
+        assert!(failures.is_new("base mismatch: size=2"));
+        assert_eq!(failures.occurrences, 1);
+        assert!(!failures.should_warn());
+        assert!(!failures.is_new("base mismatch: size=2"));
+        assert!(failures.should_warn());
+        assert!(failures.is_new("base mismatch: size=1"));
+        assert_eq!(failures.occurrences, 1);
+        assert!(!failures.should_warn());
+        failures.clear();
+        assert_eq!(failures.occurrences, 0);
+        assert!(!failures.should_warn());
+        assert!(failures.is_new("base mismatch: size=1"));
+        assert_eq!(failures.occurrences, 1);
+        assert!(!failures.should_warn());
+        assert!(!failures.is_new("base mismatch: size=1"));
+        assert!(failures.should_warn());
     }
 
     use super::*;
