@@ -1,7 +1,7 @@
 //! Regression: one-shot sandbox sequencing with a host stub and optional Docker.
 #![cfg(target_os = "linux")]
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -9,6 +9,150 @@ use std::time::{Duration, Instant};
 
 fn stub() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../test-harness/sandbox-run/runtime.sh")
+}
+
+/// A `ratarmount` command whose process (and so the `sandbox run` child and
+/// the command it runs) has umask 022, whatever the test process's: FUSE
+/// create applies the caller's umask, and canonical rows include modes
+/// (R1c-1 T1b).
+fn ratarmount() -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    // SAFETY: umask is async-signal-safe and touches only the child.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o022);
+            Ok(())
+        });
+    }
+    command
+}
+
+/// T1b's fixture (R1c-1 §7): every JSON document `sandbox run` printed in
+/// these tests, normalized, recorded on the code before `finalize_top`
+/// (plan step 2a); the refactor must leave each one byte-identical.
+const REPORTS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/testdata/sandbox-run-reports.jsonl"
+);
+/// Set to record [`REPORTS`] instead of comparing with it; only on the code
+/// before the refactor, on a FUSE host where no test prints `skip:`.
+const RECORD: &str = "RATARMOUNT_RECORD_SANDBOX_RUN_REPORTS";
+
+/// How one report is normalized, by name, never by value pattern.
+#[derive(Default)]
+struct Normalize<'a> {
+    /// Temporary directories, replaced (longest first) by `$TMP1`, `$TMP2`,
+    /// … in this order, in their given and canonical spellings.
+    dirs: Vec<&'a Path>,
+    /// The HTTP stub's port, which the test knows: `127.0.0.1:<port>`.
+    port: Option<String>,
+    /// Report fields masked as `"<masked>"` (dotted paths), each of which
+    /// must exist. `wall_time_s` is always masked where it exists.
+    fields: &'a [&'a str],
+}
+
+fn mask(report: &mut Value, field: &str) {
+    let mut node = &mut *report;
+    for part in field.split('.') {
+        node = node
+            .get_mut(part)
+            .unwrap_or_else(|| panic!("T1b masks the missing field {field}"));
+    }
+    *node = json!("<masked>");
+}
+
+/// `report` normalized as `how` says.
+fn normalized(report: &Value, how: &Normalize<'_>) -> String {
+    let mut report = report.clone();
+    if report.get("wall_time_s").is_some() {
+        assert!(report["wall_time_s"].is_number(), "{report}");
+        mask(&mut report, "wall_time_s");
+    }
+    for field in how.fields {
+        mask(&mut report, field);
+    }
+    let mut text = serde_json::to_string(&report).unwrap();
+    let mut forms: Vec<(String, String)> = Vec::new();
+    for (i, dir) in how.dirs.iter().enumerate() {
+        let placeholder = format!("$TMP{}", i + 1);
+        for form in [Some(dir.to_path_buf()), dir.canonicalize().ok()]
+            .into_iter()
+            .flatten()
+        {
+            forms.push((form.to_str().unwrap().to_owned(), placeholder.clone()));
+        }
+    }
+    forms.sort_by_key(|(form, _)| std::cmp::Reverse(form.len()));
+    for (form, placeholder) in forms {
+        text = text.replace(&form, &placeholder);
+    }
+    if let Some(port) = &how.port {
+        text = text.replace(&format!("127.0.0.1:{port}"), "127.0.0.1:<port>");
+    }
+    text
+}
+
+/// Compares `report`, normalized, with T1b's fixture entry `test`/`case`,
+/// or records that entry when [`RECORD`] is exactly `1`, saying so (a
+/// recording run compares nothing).
+fn check_report(test: &str, case: &str, report: &Value, how: &Normalize<'_>) {
+    static FILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let text = normalized(report, how);
+    let key = format!("{test}/{case}");
+    let _file = FILE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut entries: std::collections::BTreeMap<String, String> = fs::read_to_string(REPORTS)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let entry: Value = serde_json::from_str(line).unwrap();
+            (
+                entry["key"].as_str().unwrap().to_owned(),
+                entry["report"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let record = std::env::var_os(RECORD);
+    assert!(
+        record.is_none() || record.as_deref() == Some("1".as_ref()),
+        "{RECORD} must be 1 to record T1b's fixture"
+    );
+    if record.is_some() {
+        eprintln!("T1b: recording {key} into {REPORTS}, comparing nothing");
+        entries.insert(key, text);
+        let mut out = String::new();
+        for (key, report) in &entries {
+            out.push_str(&json!({"key": key, "report": report}).to_string());
+            out.push('\n');
+        }
+        fs::create_dir_all(Path::new(REPORTS).parent().unwrap()).unwrap();
+        fs::write(REPORTS, out).unwrap();
+        return;
+    }
+    let expected = entries.get(&key).unwrap_or_else(|| {
+        panic!("T1b has no fixture for {key}; record {REPORTS} with {RECORD}=1 on the code before the refactor")
+    });
+    assert_eq!(&text, expected, "T1b report {key}");
+}
+
+/// The summed sizes of the regular files `files` in `top`, each of which the
+/// script must have written, plus those of `optional` that exist: what a
+/// test whose script writes host-dependent bytes checks `bytes_written`
+/// against (T1b masks it).
+fn written(top: &Path, files: &[&str], optional: &[&str]) -> u64 {
+    let size = |name: &str| {
+        let meta = fs::symlink_metadata(top.join(name))
+            .unwrap_or_else(|e| panic!("the script did not write {name}: {e}"));
+        assert!(meta.is_file(), "{name} is not a regular file");
+        meta.len()
+    };
+    let required: u64 = files.iter().map(|name| size(name)).sum();
+    let present: u64 = optional
+        .iter()
+        .filter(|name| fs::symlink_metadata(top.join(name)).is_ok())
+        .map(|name| size(name))
+        .sum();
+    required + present
 }
 fn available() -> bool {
     if !Path::new("/dev/fuse").exists() {
@@ -49,8 +193,24 @@ impl Fixture {
     fn pid(&self) -> PathBuf {
         self.temp.path().join(".top.ratarmount-run.pid")
     }
+    /// T1b: `report` against its fixture, this fixture's directory `$TMP1`
+    /// and `dirs` after it, `fields` masked.
+    fn check(&self, test: &str, case: &str, report: &Value, dirs: &[&Path], fields: &[&str]) {
+        let mut all = vec![self.temp.path()];
+        all.extend_from_slice(dirs);
+        check_report(
+            test,
+            case,
+            report,
+            &Normalize {
+                dirs: all,
+                port: None,
+                fields,
+            },
+        );
+    }
     fn command(&self, flags: &[&str], script: &str) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+        let mut command = ratarmount();
         command
             .args(["sandbox", "run", "--base"])
             .arg(&self.base)
@@ -116,8 +276,19 @@ fn wait(child: &mut Child) -> std::process::ExitStatus {
     }
 }
 fn wait_for(path: &Path, child: &mut Child) {
+    wait_until(path, child, |path| path.exists());
+}
+/// Waits until `path` holds `content`: a run killed only after its write
+/// completed leaves the same top every time (T1b), where `wait_for` races
+/// the write that follows the file's creation.
+fn wait_for_content(path: &Path, content: &[u8], child: &mut Child) {
+    wait_until(path, child, |path| {
+        fs::read(path).is_ok_and(|bytes| bytes == content)
+    });
+}
+fn wait_until(path: &Path, child: &mut Child, done: impl Fn(&Path) -> bool) {
     let start = Instant::now();
-    while !path.exists() {
+    while !done(path) {
         assert!(
             child.try_wait().unwrap().is_none(),
             "sandbox exited before marker"
@@ -186,6 +357,19 @@ fn regression_run_fuse_writes_manifest_seal_pack_and_journal() {
     assert!(Path::new(report["manifest_path"].as_str().unwrap()).exists());
     assert!(Path::new(report["journal_summary"]["path"].as_str().unwrap()).exists());
     assert!(bundle.exists());
+    // The script's opens drive the journal counts; their exact values
+    // depend on the host's shell (T1b).
+    fixture.check(
+        "writes_manifest_seal_pack_and_journal",
+        "report",
+        &report,
+        &[],
+        &[
+            "journal_summary.files_read",
+            "journal_summary.files_read_then_written",
+            "journal_summary.files_written_blind",
+        ],
+    );
 }
 
 #[test]
@@ -202,6 +386,18 @@ fn regression_run_fuse_timeout_unmounts() {
             .unwrap()
             .trim(),
     );
+    // `pwd` writes a host path into the top (T1b): checked by measurement.
+    assert_eq!(
+        report["bytes_written"],
+        written(&fixture.top, &["mountpath"], &[])
+    );
+    fixture.check(
+        "timeout_unmounts",
+        "report",
+        &report,
+        &[],
+        &["bytes_written", "patch_hash.patch"],
+    );
 }
 
 #[test]
@@ -215,7 +411,7 @@ fn regression_run_fuse_sigkill_next_run_recovers_stale_mount() {
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
-    wait_for(&fixture.top.join("ready"), &mut child);
+    wait_for_content(&fixture.top.join("ready"), b"ready\n", &mut child);
     let record: Value = serde_json::from_slice(&fs::read(fixture.pid()).unwrap()).unwrap();
     child.kill().unwrap();
     child.wait().unwrap();
@@ -224,6 +420,7 @@ fn regression_run_fuse_sigkill_next_run_recovers_stale_mount() {
     assert_eq!(report["exit_code"], 0);
     assert_eq!(report["patch_hash"]["files"], 2);
     assert_unmounted(record["mountpoint"].as_str().unwrap());
+    fixture.check("sigkill_next_run_recovers", "report", &report, &[], &[]);
 }
 
 #[test]
@@ -255,6 +452,18 @@ fn regression_run_fuse_signals_report_interrupted_and_unmount() {
                 .unwrap()
                 .trim(),
         );
+        // `pwd` writes a host path into the top (T1b): checked by measurement.
+        assert_eq!(
+            report["bytes_written"],
+            written(&fixture.top, &["mountpath", "ready"], &[])
+        );
+        fixture.check(
+            "signals_report_interrupted",
+            &format!("signal {signal}"),
+            &report,
+            &[],
+            &["bytes_written", "patch_hash.patch"],
+        );
     }
 }
 
@@ -279,6 +488,20 @@ fn regression_run_fuse_readonly_allow_denials_counted() {
     assert_eq!(report["exit_code"], 0);
     assert!(report["erofs_denied"].as_u64().unwrap() > 0);
     assert_eq!(report["patch_hash"]["files"], 1);
+    // The script drives the denial and journal counts, which depend on how
+    // the host's shell and kernel issue opens (T1b).
+    fixture.check(
+        "readonly_allow_denials_counted",
+        "report",
+        &report,
+        &[],
+        &[
+            "erofs_denied",
+            "journal_summary.files_read",
+            "journal_summary.files_read_then_written",
+            "journal_summary.files_written_blind",
+        ],
+    );
 }
 
 #[test]
@@ -297,6 +520,7 @@ fn regression_run_fuse_tmpfs_persists_top_after_unmount() {
         fs::read_link(fixture.top.join("link")).unwrap(),
         Path::new("input")
     );
+    fixture.check("tmpfs_persists_top", "report", &report, &[], &[]);
 }
 
 #[test]
@@ -334,6 +558,7 @@ fn regression_run_harness_error_is_single_json_and_exit_two() {
     assert!(report["error"].as_str().unwrap().contains("--bind"));
     assert_eq!(report["interrupted"], false);
     assert!(!fixture.pid().exists());
+    fixture.check("harness_error_single_json", "error", &report, &[], &[]);
 }
 
 #[test]
@@ -386,7 +611,7 @@ fn regression_run_refuses_top_inside_directory_base() {
     fs::create_dir(&base).unwrap();
     fs::write(base.join("f"), b"one").unwrap();
     let top = base.join("top");
-    let output = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+    let output = ratarmount()
         .args(["sandbox", "run", "--base"])
         .arg(&base)
         .arg("--top")
@@ -421,6 +646,7 @@ fn regression_run_base_digest_recorded() {
     );
     let report = fixture.run(&["--seal", "--base-digest", &digest], "printf x > out");
     assert_eq!(report["patch_hash"]["base"], digest.as_str());
+    fixture.check("base_digest_recorded", "report", &report, &[], &[]);
     let home = fixture.temp.path().join("home");
     fs::create_dir_all(&home).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
@@ -467,7 +693,7 @@ fn regression_run_credentialed_base_url_is_redacted_in_failure() {
             }
         })
         .collect();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    let mut command = ratarmount();
     command
         .args(args)
         .env("RATARMOUNT_SANDBOX_RUNTIME", stub())
@@ -476,6 +702,8 @@ fn regression_run_credentialed_base_url_is_redacted_in_failure() {
     assert!(!output.status.success());
     assert_no_secrets(&String::from_utf8_lossy(&output.stdout), "stdout");
     assert_no_secrets(&String::from_utf8_lossy(&output.stderr), "stderr");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    fixture.check("credentialed_url_failure", "error", &report, &[], &[]);
 }
 
 /// An HTTP stub that answers every request with `403 Forbidden`.
@@ -515,7 +743,7 @@ fn regression_run_transformed_url_in_error_is_redacted() {
     let port = serve_forbidden();
     for scheme in ["webdav", "http"] {
         let url = format!("{scheme}://user:s3cr3t@127.0.0.1:{port}/f.tar?token=deadbeef");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+        let mut command = ratarmount();
         command
             .args(["sandbox", "run", "--base", &url, "--top"])
             .arg(fixture.temp.path().join(format!("top-{scheme}")))
@@ -534,6 +762,16 @@ fn regression_run_transformed_url_in_error_is_redacted() {
         );
         assert_no_secrets(&stdout, "stdout");
         assert_no_secrets(&stderr, "stderr");
+        check_report(
+            "transformed_url_error",
+            scheme,
+            &serde_json::from_str(&stdout).unwrap(),
+            &Normalize {
+                dirs: vec![fixture.temp.path()],
+                port: Some(port.to_string()),
+                fields: &[],
+            },
+        );
     }
 }
 
@@ -548,7 +786,7 @@ fn regression_run_credentialed_base_url_is_redacted_on_success() {
     let port = http_tar::serve_tar_stub();
     let port = port.rsplit(':').next().unwrap().to_owned();
     let url = format!("http://user:s3cr3t@127.0.0.1:{port}/b.tar?X-Amz-Signature=deadbeef");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    let mut command = ratarmount();
     command
         .args(["sandbox", "run", "--base", &url, "--top"])
         .arg(&fixture.top)
@@ -578,6 +816,31 @@ fn regression_run_credentialed_base_url_is_redacted_on_success() {
     for (key, value) in meta.values() {
         assert_no_secrets(value, key);
     }
+    // A remote base's weak digest hashes its (redacted) URL, which holds the
+    // stub's ephemeral port, and the stack digest covers it (T1b): both are
+    // checked against what the top recorded.
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    let base = meta.known_base_digest();
+    assert!(
+        base.is_some_and(|base| base.starts_with("weak:")),
+        "{report}"
+    );
+    assert_eq!(report["patch_hash"]["base"], json!(base), "{report}");
+    assert_eq!(
+        report["patch_hash"]["stack"],
+        json!(meta.stack_digest()),
+        "{report}"
+    );
+    check_report(
+        "credentialed_url_success",
+        "report",
+        &report,
+        &Normalize {
+            dirs: vec![fixture.temp.path()],
+            port: Some(port),
+            fields: &["patch_hash.base", "patch_hash.stack"],
+        },
+    );
 }
 
 /// Regression: the signed URL expires while the command runs, so `finish()`
@@ -593,7 +856,7 @@ fn regression_run_finalization_error_is_redacted() {
     let port = http_tar::serve_tar_stub_forbidding(Some(forbid.clone()));
     let port = port.rsplit(':').next().unwrap().to_owned();
     let url = format!("http://user:s3cr3t@127.0.0.1:{port}/b.tar?X-Amz-Signature=deadbeef");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    let mut command = ratarmount();
     command
         .args(["sandbox", "run", "--base", &url, "--top"])
         .arg(&fixture.top)
@@ -613,6 +876,16 @@ fn regression_run_finalization_error_is_redacted() {
     );
     assert_no_secrets(&stdout, "stdout");
     assert_no_secrets(&stderr, "stderr");
+    check_report(
+        "finalization_error",
+        "error",
+        &serde_json::from_str(&stdout).unwrap(),
+        &Normalize {
+            dirs: vec![fixture.temp.path()],
+            port: Some(port),
+            fields: &[],
+        },
+    );
 }
 
 /// Regression (Keystone (a)): the in-FS `/.ratarmount-control/` (host pid,
@@ -659,6 +932,19 @@ fn regression_run_container_tree_has_no_control_dir() {
         !left.iter().any(|n| n.starts_with("ratarmount-run-")),
         "run dir leaked: {left:?}"
     );
+    // The host `ls` writes its own error text into the top, and the script
+    // drives the denial count (T1b): bytes checked by measurement.
+    assert_eq!(
+        report["bytes_written"],
+        written(&fixture.top, &["seen.txt", "status.txt"], &["pid.txt"])
+    );
+    fixture.check(
+        "container_tree_has_no_control_dir",
+        "report",
+        &report,
+        &[private.path()],
+        &["bytes_written", "patch_hash.patch", "erofs_denied"],
+    );
 }
 
 /// Regression (J): the mountpoint used to be a directory made directly in the
@@ -688,6 +974,29 @@ fn regression_run_mountpoint_parent_is_private_0700() {
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    // A user ID, real paths and the control socket's PID go into the top
+    // (T1b): bytes checked by measurement.
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["bytes_written"],
+        written(
+            &fixture.top,
+            &[
+                "parent.txt",
+                "parent-path.txt",
+                "parent-ls.txt",
+                "mount-path.txt"
+            ],
+            &[]
+        )
+    );
+    fixture.check(
+        "mountpoint_parent_private",
+        "report",
+        &report,
+        &[shared.path()],
+        &["bytes_written", "patch_hash.patch"],
     );
     let parent = fs::read_to_string(fixture.top.join("parent.txt")).unwrap();
     let (mode, uid) = parent.trim().split_once(' ').unwrap();
@@ -754,6 +1063,13 @@ fn regression_run_removes_own_control_socket_and_keeps_foreign_one() {
         names_in(private.path()),
         vec!["ratarmount-control-1.sock".to_string()]
     );
+    fixture.check(
+        "removes_own_control_socket",
+        "report",
+        &serde_json::from_slice(&output.stdout).unwrap(),
+        &[private.path()],
+        &[],
+    );
 }
 
 /// Regression (F): after the runner is SIGKILLed, the next run's recovery also
@@ -774,7 +1090,7 @@ fn regression_run_sigkill_recovery_leaves_no_socket_or_run_dir() {
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
-    wait_for(&fixture.top.join("ready"), &mut child);
+    wait_for_content(&fixture.top.join("ready"), b"ready\n", &mut child);
     let during = names_in(private.path());
     assert!(
         during.iter().any(|n| n.starts_with("ratarmount-run-")),
@@ -794,6 +1110,13 @@ fn regression_run_sigkill_recovery_leaves_no_socket_or_run_dir() {
     );
     let left = names_in(private.path());
     assert!(left.is_empty(), "left behind: {left:?}");
+    fixture.check(
+        "sigkill_recovery_leaves_no_socket",
+        "report",
+        &serde_json::from_slice(&output.stdout).unwrap(),
+        &[private.path()],
+        &[],
+    );
 }
 
 fn recorded_argv(fixture: &Fixture) -> Vec<String> {
@@ -825,7 +1148,8 @@ fn regression_run_container_is_hardened_by_default() {
         return;
     }
     let fixture = Fixture::new();
-    fixture.run(&[], "true");
+    let report = fixture.run(&[], "true");
+    fixture.check("container_is_hardened", "report", &report, &[], &[]);
     let argv = recorded_argv(&fixture);
     assert_eq!(flag_values(&argv, "--cap-drop"), ["ALL"], "{argv:?}");
     assert_eq!(
@@ -845,10 +1169,11 @@ fn regression_run_pids_limit_and_cap_add_reach_the_runtime() {
         return;
     }
     let fixture = Fixture::new();
-    fixture.run(
+    let report = fixture.run(
         &["--pids-limit", "64", "--cap-add", "NET_BIND_SERVICE"],
         "true",
     );
+    fixture.check("pids_limit_and_cap_add", "report", &report, &[], &[]);
     let argv = recorded_argv(&fixture);
     assert_eq!(flag_values(&argv, "--pids-limit"), ["64"], "{argv:?}");
     assert_eq!(

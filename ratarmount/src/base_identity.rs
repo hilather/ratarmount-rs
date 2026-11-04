@@ -394,4 +394,4 @@ pub(crate) mod fixtures {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

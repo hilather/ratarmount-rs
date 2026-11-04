@@ -584,12 +584,14 @@ mod tests {
         for name in ["summarize", "mark"] {
             check(journal.find_subcommand(name).unwrap().clone());
         }
-        check(
-            crate::sandbox::SandboxArgs::command()
-                .find_subcommand("run")
-                .unwrap()
-                .clone(),
-        );
+        for name in ["run", "finalize"] {
+            check(
+                crate::sandbox::SandboxArgs::command()
+                    .find_subcommand(name)
+                    .unwrap()
+                    .clone(),
+            );
+        }
         let snapshot = SnapshotArgs::command();
         for name in ["add", "list"] {
             check(snapshot.find_subcommand(name).unwrap().clone());

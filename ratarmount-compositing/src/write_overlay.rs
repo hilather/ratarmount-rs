@@ -7422,6 +7422,13 @@ pub(crate) struct SealCommitGuard {
 
 impl SealCommitGuard {
     pub(crate) fn acquire(dir: &Path) -> io::Result<Self> {
+        Self::acquire_until(dir, None)
+    }
+
+    /// [`acquire`](Self::acquire) bounded by `deadline`: a lock still held at
+    /// the deadline answers `WouldBlock` (within one 10 ms poll); `None`
+    /// waits as long as the holder keeps it, as `acquire` does.
+    pub(crate) fn acquire_until(dir: &Path, deadline: Option<Instant>) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -7438,6 +7445,15 @@ impl SealCommitGuard {
                 if error.kind() != io::ErrorKind::WouldBlock {
                     return Err(error);
                 }
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "{} is locked by a seal, unseal or commit of that overlay",
+                            dir.display()
+                        ),
+                    ));
+                }
                 #[cfg(any(test, feature = "test-hooks"))]
                 if let Some(marker) = std::env::var_os("RATARMOUNT_TEST_OVERLAY_CONTENDED") {
                     create_overlay_marker(Path::new(&marker))?;
@@ -7447,7 +7463,7 @@ impl SealCommitGuard {
         }
         #[cfg(not(unix))]
         {
-            let _ = dir;
+            let _ = (dir, deadline);
             // Sealing is Unix-only. Preserve the existing non-Unix copy-commit
             // path, which has no seal operation to serialize against.
             Ok(Self {})

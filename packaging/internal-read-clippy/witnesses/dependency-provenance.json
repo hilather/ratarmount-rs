@@ -131,8 +131,8 @@
         }
       ]
     },
-    "root_declarations_sha256": "a54b82755d62520be7b9f44e09b38f3a8b1cf8b1bd4d46402724424e9cca718a",
+    "root_declarations_sha256": "318807c59f1bf67b6e5676cd6a5569d9c6ae6c08d69d2317156e5fca727b4d0f",
     "schema": 1
   },
-  "reviewer": "PR #201 accepted N1 API review, implementation verification"
+  "reviewer": "PR #251 renewal: rustix `net` feature added for the sandbox inspection status deadline (stalled-socket timeout); no configured policy method is in rustix::net, availability witnesses rerun unchanged"
 }

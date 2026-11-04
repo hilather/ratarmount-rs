@@ -170,15 +170,27 @@ pub fn validate(
 /// Lowers are supported on the bases the sandbox mounts: one local path or a
 /// local `git:///` URL, without binds or recursion.
 fn check_base(base: &Base) -> Result<(), ApiError> {
+    check_base_for(base, "lowers")
+}
+
+/// The base rule of lowers and finalize (R1c-1 §5.5): one local path or a
+/// local `git:///` URL, without binds or recursion. A refusal names the
+/// `operation` (`lowers` or `finalize`).
+pub(crate) fn check_base_for(base: &Base, operation: &str) -> Result<(), ApiError> {
     let name = &base.name;
+    let (subject, needs) = if operation == "lowers" {
+        ("lowers are".to_owned(), "lowers need".to_owned())
+    } else {
+        (format!("{operation} is"), format!("{operation} needs"))
+    };
     if !base.options.binds.is_empty() {
         return Err(invalid(format!(
-            "lowers are not supported on base {name}, which has binds"
+            "{subject} not supported on base {name}, which has binds"
         )));
     }
     if base.options.recursive {
         return Err(invalid(format!(
-            "lowers are not supported on base {name}, which is recursive"
+            "{subject} not supported on base {name}, which is recursive"
         )));
     }
     let git = ratarmount_formats_git::parse_git_url(&base.source)
@@ -187,7 +199,7 @@ fn check_base(base: &Base) -> Result<(), ApiError> {
         .is_some();
     if !git && !Path::new(&base.source).is_absolute() {
         return Err(invalid(format!(
-            "lowers need a local base (an absolute path or a git:/// URL); base {name} is not one"
+            "{needs} a local base (an absolute path or a git:/// URL); base {name} is not one"
         )));
     }
     Ok(())

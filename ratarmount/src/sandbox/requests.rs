@@ -1,4 +1,5 @@
-//! `requests.jsonl`: the append log behind protocol v2 request IDs (Keystone #5).
+//! `requests.jsonl`: the append log behind protocol v2 request IDs (Keystone #5),
+//! one instance of the state-log engine (`state_log.rs`), which owns the file.
 //!
 //! Every line is one self-contained record state: `op` and `op_hash` are on
 //! every state, so a record's last line alone decides it. A line is written by
@@ -8,14 +9,15 @@
 
 use super::daemon::validate_name;
 use super::protocol::{one, ApiError, OperationV2, Overlay, VERSION_2};
+pub use super::state_log::Append;
+#[cfg(test)]
+pub use super::state_log::Fault;
+use super::state_log::{failure, LineError, Records, StateLog};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 
 type Result<T> = std::result::Result<T, ApiError>;
 
@@ -110,31 +112,6 @@ thread_local! {
     pub static BEFORE_OUTCOME: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Test-only fault points; each armed point fails its next hit once.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Fault {
-    OpenSyncFile,
-    OpenSyncDir,
-    OpenTruncate,
-    RemoveLeftover,
-    /// A short write: half the line reaches the file, then the write fails.
-    Write(Append),
-    /// After the whole line was written.
-    Sync(Append),
-    Truncate,
-    CompactSync,
-    CompactDirSync,
-}
-
-/// Which append a line is, for messages and fault points.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Append {
-    Running,
-    Outcome,
-    Resolution,
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -144,12 +121,62 @@ pub enum Status {
     Failed,
 }
 
-/// The operation a record belongs to; R1c adds `finalize`.
+/// The operation a record belongs to: `new` (line schema `v: 1`, R1a) or
+/// `finalize` (line schema `v: 2`, R1c-1 ruling 5).
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum Kind {
+pub enum Kind {
     New,
+    Finalize,
 }
+
+/// The attempt a finalize record names, resolved once before `running` is
+/// written (ruling 5): its ID and the random instance it got when `new`
+/// recorded it. A retry acts on this attempt only, never on a name drawn
+/// again.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct Target {
+    pub id: String,
+    pub instance: String,
+}
+
+/// Whether `instance` is an attempt instance: 32 lowercase hex digits.
+fn is_instance(instance: &str) -> bool {
+    instance.len() == 32
+        && instance
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// What a record is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Subject {
+    /// A `new` batch (line schema 1, R1a's members byte for byte).
+    New,
+    /// A finalize of one attempt (line schema 2, with `target` in every state).
+    Finalize(Target),
+}
+
+impl Subject {
+    fn kind(&self) -> Kind {
+        match self {
+            Self::New => Kind::New,
+            Self::Finalize(_) => Kind::Finalize,
+        }
+    }
+
+    fn target(&self) -> Option<&Target> {
+        match self {
+            Self::New => None,
+            Self::Finalize(target) => Some(target),
+        }
+    }
+}
+
+/// The answer to a retry of a finalize a restart cut off.
+pub const FINALIZE_INTERRUPTED: &str =
+    "finalize was cut off by a supervisor restart before it finished; the restart discarded its attempt";
 
 #[derive(Serialize)]
 struct LineOut<'a> {
@@ -158,6 +185,8 @@ struct LineOut<'a> {
     t: Status,
     op: Kind,
     op_hash: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<&'a Target>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attempts: Option<&'a [String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,6 +203,7 @@ struct LineIn {
     t: Status,
     op: Kind,
     op_hash: String,
+    target: Option<Target>,
     attempts: Option<Vec<String>>,
     result: Option<Value>,
     error: Option<StoredError>,
@@ -186,8 +216,11 @@ struct StoredError {
     message: String,
 }
 
+/// One line: `v: 1` for a `new` record (R1a's bytes), `v: 2` with `target`
+/// for a finalize record.
 fn encode_line(
     id: &str,
+    subject: &Subject,
     t: Status,
     op_hash: &str,
     attempts: Option<&[String]>,
@@ -195,11 +228,15 @@ fn encode_line(
     error: Option<&ApiError>,
 ) -> Vec<u8> {
     let mut line = serde_json::to_vec(&LineOut {
-        v: 1,
+        v: match subject {
+            Subject::New => 1,
+            Subject::Finalize(_) => 2,
+        },
         id,
         t,
-        op: Kind::New,
+        op: subject.kind(),
         op_hash,
+        target: subject.target(),
         attempts,
         result,
         error,
@@ -209,10 +246,12 @@ fn encode_line(
     line
 }
 
-/// The exact `done` line; the stored-record preflight measures it in advance.
+/// The exact `done` line of a `new` record; the stored-record preflight
+/// measures it in advance.
 pub fn done_line(id: &str, op_hash: &str, attempts: &[String], result: &Value) -> Vec<u8> {
     encode_line(
         id,
+        &Subject::New,
         Status::Done,
         op_hash,
         Some(attempts),
@@ -222,18 +261,12 @@ pub fn done_line(id: &str, op_hash: &str, attempts: &[String], result: &Value) -
 }
 
 /// A parsed line: the record it decides.
-struct Parsed {
+pub struct Parsed {
     id: String,
+    subject: Subject,
     t: Status,
     op_hash: String,
     attempts: Vec<String>,
-}
-
-enum LineError {
-    /// Not valid JSON (a short write, or zero-filled pages after a crash).
-    Damaged,
-    /// Valid JSON with another schema: corruption or a later release.
-    Schema(String),
 }
 
 fn parse_line(line: &[u8]) -> std::result::Result<Parsed, LineError> {
@@ -252,7 +285,12 @@ fn parse_line(line: &[u8]) -> std::result::Result<Parsed, LineError> {
         Some("failed") => &["attempts", "error"],
         _ => return schema("unknown or missing t"),
     };
-    let common = ["v", "id", "t", "op", "op_hash"];
+    // Keyed on `v` too: line schema 2 adds `target` to every state.
+    let common: &[&str] = if members.get("v").and_then(Value::as_u64) == Some(2) {
+        &["v", "id", "t", "op", "op_hash", "target"]
+    } else {
+        &["v", "id", "t", "op", "op_hash"]
+    };
     if let Some(key) = members
         .keys()
         .find(|key| !common.contains(&key.as_str()) && !wanted.contains(&key.as_str()))
@@ -268,17 +306,27 @@ fn parse_line(line: &[u8]) -> std::result::Result<Parsed, LineError> {
     }
     let input: LineIn =
         serde_json::from_value(value).map_err(|e| LineError::Schema(e.to_string()))?;
-    if input.v != 1 {
-        return schema(&format!("unknown v {}", input.v));
-    }
     if validate_name(&input.id).is_err() {
         return schema("invalid id");
     }
     if !is_op_hash(&input.op_hash) {
         return schema("invalid op_hash");
     }
-    // Every record R1a writes is a `new`; an unknown `op` failed above.
-    let Kind::New = input.op;
+    // `v: 1` is R1a's `new` record; `v: 2` is a finalize record.
+    let subject = match (input.v, input.op, input.target) {
+        (1, Kind::New, None) => Subject::New,
+        (2, Kind::Finalize, Some(target)) => {
+            if validate_name(&target.id).is_err() {
+                return schema("invalid target id");
+            }
+            if !is_instance(&target.instance) {
+                return schema("invalid target instance");
+            }
+            Subject::Finalize(target)
+        }
+        (1 | 2, op, _) => return schema(&format!("op {op:?} with v {}", input.v)),
+        (v, ..) => return schema(&format!("unknown v {v}")),
+    };
     // The members are the state's; a required one must not be null either.
     let attempts = match (input.t, input.attempts, input.result, input.error) {
         (Status::Running | Status::Retryable, None, None, None) => Vec::new(),
@@ -289,8 +337,20 @@ fn parse_line(line: &[u8]) -> std::result::Result<Parsed, LineError> {
     if attempts.iter().any(|id| validate_name(id).is_err()) {
         return schema("invalid attempt id");
     }
+    // A finalize `done` reserves its target, as its stored report names it; a
+    // `failed` one stores no answer that names it.
+    if let Subject::Finalize(target) = &subject {
+        let expected: &[String] = match input.t {
+            Status::Done => std::slice::from_ref(&target.id),
+            _ => &[],
+        };
+        if attempts != expected {
+            return schema("finalize attempts other than its target");
+        }
+    }
     Ok(Parsed {
         id: input.id,
+        subject,
         t: input.t,
         op_hash: input.op_hash,
         attempts,
@@ -341,6 +401,7 @@ fn defaults(operation: &OperationV2) -> Vec<(&'static str, Value)> {
             ("readonly_globs", json!(Vec::<String>::new())),
             ("lowers", json!(Vec::<String>::new())),
         ],
+        OperationV2::Finalize { .. } => vec![("pack", json!(false))],
         _ => Vec::new(),
     }
 }
@@ -379,6 +440,7 @@ pub(super) fn canonical(value: &Value, out: &mut Vec<u8>) {
 }
 
 struct Record {
+    subject: Subject,
     t: Status,
     op_hash: String,
     /// The exact last line, newline included: replays and compaction reuse it.
@@ -389,527 +451,87 @@ struct Record {
     attempts: Vec<String>,
 }
 
-pub struct RequestLog {
-    path: PathBuf,
-    dir: PathBuf,
-    /// `None` only after a compaction published the new file but could not
-    /// sync its directory; the log is then `Broken` until a restart.
-    file: Option<File>,
-    /// End of the last durable line.
-    len: u64,
+/// The record rules of `requests.jsonl`: the live records, their order,
+/// eviction under the caps and the attempt IDs they reserve.
+pub struct RequestRecords {
     records: HashMap<String, Record>,
     /// Position of each record's last line to its ID, oldest first.
     order: BTreeMap<u64, String>,
     next_position: u64,
     live_bytes: u64,
     reserved: HashMap<String, usize>,
-    /// Why appends are refused until a restart (§5.5 `Broken`).
-    broken: Option<String>,
     limits: Limits,
-    /// Bytes appended since a compaction failed before its rename (backoff).
-    since_failed_compaction: Option<u64>,
-    #[cfg(test)]
-    pub faults: Vec<Fault>,
-    #[cfg(test)]
-    pub events: std::cell::RefCell<Vec<&'static str>>,
-    #[cfg(test)]
-    pub line_high_water: usize,
+    /// The finalize targets that still exist (Keystone approval note (a)): a
+    /// finalize record whose target is pinned is never evicted. The
+    /// supervisor pins every attempt it records, by ID and instance, until
+    /// `destroy`. A restart discards every attempt, so a log opens with none.
+    /// Only the running log consults pins (admission and [`make_room`]);
+    /// replay never does, so it evicts exactly what the run evicted.
+    ///
+    /// [`make_room`]: StateLog::make_room
+    pins: HashSet<Target>,
 }
 
-/// Opens `requests.jsonl` without following symlinks, creating it if missing,
-/// and checks the descriptor as `daemon::lock` does.
-fn open_checked(path: &Path) -> Result<File> {
-    let file = {
-        #[expect(
-            clippy::disallowed_types,
-            reason = r###"internal-read:v1 {"id":"IR-E0143-T01","item":"ratarmount::sandbox::requests::open_checked","disposition":"support","category":"builder-type-support","reason":"Builder type support: Open the sandbox request log for append.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-        )]
-        #[expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0143-M01","item":"ratarmount::sandbox::requests::open_checked","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."}}"###
-        )]
-        let mut __inventory_value_0 = fs::OpenOptions::new();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0143-M02","item":"ratarmount::sandbox::requests::open_checked","disposition":"output-owner","category":"request-log","reason":"Permit creating the sandbox request log while preserving an existing log inode.","creation":{"policy":"append-or-create","basis":"Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor."}}"###
-        )]
-        let __inventory_value_1 = __inventory_value_0.read(true).append(true).create(true);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0143-M03","item":"ratarmount::sandbox::requests::open_checked","disposition":"output-owner","category":"request-log","reason":"Open the sandbox request log once per daemon start; compaction keeps its own persisted descriptor.","creation":{"policy":"append-or-create","basis":"Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor."}}"###
-        )]
-        let __inventory_value_2 = __inventory_value_1
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path);
-        __inventory_value_2
-    }
-    .map_err(|e| failure(path, "cannot open", e))?;
-    let meta = file
-        .metadata()
-        .map_err(|e| failure(path, "cannot stat", e))?;
-    if !meta.is_file()
-        || meta.uid() != unsafe { libc::geteuid() }
-        || meta.mode() & 0o077 != 0
-        || meta.nlink() != 1
-    {
-        return Err(ApiError::new(
-            "unsafe_path",
-            "requests.jsonl must be a private, owned regular file",
-        ));
-    }
-    Ok(file)
-}
+/// `requests.jsonl` through the state-log engine.
+pub type RequestLog = StateLog<RequestRecords>;
 
-/// Makes the state directory's entries durable (creation, compaction rename).
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = r###"internal-read:v1 {"id":"IR-E0145-M01","item":"ratarmount::sandbox::requests::sync_dir","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname."}}"###
-    )]
-    File::open(dir)?.sync_all()?;
-    Ok(())
-}
-
-fn failure(path: &Path, what: &str, error: io::Error) -> ApiError {
-    ApiError::new("io", format!("{}: {what}: {error}", path.display()))
-}
-
-/// Skips the rest of an over-long line, returning the bytes skipped.
-fn skip_line(reader: &mut impl BufRead) -> io::Result<u64> {
-    let mut skipped = 0;
-    loop {
-        let buffer = reader.fill_buf()?;
-        if buffer.is_empty() {
-            return Ok(skipped);
-        }
-        match buffer.iter().position(|c| *c == b'\n') {
-            Some(end) => {
-                reader.consume(end + 1);
-                return Ok(skipped + end as u64 + 1);
-            }
-            None => {
-                let n = buffer.len();
-                reader.consume(n);
-                skipped += n as u64;
-            }
-        }
-    }
-}
-
-impl RequestLog {
-    /// Opens the log of the state directory `dir` (§5.5 Open): the checked
-    /// open, file and directory syncs before anything is acted on, the
-    /// streaming replay with torn-tail truncation, then removal of leftover
-    /// compaction temp files. Every refusal comes before `reconcile`.
-    pub fn open(dir: &Path, limits: Limits) -> Result<Self> {
-        let path = dir.join(NAME);
-        let file = open_checked(&path)?;
-        let mut log = Self {
-            path,
-            dir: dir.into(),
-            file: Some(file),
-            len: 0,
+impl RequestRecords {
+    pub fn new(limits: Limits) -> Self {
+        Self {
             records: HashMap::new(),
             order: BTreeMap::new(),
             next_position: 0,
             live_bytes: 0,
             reserved: HashMap::new(),
-            broken: None,
             limits,
-            since_failed_compaction: None,
-            #[cfg(test)]
-            faults: TEST_FAULTS.with(|faults| faults.take()),
-            #[cfg(test)]
-            events: Default::default(),
-            #[cfg(test)]
-            line_high_water: 0,
-        };
-        // Make durable whatever a killed daemon left visible but unsynced (a
-        // line whose sync never ran, a compaction rename whose directory sync
-        // never ran, the file's creation) before acting on it (codex-9 #2).
-        log.sync_file()
-            .map_err(|e| failure(&log.path, "cannot sync", e))?;
-        log.event("file_sync");
-        log.sync_state_dir()
-            .map_err(|e| failure(&log.path, "cannot sync the directory of", e))?;
-        log.event("dir_sync");
-        let file = log.file.take().expect("the log was just opened");
-        let replayed = log.replay(&file);
-        log.file = Some(file);
-        replayed?;
-        log.remove_leftovers();
-        Ok(log)
+            pins: HashSet::new(),
+        }
     }
 
-    /// Reads one line at a time through the checked descriptor and replays
-    /// each valid line with the append rule, so memory holds the capped live
-    /// set and one line buffer however much history the file has.
-    fn replay(&mut self, file: &File) -> Result<()> {
-        let mut reader = BufReader::with_capacity(64 << 10, file);
-        let mut line = Vec::new();
-        let mut offset = 0;
-        loop {
-            line.clear();
-            let read = (&mut reader)
-                .take(LINE_BOUND)
-                .read_until(b'\n', &mut line)
-                .map_err(|e| failure(&self.path, "cannot read", e))?;
-            if read == 0 {
+    /// Whether `record` is a finalize record whose target is pinned.
+    fn pinned(&self, record: &Record) -> bool {
+        match &record.subject {
+            Subject::New => false,
+            Subject::Finalize(target) => self.pins.contains(target),
+        }
+    }
+
+    /// Whether `record` may make room for a new one: finished and not pinned.
+    fn evictable(&self, record: &Record) -> bool {
+        record.t != Status::Running && !self.pinned(record)
+    }
+
+    /// The records [`apply`](Self::apply) would evict for a line of `bytes`
+    /// for `id`, oldest first.
+    fn victims(&self, id: &str, bytes: u64) -> Vec<String> {
+        let (mut count, mut live) = (self.records.len(), self.live_bytes + bytes);
+        match self.records.get(id) {
+            Some(old) => live -= old.line.len() as u64,
+            None => count += 1,
+        }
+        let mut victims = Vec::new();
+        for victim in self.order.values() {
+            if count <= self.limits.records && live <= self.limits.live_bytes {
                 break;
             }
-            if offset == 0 {
-                self.event("read");
-            }
-            #[cfg(test)]
-            {
-                self.line_high_water = self.line_high_water.max(line.len());
-            }
-            let start = offset;
-            offset += read as u64;
-            let terminated = line.ends_with(b"\n");
-            if !terminated && read as u64 == LINE_BOUND {
-                offset +=
-                    skip_line(&mut reader).map_err(|e| failure(&self.path, "cannot read", e))?;
-            }
-            let last = reader
-                .fill_buf()
-                .map_err(|e| failure(&self.path, "cannot read", e))?
-                .is_empty();
-            let parsed = if terminated {
-                parse_line(&line)
-            } else {
-                Err(LineError::Damaged)
-            };
-            match parsed {
-                Ok(parsed) => self.apply(parsed, std::mem::take(&mut line)),
-                // Every append is synced before the next starts, so only the
-                // last line can be physically damaged: it is torn.
-                Err(LineError::Damaged) if last => {
-                    self.truncate_tail(file, start)
-                        .map_err(|e| failure(&self.path, "cannot truncate the torn tail of", e))?;
-                    self.event("truncate");
-                    offset = start;
-                    break;
-                }
-                Err(LineError::Damaged) => {
-                    return Err(ApiError::new(
-                        "invalid_request",
-                        format!(
-                            "{}: damaged request record at byte {start}; move it aside to start without request records",
-                            self.path.display()
-                        ),
-                    ))
-                }
-                Err(LineError::Schema(why)) => {
-                    return Err(ApiError::new(
-                        "invalid_request",
-                        format!(
-                            "{}: unsupported request record at byte {start} ({why}); move it aside to start without request records",
-                            self.path.display()
-                        ),
-                    ))
-                }
-            }
-        }
-        self.len = offset;
-        Ok(())
-    }
-
-    /// Removes leftover compaction temp files (regular files only). A
-    /// leftover is harmless, so a failed removal is logged and ignored.
-    fn remove_leftovers(&mut self) {
-        let entries = match fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(error) => {
-                log::warn!(
-                    "cannot list {} for compaction leftovers: {error}",
-                    self.dir.display()
-                );
-                return;
-            }
-        };
-        let prefix = format!("{NAME}.");
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if !(name.len() > prefix.len() + ".compact".len()
-                && name.starts_with(&prefix)
-                && name.ends_with(".compact"))
-            {
+            let record = &self.records[victim];
+            if victim == id || record.t == Status::Running {
                 continue;
             }
-            let path = entry.path();
-            if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
-                continue;
-            }
-            if let Err(error) = self.remove_leftover(&path) {
-                log::warn!(
-                    "cannot remove compaction leftover {}: {error}",
-                    path.display()
-                );
-            }
+            count -= 1;
+            live -= record.line.len() as u64;
+            victims.push(victim.clone());
         }
-    }
-
-    fn file(&self) -> io::Result<&File> {
-        self.file
-            .as_ref()
-            .ok_or_else(|| io::Error::other("the request log is not open"))
-    }
-
-    // Each fault point is one `#[cfg(test)]` statement in a small helper.
-
-    fn sync_file(&mut self) -> io::Result<()> {
-        #[cfg(test)]
-        self.check_fault(Fault::OpenSyncFile)?;
-        self.file()?.sync_all()
-    }
-
-    fn sync_state_dir(&mut self) -> io::Result<()> {
-        #[cfg(test)]
-        self.check_fault(Fault::OpenSyncDir)?;
-        sync_dir(&self.dir)
-    }
-
-    fn truncate_tail(&mut self, file: &File, start: u64) -> io::Result<()> {
-        #[cfg(test)]
-        self.check_fault(Fault::OpenTruncate)?;
-        file.set_len(start)?;
-        file.sync_data()
-    }
-
-    fn remove_leftover(&mut self, path: &Path) -> io::Result<()> {
-        #[cfg(test)]
-        self.check_fault(Fault::RemoveLeftover)?;
-        fs::remove_file(path)
-    }
-
-    fn sync_compacted_dir(&mut self) -> io::Result<()> {
-        #[cfg(test)]
-        self.check_fault(Fault::CompactDirSync)?;
-        sync_dir(&self.dir)
-    }
-
-    #[cfg(test)]
-    fn check_fault(&mut self, point: Fault) -> io::Result<()> {
-        match self.faults.iter().position(|armed| *armed == point) {
-            Some(i) => {
-                self.faults.remove(i);
-                Err(io::Error::other(format!("injected {point:?} failure")))
-            }
-            None => Ok(()),
-        }
-    }
-
-    fn event(&self, _name: &'static str) {
-        #[cfg(test)]
-        self.events.borrow_mut().push(_name);
-    }
-
-    pub fn limits(&self) -> Limits {
-        self.limits
-    }
-
-    /// The live record of `id`: its state and `op_hash`.
-    pub fn lookup(&self, id: &str) -> Option<(Status, &str)> {
-        self.event("lookup");
-        self.records.get(id).map(|r| (r.t, r.op_hash.as_str()))
-    }
-
-    /// Whether a live record names attempt `id` (§5.6).
-    pub fn is_reserved(&self, id: &str) -> bool {
-        self.reserved.contains_key(id)
-    }
-
-    /// The refusal while the log is `Broken`.
-    pub fn unavailable(&self) -> ApiError {
-        ApiError::new(
-            "io",
-            format!(
-                "request log unavailable since {}; restart the daemon",
-                self.broken.as_deref().unwrap_or("an append failed")
-            ),
-        )
-    }
-
-    /// The stored answer of a `done` (`Ok(result)`) or `failed` (`Err(error)`)
-    /// record, unchanged since it was first answered.
-    pub fn stored(&self, id: &str) -> Result<Value> {
-        let unreadable =
-            || ApiError::new("io", format!("stored request record {id} is unreadable"));
-        let record = self.records.get(id).ok_or_else(unreadable)?;
-        let input: LineIn = serde_json::from_slice(&record.line).map_err(|_| unreadable())?;
-        match (input.result, input.error) {
-            (Some(result), None) => Ok(result),
-            (None, Some(error)) => Err(ApiError::new(&error.code, error.message)),
-            _ => Err(unreadable()),
-        }
-    }
-
-    /// Appends `running` before the request runs (§5.3 step 4). A failed
-    /// write or sync is truncated away: if that works the log stays open and
-    /// memory is exactly as before, else the log is `Broken`.
-    pub fn begin(&mut self, id: &str, op_hash: &str) -> Result<()> {
-        if self.broken.is_some() {
-            return Err(self.unavailable());
-        }
-        let line = encode_line(id, Status::Running, op_hash, None, None, None);
-        if let Err((error, truncated)) = self.write(&line, Append::Running) {
-            let error = failure(&self.path, "cannot append to", error);
-            if !truncated {
-                self.broken = Some(format!(
-                    "a failed running append for {id} could not be truncated ({})",
-                    error.message
-                ));
-            }
-            return Err(error);
-        }
-        self.apply_new(id, Status::Running, op_hash, Vec::new(), line);
-        Ok(())
-    }
-
-    /// Appends the outcome of the running request `id` (§5.3 step 6), then
-    /// answers it. A failed append leaves the log `Broken` with the record
-    /// still `running` and answers `io`; the line is truncated back when
-    /// possible. Compaction never changes the answer.
-    pub fn finish(&mut self, id: &str, op_hash: &str, outcome: Outcome) -> Result<Value> {
-        #[cfg(test)]
-        BEFORE_OUTCOME.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().as_mut() {
-                hook();
-            }
-        });
-        let (t, attempts, line, answer) = match outcome {
-            Ok((attempts, result)) => {
-                let line = done_line(id, op_hash, &attempts, &result);
-                (Status::Done, attempts, line, Ok(result))
-            }
-            Err(BatchError { error, kept }) if kept.is_empty() => {
-                let line = encode_line(id, Status::Retryable, op_hash, None, None, None);
-                (Status::Retryable, kept, line, Err(error))
-            }
-            Err(BatchError { error, kept }) => {
-                let line = encode_line(
-                    id,
-                    Status::Failed,
-                    op_hash,
-                    Some(kept.as_slice()),
-                    None,
-                    Some(&error),
-                );
-                (Status::Failed, kept, line, Err(error))
-            }
-        };
-        if let Err((error, _)) = self.write(&line, Append::Outcome) {
-            let error = failure(&self.path, "cannot append to", error);
-            self.broken = Some(format!(
-                "the outcome append for {id} failed ({})",
-                error.message
-            ));
-            return Err(error);
-        }
-        self.apply_new(id, t, op_hash, attempts, line);
-        self.maybe_compact();
-        answer
-    }
-
-    /// Resolves every record a restart cut off to `failed interrupted`, one
-    /// synced append each, after `reconcile` has discarded every attempt and
-    /// before anything is served (§5.3 Restart).
-    pub fn resolve_interrupted(&mut self) -> Result<()> {
-        let running: Vec<(String, String)> = self
-            .order
-            .values()
-            .filter_map(|id| {
-                let record = &self.records[id];
-                (record.t == Status::Running).then(|| (id.clone(), record.op_hash.clone()))
-            })
-            .collect();
-        for (id, op_hash) in running {
-            let error = ApiError::new("interrupted", INTERRUPTED);
-            let line = encode_line(
-                &id,
-                Status::Failed,
-                &op_hash,
-                Some(&[][..]),
-                None,
-                Some(&error),
-            );
-            if let Err((error, _)) = self.write(&line, Append::Resolution) {
-                return Err(failure(
-                    &self.path,
-                    "cannot resolve an interrupted request in",
-                    error,
-                ));
-            }
-            self.apply_new(&id, Status::Failed, &op_hash, Vec::new(), line);
-        }
-        Ok(())
-    }
-
-    /// One `write_all` of the whole line, then `sync_data`; on failure the line
-    /// is truncated away when possible: `Err((error, truncated))`. Only the
-    /// log's length changes here; callers change memory after this returns.
-    fn write(&mut self, line: &[u8], append: Append) -> std::result::Result<(), (io::Error, bool)> {
-        self.event("append");
-        if let Err(error) = self.write_and_sync(line, append) {
-            let truncated = self.truncate(self.len).is_ok();
-            return Err((error, truncated));
-        }
-        self.len += line.len() as u64;
-        if let Some(appended) = &mut self.since_failed_compaction {
-            *appended += line.len() as u64;
-        }
-        Ok(())
-    }
-
-    fn write_and_sync(&mut self, line: &[u8], _append: Append) -> io::Result<()> {
-        #[cfg(test)]
-        if self.check_fault(Fault::Write(_append)).is_err() {
-            self.file()?.write_all(&line[..line.len() / 2])?;
-            return Err(io::Error::other("injected short write"));
-        }
-        self.file()?.write_all(line)?;
-        #[cfg(test)]
-        self.check_fault(Fault::Sync(_append))?;
-        self.file()?.sync_data()
-    }
-
-    fn truncate(&mut self, len: u64) -> io::Result<()> {
-        #[cfg(test)]
-        self.check_fault(Fault::Truncate)?;
-        let file = self.file()?;
-        file.set_len(len)?;
-        file.sync_data()
-    }
-
-    /// Applies a durable line to memory, as replay does.
-    fn apply_new(
-        &mut self,
-        id: &str,
-        t: Status,
-        op_hash: &str,
-        attempts: Vec<String>,
-        line: Vec<u8>,
-    ) {
-        self.apply(
-            Parsed {
-                id: id.into(),
-                t,
-                op_hash: op_hash.into(),
-                attempts,
-            },
-            line,
-        );
+        victims
     }
 
     /// The line replaces its ID's record, or creates it, as the newest; then
-    /// the oldest finished records other than it are evicted until both caps
-    /// hold. A `running` record is never evicted.
+    /// the oldest records other than it and other than `running` ones are
+    /// evicted until both caps hold (R1a's rule). Pins play no part, so a
+    /// replay of the file evicts exactly what the run evicted: the run keeps
+    /// a pinned finalize record by re-appending its line before it writes a
+    /// line that would evict it ([`StateLog::make_room`]), and refuses a new
+    /// record that only evicting a pinned one could make room for (`admit`).
     fn apply(&mut self, parsed: Parsed, line: Vec<u8>) {
         self.remove(&parsed.id);
         let position = self.next_position;
@@ -922,6 +544,7 @@ impl RequestLog {
         self.records.insert(
             parsed.id.clone(),
             Record {
+                subject: parsed.subject,
                 t: parsed.t,
                 op_hash: parsed.op_hash,
                 line,
@@ -929,17 +552,63 @@ impl RequestLog {
                 attempts: parsed.attempts,
             },
         );
+        self.evict(Some(&parsed.id));
+    }
+
+    /// Evicts the oldest records other than `keep` and other than `running`
+    /// ones until both caps hold, or none is left.
+    fn evict(&mut self, keep: Option<&str>) {
         while self.records.len() > self.limits.records || self.live_bytes > self.limits.live_bytes {
             let victim = self
                 .order
                 .values()
-                .find(|id| **id != parsed.id && self.records[*id].t != Status::Running)
+                .find(|id| Some(id.as_str()) != keep && self.records[*id].t != Status::Running)
                 .cloned();
             match victim {
                 Some(victim) => self.remove(&victim),
                 None => break,
             }
         }
+    }
+
+    /// Whether a new record `id` with a line of `bytes` would fit the caps
+    /// once every evictable record were evicted. The record is counted at its
+    /// largest (the per-record cap), so its outcome line, which is never
+    /// refused, can always be made room for without a pinned record. Refuses
+    /// with `capacity` otherwise, before anything is written (approval note
+    /// (a): a pinned finalize record is never evicted to make room). With no
+    /// pinned record there is nothing to protect, and R1a's rule stands: the
+    /// set may stay over a cap by its running records, and nothing is refused.
+    fn admit(&self, id: &str, bytes: u64) -> Result<()> {
+        let protect = self
+            .records
+            .iter()
+            .any(|(key, record)| key != id && record.t != Status::Running && self.pinned(record));
+        if !protect {
+            return Ok(());
+        }
+        let bytes = bytes.max(self.limits.record_bytes);
+        let (mut count, mut live) = (self.records.len() + 1, self.live_bytes + bytes);
+        if let Some(old) = self.records.get(id) {
+            count -= 1;
+            live -= old.line.len() as u64;
+        }
+        for (key, record) in &self.records {
+            if key != id && self.evictable(record) {
+                count -= 1;
+                live -= record.line.len() as u64;
+            }
+        }
+        if count > self.limits.records || live > self.limits.live_bytes {
+            return Err(ApiError::new(
+                "capacity",
+                format!(
+                    "the request log is full of records that may not be evicted ({count} records and {live} bytes of at most {} and {}): finalize records whose attempts still exist, or requests still running; destroy the attempts those finalize requests name, then retry",
+                    self.limits.records, self.limits.live_bytes
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn remove(&mut self, id: &str) {
@@ -957,108 +626,359 @@ impl RequestLog {
             }
         }
     }
+}
 
-    /// Compacts after an outcome append when the file is over twice the live
-    /// bytes and over the floor, no record is running, and any backoff after a
-    /// failure before the rename has passed (§5.5 Compaction).
-    fn maybe_compact(&mut self) {
-        if self.broken.is_some()
-            || self.len <= 2 * self.live_bytes
-            || self.len <= self.limits.compaction_floor
-            || self.records.values().any(|r| r.t == Status::Running)
-            || self
-                .since_failed_compaction
-                .is_some_and(|appended| appended < self.live_bytes)
-        {
-            return;
-        }
-        self.event("compact");
-        let (temp, written) = match self.write_compacted() {
-            Ok(written) => written,
-            Err(error) => {
-                log::warn!("cannot compact {}: {error}", self.path.display());
-                self.since_failed_compaction = Some(0);
-                return;
-            }
-        };
-        let file = match temp.persist(&self.path) {
-            Ok(file) => file,
-            Err(error) => {
-                // Dropping the returned temp file removes it.
-                log::warn!("cannot compact {}: {}", self.path.display(), error.error);
-                self.since_failed_compaction = Some(0);
-                return;
-            }
-        };
-        // The old descriptor now names an unlinked inode: drop it at once so
-        // nothing lands there, and refuse appends until the rename is durable.
-        self.broken = Some(format!(
-            "a compaction of {} published the file before its directory was synced",
-            self.path.display()
-        ));
-        self.file = None;
-        match self.sync_compacted_dir() {
-            Ok(()) => {
-                // `persist` returned the temp file's own O_APPEND descriptor of the
-                // published inode, so a failed append's truncation leaves no gap.
-                self.file = Some(file);
-                self.len = written;
-                self.broken = None;
-                self.since_failed_compaction = None;
-            }
-            Err(error) => {
-                self.broken = Some(format!(
-                    "a compaction could not sync the directory of {} ({error})",
-                    self.path.display()
-                ));
-            }
-        }
+impl Records for RequestRecords {
+    type Parsed = Parsed;
+    const NAME: &'static str = NAME;
+    const LINE_BOUND: u64 = LINE_BOUND;
+    const RECORD: &'static str = "request record";
+    const ADVICE: &'static str = "move it aside to start without request records";
+    const LOG: &'static str = "request log";
+
+    fn parse(line: &[u8]) -> std::result::Result<Parsed, LineError> {
+        parse_line(line)
     }
 
-    /// Writes every live last line, byte for byte and in file order, to a
-    /// synced temp file beside the log.
-    fn write_compacted(&mut self) -> io::Result<(tempfile::NamedTempFile, u64)> {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0144-M01","item":"<ratarmount::sandbox::requests::RequestLog>::write_compacted","disposition":"output-owner","category":"request-log-compaction","reason":"Stage the compacted sandbox request log beside requests.jsonl before an atomic rename.","creation":{"policy":"exclusive-new-file","basis":"tempfile creates the name with O_EXCL, mode 0600 and append inside the 0700 state directory; persist renames it over the log."}}"###
-        )]
-        let mut temp = tempfile::Builder::new()
-            .prefix(&format!("{NAME}."))
-            .suffix(".compact")
-            .append(true)
-            .tempfile_in(&self.dir)?;
-        let mut written = 0;
-        for id in self.order.values() {
-            let line = &self.records[id].line;
-            temp.write_all(line)?;
-            written += line.len() as u64;
-        }
-        #[cfg(test)]
-        self.check_fault(Fault::CompactSync)?;
-        temp.as_file().sync_all()?;
-        Ok((temp, written))
+    fn apply(&mut self, parsed: Parsed, line: Vec<u8>) {
+        RequestRecords::apply(self, parsed, line);
     }
 
-    #[cfg(test)]
-    pub fn live_lines(&self) -> Vec<Vec<u8>> {
+    fn live_lines(&self) -> Vec<&[u8]> {
         self.order
             .values()
-            .map(|id| self.records[id].line.clone())
+            .map(|id| self.records[id].line.as_slice())
             .collect()
     }
 
+    fn live_bytes(&self) -> u64 {
+        self.live_bytes
+    }
+
+    /// No record is running (§5.5 Compaction).
+    fn may_compact(&self) -> bool {
+        !self.records.values().any(|r| r.t == Status::Running)
+    }
+
+    fn compaction_floor(&self) -> u64 {
+        self.limits.compaction_floor
+    }
+
     #[cfg(test)]
-    pub fn is_broken(&self) -> bool {
-        self.broken.is_some()
+    fn take_test_faults() -> Vec<Fault> {
+        TEST_FAULTS.with(|faults| faults.take())
+    }
+}
+
+impl StateLog<RequestRecords> {
+    /// Opens the log of the state directory `dir` (§5.5 Open) through the
+    /// engine: the checked open, file and directory syncs before anything is
+    /// acted on, the streaming replay with torn-tail truncation, then removal
+    /// of leftover compaction temp files. Every refusal comes before
+    /// `reconcile`, which discards every attempt, so nothing is pinned yet.
+    pub fn open(dir: &Path, limits: Limits) -> Result<Self> {
+        Self::open_with(dir, RequestRecords::new(limits))
+    }
+
+    pub fn limits(&self) -> Limits {
+        self.records.limits
+    }
+
+    /// The live record of `id`: its state and `op_hash`.
+    pub fn lookup(&self, id: &str) -> Option<(Status, &str)> {
+        self.event("lookup");
+        self.records
+            .records
+            .get(id)
+            .map(|r| (r.t, r.op_hash.as_str()))
+    }
+
+    /// The stored target of the live finalize record `id` (ruling 5).
+    pub fn target(&self, id: &str) -> Option<&Target> {
+        self.records
+            .records
+            .get(id)
+            .and_then(|record| record.subject.target())
+    }
+
+    /// Whether a live record names attempt `id` (§5.6).
+    pub fn is_reserved(&self, id: &str) -> bool {
+        self.records.reserved.contains_key(id)
+    }
+
+    /// Pins `target`: its finalize records are never evicted until
+    /// [`unpin`](Self::unpin) (approval note (a)).
+    pub fn pin(&mut self, target: Target) {
+        self.records.pins.insert(target);
+    }
+
+    /// Unpins `target`, whose attempt is gone; its records become evictable.
+    pub fn unpin(&mut self, target: &Target) {
+        self.records.pins.remove(target);
+    }
+
+    /// Before a line of `bytes` for `id` is written (approval note (a)):
+    /// each pinned record that line would evict is appended again, byte for
+    /// byte, which moves it to the end of the retry window, so the line
+    /// evicts only unpinned records. A replay applies the same lines in the
+    /// same order and so evicts what the run evicted, without pins. A failed
+    /// append is truncated away when possible, else the log is `Broken`.
+    fn make_room(&mut self, id: &str, bytes: u64) -> Result<()> {
+        let mut moved = HashSet::new();
+        loop {
+            let pinned = self
+                .records
+                .victims(id, bytes)
+                .into_iter()
+                .find(|victim| self.records.pinned(&self.records.records[victim]));
+            // Every candidate pinned is what `admit` keeps from happening.
+            let Some(victim) = pinned.filter(|victim| moved.insert(victim.clone())) else {
+                return Ok(());
+            };
+            let record = &self.records.records[&victim];
+            let (line, subject, t, op_hash, attempts) = (
+                record.line.clone(),
+                record.subject.clone(),
+                record.t,
+                record.op_hash.clone(),
+                record.attempts.clone(),
+            );
+            if let Err((error, truncated)) = self.write(&line, Append::Rotation) {
+                let error = failure(self.path(), "cannot append to", error);
+                if !truncated {
+                    self.broken = Some(format!(
+                        "a failed append moving request record {victim} could not be truncated ({})",
+                        error.message
+                    ));
+                }
+                return Err(error);
+            }
+            self.apply_new(&victim, subject, t, &op_hash, attempts, line);
+        }
+    }
+
+    /// The stored answer of a `done` (`Ok(result)`) or `failed` (`Err(error)`)
+    /// record, unchanged since it was first answered.
+    pub fn stored(&self, id: &str) -> Result<Value> {
+        let unreadable =
+            || ApiError::new("io", format!("stored request record {id} is unreadable"));
+        let record = self.records.records.get(id).ok_or_else(unreadable)?;
+        let input: LineIn = serde_json::from_slice(&record.line).map_err(|_| unreadable())?;
+        match (input.result, input.error) {
+            (Some(result), None) => Ok(result),
+            (None, Some(error)) => Err(ApiError::new(&error.code, error.message)),
+            _ => Err(unreadable()),
+        }
+    }
+
+    /// Appends `running` before the request runs (§5.3 step 4). A failed
+    /// write or sync is truncated away: if that works the log stays open and
+    /// memory is exactly as before, else the log is `Broken`.
+    pub fn begin(&mut self, id: &str, op_hash: &str) -> Result<()> {
+        self.begin_with(id, Subject::New, op_hash)
+    }
+
+    /// [`begin`](Self::begin) for a finalize of `target`: a `v: 2` line that
+    /// stores the target (ruling 5).
+    pub fn begin_finalize(&mut self, id: &str, op_hash: &str, target: &Target) -> Result<()> {
+        self.begin_with(id, Subject::Finalize(target.clone()), op_hash)
+    }
+
+    fn begin_with(&mut self, id: &str, subject: Subject, op_hash: &str) -> Result<()> {
+        if self.broken.is_some() {
+            return Err(self.unavailable());
+        }
+        let line = encode_line(id, &subject, Status::Running, op_hash, None, None, None);
+        // Fail closed (approval note (a)): no pinned finalize record is ever
+        // evicted to make room.
+        self.records.admit(id, line.len() as u64)?;
+        self.make_room(id, line.len() as u64)?;
+        if let Err((error, truncated)) = self.write(&line, Append::Running) {
+            let error = failure(self.path(), "cannot append to", error);
+            if !truncated {
+                self.broken = Some(format!(
+                    "a failed running append for {id} could not be truncated ({})",
+                    error.message
+                ));
+            }
+            return Err(error);
+        }
+        self.apply_new(id, subject, Status::Running, op_hash, Vec::new(), line);
+        Ok(())
+    }
+
+    /// Appends the outcome of the running request `id` (§5.3 step 6), then
+    /// answers it. A failed append leaves the log `Broken` with the record
+    /// still `running` and answers `io`; the line is truncated back when
+    /// possible. Compaction never changes the answer.
+    pub fn finish(&mut self, id: &str, op_hash: &str, outcome: Outcome) -> Result<Value> {
+        let (t, attempts, line, answer) = match outcome {
+            Ok((attempts, result)) => {
+                let line = done_line(id, op_hash, &attempts, &result);
+                (Status::Done, attempts, line, Ok(result))
+            }
+            Err(BatchError { error, kept }) if kept.is_empty() => {
+                let line = encode_line(
+                    id,
+                    &Subject::New,
+                    Status::Retryable,
+                    op_hash,
+                    None,
+                    None,
+                    None,
+                );
+                (Status::Retryable, kept, line, Err(error))
+            }
+            Err(BatchError { error, kept }) => {
+                let line = encode_line(
+                    id,
+                    &Subject::New,
+                    Status::Failed,
+                    op_hash,
+                    Some(kept.as_slice()),
+                    None,
+                    Some(&error),
+                );
+                (Status::Failed, kept, line, Err(error))
+            }
+        };
+        self.finish_with(id, Subject::New, op_hash, t, attempts, line, answer)
+    }
+
+    /// The outcome of the running finalize `id` of `target`: `done` with its
+    /// report, which names and so reserves the target's ID, or `retryable`:
+    /// every finalize error is retryable (nothing needs undoing; a retry
+    /// resumes on the same target). Only a restart writes `failed`.
+    pub fn finish_finalize(
+        &mut self,
+        id: &str,
+        op_hash: &str,
+        target: &Target,
+        outcome: Result<Value>,
+    ) -> Result<Value> {
+        let subject = Subject::Finalize(target.clone());
+        let (t, attempts, line) = match &outcome {
+            Ok(report) => {
+                let attempts = vec![target.id.clone()];
+                let line = encode_line(
+                    id,
+                    &subject,
+                    Status::Done,
+                    op_hash,
+                    Some(&attempts),
+                    Some(report),
+                    None,
+                );
+                (Status::Done, attempts, line)
+            }
+            Err(_) => {
+                let line = encode_line(id, &subject, Status::Retryable, op_hash, None, None, None);
+                (Status::Retryable, Vec::new(), line)
+            }
+        };
+        self.finish_with(id, subject, op_hash, t, attempts, line, outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_with(
+        &mut self,
+        id: &str,
+        subject: Subject,
+        op_hash: &str,
+        t: Status,
+        attempts: Vec<String>,
+        line: Vec<u8>,
+        answer: Result<Value>,
+    ) -> Result<Value> {
+        #[cfg(test)]
+        BEFORE_OUTCOME.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+        let written = self.make_room(id, line.len() as u64).and_then(|()| {
+            self.write(&line, Append::Outcome)
+                .map_err(|(error, _)| failure(self.path(), "cannot append to", error))
+        });
+        if let Err(error) = written {
+            self.broken = Some(format!(
+                "the outcome append for {id} failed ({})",
+                error.message
+            ));
+            return Err(error);
+        }
+        self.apply_new(id, subject, t, op_hash, attempts, line);
+        self.maybe_compact();
+        answer
+    }
+
+    /// Resolves every record a restart cut off to `failed interrupted`, one
+    /// synced append each, after `reconcile` has discarded every attempt and
+    /// before anything is served (§5.3 Restart). A finalize record keeps its
+    /// target and gets the finalize message.
+    pub fn resolve_interrupted(&mut self) -> Result<()> {
+        let running: Vec<(String, Subject, String)> = self
+            .records
+            .order
+            .values()
+            .filter_map(|id| {
+                let record = &self.records.records[id];
+                (record.t == Status::Running)
+                    .then(|| (id.clone(), record.subject.clone(), record.op_hash.clone()))
+            })
+            .collect();
+        for (id, subject, op_hash) in running {
+            let message = match subject {
+                Subject::New => INTERRUPTED,
+                Subject::Finalize(_) => FINALIZE_INTERRUPTED,
+            };
+            let error = ApiError::new("interrupted", message);
+            let line = encode_line(
+                &id,
+                &subject,
+                Status::Failed,
+                &op_hash,
+                Some(&[][..]),
+                None,
+                Some(&error),
+            );
+            self.make_room(&id, line.len() as u64)?;
+            if let Err((error, _)) = self.write(&line, Append::Resolution) {
+                return Err(failure(
+                    self.path(),
+                    "cannot resolve an interrupted request in",
+                    error,
+                ));
+            }
+            self.apply_new(&id, subject, Status::Failed, &op_hash, Vec::new(), line);
+        }
+        Ok(())
+    }
+
+    /// Applies a durable line to memory, as replay does.
+    fn apply_new(
+        &mut self,
+        id: &str,
+        subject: Subject,
+        t: Status,
+        op_hash: &str,
+        attempts: Vec<String>,
+        line: Vec<u8>,
+    ) {
+        self.records.apply(
+            Parsed {
+                id: id.into(),
+                subject,
+                t,
+                op_hash: op_hash.into(),
+                attempts,
+            },
+            line,
+        );
     }
 
     #[cfg(test)]
     pub fn status(&self, id: &str) -> Option<Status> {
-        self.records.get(id).map(|r| r.t)
-    }
-
-    #[cfg(test)]
-    pub fn descriptor(&self) -> Option<&File> {
-        self.file.as_ref()
+        self.records.records.get(id).map(|r| r.t)
     }
 }

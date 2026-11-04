@@ -2,8 +2,7 @@
 
 use crate::control_socket_path;
 use clap::Args;
-use ratarmount_compositing::overlay_changes::{self, ChangeOptions, Normalize};
-use ratarmount_compositing::{overlay_fsck, overlay_seal, OverlayMeta};
+use ratarmount_compositing::OverlayMeta;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -12,7 +11,7 @@ use std::ffi::OsString;
     reason = r###"internal-read:v1 {"id":"IR-E0136-T01","item":"ratarmount::sandbox::run","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for sandbox run locking and state output.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
 )]
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Seek, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -1097,98 +1096,52 @@ fn finish(args: &RunArgs, top: &Path, journal: &Path, execution: Execution) -> i
         bytes_written,
         start,
     } = execution;
-    let fsck = overlay_fsck::fsck(top, true)?;
-    if !fsck.is_clean() {
-        return Err(io::Error::other(format!("fsck: {}", fsck.result())));
-    }
     // Factory and lazy source progress must never contaminate the JSON report.
     let _progress = crate::diff::ProgressToStderr::new()?;
-    // The base is classified through the factory and gated against what the
-    // overlay recorded BEFORE anything is sealed or packed: a base edited
-    // during the run fails closed instead of being sealed as if unchanged.
-    let recorded = OverlayMeta::read(top).map_err(io::Error::other)?;
-    let base = crate::overlay_cmd::classify_base(
-        Some(&args.base),
-        recorded.as_ref(),
-        None,
-        &crate::base_identity::OverlayRunContext::default(),
-    )
-    .map_err(io::Error::other)?;
-    crate::overlay_cmd::gate_base(
-        top,
-        recorded.as_ref(),
-        &base,
-        &crate::overlay_cmd::BaseIdentityArgs {
-            force_base_mismatch: false,
+    let mut classify = |recorded: Option<&OverlayMeta>| {
+        crate::overlay_cmd::classify_base(
+            Some(&args.base),
+            recorded,
+            None,
+            &crate::base_identity::OverlayRunContext::default(),
+        )
+        .map_err(io::Error::other)
+    };
+    let mut compose = |source| {
+        crate::MountLowerStack::compose(source, &args.lower, &crate::lower_stack_services())
+    };
+    let manifest = sidecar(top, ".manifest.jsonl");
+    let summary = sidecar(top, ".journal.summary.json");
+    let finalized = super::finalize::finalize_top(
+        super::finalize::FinalizeTop {
+            top,
+            repair: super::finalize::Repair::Always,
+            classify: &mut classify,
+            compose: &mut compose,
             base_digest: match &args.base_digest {
                 Some(ratarmount_compositing::BaseDigestRequest::Supplied(digest)) => {
                     Some(digest.clone())
                 }
                 _ => None,
             },
+            seal: (args.seal || args.pack.is_some()).then_some(None),
+            pack: args.pack.as_deref().map(|bundle| super::finalize::Pack {
+                bundle,
+                journal: args.journal.then_some(journal),
+            }),
+            manifest: &manifest,
+            journal: args.journal.then_some((journal, summary.as_path())),
+            #[cfg(test)]
+            before_meta_read: None,
         },
-    )
-    .map_err(io::Error::other)?;
-    let lower = crate::MountLowerStack::compose(
-        base.source(),
-        &args.lower,
-        &crate::lower_stack_services(),
+        &mut super::finalize::FinalizeProgress::default(),
     )?;
-    if args.seal || args.pack.is_some() {
-        overlay_seal::seal(top, &base, lower.clone())?;
-    }
-    let bundle = args.pack.as_ref().map(std::path::absolute).transpose()?;
-    if let Some(bundle) = &bundle {
-        crate::overlay_pack::pack(
-            top,
-            bundle,
-            lower.clone(),
-            &crate::overlay_pack::PackOptions {
-                include_journal: args.journal.then(|| journal.to_path_buf()),
-                ..Default::default()
-            },
-        )?;
-    }
-    let options = ChangeOptions {
-        normalize: Normalize::Strict,
-        ..Default::default()
-    };
-    let changes = overlay_changes::change_set(top, lower, &options)?;
-    let hash = overlay_changes::canonical_hash(&changes, &options)?;
-    let manifest = sidecar(top, ".manifest.jsonl");
-    #[expect(
-        clippy::disallowed_methods,
-        reason = r###"internal-read:v1 {"id":"IR-B0131-M01","item":"ratarmount::sandbox::run::finish","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-    )]
-    overlay_changes::write_manifest(&changes, &mut File::create(&manifest)?)?;
-    let meta = OverlayMeta::read(top)
-        .map_err(io::Error::other)?
-        .ok_or_else(|| io::Error::other("overlay metadata missing"))?;
-    let summary = if args.journal {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0132-M01","item":"ratarmount::sandbox::run::finish","disposition":"out-of-family","category":"structured-control-record","reason":"operation journal JSONL summarized after the run","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )]
-        let summary =
-            crate::journal_cmd::summarize(BufReader::new(File::open(journal)?), None, None)?;
-        let path = sidecar(top, ".journal.summary.json");
-        #[expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0133-M01","item":"ratarmount::sandbox::run::finish","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )]
-        serde_json::to_writer(File::create(&path)?, &summary)?;
-        Some(
-            json!({"path":path, "files_read":summary.files_read.len(), "files_read_then_written":summary.files_read_then_written.len(), "files_written_blind":summary.files_written_blind.len()}),
-        )
-    } else {
-        None
-    };
     Ok(json!({
         "exit_code":exit_code, "timed_out":timed_out, "interrupted":SIGNAL.load(Ordering::Relaxed) != 0,
         "wall_time_s":start.elapsed().as_secs_f64(),
-        "patch_hash":{"patch":hash, "base":meta.known_base_digest(), "stack":meta.stack_digest(), "files":changes.len(), "normalize":"strict", "algo":"sha256", "excludes":[], "sealed":meta.layer_sealed(), "base_pending":meta.base_digest_kind() == Some("pending"), "base_digest_state":meta.base_digest_state()},
-        "manifest_path":manifest, "journal_summary":summary, "overlay":top, "bundle":bundle,
-        "erofs_denied":erofs_denied, "bytes_written":bytes_written, "fsck_result":fsck.result()
+        "patch_hash":finalized.patch_hash(),
+        "manifest_path":finalized.manifest, "journal_summary":finalized.journal_summary, "overlay":top, "bundle":finalized.bundle,
+        "erofs_denied":erofs_denied, "bytes_written":bytes_written, "fsck_result":finalized.fsck_result
     }))
 }
 
@@ -1196,6 +1149,7 @@ fn finish(args: &RunArgs, top: &Path, journal: &Path, execution: Execution) -> i
 mod tests {
     use super::*;
     use clap::Parser;
+    use ratarmount_compositing::overlay_changes::{self, ChangeOptions, Normalize};
     use ratarmount_compositing::HIDDEN_DB;
     use std::sync::Arc;
 
@@ -1895,6 +1849,211 @@ mod tests {
             !OverlayMeta::read(&top).unwrap().unwrap().layer_sealed(),
             "nothing may be sealed over a changed base"
         );
+    }
+
+    const FINISH_GOLDEN: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/sandbox/testdata/sandbox-run-finish-golden.jsonl"
+    );
+
+    /// The T1 cases (R1c-1 §7): `finish` over a directory base, each report
+    /// or error with `wall_time_s` masked, the temporary directory as `$TMP`
+    /// and `weak:` digests (which hash the temporary path's mtimes) masked.
+    const FINISH_CASES: [&str; 6] = [
+        "plain",
+        "seal",
+        "pack_journal",
+        "repair",
+        "gate_refusal",
+        "bundle_lower_gate_refusal",
+    ];
+
+    /// `text` with every `weak:` digest's value replaced by `<weak>`.
+    fn mask_weak_digests(text: &str) -> String {
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(at) = rest.find("weak:") {
+            out.push_str(&rest[..at + "weak:".len()]);
+            rest = &rest[at + "weak:".len()..];
+            let digest = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == ':'))
+                .unwrap_or(rest.len());
+            if digest > 0 {
+                out.push_str("<weak>");
+            }
+            rest = &rest[digest..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Runs one T1 case on a fresh temporary directory: its normalized
+    /// report (`{"report":…}`) or error (`{"error":…}`).
+    fn finish_case(case: &str) -> Value {
+        use ratarmount_compositing::{BaseDigestRequest, FolderMountSource};
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let top = temp.path().join("top");
+        fs::create_dir(&base).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+        for (name, content) in [("f", "original\n"), ("g", "gone\n")] {
+            fs::write(base.join(name), content).unwrap();
+            fs::set_permissions(base.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let view = || -> Arc<dyn ratarmount_core::MountSource> {
+            Arc::new(FolderMountSource::new(&base).unwrap())
+        };
+        let gated = matches!(case, "gate_refusal" | "bundle_lower_gate_refusal");
+        let mut args = args(&[]);
+        args.base = base.clone();
+        args.top = top.clone();
+        if !gated {
+            args.base_digest = Some(BaseDigestRequest::Supplied(digest.clone()));
+        }
+        if case == "bundle_lower_gate_refusal" {
+            // A layer deleting `g`, sealed over the original base and packed.
+            let layer = temp.path().join("layer");
+            let overlay = crate::base_identity::fixtures::overlay_over(
+                view(),
+                &layer,
+                &base.to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+            overlay.unlink("/g").unwrap();
+            drop(overlay);
+            crate::base_identity::fixtures::seal(&layer, view()).unwrap();
+            let bundle = temp.path().join("layer.tar.zst");
+            crate::overlay_pack::pack(
+                &layer,
+                &bundle,
+                view(),
+                &crate::overlay_pack::PackOptions::default(),
+            )
+            .unwrap();
+            args.lower = vec![bundle];
+        }
+        let overlay = crate::base_identity::fixtures::overlay_over_with(
+            view(),
+            &top,
+            &base.to_string_lossy(),
+            Vec::new(),
+            if gated {
+                BaseDigestRequest::Compute
+            } else {
+                BaseDigestRequest::Supplied(digest)
+            },
+        )
+        .unwrap();
+        overlay.create_symlink("/link", "/target").unwrap();
+        overlay.unlink("/f").unwrap();
+        drop(overlay);
+        match case {
+            "seal" | "gate_refusal" | "bundle_lower_gate_refusal" => args.seal = true,
+            "pack_journal" => {
+                args.pack = Some(temp.path().join("bundle.tar.zst"));
+                args.journal = true;
+                fs::write(
+                    sidecar(&top, ".journal.jsonl"),
+                    concat!(
+                        "{\"journal\":1}\n",
+                        "{\"op\":\"open\",\"path\":\"/f\",\"layer\":\"base\",\"comm\":\"sh\"}\n",
+                        "{\"op\":\"read\",\"path\":\"/f\",\"ts\":1,\"bytes\":9}\n",
+                        "{\"op\":\"write\",\"path\":\"/new\",\"ts\":2,\"bytes\":5}\n",
+                    ),
+                )
+                .unwrap();
+            }
+            // Content under the tombstoned name: fsck removes it.
+            "repair" => fs::write(top.join("f"), b"stale").unwrap(),
+            _ => {}
+        }
+        match case {
+            // The base is edited while the container ran: `f` changes, and
+            // `g`, which the bundle layer deletes, disappears, so verifying
+            // that bundle on the edited base would fail with its own error.
+            "gate_refusal" | "bundle_lower_gate_refusal" => {
+                fs::write(base.join("f"), b"edited during the run, longer").unwrap();
+                fs::remove_file(base.join("g")).unwrap();
+            }
+            _ => {}
+        }
+        let result = finish(
+            &args,
+            &top,
+            &sidecar(&top, ".journal.jsonl"),
+            Execution {
+                exit_code: 3,
+                timed_out: false,
+                erofs_denied: 2,
+                bytes_written: 6,
+                start: Instant::now(),
+            },
+        );
+        let placeholders = |text: &str| {
+            let mut text = text.to_owned();
+            for root in [temp.path().canonicalize().unwrap(), temp.path().into()] {
+                text = text.replace(root.to_str().unwrap(), "$TMP");
+            }
+            mask_weak_digests(&text)
+        };
+        match result {
+            Ok(mut report) => {
+                assert!(report["wall_time_s"].is_number(), "{report}");
+                report["wall_time_s"] = json!("<masked>");
+                let text = placeholders(&serde_json::to_string(&report).unwrap());
+                json!({"case": case, "report": text})
+            }
+            Err(error) => json!({"case": case, "error": placeholders(&error.to_string())}),
+        }
+    }
+
+    /// Writes `testdata/sandbox-run-finish-golden.jsonl` from `finish`. The
+    /// committed fixture was recorded from the `finish` that predates
+    /// `finalize_top` (R1c-1 step 2a); regenerate only on purpose.
+    #[test]
+    #[ignore = "fixture generator: cargo test -p ratarmount --bin ratarmount generate_sandbox_run_finish_golden -- --ignored"]
+    fn generate_sandbox_run_finish_golden() {
+        let mut output = String::new();
+        for case in FINISH_CASES {
+            output.push_str(&serde_json::to_string(&finish_case(case)).unwrap());
+            output.push('\n');
+        }
+        fs::write(FINISH_GOLDEN, output).unwrap();
+    }
+
+    /// Regression (R1c-1 T1, source test 10): `finalize_top` must leave every
+    /// `sandbox run` report byte for byte as the `finish` before it wrote it,
+    /// and keep its error order (classify, gate, compose): a bundle lower over
+    /// an edited base is refused with the gate's text, never with a bundle
+    /// verification error.
+    #[test]
+    fn regression_sandbox_run_report_identical_after_finalize_top() {
+        let golden = fs::read_to_string(FINISH_GOLDEN).unwrap();
+        let expected: Vec<Value> = golden
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(expected.len(), FINISH_CASES.len());
+        for (case, expected) in FINISH_CASES.into_iter().zip(expected) {
+            assert_eq!(finish_case(case), expected, "case {case}");
+        }
+        let error = |case: &str| {
+            let line = golden
+                .lines()
+                .find(|line| line.contains(&format!("\"case\":\"{case}\"")))
+                .unwrap();
+            serde_json::from_str::<Value>(line).unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        for case in ["gate_refusal", "bundle_lower_gate_refusal"] {
+            let error = error(case);
+            assert!(error.contains("--force-base-mismatch"), "{case}: {error}");
+            assert!(!error.contains("lower bundle"), "{case}: {error}");
+        }
     }
 
     /// Regression (J): the private parent is 0700 and only a directory this

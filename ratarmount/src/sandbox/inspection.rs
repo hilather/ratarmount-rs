@@ -1,7 +1,7 @@
 //! Private read-only child channel: SQLite intentionally permits only its owner.
 
 use super::protocol::{Attempt, MAX_RESPONSE};
-use ratarmount_compositing::{LowerLayerRecord, WriteOverlay};
+use ratarmount_compositing::{LowerLayerRecord, OverlayQuota, WriteOverlay};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -55,7 +55,21 @@ fn configure_accepted_stream(stream: &UnixStream) -> io::Result<()> {
     stream.set_nonblocking(false)
 }
 
-pub(crate) fn start(path: &Path, overlay: &Arc<WriteOverlay>) -> io::Result<Inspector> {
+/// The reply to `status`: one JSON line, which the client decodes as such.
+#[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Status {
+    /// Writes the mount's read-only rules refused (0 without a policy).
+    pub erofs_denied: u64,
+}
+
+/// Serves `deleted_paths`, `lower_layers` and `status` for the mount's
+/// overlay. `quota` is the mount's quota and policy handle, when it has one.
+pub(crate) fn start(
+    path: &Path,
+    overlay: &Arc<WriteOverlay>,
+    quota: Option<Arc<OverlayQuota>>,
+) -> io::Result<Inspector> {
     validate_socket_path(path)?;
     let parent = fs::symlink_metadata(
         path.parent()
@@ -90,7 +104,10 @@ pub(crate) fn start(path: &Path, overlay: &Arc<WriteOverlay>) -> io::Result<Insp
                         .take(64)
                         .read_line(&mut command)
                         .is_err()
-                        || !matches!(command.as_str(), "deleted_paths\n" | "lower_layers\n")
+                        || !matches!(
+                            command.as_str(),
+                            "deleted_paths\n" | "lower_layers\n" | "status\n"
+                        )
                     {
                         continue;
                     }
@@ -102,6 +119,9 @@ pub(crate) fn start(path: &Path, overlay: &Arc<WriteOverlay>) -> io::Result<Insp
                             overlay.load_tombstone_paths().into_iter().collect();
                         deleted.sort();
                         serde_json::to_vec(&deleted).ok()
+                    } else if command == "status\n" {
+                        let erofs_denied = quota.as_ref().map_or(0, |q| q.usage().erofs_denied);
+                        serde_json::to_vec(&Status { erofs_denied }).ok()
                     } else {
                         // The layers this mount composed, through its own connection.
                         overlay
@@ -141,9 +161,16 @@ pub fn lower_layers(attempt: &Attempt, timeout: Duration) -> io::Result<Vec<Lowe
     request(attempt, b"lower_layers\n", timeout)
 }
 
+/// The child's `erofs_denied` count (R1c-1 §5.4 step 4), within `timeout`.
+/// A child whose overlay was dropped ends the connection without an answer,
+/// which is an error.
+pub fn status(attempt: &Attempt, timeout: Duration) -> io::Result<Status> {
+    request(attempt, b"status\n", timeout)
+}
+
 /// Sends `command` and reads the one-line reply, all within `timeout` from
-/// now: each read gets only the time left, so a reply trickled in small
-/// pieces cannot stretch the exchange past it.
+/// now, the connect included: each step gets only the time left, so a reply
+/// trickled in small pieces cannot stretch the exchange past it.
 fn request<T: serde::de::DeserializeOwned>(
     attempt: &Attempt,
     command: &[u8],
@@ -156,7 +183,7 @@ fn request<T: serde::de::DeserializeOwned>(
             .filter(|left| !left.is_zero())
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "inspection timed out"))
     };
-    let mut stream = UnixStream::connect(socket_path(attempt))?;
+    let mut stream = connect(&socket_path(attempt), &left)?;
     stream.set_write_timeout(Some(left()?))?;
     stream.write_all(command)?;
     let mut reply = Vec::new();
@@ -184,6 +211,39 @@ fn request<T: serde::de::DeserializeOwned>(
         return Err(io::Error::other("oversized inspection response"));
     }
     serde_json::from_slice(&reply[..end]).map_err(io::Error::other)
+}
+
+/// Connects to the inspection socket at `path` within the time `left` gives.
+/// On Linux a connect to a listener whose backlog is full (a child that
+/// stopped accepting, with earlier connects still queued) waits until the
+/// listener accepts or closes, for as long as the socket's send timeout
+/// allows, so that timeout is set before connecting. `FD_CLOEXEC` is set
+/// right after `socket()` because `SOCK_CLOEXEC` does not exist on macOS: the
+/// supervisor's serve thread, the only caller, is also the only thread that
+/// spawns children, so none can inherit the socket in between.
+fn connect(path: &Path, left: &dyn Fn() -> io::Result<Duration>) -> io::Result<UnixStream> {
+    use rustix::net::{sockopt, AddressFamily, SocketAddrUnix, SocketType};
+    let address = SocketAddrUnix::new(path)?;
+    let socket = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+    rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
+    loop {
+        sockopt::set_socket_timeout(&socket, sockopt::Timeout::Send, Some(left()?))?;
+        match rustix::net::connect(&socket, &address) {
+            Ok(()) => return Ok(UnixStream::from(socket)),
+            Err(rustix::io::Errno::INTR) => continue,
+            // The send timeout passed with the backlog still full.
+            Err(rustix::io::Errno::AGAIN) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "inspection timed out: {} accepted no connection",
+                        path.display()
+                    ),
+                ))
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 #[cfg(test)]

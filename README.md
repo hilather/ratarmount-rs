@@ -258,7 +258,7 @@ Commands beyond mounting (see `ratarmount COMMAND --help`):
 | `journal summarize\|mark` | Summarize operation JSONL or mark an agent turn |
 | `tensors manifest PATH...` | Map local checkpoint tensors and expert slices to file byte ranges ([format and limits](docs/formats-tensors.md#expert-manifest)) |
 | `sandbox run` | Run one container command and finalize its attempt |
-| `sandbox daemon\|create-base\|new\|list\|diff\|stats\|destroy\|shutdown` | Manage attempts through the supervisor API |
+| `sandbox daemon\|create-base\|new\|list\|diff\|stats\|finalize\|destroy\|shutdown` | Manage attempts through the supervisor API; `finalize` seals, hashes and syncs one |
 | `snapshot <git> OUT.tar.zst` | Export a deterministic committed Git snapshot, optionally with its index |
 | `snapshot add\|list` | Wrap local restic snapshots |
 
