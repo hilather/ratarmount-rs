@@ -789,6 +789,17 @@ mod tests {
         }
     }
 
+    /// Regression (R1c-1 carry-in 1, Keystone note 1): the inspection socket
+    /// must be CLOEXEC — a dropped `SocketFlags::CLOEXEC` would leak it into
+    /// every later child. On Linux the flag is taken atomically at
+    /// `socket()`; on other Unixes `FD_CLOEXEC` is set right after.
+    #[test]
+    fn regression_inspection_socket_cloexec() {
+        let socket = stream_socket().unwrap();
+        let flags = rustix::io::fcntl_getfd(&socket).unwrap();
+        assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+    }
+
     /// A `ProcessMounter` whose unmount helper is the script `body` (run as
     /// `HELPER -u -- PATH`, its argv appended to `argv.log`) and whose mount
     /// table is the file `mounts`, listing `path`.

@@ -104,7 +104,7 @@ pub struct Retained {
 }
 
 impl Retained {
-    fn line(&self) -> Vec<u8> {
+    fn line(&self) -> Result<Vec<u8>> {
         let mut line = serde_json::to_vec(&Line {
             v: 1,
             id: self.id.clone(),
@@ -118,9 +118,17 @@ impl Retained {
             paths: Some(self.paths.clone()),
             report: Some(self.report.clone()),
         })
-        .expect("retained records serialize to JSON");
+        .map_err(|error| {
+            ApiError::new(
+                "io",
+                format!(
+                    "the retained record of {} cannot be serialized: {error}",
+                    self.id
+                ),
+            )
+        })?;
         line.push(b'\n');
-        line
+        Ok(line)
     }
 }
 
@@ -343,7 +351,7 @@ impl StateLog<RetainedRecords> {
     /// Appends a `retained` record (the commit's R2), synced before memory
     /// changes; a failed append is truncated away, else the log is `Broken`.
     pub fn append_retained(&mut self, record: &Retained) -> Result<()> {
-        let line = record.line();
+        let line = record.line()?;
         self.append(
             line,
             Parsed::Retained(Box::new(record.clone())),
@@ -680,6 +688,19 @@ impl<M: Mounter> Supervisor<M> {
                     self.retain_trees_preflight(resolved.as_path(), existing == layers)?;
                     let canonical =
                         resolved.join(layers.strip_prefix(&existing).unwrap_or(Path::new("")));
+                    // The record names the position by its cache path, which
+                    // serde writes as UTF-8: a cache path that is not UTF-8
+                    // (the configured root, or a symlink it resolved through)
+                    // is refused like R1b's lower paths.
+                    if canonical.to_str().is_none() {
+                        return Err(ApiError::new(
+                            "invalid_request",
+                            format!(
+                                "the bundle cache path {} is not UTF-8, so a retained record cannot name it",
+                                layers.display()
+                            ),
+                        ));
+                    }
                     prefix.push(LowerLayerRecord {
                         path: canonical.join("f".repeat(64)),
                         layer_digest: lower.layer_digest().into(),
@@ -713,7 +734,7 @@ impl<M: Mounter> Supervisor<M> {
             },
             report: widest_report(&attempt, &root),
         };
-        let size = record.line().len() as u64;
+        let size = record.line()?.len() as u64;
         if size > LINE_BOUND {
             return Err(ApiError::new(
                 "capacity",

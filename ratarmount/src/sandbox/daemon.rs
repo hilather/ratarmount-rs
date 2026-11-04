@@ -632,8 +632,8 @@ impl<M: Mounter> Supervisor<M> {
 
     /// Runs a v1 operation, or for a v2 one the same v1 operation; a v2 `new`
     /// with a `request_id` goes through the request-ID layer (§5.3), and every
-    /// v2 `new` passes its `lowers` and `journal` on: without them, and without
-    /// a `request_id`, it is a v1 `new`.
+    /// v2 `new` passes its `lowers`, `journal` and `retain` on: without them,
+    /// and without a `request_id`, it is a v1 `new`.
     pub fn handle(&mut self, operation: impl Into<Op>) -> Result<Value> {
         self.supervise();
         let operation = match operation.into() {

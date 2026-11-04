@@ -2901,8 +2901,9 @@ any mount process exists, so a retry under the same `request_id` runs again:
   commit could not move it into retained/"); storage that the
   [durability](#durability) rule refuses, checked at `new` for `attempts/`,
   `indexes/BASE/`, each directory lower and each bundle lower's cache directory
-  (or its deepest existing ancestor); and a bundle lower when neither
-  `XDG_CACHE_HOME` nor `HOME` is set.
+  (or its deepest existing ancestor); a bundle lower when neither
+  `XDG_CACHE_HOME` nor `HOME` is set; and a bundle lower whose cache path is
+  not UTF-8, since a `retained` record must name it.
 - `lower_changed`: a directory lower whose root has a write bit (with the
   `ratarmount overlay seal` remedy).
 - `capacity`: past `--max-retained` ("retaining N more attempts would pass
@@ -2987,9 +2988,9 @@ attempt-ID name — a stray file, a symlink or another name; move it aside.
   retained, or build layers meant to be retained as sealed directories with
   `overlay unpack`.
 - The commit's rename needs a state filesystem with no-replace renames, which
-  ext4, xfs, btrfs and tmpfs have (OpenZFS before 2.2 does not). Without them
-  every retain fails with `io` at the rename, after the whole finalize ("… does
-  not support no-replace renames (use ext4, xfs, btrfs or tmpfs)").
+  every filesystem on the durability allowlist has (ext4, xfs, btrfs and
+  tmpfs; OpenZFS before 2.2 does not), so a state filesystem without them is
+  refused at `new` with `invalid_request`, before anything starts.
 - For a retained attempt to survive a reboot, keep the state directory, the
   bundle cache and every lower on persistent filesystems: `$XDG_RUNTIME_DIR`,
   and often `/tmp`, are tmpfs.

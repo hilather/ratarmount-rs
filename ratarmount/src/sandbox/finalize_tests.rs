@@ -4020,7 +4020,9 @@ fn stack_in(env: &Env, parent: &Path, count: usize) -> Vec<PathBuf> {
 /// refused, before any attempt exists, on what finalize cannot retain: a
 /// non-TAR archive judged by its prepared index's `backendName` (v1 on that
 /// base unchanged), an archive without a prepared index or without a TAR
-/// index, a RAM overlay, a full `--max-retained`; by the durability rule for
+/// index, a RAM overlay, a full `--max-retained` (every live attempt created
+/// with `retain`, and every slot of a batch's `count`, counts); by the
+/// durability rule for
 /// `attempts/`, `indexes/`, each directory lower and each bundle position's
 /// cache directory (never the bundle file); and a future `retained.jsonl`
 /// line over 64 KiB (escapes counted) is `capacity`.
@@ -4161,6 +4163,34 @@ fn regression_supervisor_retain_preflight() {
         .new_v2("task", &[], Overlay::Disk, true, None)
         .unwrap_err();
     assert_eq!(error.code, "capacity", "{}", error.message);
+    // One slot over the held count: a batch counts its whole `count`, and a
+    // live, unfinalized attempt created with `retain` holds a slot.
+    env.sup.max_retained = env.sup.held().len() + 1;
+    let spawns = env.fake.0.lock().unwrap().spawns;
+    let error = env
+        .sup
+        .handle(OperationV2::New {
+            base: "task".into(),
+            count: 2,
+            overlay: Overlay::Disk,
+            quota: None,
+            readonly_globs: vec![],
+            request_id: None,
+            lowers: vec![],
+            journal: None,
+            retain: true,
+        })
+        .unwrap_err();
+    assert_eq!(error.code, "capacity", "{}", error.message);
+    nothing_started(&env, spawns);
+    let live = env.attempt(true, false);
+    assert!(env.sup.held().contains(&live.id));
+    let spawns = env.fake.0.lock().unwrap().spawns;
+    let error = env
+        .new_v2("task", &[], Overlay::Disk, true, None)
+        .unwrap_err();
+    assert_eq!(error.code, "capacity", "{}", error.message);
+    nothing_started(&env, spawns);
     env.sup.max_retained = super::retained::MAX_RETAINED;
     // The durability rule at `new`: attempts/, indexes/<base>/'s parent, a
     // directory lower's root or its parent on overlayfs.
@@ -4306,6 +4336,11 @@ fn regression_supervisor_retained_lifecycle() {
     assert_eq!(
         env.listed_all(),
         vec![(attempt.id.clone(), "retained".to_owned())]
+    );
+    // The commit dropped the child's mount-table entry at the old path.
+    assert_eq!(
+        env.fake.0.lock().unwrap().forgotten,
+        vec![attempt.path.clone()]
     );
     // v1 and v2 `list` hide it and answer the same bytes.
     let other = env.attempt(false, false);
@@ -5282,32 +5317,41 @@ fn regression_supervisor_retain_kept_target_unreadable_is_not_not_found() {
 /// preflight accepted a mount at that exact path even though no stop runs
 /// there, and S then refused it with a less specific device-mismatch `io`.
 /// A mount at or below `retained/ID/mnt` is refused at the preflight like
-/// any other mount inside a tree.
+/// any other mount inside a tree. The finalized (non-retained) fast path
+/// names no `mnt` either (PR A's still exempted `attempts/ID/mnt`, so a
+/// mount there reached S's `io` instead; sweep 3 review): no stop runs on
+/// a fast path.
 #[test]
 fn regression_supervisor_retain_fast_path_refuses_a_mount_at_mnt() {
     if !linux() {
         return;
     }
-    let mut env = Env::new();
-    let attempt = env.attempt(true, false);
-    env.finalize(&attempt.id, false, None).unwrap();
-    let kept = env.kept(&attempt.id);
-    for mount in [kept.join("mnt"), kept.join("mnt/inner")] {
-        env.fake.0.lock().unwrap().extra_mounts = vec![mount.clone()];
-        let error = env.finalize(&attempt.id, false, None).unwrap_err();
-        assert_eq!(
-            error.code, "invalid_request",
-            "{mount:?}: {}",
-            error.message
-        );
-        assert!(
-            error.message.contains("has a mount inside it"),
-            "{mount:?}: {}",
-            error.message
-        );
-        env.fake.0.lock().unwrap().extra_mounts.clear();
+    for retain in [true, false] {
+        let mut env = Env::new();
+        let attempt = env.attempt(retain, false);
+        env.finalize(&attempt.id, false, None).unwrap();
+        let root = if retain {
+            env.kept(&attempt.id)
+        } else {
+            attempt.path.parent().unwrap().to_path_buf()
+        };
+        for mount in [root.join("mnt"), root.join("mnt/inner")] {
+            env.fake.0.lock().unwrap().extra_mounts = vec![mount.clone()];
+            let error = env.finalize(&attempt.id, false, None).unwrap_err();
+            assert_eq!(
+                error.code, "invalid_request",
+                "{retain} {mount:?}: {}",
+                error.message
+            );
+            assert!(
+                error.message.contains("has a mount inside it"),
+                "{retain} {mount:?}: {}",
+                error.message
+            );
+            env.fake.0.lock().unwrap().extra_mounts.clear();
+        }
+        env.finalize(&attempt.id, false, None).unwrap();
     }
-    env.finalize(&attempt.id, false, None).unwrap();
 }
 
 /// Regression (sweep 2 review): `new` with `retain` ran the durability
@@ -6892,6 +6936,50 @@ fn regression_supervisor_retain_preflight_follows_a_symlinked_cache_root() {
     let report = env.finalize(&attempt.id, false, None).unwrap();
     assert_eq!(report["status"], "retained", "{report}");
     assert!(env.sup.seams.syncs.contains(&entry));
+}
+
+/// Regression (sweep 3 review): a bundle cache path that is not UTF-8 — a
+/// `XDG_CACHE_HOME`/`HOME` value, or a symlink it resolves through — made
+/// the `retained` record of the retain preflight fail to serialize, and the
+/// `expect` in `Retained::line` panicked the whole daemon (every live
+/// attempt's child died with it). `new` with `retain` and a bundle lower
+/// now refuses it with `invalid_request`, existing or not, before anything
+/// starts, and the next request is still answered.
+#[test]
+fn regression_supervisor_retain_non_utf8_cache_path() {
+    if !linux() {
+        return;
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let mut env = Env::new();
+    let (_, bundle) = env.bundle("B", &[("b.txt", "b\n")]);
+    let cache = env.dir().join(std::ffi::OsStr::from_bytes(b"cache-\xff"));
+    env.sup.seams.cache_root = Some(cache.clone());
+    // A cache root that does not exist yet: the check still sees the path
+    // the record would name (its deepest existing ancestor is UTF-8).
+    let spawns = env.fake.0.lock().unwrap().spawns;
+    for request_id in [None, Some("nonutf8")] {
+        let error = env
+            .new_v2("task", &[&bundle], Overlay::Disk, true, request_id)
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_request", "{}", error.message);
+        assert!(error.message.contains("UTF-8"), "{}", error.message);
+        nothing_started(&env, spawns);
+    }
+    assert_eq!(
+        env.sup.requests.status("nonutf8"),
+        Some(super::requests::Status::Retryable)
+    );
+    // An existing non-UTF-8 cache directory resolves to a non-UTF-8 path.
+    fs::create_dir_all(cache.join("ratarmount/layers")).unwrap();
+    let error = env
+        .new_v2("task", &[&bundle], Overlay::Disk, true, None)
+        .unwrap_err();
+    assert_eq!(error.code, "invalid_request", "{}", error.message);
+    assert!(error.message.contains("UTF-8"), "{}", error.message);
+    nothing_started(&env, spawns);
+    // The supervisor is unaffected: the next request is answered.
+    env.new_v2("task", &[], Overlay::Disk, true, None).unwrap();
 }
 
 /// Regression (R1c-1 sweep 1 Claude N5): a lower removed after step 3 was
