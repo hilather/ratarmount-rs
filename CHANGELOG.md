@@ -12,6 +12,7 @@
 
 ### Fixes
 
+- Live and offline overlay commits treat implied TAR parent directories as having no archive member: permission changes append a directory entry, and deleting an implied directory no longer fails with a missing suffix member. Successful live commits clear its pending metadata; persistent interval failures warn at occurrences 2, 4, 8, ... after the first error. (#254; legacy-sidecar follow-up: #255)
 - Sandbox supervisor: connecting to an attempt's inspection socket (`diff` and `stats` of a serving attempt, the lower-layer re-check of a version 2 `new`, finalize's `erofs_denied`) now counts against the exchange's timeout. A mount process that stopped accepting connections held the daemon indefinitely once its listen backlog had filled, since earlier connects that gave up stay queued.
 
 ## 0.1.37
@@ -27,6 +28,7 @@
 
 ### Fixes
 
+- Dependencies: zstd 0.13.3 → 0.13.4, zstd-safe 7.3.0 → 7.4.0 and zstd-sys 2.1.0 → 2.1.2 (bundled libzstd 1.5.7 unchanged), fixing RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403 and RUSTSEC-2026-0410 (stream data leaking through a reused context, `Seekable::decompress` setting a `Vec` length past its capacity, uninitialized memory after a failed legacy-frame decode, and the wasm allocator shim). Lockfile-only; no API change.
 - Offline commit and recovery refuse a symlinked overlay database or any `-wal`, `-journal`, or `-shm` companion with exit 1. `--force-base-mismatch` cannot bypass this refusal. Before any write, refusal leaves the archive, symlink targets, database and recovery state unchanged. Writable mounts apply the same companion checks, including links inserted after classification (#239, #243).
 - A writable mount refuses an overlay database (`.ratarmount.overlay.sqlite`) that is a symlink, with exit 1 and an error naming the path, and never writes the link's target; a link swapped in after classification is refused at open (#222, #237).
 

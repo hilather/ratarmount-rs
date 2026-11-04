@@ -11272,3 +11272,213 @@ fn regression_remote_spool_hash_keeps_aliased_database_lock() {
     assert!(!other_process_sees_lock(&db), "oracle check");
     drop(h);
 }
+
+/// Regression #254: an implied parent directory (no TAR member; the index
+/// row is `isgenerated` with offsetheader 0) must not count as an archive
+/// member. Metadata changes on it must commit as a pure append, and
+/// removing it must classify as overlay-only, for live and offline commits.
+#[test]
+fn regression_254_implied_parent_dir_commit() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for compressed in [true, false] {
+        for (offline, idle, remove) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (false, false, true),
+            (true, false, true),
+        ] {
+            let cell =
+                format!("compressed={compressed}, offline={offline}, idle={idle}, remove={remove}");
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join(if compressed {
+                "base.tar.zst"
+            } else {
+                "base.tar"
+            });
+            let members = [ustar_file("a/b/f", b"payload")];
+            if compressed {
+                write_single_frame_tar_zst(&archive, &members);
+            } else {
+                fs::write(&archive, pack_tar(&members)).unwrap();
+            }
+            let root = dir.path().join("ov");
+            let ov = WriteOverlay::new_for_tests(
+                Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+                &root,
+            )
+            .unwrap();
+            if remove {
+                ov.unlink("/a/b/f").unwrap();
+                ov.rmdir("/a/b").unwrap();
+            } else {
+                ov.set_metadata(
+                    "/a/b",
+                    &OverlayMetadata {
+                        mode: Some(0o700),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert!(ov.metadata_for_path("/a/b").is_some(), "{cell}");
+            }
+            let result = if offline {
+                drop(ov);
+                commit_overlay(
+                    &root,
+                    &archive,
+                    &CommitOverlayOptions {
+                        yes: true,
+                        ..Default::default()
+                    },
+                )
+            } else {
+                let reopen =
+                    |p: &Path| Ok(Arc::new(provenance_base(p, "utf-8")?) as Arc<dyn MountSource>);
+                let result = if idle {
+                    ov.commit_live_idle(&archive, Duration::ZERO, reopen)
+                } else {
+                    ov.commit_live(&archive, reopen)
+                };
+                if result.as_ref().is_ok_and(|committed| *committed) && !remove {
+                    assert!(ov.metadata_for_path("/a/b").is_none(), "{cell}");
+                    if idle {
+                        let before = fs::read(&archive).unwrap();
+                        assert!(
+                            !ov.commit_live_idle(&archive, Duration::ZERO, |_| {
+                                panic!("empty second idle tick must not reopen the base")
+                            })
+                            .unwrap(),
+                            "{cell}"
+                        );
+                        assert_eq!(fs::read(&archive).unwrap(), before, "{cell}");
+                    }
+                }
+                result
+            };
+            let ok = match result {
+                Err(error)
+                    if !compressed && (!offline || remove) && soft_skip_gnu_tar_commit(&error) =>
+                {
+                    eprintln!("skip: {cell} needs working GNU tar: {error}");
+                    continue;
+                }
+                result => result.unwrap_or_else(|error| panic!("{cell}: {error}")),
+            };
+            assert!(ok, "commit ({cell})");
+            let committed = provenance_base(&archive, "utf-8").unwrap();
+            if remove {
+                assert!(committed.lookup("/a/b/f", 0).is_none(), "{cell}");
+                assert!(committed.lookup("/a/b", 0).is_none(), "{cell}");
+            } else {
+                let fi = committed.lookup("/a/b", 0).unwrap();
+                assert!(ratarmount_core::is_dir_mode(fi.mode), "{cell}");
+                assert_eq!(fi.mode & 0o7777, 0o700, "{cell}");
+                assert_eq!(read_member(&committed, "/a/b/f"), b"payload", "{cell}");
+            }
+        }
+    }
+}
+
+/// Regression: generated offsets are not TAR member offsets; real offset zero,
+/// sparse members and recursion depth must still participate in classification.
+#[test]
+fn regression_254_tar_offsetheaders_in_ignores_generated_entries() {
+    let mut fi = tar_fi_at(0);
+    if let UserData::Tar(t) = &mut fi.userdata[0] {
+        t.isgenerated = true;
+    }
+    fi.userdata.push(UserData::Other("wrapper".into()));
+    fi.userdata.extend(tar_fi_at(0).userdata);
+    let mut sparse = tar_fi_at(1024);
+    if let UserData::Tar(t) = &mut sparse.userdata[0] {
+        t.issparse = true;
+        t.recursiondepth = 1;
+    }
+    fi.userdata.extend(sparse.userdata);
+    assert_eq!(tar_offsetheaders_in(&fi).collect::<Vec<_>>(), [0, 1024]);
+}
+
+/// Regression: implied-only histories have no rewrite members, but missing
+/// provenance in any visited version must still fail both empty-offset checks.
+#[test]
+fn regression_254_all_tar_offsetheaders_implied_versions() {
+    struct Versions {
+        nver: u32,
+        version_paths: bool,
+        history: Vec<FileInfo>,
+        current: FileInfo,
+    }
+    impl MountSource for Versions {
+        fn list(&self, _: &str) -> Option<ListResult> {
+            None
+        }
+        fn lookup(&self, path: &str, version: i32) -> Option<FileInfo> {
+            if self.version_paths {
+                if let Some(version) = path.strip_prefix("/entry.versions/") {
+                    let index = version.parse::<usize>().ok()?.checked_sub(1)?;
+                    return self.history.get(index).cloned();
+                }
+            }
+            if path != "/entry" {
+                return None;
+            }
+            if version == 0 {
+                Some(self.current.clone())
+            } else {
+                self.history.get((version - 1) as usize).cloned()
+            }
+        }
+        fn versions(&self, _: &str) -> u32 {
+            self.nver
+        }
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            panic!("offset classification must not open members")
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    let mut implied = tar_fi_at(0);
+    if let UserData::Tar(t) = &mut implied.userdata[0] {
+        t.isgenerated = true;
+    }
+    implied.userdata.extend(implied.userdata.clone());
+    implied.userdata.push(UserData::Other("wrapper".into()));
+    let mut no_offset = tar_fi_at(0);
+    if let UserData::Tar(t) = &mut no_offset.userdata[0] {
+        t.offsetheader = None;
+    }
+    let mut no_tar = implied.clone();
+    no_tar.userdata = vec![UserData::Other("no TAR provenance".into())];
+    let mut mixed = implied.clone();
+    mixed.userdata.extend(no_offset.userdata.clone());
+
+    assert!(all_tar_offsetheaders(&NullBase, "/absent")
+        .unwrap()
+        .is_empty());
+    for (nver, version_paths) in [(0, true), (1, true), (2, false)] {
+        let mut base = Versions {
+            nver,
+            version_paths,
+            history: Vec::new(),
+            current: implied.clone(),
+        };
+        assert!(all_tar_offsetheaders(&base, "entry").unwrap().is_empty());
+        base.history = vec![implied.clone(), implied.clone()];
+        assert!(all_tar_offsetheaders(&base, "/entry").unwrap().is_empty());
+        for bad in [&no_offset, &no_tar, &mixed] {
+            base.current = bad.clone();
+            base.history = vec![implied.clone(), implied.clone()];
+            let err = all_tar_offsetheaders(&base, "/entry").unwrap_err();
+            assert!(err.to_string().contains("cannot classify"), "{err}");
+            base.current = implied.clone();
+            base.history = vec![bad.clone(), implied.clone()];
+            let err = all_tar_offsetheaders(&base, "/entry").unwrap_err();
+            assert!(err.to_string().contains("cannot classify"), "{err}");
+        }
+        base.history = vec![tar_fi_at(1024), tar_fi_at(0)];
+        assert_eq!(all_tar_offsetheaders(&base, "/entry").unwrap(), [0, 1024]);
+    }
+}
