@@ -43,7 +43,7 @@ directory holding the decompressed file.
 | **gzip** | Checkpoint every few MiB, built on first mount | Imports and exports RGZI and GZIDX seek indexes. Throughput is below Python's rapidgzip on small `.tar.gz` files; an opt-in `gzip-rapidgzip` build feature closes part of the gap. If you own the file, `--repack-seekable` converts it to multi-frame zstd or writes a sidecar seek index |
 | **bzip2** | 900 KiB block | Block map stored in the index; multi-stream files supported |
 | **xz** | Block | Multi-block and multi-stream files (`xz --block-size`, `pixz`) seek cheaply. A single-block file larger than about 256 MiB is decoded in full and spilled to a temporary file |
-| **zstd** | Frame | Multi-frame files and files with the official seek table are random access; `ratarmount shard` and `--repack-seekable` produce both. A single-frame file is decoded in full. Sequential reads decode ahead on up to four threads |
+| **zstd** | Frame | Multi-frame files and files with the official seek table are random access; `ratarmount shard` and `--repack-seekable` produce both. Top-level local archives and repacking support leading skippable frames; nested/Range sniffing requires data-frame magic at offset 0. A single-frame file is decoded in full. Sequential reads decode ahead on up to four threads |
 | **lz4** | Independent block | `lz4 -B7` style independent blocks seek cheaply |
 | **lzip**, **lzo**, **compress (`.Z`)**, **lzma**, **zlib** | Stream or member | Seekable bodies with the same checkpoint approach |
 | Concatenated streams | Partial | `--ignore-zeros` for TAR; concatenated zstd frames are the normal multi-frame case |
@@ -231,7 +231,9 @@ The complete status against the Python original is in the
    rapidgzip's parallel decoder, so small `.tar.gz` reads are slower than in
    Python. The opt-in `gzip-rapidgzip` build feature is a partial answer; the
    complete one is to repack archives you own with `--repack-seekable`. Exotic
-   xz filters and single-frame zstd larger than RAM decode in full.
+   xz filters and single-frame zstd larger than RAM decode in full. Nested/Range
+   zstd sniffing still requires data-frame magic at offset 0; leading skippables
+   are supported for top-level local archives and `--repack-seekable`.
 2. **Formats that are partial.** Classic SquashFS LZMA (spools through
    `unsquashfs`), pure RAR (libarchive only), encrypted SQLAR without
    sqlcipher, PDF Separation and Lab colour, LVM/RAID/Btrfs inside disk images,

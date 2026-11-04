@@ -91,6 +91,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 
 | Symptom / fix | Commands |
 |---------------|----------|
+| #257: leading zstd skippables misdetected as LZ4; prefixed seek-table offsets and truncated skippables | `CARGO_BUILD_JOBS=2 TMPDIR=/var/tmp flock /tmp/muse-cargo.lock cargo test -p ratarmount-compress --lib regression_257_` |
 | #254: implied TAR parent directories fail live/offline chmod or delete commits; successful idle chmod must clear pending metadata | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount-compositing --lib regression_254_implied_parent_dir_commit` |
 | #254: persistent interval commit failures need warnings at occurrences 2/4/8/... and reset on message change or success | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount regression_254_interval_repeat_warn_schedule` |
 | RUSTSEC-2026-0391/0398/0403/0410: stale zstd / zstd-safe / zstd-sys in workspace or Clippy witness lockfiles | `bash packaging/test-zstd-advisory-floor.sh` |

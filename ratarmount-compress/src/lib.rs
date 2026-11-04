@@ -185,10 +185,61 @@ pub fn detect_compression(path: &Path) -> Result<CompressionFormat> {
     let mut magic = [0u8; 16];
     let n = f.read(&mut magic)?;
     let by_magic = detect_compression_magic(&magic[..n])?;
+    let by_magic = refine_skippable_format(&mut f, by_magic, &magic[..n])?;
     if by_magic != CompressionFormat::None {
         return Ok(by_magic);
     }
     Ok(detect_compression_extension(path).unwrap_or(CompressionFormat::None))
+}
+
+/// Zstd and LZ4 share skippable-frame magic; inspect the first data frame.
+pub(crate) fn refine_skippable_format<R: Read + Seek>(
+    reader: &mut R,
+    by_magic: CompressionFormat,
+    head: &[u8],
+) -> Result<CompressionFormat> {
+    if by_magic != CompressionFormat::Lz4
+        || head.len() < 4
+        || u32::from_le_bytes(head[..4].try_into().unwrap()) & 0xFFFF_FFF0 != 0x184D_2A50
+    {
+        return Ok(by_magic);
+    }
+
+    let len = reader.seek(SeekFrom::End(0))?;
+    let mut pos = 0u64;
+    while pos < len {
+        reader.seek(SeekFrom::Start(pos))?;
+        let mut magic = [0u8; 4];
+        match reader.read_exact(&mut magic) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        if magic == [0x28, 0xB5, 0x2F, 0xFD] {
+            return Ok(CompressionFormat::Zstd);
+        }
+        if u32::from_le_bytes(magic) & 0xFFFF_FFF0 != 0x184D_2A50 {
+            break;
+        }
+        let mut size = [0u8; 4];
+        match reader.read_exact(&mut size) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        let Some(next) = pos
+            .checked_add(8)
+            .and_then(|p| p.checked_add(u64::from(u32::from_le_bytes(size))))
+        else {
+            break;
+        };
+        if next >= len {
+            break;
+        }
+        pos = next;
+    }
+    // Keep the existing LZ4 classification/error path for ambiguous inputs.
+    Ok(by_magic)
 }
 
 pub fn detect_compression_magic(magic: &[u8]) -> Result<CompressionFormat> {
@@ -832,6 +883,76 @@ mod tests {
             detect_compression_magic(b"LRZI\x00\x06").unwrap(),
             CompressionFormat::Lrzip
         );
+    }
+
+    /// Regression: #257 leading shared skippable magic routed zstd files to LZ4.
+    #[test]
+    fn regression_257_detect_skippable_zstd() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.bin");
+        let frame = encode_zstd_frame(b"zstd payload", 1).unwrap();
+        let skip = b"\x50\x2a\x4d\x18\x04\0\0\0\0\0\0\0";
+        let empty_skip = b"\x5f\x2a\x4d\x18\0\0\0\0";
+        for prefix in [skip.to_vec(), [empty_skip.as_slice(), skip].concat()] {
+            let bytes = [prefix.as_slice(), &frame].concat();
+            std::fs::write(&path, &bytes).unwrap();
+            // The slice-only API intentionally keeps its original classification.
+            assert_eq!(
+                detect_compression_magic(&bytes[..16]).unwrap(),
+                CompressionFormat::Lz4
+            );
+            assert_eq!(detect_compression(&path).unwrap(), CompressionFormat::Zstd);
+            let body = open_seekable_zstd(&path).unwrap();
+            let mut actual = Vec::new();
+            body.open_reader()
+                .unwrap()
+                .read_to_end(&mut actual)
+                .unwrap();
+            assert_eq!(actual, b"zstd payload");
+        }
+    }
+
+    /// Regression: #257 incomplete or ambiguous prefixes must keep the LZ4 error path.
+    #[test]
+    fn regression_257_skippable_detection_ambiguous_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.zst");
+        let skip = b"\x50\x2a\x4d\x18\x04\0\0\0\0\0\0\0";
+        let mut cases = vec![
+            skip.to_vec(),
+            [skip.as_slice(), skip].concat(),
+            [skip.as_slice(), b"junk"].concat(),
+            [skip.as_slice(), b"\x28\xb5\x2f"].concat(),
+            b"\x50\x2a\x4d\x18\xff\xff\xff\xff\x28\xb5\x2f\xfd".to_vec(),
+        ];
+        for len in 4..8 {
+            cases.push(skip[..len].to_vec());
+        }
+        for bytes in cases {
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(detect_compression(&path).unwrap(), CompressionFormat::Lz4);
+        }
+    }
+
+    /// Regression: #257 shared skippable magic must still admit actual LZ4 streams.
+    #[test]
+    fn regression_257_skippable_lz4_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.lz4");
+        let payload = b"an actual LZ4 payload";
+        let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+        encoder.write_all(payload).unwrap();
+        let mut bytes = b"\x50\x2a\x4d\x18\x04\0\0\0skip".to_vec();
+        bytes.extend(encoder.finish().unwrap());
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(detect_compression(&path).unwrap(), CompressionFormat::Lz4);
+        let body = open_seekable_lz4(&path).unwrap();
+        let mut actual = Vec::new();
+        body.open_reader()
+            .unwrap()
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(actual, payload);
     }
 
     #[test]

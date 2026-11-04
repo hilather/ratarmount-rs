@@ -28,6 +28,12 @@ Nested mounts (e.g. `.tar.zst` inside ZIP/7z with `-r`) use the same seekable
 body path when the outer member is `Read + Seek` — see
 [embedded-nested-archives.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/embedded-nested-archives.md).
 
+Leading skippable frames (including pzstd headers) are supported for top-level
+local archives and `--repack-seekable`. Nested-member and remote Range sniffing
+still require the zstd data-frame magic `28 B5 2F FD` at offset 0. A stream with
+a skippable prefix uses the frame walk even if it has a seek-table footer, so
+its frame offsets include the prefix.
+
 ---
 
 ## Recommendation for producers
