@@ -619,7 +619,7 @@ impl RequestRecords {
             return Err(ApiError::new(
                 "capacity",
                 format!(
-                    "the request log is full of records that may not be evicted ({count} records and {live} bytes of at most {} and {}): finalize records whose attempts still exist, or requests still running; destroy the attempts those finalize requests name, then retry",
+                    "the request log is full of records that may not be evicted ({count} records and {live} bytes of at most {} and {}): finalize records whose attempts still exist, or requests still running; destroy the attempts those finalize requests name, then retry — for a retained attempt, which cannot be destroyed in this release, stop the daemon and move requests.jsonl aside, losing the retry records",
                     self.limits.records, self.limits.live_bytes
                 ),
             ));

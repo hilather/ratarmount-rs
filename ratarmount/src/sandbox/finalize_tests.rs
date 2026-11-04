@@ -6982,6 +6982,66 @@ fn regression_supervisor_retain_non_utf8_cache_path() {
     env.new_v2("task", &[], Overlay::Disk, true, None).unwrap();
 }
 
+/// Regression (sweep 4 review): a relative `XDG_CACHE_HOME` — the real repro
+/// held the bytes `cache-\xff` — whose path exists nowhere below the working
+/// directory the daemon runs with left the ancestor walk without an existing
+/// ancestor, so the preflight substituted `/` for it, `strip_prefix("/")`
+/// failed and the record position became `/`: the filesystem, UTF-8 and
+/// record-size checks inspected the root instead of the configured path, and
+/// `new` with `retain` created the cache and spawned the worker, which then
+/// failed `mount_failed` on the non-UTF-8 cache path. The cache path is made
+/// absolute first and `new` answers `invalid_request` before anything is
+/// created or spawned.
+#[test]
+fn regression_supervisor_retain_absent_relative_cache_path() {
+    if !linux() {
+        return;
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let mut env = Env::new();
+    let (_, bundle) = env.bundle("B", &[("b.txt", "b\n")]);
+    env.sup.seams.cache_root = Some(PathBuf::from(std::ffi::OsStr::from_bytes(b"cache-\xff")));
+    let spawns = env.fake.0.lock().unwrap().spawns;
+    let error = env
+        .new_v2("task", &[&bundle], Overlay::Disk, true, Some("relcache"))
+        .unwrap_err();
+    assert_eq!(error.code, "invalid_request", "{}", error.message);
+    assert!(error.message.contains("UTF-8"), "{}", error.message);
+    nothing_started(&env, spawns);
+    assert_eq!(
+        env.sup.requests.status("relcache"),
+        Some(super::requests::Status::Retryable)
+    );
+}
+
+/// Regression (sweep 4 review): `widest_report` is the hand-kept estimate the
+/// record preflight uses for the `retained.jsonl` line an attempt would
+/// write. If a field the real report grows is missing or narrower there,
+/// `new` admits a stack whose commit then refuses `capacity` on every try:
+/// the attempt can never be retained. The stored report of a real retain —
+/// with a journal and a bundle, its widest shapes — must serialize no larger
+/// than the estimate built for its stack.
+#[test]
+fn regression_supervisor_retain_report_fits_the_preflight_estimate() {
+    if !linux() {
+        return;
+    }
+    let mut env = Env::new();
+    let attempt = env.attempt(true, true);
+    fs::write(
+        attempt.path.parent().unwrap().join("journal.jsonl"),
+        "{\"journal\":1}\n{\"op\":\"read\",\"path\":\"/f\",\"ts\":1,\"bytes\":9}\n",
+    )
+    .unwrap();
+    let report = env.finalize(&attempt.id, true, None).unwrap();
+    assert_eq!(report["status"], "retained", "{report}");
+    let entry = &env.sup.retained[&attempt.id];
+    let widest = super::retained::widest_report(&entry.attempt, &env.kept(&attempt.id));
+    let real = serde_json::to_vec(&entry.report).unwrap().len();
+    let estimate = serde_json::to_vec(&widest).unwrap().len();
+    assert!(real <= estimate, "real report {real} > estimate {estimate}");
+}
+
 /// Regression (R1c-1 sweep 1 Claude N5): a lower removed after step 3 was
 /// answered `io` by S's first device read, where S's lock step answers
 /// R1b's `lower_changed`; it is `lower_changed` naming the lower, before

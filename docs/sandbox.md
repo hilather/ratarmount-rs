@@ -2480,10 +2480,14 @@ opened without following symlinks.
   with `capacity` and appends nothing ("the request log is full of records that
   may not be evicted (…): finalize records whose attempts still exist, or
   requests still running; destroy the attempts those finalize requests name,
-  then retry"). Records of destroyed attempts are evicted as before, so a retry
+  then retry — for a retained attempt, which cannot be destroyed in this
+  release, stop the daemon and move requests.jsonl aside, losing the retry
+  records"). Records of destroyed attempts are evicted as before, so a retry
   of a finalize whose attempt was destroyed long ago may run as a new request. A
   retained attempt cannot be destroyed in this release, so the finalize records
-  that name it stay. A `new` whose stored record would exceed 4 MiB is refused
+  that name it stay; when they are what fills the window, moving
+  `requests.jsonl` aside is the only remedy (a `forget` operation is planned).
+  A `new` whose stored record would exceed 4 MiB is refused
   with `capacity` before any attempt exists (only reachable
   with very long state or tmpfs paths). The file is rewritten with only the
   live records once it is over 8 MiB and more than twice their size.

@@ -433,7 +433,7 @@ fn retained_error(id: &str) -> ApiError {
 
 /// The widest report a retained record of this stack can carry, for the
 /// record preflight: every field at its widest.
-fn widest_report(attempt: &Attempt, root: &Path) -> Value {
+pub(super) fn widest_report(attempt: &Attempt, root: &Path) -> Value {
     let digest = format!("sha256:{}", "f".repeat(64));
     let path = |name: &str| root.join(name);
     json!({
@@ -672,6 +672,18 @@ impl<M: Mounter> Supervisor<M> {
                             "invalid_request",
                             "a bundle lower needs a cache directory: neither XDG_CACHE_HOME nor HOME is set",
                         ));
+                    };
+                    // The child resolves a relative cache root against the
+                    // working directory it inherits; so does this check. The
+                    // ancestor walk needs the absolute path: no ancestor of
+                    // an absent relative path exists, and substituting `/`
+                    // would drop the configured path from every check below.
+                    let layers = if layers.is_absolute() {
+                        layers
+                    } else {
+                        std::env::current_dir()
+                            .map_err(|e| io_error("the bundle cache path", &layers, e))?
+                            .join(layers)
                     };
                     // The child creates it under its deepest existing ancestor,
                     // following a symlinked cache root; so does this check.

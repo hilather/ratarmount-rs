@@ -8,15 +8,31 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub(super) fn private_tempdir() -> tempfile::TempDir {
-    tempfile::Builder::new()
+    // TMPDIR selects the root; a relative one is no root. Leave room for
+    // attempts/ID/inspect.sock within Darwin's 104-byte sun_path.
+    let root = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let dir = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
-        // Leave room for attempts/ID/inspect.sock within Darwin's 104-byte sun_path.
-        .tempdir_in("/tmp")
-        .unwrap()
+        .tempdir_in(&root)
+        .unwrap();
+    assert!(
+        dir.path()
+            .join("attempts/attempt-000000/inspect.sock")
+            .as_os_str()
+            .len()
+            < 104,
+        "TMPDIR {} leaves no room for attempts/ID/inspect.sock within a 104-byte sun_path ({})",
+        root.display(),
+        dir.path().display()
+    );
+    dir
 }
 
 #[derive(Default)]
