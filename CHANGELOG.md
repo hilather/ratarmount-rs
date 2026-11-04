@@ -12,6 +12,7 @@
 
 ### Fixes
 
+- Top-level local zstd archives and `--repack-seekable` recognize leading skippable frames, including pzstd output, instead of routing them to LZ4. Prefixed seek tables fall back to actual frame offsets, and truncated skippable frames are rejected. Fixes #257.
 - Live and offline overlay commits treat implied TAR parent directories as having no archive member: permission changes append a directory entry, and deleting an implied directory no longer fails with a missing suffix member. Successful live commits clear its pending metadata; persistent interval failures warn at occurrences 2, 4, 8, ... after the first error. (#254; legacy-sidecar follow-up: #255)
 - Sandbox supervisor: connecting to an attempt's inspection socket (`diff` and `stats` of a serving attempt, the lower-layer re-check of a version 2 `new`, finalize's `erofs_denied`) now counts against the exchange's timeout. A mount process that stopped accepting connections held the daemon indefinitely once its listen backlog had filled, since earlier connects that gave up stay queued.
 

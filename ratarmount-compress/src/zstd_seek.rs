@@ -397,14 +397,18 @@ fn scan_zstd_frames_walk<R: Read + Seek>(reader: &mut R) -> Result<ZstdFrameMap>
             let mut size_buf = [0u8; 4];
             match reader.read_exact(&mut size_buf) {
                 Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Err(CompressError::Msg("truncated zstd skippable frame".into()));
+                }
                 Err(e) => return Err(e.into()),
             }
-            let skip_size = u32::from_le_bytes(size_buf) as u64;
+            let skip_size = u64::from(u32::from_le_bytes(size_buf));
             let span_end = pos
-                .checked_add(SKIPPABLE_HEADER_SIZE + skip_size)
-                .ok_or_else(|| CompressError::Msg("zstd skippable frame size overflow".into()))?;
-            if magic == SEEK_TABLE_SKIPPABLE_MAGIC && skip_size >= 4 && span_end <= file_len {
+                .checked_add(SKIPPABLE_HEADER_SIZE)
+                .and_then(|p| p.checked_add(skip_size))
+                .filter(|&end| end <= file_len)
+                .ok_or_else(|| CompressError::Msg("truncated zstd skippable frame".into()))?;
+            if magic == SEEK_TABLE_SKIPPABLE_MAGIC && skip_size >= 4 {
                 reader.seek(SeekFrom::Start(span_end - 4))?;
                 let mut footer_magic = [0u8; 4];
                 if reader.read_exact(&mut footer_magic).is_ok()
@@ -947,11 +951,16 @@ fn build_frame_map_from_bytes(data: &[u8]) -> Result<(Vec<FrameInfo>, u64)> {
         let magic = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
 
         if (SKIPPABLE_MAGIC_MIN..=SKIPPABLE_MAGIC_MAX).contains(&magic) {
-            if pos + 8 > data.len() {
-                break;
-            }
-            let sz = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
-            pos += 8 + sz;
+            let header_end = (pos as u64)
+                .checked_add(SKIPPABLE_HEADER_SIZE)
+                .filter(|&end| end <= file_len)
+                .ok_or_else(|| CompressError::Msg("truncated zstd skippable frame".into()))?;
+            let sz = u32::from_le_bytes(data[pos + 4..header_end as usize].try_into().unwrap());
+            let span_end = header_end
+                .checked_add(u64::from(sz))
+                .filter(|&end| end <= file_len)
+                .ok_or_else(|| CompressError::Msg("truncated zstd skippable frame".into()))?;
+            pos = span_end as usize;
             continue;
         }
         if data[pos..pos + 4] != ZSTD_MAGIC {
@@ -1610,6 +1619,14 @@ impl Seek for ZstdFrameReader {
 fn try_load_seek_table_from_reader<R: Read + Seek>(
     reader: &mut R,
 ) -> Result<(Vec<FrameInfo>, u64)> {
+    reader.seek(SeekFrom::Start(0))?;
+    let mut first_magic = [0u8; 4];
+    reader.read_exact(&mut first_magic)?;
+    if first_magic != ZSTD_MAGIC {
+        return Err(CompressError::Msg(
+            "seek table data does not start at offset 0".into(),
+        ));
+    }
     let file_len = reader.seek(SeekFrom::End(0))?;
     if file_len < SEEK_TABLE_FOOTER_SIZE + SKIPPABLE_HEADER_SIZE {
         return Err(CompressError::Msg("file too small for seek table".into()));
@@ -1965,6 +1982,171 @@ mod tests {
         let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
         enc.write_all(part).unwrap();
         enc.finish().unwrap()
+    }
+
+    fn skippable_frame(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = SKIPPABLE_MAGIC_MIN.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    /// Regression: #257 a prefixed seek table must not replace real frame offsets.
+    #[test]
+    fn regression_257_skippable_seek_table_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seekable.zst");
+        let parts: [&[u8]; 2] = [b"first frame", b"second frame payload"];
+        let first = encode_frame(parts[0]);
+        let second = encode_frame(parts[1]);
+        let skip = skippable_frame(b"skip");
+        for (prefixed, cover_prefix) in [
+            (false, false),
+            (true, false),
+            // Even matching coverage cannot put a data frame at offset zero here.
+            (true, true),
+        ] {
+            let mut bytes = Vec::new();
+            if prefixed {
+                bytes.extend_from_slice(&skip);
+            }
+            let first_offset = bytes.len() as u64;
+            bytes.extend_from_slice(&first);
+            let second_offset = bytes.len() as u64;
+            bytes.extend_from_slice(&second);
+            let first_size = first.len() + if cover_prefix { skip.len() } else { 0 };
+            bytes.extend(build_seek_table_skippable(&[
+                (first_size as u32, parts[0].len() as u32),
+                (second.len() as u32, parts[1].len() as u32),
+            ]));
+            std::fs::write(&path, &bytes).unwrap();
+
+            let valid_table = !prefixed;
+            assert_eq!(
+                try_load_seek_table_from_reader(&mut Cursor::new(&bytes)).is_ok(),
+                valid_table
+            );
+            let map = scan_zstd_frames(&mut Cursor::new(&bytes)).unwrap();
+            assert_eq!(map.frames.len(), 2);
+            assert_eq!(map.frames[0].compressed_offset, first_offset);
+            assert_eq!(map.frames[1].compressed_offset, second_offset);
+            let blocks = export_zstd_blocks_from_reader(&mut Cursor::new(&bytes)).unwrap();
+            assert_eq!(blocks[0], (first_offset, 0));
+            assert_eq!(blocks[1], (second_offset, parts[0].len() as u64));
+
+            let expected = parts.concat();
+            for body in [
+                open_seekable_zstd(&path).unwrap(),
+                open_seekable_zstd_from_reader(Cursor::new(bytes.clone()), &path).unwrap(),
+            ] {
+                assert_eq!(
+                    body.kind(),
+                    if valid_table {
+                        "zstd-seek-table"
+                    } else {
+                        "zstd-frames"
+                    }
+                );
+                let mut reader = body.open_reader().unwrap();
+                let mut actual = Vec::new();
+                reader.read_to_end(&mut actual).unwrap();
+                assert_eq!(actual, expected);
+                reader
+                    .seek(SeekFrom::Start(parts[0].len() as u64 - 2))
+                    .unwrap();
+                let mut boundary = [0u8; 6];
+                reader.read_exact(&mut boundary).unwrap();
+                assert_eq!(boundary, expected[parts[0].len() - 2..parts[0].len() + 4]);
+            }
+        }
+    }
+
+    /// Regression: #257 truncated trailing skippables must not expose only earlier frames.
+    #[test]
+    fn regression_257_truncated_skippable_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.zst");
+        let output = dir.path().join("repacked.zst");
+        let skip = skippable_frame(b"prefix");
+        let mut suffixes = (4..8).map(|len| skip[..len].to_vec()).collect::<Vec<_>>();
+        for size in [10u32, u32::MAX] {
+            let mut suffix = SKIPPABLE_MAGIC_MAX.to_le_bytes().to_vec();
+            suffix.extend_from_slice(&size.to_le_bytes());
+            suffix.push(0);
+            suffixes.push(suffix);
+        }
+        for prefixed in [false, true] {
+            for suffix in &suffixes {
+                let mut bytes = if prefixed { skip.clone() } else { Vec::new() };
+                bytes.extend(encode_frame(b"first"));
+                bytes.extend(encode_frame(b"second"));
+                bytes.extend_from_slice(suffix);
+                std::fs::write(&path, &bytes).unwrap();
+                assert_eq!(
+                    crate::detect_compression(&path).unwrap(),
+                    crate::CompressionFormat::Zstd
+                );
+                for error in [
+                    scan_zstd_frames(&mut Cursor::new(&bytes)).unwrap_err(),
+                    build_frame_map_from_bytes(&bytes).unwrap_err(),
+                    try_parallel_frame_decode_bytes(&bytes, 2).unwrap_err(),
+                ] {
+                    assert_eq!(error.to_string(), "truncated zstd skippable frame");
+                }
+                for threads in [1, 4] {
+                    assert!(open_seekable_zstd_with_threads(&path, threads).is_err());
+                    assert!(open_seekable_zstd_with_threads_from_reader(
+                        Cursor::new(bytes.clone()),
+                        threads,
+                        &path
+                    )
+                    .is_err());
+                }
+                assert!(
+                    crate::repack_seekable(&path, &output, &crate::RepackOptions::default())
+                        .is_err()
+                );
+                assert!(!output.exists());
+            }
+        }
+    }
+
+    /// Regression: #257 complete skippable frames ending exactly at EOF remain valid.
+    #[test]
+    fn regression_257_complete_trailing_skippable_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("complete.zst");
+        for prefixed in [false, true] {
+            for payload in [b"".as_slice(), b"trailing payload"] {
+                let mut bytes = if prefixed {
+                    skippable_frame(b"prefix")
+                } else {
+                    Vec::new()
+                };
+                bytes.extend(encode_frame(b"first"));
+                bytes.extend(encode_frame(b"second"));
+                bytes.extend(skippable_frame(payload));
+                std::fs::write(&path, &bytes).unwrap();
+                assert_eq!(
+                    scan_zstd_frames(&mut Cursor::new(&bytes))
+                        .unwrap()
+                        .frames
+                        .len(),
+                    2
+                );
+                assert_eq!(build_frame_map_from_bytes(&bytes).unwrap().0.len(), 2);
+                for threads in [1, 4] {
+                    let body = open_seekable_zstd_with_threads(&path, threads).unwrap();
+                    assert_eq!(body.kind(), "zstd-frames");
+                    let mut actual = Vec::new();
+                    body.open_reader()
+                        .unwrap()
+                        .read_to_end(&mut actual)
+                        .unwrap();
+                    assert_eq!(actual, b"firstsecond");
+                }
+            }
+        }
     }
 
     fn ahead_fixture(threads: u32, budget: u64) -> (tempfile::TempDir, ZstdFrameReader, Vec<u8>) {

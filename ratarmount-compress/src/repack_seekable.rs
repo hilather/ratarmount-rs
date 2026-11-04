@@ -38,8 +38,8 @@ use crate::zstd_seek::{
     build_seek_table_skippable, encode_zstd_frame_to, scan_zstd_frames, ZstdFrameMap,
 };
 use crate::{
-    detect_compression_extension, detect_compression_magic, CompressError, CompressionFormat,
-    Result,
+    detect_compression_extension, detect_compression_magic, refine_skippable_format, CompressError,
+    CompressionFormat, Result,
 };
 
 /// Default uncompressed frame size (8 MiB). Matches `split -b 8M` in
@@ -243,7 +243,8 @@ fn classify_input(path: &Path) -> Result<InputKind> {
     if is_zip_or_7z(magic) {
         return Err(v1_reads_err());
     }
-    match detect_compression_magic(magic)? {
+    let by_magic = detect_compression_magic(magic)?;
+    match refine_skippable_format(&mut file, by_magic, magic)? {
         CompressionFormat::Zstd => Ok(InputKind::Zstd),
         CompressionFormat::Gzip => Ok(InputKind::Gzip),
         CompressionFormat::None => match detect_compression_extension(path) {
@@ -1012,6 +1013,95 @@ mod tests {
         let mut buf = vec![0u8; b"BBBB-second".len()];
         reader.read_exact(&mut buf).unwrap();
         assert_eq!(buf, b"BBBB-second");
+    }
+
+    /// Regression: #257 leading and interleaved skippables must preserve TAR bytes and offsets.
+    #[test]
+    fn regression_257_repack_prefixed_multiframe_tar() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("prefixed.tar.zst");
+        let output = dir.path().join("copied.tar.zst");
+        let tar = two_member_tar();
+        let first = encode_zstd_frame(&tar[..1024], 1).unwrap();
+        let second = encode_zstd_frame(&tar[1024..], 1).unwrap();
+        let skip = b"\x50\x2a\x4d\x18\x04\0\0\0skip";
+        let bytes = [skip.as_slice(), &first, skip, &second].concat();
+        fs::write(&input, &bytes).unwrap();
+
+        assert_eq!(
+            crate::detect_compression(&input).unwrap(),
+            CompressionFormat::Zstd
+        );
+        let map = scan_zstd_frames(&mut std::io::Cursor::new(&bytes)).unwrap();
+        assert_eq!(map.frames.len(), 2);
+        assert_eq!(map.frames[0].compressed_offset, skip.len() as u64);
+        assert_eq!(
+            map.frames[1].compressed_offset,
+            (2 * skip.len() + first.len()) as u64
+        );
+        assert_eq!(map.frames[1].uncompressed_offset, 1024);
+        assert!(map.seek_table.is_none());
+        // This is the detect-then-open body path used for top-level local mounts.
+        let body = open_seekable_zstd(&input).unwrap();
+        assert_eq!(body.kind(), "zstd-frames");
+        let mut reader = body.open_reader().unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, tar);
+        assert_eq!(ustar_names(&actual), ["a.txt", "b.txt"]);
+        reader.seek(SeekFrom::Start(1020)).unwrap();
+        let mut boundary = [0u8; 16];
+        reader.read_exact(&mut boundary).unwrap();
+        assert_eq!(boundary, tar[1020..1036]);
+        reader.seek(SeekFrom::Start(1536)).unwrap();
+        let mut member = [0u8; 13];
+        reader.read_exact(&mut member).unwrap();
+        assert_eq!(&member, b"bravo-payload");
+
+        let report = repack_seekable(&input, &output, &RepackOptions::default()).unwrap();
+        assert_eq!(report.action, RepackAction::CopiedWithoutFooter);
+        assert_eq!(report.uncompressed_len, tar.len() as u64);
+        assert_eq!(fs::read(&output).unwrap(), bytes);
+    }
+
+    /// Regression: #257 a single prefixed zstd frame must mount and repack by recompressing.
+    #[test]
+    fn regression_257_repack_prefixed_single_frame_tar() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("prefixed.tar.zst");
+        let output = dir.path().join("repacked.tar.zst");
+        let tar = two_member_tar();
+        let mut bytes = b"\x50\x2a\x4d\x18\x04\0\0\0skip".to_vec();
+        bytes.extend(encode_zstd_frame(&tar, 1).unwrap());
+        fs::write(&input, bytes).unwrap();
+        assert_eq!(
+            crate::detect_compression(&input).unwrap(),
+            CompressionFormat::Zstd
+        );
+        let body = open_seekable_zstd(&input).unwrap();
+        let mut actual = Vec::new();
+        body.open_reader()
+            .unwrap()
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(actual, tar);
+
+        let opts = RepackOptions {
+            frame_size: 512,
+            ..Default::default()
+        };
+        let report = repack_seekable(&input, &output, &opts).unwrap();
+        assert_eq!(report.action, RepackAction::Recompressed { frames: 6 });
+        let body = open_seekable_zstd(&output).unwrap();
+        assert_eq!(body.kind(), "zstd-seek-table");
+        let mut reader = body.open_reader().unwrap();
+        actual.clear();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, tar);
+        reader.seek(SeekFrom::Start(508)).unwrap();
+        let mut boundary = [0u8; 16];
+        reader.read_exact(&mut boundary).unwrap();
+        assert_eq!(boundary, tar[508..524]);
     }
 
     /// Regression: single-frame zstd recompress round-trips; a random read matches
