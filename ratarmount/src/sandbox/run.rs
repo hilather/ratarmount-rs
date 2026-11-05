@@ -103,7 +103,7 @@ impl ProcessIdentity {
     fn new(pid: u32) -> Self {
         Self {
             pid,
-            start: process_start(pid),
+            start: process_start(pid).ok().flatten(),
         }
     }
 
@@ -112,7 +112,8 @@ impl ProcessIdentity {
             return false;
         }
         if let Some(start) = &self.start {
-            return process_start(self.pid).as_ref() == Some(start);
+            // An unreadable stat is not proof of exit: report busy.
+            return process_start(self.pid).map_or(true, |now| now.as_ref() == Some(start));
         }
         // On platforms without /proc, conservatively treat a live PID as busy.
         unsafe { libc::kill(self.pid as i32, 0) == 0 }
@@ -142,18 +143,39 @@ fn is_runner(pid: u32) -> bool {
     }
 }
 
-fn process_start(pid: u32) -> Option<String> {
+/// The start time of a live, non-zombie `pid`. `Ok(None)` means the process
+/// is gone (or a zombie); any other read failure (EMFILE, EIO, ...) is an
+/// error, never evidence that the process exited.
+fn process_start(pid: u32) -> io::Result<Option<String>> {
+    #[cfg(all(test, target_os = "linux"))]
+    cleanup_test_hooks::stat(pid)?;
     #[expect(
         clippy::disallowed_methods,
         reason = r###"internal-read:v1 {"id":"IR-B0118-M01","item":"ratarmount::sandbox::run::process_start","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    };
     // comm can contain spaces and ')'; starttime is field 22.
-    let fields = stat.rsplit_once(") ")?.1;
+    let malformed = || io::Error::other(format!("malformed /proc/{pid}/stat"));
+    let fields = stat.rsplit_once(") ").ok_or_else(malformed)?.1;
     if fields.starts_with("Z ") {
-        return None;
+        return Ok(None);
     }
-    Some(fields.split_whitespace().nth(19)?.into())
+    Ok(Some(
+        fields
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(malformed)?
+            .into(),
+    ))
 }
 
 /// Send `signal` to the recorded process; returns whether it was sent. On Linux
@@ -179,7 +201,9 @@ fn signal_recorded(identity: &ProcessIdentity, signal: libc::c_int) -> io::Resul
             return Ok(false);
         };
         match pidfd_open(pid, PidfdFlags::empty()) {
-            Ok(pidfd) if process_start(identity.pid).as_deref() == Some(start) => {
+            // A stat read error (e.g. EMFILE while the pidfd is held) is
+            // returned, so the caller keeps the record and retries.
+            Ok(pidfd) if process_start(identity.pid)?.as_deref() == Some(start) => {
                 return match pidfd_send_signal(&pidfd, named) {
                     Ok(()) => Ok(true),
                     Err(Errno::SRCH) => Ok(false),
@@ -195,7 +219,7 @@ fn signal_recorded(identity: &ProcessIdentity, signal: libc::c_int) -> io::Resul
             Err(error) => return Err(error.into()),
         }
     }
-    if process_start(identity.pid).as_deref() != Some(start) {
+    if process_start(identity.pid)?.as_deref() != Some(start) {
         return Ok(false);
     }
     if unsafe { libc::kill(pid, signal) } == 0 {
@@ -238,6 +262,28 @@ mod cleanup_test_hooks {
 
     thread_local! {
         static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+        static STAT_FAULT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Fail `/proc/<pid>/stat` reads for `pid` with EMFILE on this thread.
+    pub struct StatFault;
+    impl StatFault {
+        pub fn arm(pid: u32) -> Self {
+            STAT_FAULT.set(Some(pid));
+            Self
+        }
+    }
+    impl Drop for StatFault {
+        fn drop(&mut self) {
+            STAT_FAULT.set(None);
+        }
+    }
+
+    pub fn stat(pid: u32) -> io::Result<()> {
+        if STAT_FAULT.get() == Some(pid) {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        Ok(())
     }
 
     pub struct Guard;
@@ -1931,6 +1977,18 @@ mod tests {
             child.try_wait().unwrap().is_none(),
             "a record that does not name the child signalled it"
         );
+        {
+            // A stat read failure after the pidfd is open is an error, not a
+            // missing process, and nothing is signalled.
+            let _fault = cleanup_test_hooks::StatFault::arm(child.id());
+            let error = signal_recorded(&recorded, libc::SIGKILL).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+            assert!(recorded.alive(), "an unreadable stat must count as busy");
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a stat read failure signalled the child"
+        );
         assert!(signal_recorded(&recorded, libc::SIGTERM).unwrap());
         assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
         assert!(!signal_recorded(&recorded, libc::SIGKILL).unwrap());
@@ -1960,7 +2018,7 @@ mod tests {
                 start: if reused {
                     Some("0".into())
                 } else {
-                    process_start(child.id())
+                    process_start(child.id()).unwrap()
                 },
             };
             let top = temp.path().join(format!("top-{reused}"));
