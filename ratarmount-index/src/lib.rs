@@ -2263,7 +2263,8 @@ impl SqliteIndex {
     /// - `archive_path` does not exist → `Ok` (virtual labels; cannot fingerprint).
     ///   URL / `oci:{digest}` labels hit this no-op; after fetching a remote sidecar
     ///   call [`check_tarstats_matches_remote`] instead.
-    /// - Size or whole-second mtime mismatch → [`IndexError::Mismatch`] (caller rebuilds).
+    /// - Size, whole-second mtime or nanoseconds (when stored) mismatch →
+    ///   [`IndexError::Mismatch`] (caller rebuilds).
     /// - When edge SHA-256 samples are stored, they must match (catches same-size/same-second replaces).
     ///
     /// Call **before** trusting `files` rows or compression side tables (RGZI / zstdblocks /
@@ -2292,6 +2293,26 @@ impl SqliteIndex {
                 stored.st_mtime,
                 actual_meta.st_mtime
             )));
+        }
+        if let Some(stored_ns) = stored.st_mtime_ns {
+            match actual_meta.st_mtime_ns {
+                Some(actual_ns) if actual_ns == stored_ns => {}
+                Some(actual_ns) => {
+                    return Err(IndexError::Mismatch(format!(
+                        "archive mtime_ns mismatch for {}: index tarstats st_mtime_ns={} current={}",
+                        archive_path.display(),
+                        stored_ns,
+                        actual_ns
+                    )));
+                }
+                None => {
+                    return Err(IndexError::Mismatch(format!(
+                        "archive mtime_ns missing for {} but index stored st_mtime_ns={}",
+                        archive_path.display(),
+                        stored_ns
+                    )));
+                }
+            }
         }
         // Content samples: only when present in the index (Python indexes omit them).
         if let Some(ref want_full) = stored.full_sha256 {
@@ -4023,6 +4044,53 @@ mod tests {
         assert!(stats.full_sha256.is_none());
     }
 
+    /// Regression: #263 a same-second mtime change passed warm-index validation
+    /// for large archives with matching size and edge hashes; legacy stats omit ns.
+    #[test]
+    fn check_tarstats_matches_archive_rejects_mtime_ns_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, vec![0x5a; TARSTATS_FULL_HASH_MAX as usize + 1]).unwrap();
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.store_tarstats_for_path(&archive).unwrap();
+        let stored = idx.tarstats().unwrap().unwrap();
+        let stored_ns = stored.st_mtime_ns.unwrap();
+        assert!(stored.full_sha256.is_none());
+        assert!(stored.prefix512_sha256.is_some());
+        assert!(stored.suffix512_sha256.is_some());
+        idx.check_tarstats_matches_archive(&archive).unwrap();
+
+        let other_ns = (stored_ns + 500_000_000) % 1_000_000_000;
+        let when = std::time::UNIX_EPOCH
+            + std::time::Duration::new(stored.st_mtime.try_into().unwrap(), other_ns as u32);
+        std::fs::File::options()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+        let actual = tar_stats_from_path(&archive).unwrap();
+        assert_eq!(actual.st_size, stored.st_size);
+        assert_eq!(actual.st_mtime, stored.st_mtime);
+        assert_ne!(actual.st_mtime_ns, stored.st_mtime_ns);
+        assert_eq!(actual.prefix512_sha256, stored.prefix512_sha256);
+        assert_eq!(actual.suffix512_sha256, stored.suffix512_sha256);
+        let err = idx.check_tarstats_matches_archive(&archive).unwrap_err();
+        assert!(
+            matches!(err, IndexError::Mismatch(ref msg) if msg.contains("mtime_ns")),
+            "{err}"
+        );
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&serialize_tarstats(&stored)).unwrap();
+        legacy.as_object_mut().unwrap().remove("st_mtime_ns");
+        idx.store_metadata_key_value("tarstats", &legacy.to_string())
+            .unwrap();
+        assert!(idx.tarstats().unwrap().unwrap().st_mtime_ns.is_none());
+        idx.check_tarstats_matches_archive(&archive)
+            .expect("legacy tarstats without nanoseconds still accept the same whole second");
+    }
+
     /// Regression: warm index must not be trusted when archive size/mtime/content no longer match tarstats.
     #[test]
     fn check_tarstats_matches_archive_rejects_size_or_mtime_mismatch() {
@@ -4069,7 +4137,10 @@ mod tests {
         {
             let stored = idx.tarstats().unwrap().unwrap();
             let when = std::time::UNIX_EPOCH
-                + std::time::Duration::from_secs(stored.st_mtime.max(0) as u64);
+                + std::time::Duration::new(
+                    stored.st_mtime.max(0) as u64,
+                    stored.st_mtime_ns.unwrap().try_into().unwrap(),
+                );
             let times = std::fs::FileTimes::new().set_modified(when);
             std::fs::File::options()
                 .write(true)
@@ -4082,7 +4153,7 @@ mod tests {
             .check_tarstats_matches_archive(&archive)
             .expect_err("content fingerprint mismatch");
         assert!(
-            matches!(err, IndexError::Mismatch(_)),
+            matches!(err, IndexError::Mismatch(ref msg) if msg.contains("fingerprint")),
             "expected Mismatch for content sample, got {err:?}"
         );
 

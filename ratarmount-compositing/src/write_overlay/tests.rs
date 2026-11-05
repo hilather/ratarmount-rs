@@ -2401,8 +2401,11 @@ fn regression_261_gnu_copy_commit_removes_stale_sidecar_when_edges_match() {
             let stale = SqliteIndex::open_read_only(&saved_sidecar).unwrap();
             let stored = stale.tarstats().unwrap().unwrap();
             assert!(stored.full_sha256.is_none());
-            let mtime =
-                std::time::UNIX_EPOCH + Duration::from_secs(stored.st_mtime.try_into().unwrap());
+            let mtime = std::time::UNIX_EPOCH
+                + Duration::new(
+                    stored.st_mtime.try_into().unwrap(),
+                    stored.st_mtime_ns.unwrap().try_into().unwrap(),
+                );
             File::options()
                 .write(true)
                 .open(&archive)
@@ -2429,6 +2432,240 @@ fn regression_261_gnu_copy_commit_removes_stale_sidecar_when_edges_match() {
             b"small addition\n"
         );
     }
+}
+
+fn run_263_xdg_child(test_name: &str) -> bool {
+    if std::env::var_os("RATARMOUNT_TEST_263_XDG_CHILD").is_some() {
+        return false;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let xdg = dir.path().join("xdg");
+    fs::create_dir_all(xdg.join("ratarmount")).unwrap();
+    let out = StdCommand::new(std::env::current_exe().unwrap())
+        .env("RATARMOUNT_TEST_263_XDG_CHILD", "1")
+        .env("XDG_CACHE_HOME", &xdg)
+        .args([test_name, "--exact", "--nocapture"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "child stdout: {}\nchild stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("running 1 test"));
+    eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    true
+}
+
+/// Regression: #263 a stale XDG index survived GNU copy publication and served
+/// the pre-commit tree when only the archive's mtime nanoseconds changed.
+#[test]
+fn regression_263_gnu_copy_commit_stale_xdg_index_rejected_on_warm_open() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    if run_263_xdg_child(
+        "write_overlay::tests::regression_263_gnu_copy_commit_stale_xdg_index_rejected_on_warm_open",
+    ) {
+        return;
+    }
+    if let Err(e) = ensure_gnu_tar() {
+        eprintln!("skip: {e}");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("base.tar");
+    let large = vec![0x5a; 512 * 1024];
+    let mut tar = pack_tar(&[
+        ustar_file("prefix.txt", b"untouched prefix\n"),
+        ustar_file("old.bin", &large),
+    ]);
+    const RECORD_SIZE: usize = 20 * 512;
+    tar.resize(tar.len().div_ceil(RECORD_SIZE) * RECORD_SIZE, 0);
+    fs::write(&archive, tar).unwrap();
+    let sidecar = append_index(&archive, false);
+    let saved_index = fs::read(&sidecar).unwrap();
+    let stored = SqliteIndex::open_read_only(&sidecar)
+        .unwrap()
+        .tarstats()
+        .unwrap()
+        .unwrap();
+    assert!(stored.st_size > ratarmount_index::TARSTATS_FULL_HASH_MAX);
+    assert!(stored.full_sha256.is_none());
+    let xdg_folder = PathBuf::from(std::env::var_os("XDG_CACHE_HOME").unwrap()).join("ratarmount");
+    let xdg_index = ratarmount_index::possible_index_paths(
+        &archive,
+        &ratarmount_index::default_index_folders(),
+    )
+    .into_iter()
+    .find(|path| path.parent() == Some(xdg_folder.as_path()))
+    .expect("existing XDG_CACHE_HOME must be a default lookup folder");
+    fs::create_dir_all(&xdg_folder).unwrap();
+    fs::write(&xdg_index, &saved_index).unwrap();
+    assert!(append_warm_open(&archive, false, &xdg_index)
+        .lookup("/old.bin", 0)
+        .is_some());
+    let companions: Vec<_> = ["-wal", "-shm", "-journal"]
+        .into_iter()
+        .map(|suffix| {
+            let mut path = xdg_index.clone().into_os_string();
+            path.push(suffix);
+            let path = PathBuf::from(path);
+            fs::write(&path, b"stale SQLite companion").unwrap();
+            path
+        })
+        .collect();
+    let overlay = dir.path().join("ov");
+    let ov = overlay_with_base(open_uncompressed_tar_base(&archive, false), &overlay);
+    ov.rename("/old.bin", "/renamed.bin").unwrap();
+    fs::write(overlay.join("added.txt"), b"small addition\n").unwrap();
+    drop(ov);
+    assert!(!collect_overlay_commit_plan(&overlay)
+        .unwrap()
+        .has_metadata_changes());
+    assert!(commit_overlay(
+        &overlay,
+        &archive,
+        &CommitOverlayOptions {
+            mode: CommitMode::Copy,
+            ..yes_commit_opts()
+        }
+    )
+    .unwrap());
+    assert!(
+        !sidecar.exists(),
+        "stale sibling index survived publication"
+    );
+    assert!(!xdg_index.exists(), "stale XDG index survived publication");
+    for path in &companions {
+        assert!(!path.exists(), "stale companion {}", path.display());
+    }
+    let (prefix, suffix) = ratarmount_index::archive_edge_hashes(&archive).unwrap();
+    if fs::metadata(&archive).unwrap().len() != stored.st_size
+        || Some(prefix) != stored.prefix512_sha256
+        || Some(suffix) != stored.suffix512_sha256
+    {
+        eprintln!("skip: same-second collision pin: host GNU tar changed size or edges");
+        return;
+    }
+
+    // Simulate a stale cache reappearing after publication.
+    fs::write(&xdg_index, saved_index).unwrap();
+    let other_ns = (stored.st_mtime_ns.unwrap() + 500_000_000) % 1_000_000_000;
+    let mtime =
+        std::time::UNIX_EPOCH + Duration::new(stored.st_mtime.try_into().unwrap(), other_ns as u32);
+    File::options()
+        .write(true)
+        .open(&archive)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(mtime))
+        .unwrap();
+    let actual = ratarmount_index::tar_stats_from_metadata(&fs::metadata(&archive).unwrap());
+    assert_eq!(actual.st_mtime, stored.st_mtime);
+    assert_ne!(actual.st_mtime_ns, stored.st_mtime_ns);
+    let stale = SqliteIndex::open_read_only(&xdg_index).unwrap();
+    let err = stale.check_tarstats_matches_archive(&archive).unwrap_err();
+    assert!(
+        matches!(err, ratarmount_index::IndexError::Mismatch(ref msg) if msg.contains("mtime_ns")),
+        "{err}"
+    );
+    drop(stale);
+    match SqliteIndexedTar::open_with_existing_index(
+        &archive,
+        &archive,
+        &xdg_index,
+        OpenOptions::default(),
+        &mut None,
+    ) {
+        Err(ratarmount_formats_tar::TarError::Index(ratarmount_index::IndexError::Mismatch(
+            msg,
+        ))) => {
+            assert!(msg.contains("mtime_ns"), "{msg}");
+        }
+        Err(e) => panic!("unexpected warm-open error: {e}"),
+        Ok(_) => panic!("warm open accepted the stale XDG index"),
+    }
+    SqliteIndexedTar::create_index(
+        &archive,
+        &archive,
+        Some(&xdg_index),
+        &OpenOptions {
+            write_index: true,
+            index_minimum_file_count: 0,
+            ..OpenOptions::default()
+        },
+        "test",
+        &mut None,
+    )
+    .unwrap();
+    let base = append_warm_open(&archive, false, &xdg_index);
+    assert!(base.lookup("/old.bin", 0).is_none());
+    assert_eq!(
+        read_member(base.as_ref(), "/prefix.txt"),
+        b"untouched prefix\n"
+    );
+    assert_eq!(read_member(base.as_ref(), "/renamed.bin"), large);
+    assert_eq!(
+        read_member(base.as_ref(), "/added.txt"),
+        b"small addition\n"
+    );
+}
+
+/// Regression: #263 flattened cache names exceeding NAME_MAX cannot be usable
+/// indexes and must not prevent an offline GNU copy commit from publishing.
+#[cfg(unix)]
+#[test]
+fn regression_263_gnu_copy_commit_skips_overlong_lookup_names() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    if run_263_xdg_child(
+        "write_overlay::tests::regression_263_gnu_copy_commit_skips_overlong_lookup_names",
+    ) {
+        return;
+    }
+    if let Err(e) = ensure_gnu_tar() {
+        eprintln!("skip: {e}");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut parent = dir.path().to_path_buf();
+    for _ in 0..4 {
+        parent.push("archive-parent-".repeat(5));
+    }
+    fs::create_dir_all(&parent).unwrap();
+    let archive = parent.join("base.tar");
+    fs::write(&archive, pack_tar(&[ustar_file("old", b"original")])).unwrap();
+    let sidecar = append_index(&archive, false);
+    let mut overlong_candidates = 0;
+    for path in
+        ratarmount_index::possible_index_paths(&archive, &ratarmount_index::default_index_folders())
+    {
+        if path != sidecar && path.parent().is_some_and(Path::is_dir) {
+            assert_eq!(
+                fs::metadata(&path).unwrap_err().raw_os_error(),
+                Some(libc::ENAMETOOLONG),
+                "{}",
+                path.display()
+            );
+            overlong_candidates += 1;
+        }
+    }
+    assert!(overlong_candidates > 0, "isolated XDG cache must exist");
+    let overlay = dir.path().join("ov");
+    fs::create_dir(&overlay).unwrap();
+    fs::write(overlay.join("added"), b"new contents").unwrap();
+    assert!(commit_overlay(
+        &overlay,
+        &archive,
+        &CommitOverlayOptions {
+            mode: CommitMode::Copy,
+            ..yes_commit_opts()
+        }
+    )
+    .unwrap());
+    assert!(!sidecar.exists());
+    let fresh = append_index(&archive, false);
+    let base = append_warm_open(&archive, false, &fresh);
+    assert_eq!(read_member(base.as_ref(), "/old"), b"original");
+    assert_eq!(read_member(base.as_ref(), "/added"), b"new contents");
 }
 
 /// Regression: successful append followed by reopen failure must refuse stale reads.
