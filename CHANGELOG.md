@@ -12,6 +12,7 @@
 
 ### Fixes
 
+- Offline GNU TAR copy commits remove the sibling index before publishing the updated archive, so a warm remount sees renamed, deleted and added members even when archive size, mtime and edge hashes match. Fixes #261.
 - Live and offline uncompressed TAR overlay commits disable GNU tar append recursion so nested additions no longer become self-hardlinks that read as 0 B on remount. Commits preserve new directory modes, including recent parents of idle children, without overwriting existing parent metadata and refuse unreadable overlay subtrees. Raw-directory commits retain empty directories in TAR, ZIP and zstd archives. Fixes #259.
 - Top-level local zstd archives and `--repack-seekable` recognize leading skippable frames, including pzstd output, instead of routing them to LZ4. Prefixed seek tables fall back to actual frame offsets, and truncated skippable frames are rejected. Fixes #257.
 - Live and offline overlay commits treat implied TAR parent directories as having no archive member: permission changes append a directory entry, and deleting an implied directory no longer fails with a missing suffix member. Successful live commits clear its pending metadata; persistent interval failures warn at occurrences 2, 4, 8, ... after the first error. (#254; legacy-sidecar follow-up: #255)
