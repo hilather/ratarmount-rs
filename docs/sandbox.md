@@ -2844,7 +2844,7 @@ recorded attempt and never resolves `id` again:
 | A try returned a report | Gets the stored report, byte for byte; nothing runs, not even the durability step. |
 | The last try failed (`writers_active`, `lower_changed`, `in_use`, `io`, …) and the recorded attempt still exists | Runs again on that attempt and resumes; if another finalize completed it meanwhile, the retry gets that stored report after the durability step. |
 | The recorded attempt is gone (destroyed, or discarded by a restart), also when a new attempt has drawn its ID since | `not_found`: "attempt ID that this request finalizes is gone (destroyed, or discarded by a restart); a retry never acts on another attempt of the same name". Nothing is appended, and every later retry answers the same. |
-| The recorded attempt was retained, and the daemon restarted since | The not-served `invalid_request` of [retained attempts](#retained-attempts); nothing is appended. |
+| The recorded attempt was retained, and the daemon restarted since (also when `retained.jsonl` is gone but its name remains under `retained/`) | The not-served `invalid_request` of [retained attempts](#retained-attempts); nothing is appended. |
 | A try was cut off by a supervisor restart | `interrupted`: "finalize was cut off by a supervisor restart before it finished; an attempt that was not retained was discarded, and a retained one is kept on disk". |
 
 Every finalize error is retryable, since nothing needs undoing; only a restart

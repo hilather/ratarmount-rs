@@ -435,6 +435,9 @@ fn retained_error(id: &str) -> ApiError {
 /// record preflight: every field at its widest.
 pub(super) fn widest_report(attempt: &Attempt, root: &Path) -> Value {
     let digest = format!("sha256:{}", "f".repeat(64));
+    // A Git base in a SHA-256 repository records `git-tree:` and 64 digits —
+    // the widest `patch_hash.base` (a `weak:` stamp is shorter).
+    let base = format!("git-tree:{}", "f".repeat(64));
     let path = |name: &str| root.join(name);
     json!({
         "status": "retained",
@@ -442,7 +445,7 @@ pub(super) fn widest_report(attempt: &Attempt, root: &Path) -> Value {
             "id": attempt.id, "base": attempt.base, "path": attempt.path,
             "overlay_dir": attempt.overlay_dir, "status": "retained"
         },
-        "patch_hash": {"patch": digest, "base": digest, "stack": digest, "files": u64::MAX,
+        "patch_hash": {"patch": digest, "base": base, "stack": digest, "files": u64::MAX,
             "normalize": "strict", "algo": "sha256", "excludes": [], "sealed": true,
             "base_pending": false, "base_digest_state": "present"},
         "layer_digest": digest,

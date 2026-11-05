@@ -791,8 +791,9 @@ mod tests {
 
     /// Regression (R1c-1 carry-in 1, Keystone note 1): the inspection socket
     /// must be CLOEXEC — a dropped `SocketFlags::CLOEXEC` would leak it into
-    /// every later child. On Linux the flag is taken atomically at
-    /// `socket()`; on other Unixes `FD_CLOEXEC` is set right after.
+    /// every later child. `stream_socket` takes the flag atomically at
+    /// `socket()` on Linux and sets `FD_CLOEXEC` right after elsewhere; the
+    /// test guards only that the flag is set, not how it got there.
     #[test]
     fn regression_inspection_socket_cloexec() {
         let socket = stream_socket().unwrap();

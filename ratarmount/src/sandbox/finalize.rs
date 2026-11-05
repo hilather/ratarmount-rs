@@ -598,6 +598,12 @@ impl<M: Mounter> Supervisor<M> {
         if kept {
             return Err(self.not_served(&target.id));
         }
+        // A bare name under `retained/` (the record's log is gone) holds the
+        // ID the way `resolve_target` holds it through `held()`: not served,
+        // never "gone" while the tree is on disk.
+        if self.bare_retained.contains(&target.id) {
+            return Err(self.not_served(&target.id));
+        }
         Err(ApiError::new(
             "not_found",
             format!(

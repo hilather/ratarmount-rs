@@ -12,12 +12,33 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub(super) fn private_tempdir() -> tempfile::TempDir {
-    // TMPDIR selects the root; a relative one is no root. Leave room for
-    // attempts/ID/inspect.sock within Darwin's 104-byte sun_path.
-    let root = std::env::var_os("TMPDIR")
+    // TMPDIR selects the root; a relative one is no root.
+    let requested = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .unwrap_or_else(|| PathBuf::from("/tmp"));
+    private_tempdir_in(&requested)
+}
+
+/// `private_tempdir` at `requested`. `Supervisor::open` canonicalizes the
+/// state root, so room for attempts/ID/inspect.sock within Darwin's 104-byte
+/// `sun_path` is judged on the resolved path: a short `TMPDIR` symlink to a
+/// long directory (macOS /var/folders resolves under /private) would
+/// otherwise pass the check and overflow the socket path. Falls back to
+/// `/tmp` (resolved) when the resolved root leaves no room.
+fn private_tempdir_in(requested: &Path) -> tempfile::TempDir {
+    let resolved = requested
+        .canonicalize()
+        .unwrap_or_else(|_| requested.to_path_buf());
+    // tempfile names each directory `.tmp` + 6 characters.
+    let socket = "/.tmpXXXXXX/attempts/attempt-000000/inspect.sock".len();
+    let root = if resolved.as_os_str().len() + socket < 104 {
+        resolved
+    } else {
+        Path::new("/tmp")
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    };
     let dir = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(&root)
@@ -28,11 +49,52 @@ pub(super) fn private_tempdir() -> tempfile::TempDir {
             .as_os_str()
             .len()
             < 104,
-        "TMPDIR {} leaves no room for attempts/ID/inspect.sock within a 104-byte sun_path ({})",
+        "temporary root {} leaves no room for attempts/ID/inspect.sock within a 104-byte sun_path ({})",
         root.display(),
         dir.path().display()
     );
     dir
+}
+
+/// Regression (sweep 5 review): the socket-length check measured `TMPDIR` as
+/// written, but `Supervisor::open` canonicalizes the state root, so a short
+/// `TMPDIR` symlink to a long directory passed the check and the real socket
+/// path overflowed `sun_path` (macOS /var/folders -> /private/var/folders).
+/// The check must use the resolved path and fall back to `/tmp`.
+#[test]
+fn regression_private_tempdir_judges_the_resolved_root() {
+    let anchor = private_tempdir();
+    let mut long = anchor.path().canonicalize().unwrap();
+    while long.as_os_str().len() < 120 {
+        long.push("a_long_directory_component");
+    }
+    fs::create_dir_all(&long).unwrap();
+    let short = anchor.path().join("s");
+    symlink(&long, &short).unwrap();
+    let dir = private_tempdir_in(&short);
+    let resolved = dir.path().canonicalize().unwrap();
+    assert!(
+        !resolved.starts_with(&long),
+        "{resolved:?} is under the long dir"
+    );
+    assert!(
+        resolved
+            .join("attempts/attempt-000000/inspect.sock")
+            .as_os_str()
+            .len()
+            < 104,
+        "{resolved:?}"
+    );
+    // A short real directory is still used as is (resolved).
+    let direct = private_tempdir();
+    let dir = private_tempdir_in(direct.path());
+    assert!(
+        dir.path()
+            .starts_with(direct.path().canonicalize().unwrap()),
+        "{:?} not under {:?}",
+        dir.path(),
+        direct.path()
+    );
 }
 
 #[derive(Default)]

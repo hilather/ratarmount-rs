@@ -2484,9 +2484,15 @@ fn regression_supervisor_finalize_sync_poison() {
             base: None,
         })
         .unwrap();
-    // A finalize whose trees all report another device succeeds.
+    // A finalize whose trees all report another device succeeds. The
+    // override covers the whole temporary root (the state directory and the
+    // scratch directory are siblings under it): `/tmp` cannot be written
+    // literally, `private_tempdir` honors `TMPDIR`.
     let elsewhere = env.attempt(false, false);
-    env.sup.seams.devices.insert(PathBuf::from("/tmp"), 999);
+    env.sup
+        .seams
+        .devices
+        .insert(env.dir().parent().unwrap().to_path_buf(), 999);
     env.finalize(&elsewhere.id, false, None).unwrap();
     env.sup.seams.devices.clear();
     drop(env);
@@ -5312,6 +5318,61 @@ fn regression_supervisor_retain_kept_target_unreadable_is_not_not_found() {
     assert_eq!(env.requests_len(), len, "nothing appended");
 }
 
+/// Regression (sweep 5 review): a retry of a retain commit that failed at
+/// R4 must not report its kept tree as gone once `retained.jsonl` is moved
+/// aside. The bare name under `retained/` still holds the ID, as it does for
+/// a fresh `finalize` of the same ID: the stored target answers the
+/// not-served `invalid_request`, appends nothing and stays `retryable`;
+/// before this, `kept_unserved` found no live record and the retry answered
+/// `not_found` for a tree still on disk.
+#[test]
+fn regression_supervisor_retain_retry_of_bare_kept_tree_is_not_served() {
+    if !linux() {
+        return;
+    }
+    let mut env = Env::new();
+    let attempt = env.attempt(true, false);
+    // A retryable finalize record holds the target: an fsync failure at R4.
+    env.sup
+        .seams
+        .fsync_errors
+        .insert(env.sup.root.join("retained"), 5);
+    let error = env.finalize(&attempt.id, false, Some("q")).unwrap_err();
+    assert_eq!(error.code, "io", "{}", error.message);
+    env.sup.seams.fsync_errors.clear();
+    assert_eq!(
+        env.sup.requests.status("q"),
+        Some(super::requests::Status::Retryable)
+    );
+    // `retained.jsonl` moved aside and a restart: a bare name, no record.
+    let aside = env.dir().join("aside.jsonl");
+    fs::rename(env.sup.root.join(super::retained::NAME), &aside).unwrap();
+    let mut env = env.reopen();
+    assert!(env.sup.bare_retained.contains(&attempt.id));
+    assert!(env.sup.retained_log.live(&attempt.id).is_none());
+    let len = env.requests_len();
+    let error = env.finalize(&attempt.id, false, Some("q")).unwrap_err();
+    assert_eq!(error.code, "invalid_request", "{}", error.message);
+    assert!(
+        error.message.contains("does not serve"),
+        "{}",
+        error.message
+    );
+    assert_eq!(env.requests_len(), len, "nothing appended");
+    assert_eq!(
+        env.sup.requests.status("q"),
+        Some(super::requests::Status::Retryable)
+    );
+    // A fresh `finalize` of the same ID answers it the same way.
+    let error = env.finalize(&attempt.id, false, Some("fresh")).unwrap_err();
+    assert_eq!(error.code, "invalid_request", "{}", error.message);
+    assert!(
+        error.message.contains("does not serve"),
+        "{}",
+        error.message
+    );
+}
+
 /// Regression (sweep 1 review): the retained fast path's tree carried
 /// `retained/ID/mnt` as the mount point a stop removes, so the durability
 /// preflight accepted a mount at that exact path even though no stop runs
@@ -5473,25 +5534,37 @@ fn fsyncs_of(events: &[String], root: &Path, path: &Path) -> Vec<usize> {
 
 /// Regression (R1c-1 T20.1, ruling 1+2, pre-R1c hit): a cache entry
 /// published before the attempt with no sync (as the pre-R1c route left
-/// entries), named by the attempt's records as a cache hit, was never made
-/// durable by a retain. The recorder shows, in order: the entry's files, the
-/// entry, its parent; the top; `attempts/ID`; `indexes/<base>/`; the S3
-/// ancestors, deepest first and each once; then the `retained` append, the
-/// rename, `retained/` and `attempts/`. Every sync comes from that finalize;
-/// a second retained attempt over the same entry syncs it again.
+/// entries — staged beside the destination and renamed into place, with no
+/// entry lock and no fsync), named by the attempt's records as a cache hit,
+/// was never made durable by a retain. The recorder shows, in order: the
+/// entry's files, the entry, its parent; the top; `attempts/ID`;
+/// `indexes/<base>/`; the S3 ancestors, deepest first and each once; then
+/// the `retained` append, the rename, `retained/` and `attempts/`. Every
+/// sync comes from that finalize; a second retained attempt over the same
+/// entry syncs it again.
 #[test]
 fn regression_supervisor_retain_syncs_preexisting_cache_entry() {
     if !linux() {
         return;
     }
+    use sha2::Digest;
     let mut env = Env::new();
-    let (_, bundle) = env.bundle("Pre", &[("p.txt", "p\n")]);
+    let (layer, bundle) = env.bundle("Pre", &[("p.txt", "p\n")]);
     let xdg = env.dir().join("xdg");
     let cache = xdg.join("ratarmount/layers");
-    let entry = cache_thread(bundle.clone(), cache.clone(), env.base.clone(), None)
-        .join()
-        .unwrap()
-        .unwrap();
+    fs::create_dir_all(&cache).unwrap();
+    // The pre-R1c fill: the sealed entry renamed into place under the name
+    // `private_copy` gives it, the bundle bytes' digest — no lock, no sync.
+    // Renaming a directory updates its `..`, which needs a write bit on it,
+    // as `publish_layer`'s fchmod dance grants and restores.
+    let mode = fs::metadata(&layer).unwrap().permissions().mode() & 0o7777;
+    fs::set_permissions(&layer, fs::Permissions::from_mode(mode | 0o200)).unwrap();
+    let entry = cache.join(format!(
+        "{:x}",
+        sha2::Sha256::digest(fs::read(&bundle).unwrap())
+    ));
+    fs::rename(&layer, &entry).unwrap();
+    fs::set_permissions(&entry, fs::Permissions::from_mode(mode)).unwrap();
     env.cache_at(&xdg);
     let attempt = env.layered(&[&bundle], true);
     assert_eq!(
@@ -6141,6 +6214,47 @@ fn regression_request_log_replay_matches_the_run() {
     let live = log.live_lines();
     drop(log);
     assert_eq!(bare_log(dir.path()).live_lines(), live);
+}
+
+/// Regression (sweep 5 review): `pin` while the pins are unknown (`None`,
+/// every finalize record held between `open` and `set_pins`) must not narrow
+/// the set to that one target, which would silently make every other
+/// target's records evictable. Until `set_pins` a `new` that only evicting
+/// a pinned record could admit is `capacity`; `pin` then narrows as usual.
+#[test]
+fn regression_request_log_pin_before_set_pins_keeps_everything_pinned() {
+    use super::requests::{Pins, RequestLog, Status, Target};
+    let _limits = Limits::set(super::requests::Limits::new(3, 64 << 20, 4 << 20, 1).unwrap());
+    let dir = private_tempdir();
+    let hash = format!("sha256:{}", "0".repeat(64));
+    let target = |n: u8| Target {
+        id: format!("attempt-00000{n}"),
+        instance: format!("{n:032x}"),
+    };
+    let (x, y, z) = (target(1), target(2), target(3));
+    let mut log = RequestLog::open(dir.path(), super::requests::limits()).unwrap();
+    for (id, target) in [("F", &x), ("G", &y), ("H", &z)] {
+        log.begin_finalize(id, &hash, target).unwrap();
+        let busy = ApiError::new("writers_active", "busy");
+        assert!(log.finish_finalize(id, &hash, target, Err(busy)).is_err());
+    }
+    // `pin` under unknown pins holds every record: `N` is `capacity`, never
+    // "G or H evicted".
+    log.pin(x.clone());
+    let error = log.begin("N", &hash).unwrap_err();
+    assert_eq!(error.code, "capacity", "{}", error.message);
+    // `set_pins` then installs the real set: `N` fits by evicting `G`, the
+    // oldest record its targets do not name; `F` (pinned) is moved, `H`
+    // (unpinned) is not reached.
+    log.set_pins(Pins {
+        targets: [x].into_iter().collect(),
+        ids: Default::default(),
+    });
+    log.begin("N", &hash).unwrap();
+    log.finish("N", &hash, Ok((vec![], json!([])))).unwrap();
+    assert_eq!(log.status("F"), Some(Status::Retryable));
+    assert_eq!(log.status("G"), None);
+    assert_eq!(log.status("H"), Some(Status::Retryable));
 }
 
 const HOT_POINT: &str = "hot_journal";
@@ -7040,6 +7154,15 @@ fn regression_supervisor_retain_report_fits_the_preflight_estimate() {
     let real = serde_json::to_vec(&entry.report).unwrap().len();
     let estimate = serde_json::to_vec(&widest).unwrap().len();
     assert!(real <= estimate, "real report {real} > estimate {estimate}");
+    // A Git base's `git-tree:` + 64 digits is the widest `patch_hash.base`
+    // (2 bytes wider than `sha256:`), and must fit the same estimate.
+    let mut git = entry.report.clone();
+    git["patch_hash"]["base"] = json!(format!("git-tree:{}", "f".repeat(64)));
+    let real = serde_json::to_vec(&git).unwrap().len();
+    assert!(
+        real <= estimate,
+        "git-base report {real} > estimate {estimate}"
+    );
 }
 
 /// Regression (R1c-1 sweep 1 Claude N5): a lower removed after step 3 was

@@ -723,13 +723,14 @@ impl StateLog<RequestRecords> {
     }
 
     /// Pins `target`: its finalize records are never evicted until
-    /// [`unpin`](Self::unpin) (approval note (a)).
+    /// [`unpin`](Self::unpin) (approval note (a)). `None` means the pins are
+    /// unknown and every finalize record is already held, so a `pin` before
+    /// `set_pins` changes nothing rather than narrowing the set to this one
+    /// target — `open` installs the real pins before any `new` calls this.
     pub fn pin(&mut self, target: Target) {
-        self.records
-            .pins
-            .get_or_insert_with(Pins::default)
-            .targets
-            .insert(target);
+        if let Some(pins) = &mut self.records.pins {
+            pins.targets.insert(target);
+        }
     }
 
     /// Unpins `target`, whose attempt is gone; its records become evictable.
