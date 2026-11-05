@@ -2320,6 +2320,117 @@ fn commit_overlay_append_invalidates_stale_sidecar() {
     }
 }
 
+/// Regression: #261 GNU copy commits left a warm sidecar usable when archive
+/// size, whole-second mtime and edge hashes survived a rename plus a small add.
+#[test]
+fn regression_261_gnu_copy_commit_removes_stale_sidecar_when_edges_match() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for compressed_sidecar in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        let large = vec![0x5a; 512 * 1024];
+        let mut tar = pack_tar(&[
+            ustar_file("prefix.txt", b"untouched prefix\n"),
+            ustar_file("old.bin", &large),
+        ]);
+        // GNU tar writes 20-block records. Leave room in the last record for
+        // the small addition so deleting and renaming the large member can
+        // preserve the archive's size and both 512-byte edge samples.
+        const RECORD_SIZE: usize = 20 * 512;
+        tar.resize(tar.len().div_ceil(RECORD_SIZE) * RECORD_SIZE, 0);
+        fs::write(&archive, tar).unwrap();
+        let before_len = fs::metadata(&archive).unwrap().len();
+        assert!(before_len > ratarmount_index::TARSTATS_FULL_HASH_MAX);
+        let before_edges = ratarmount_index::archive_edge_hashes(&archive).unwrap();
+        let sidecar = append_index(&archive, false);
+        let saved_sidecar = dir.path().join("old.index.sqlite");
+        fs::copy(&sidecar, &saved_sidecar).unwrap();
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_uncompressed_tar_base(&archive, false), &overlay);
+        ov.rename("/old.bin", "/renamed.bin").unwrap();
+        fs::write(overlay.join("added.txt"), b"small addition\n").unwrap();
+        drop(ov);
+        let plan = collect_overlay_commit_plan(&overlay).unwrap();
+        assert!(plan.deleted_paths.contains("old.bin"));
+        assert!(!plan.has_metadata_changes(), "must exercise GNU TAR copy");
+
+        if compressed_sidecar {
+            // A compressed sibling must be unlinked at its original path,
+            // without resolving it into a decompressed temporary index.
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder
+                .write_all(&fs::read(&saved_sidecar).unwrap())
+                .unwrap();
+            fs::write(&sidecar, encoder.finish().unwrap()).unwrap();
+        }
+        let companions: Vec<_> = ["-wal", "-shm", "-journal"]
+            .into_iter()
+            .map(|suffix| {
+                let mut path = sidecar.clone().into_os_string();
+                path.push(suffix);
+                PathBuf::from(path)
+            })
+            .collect();
+        for path in &companions {
+            fs::write(path, b"stale SQLite companion").unwrap();
+        }
+
+        match commit_overlay(&overlay, &archive, &yes_commit_opts()) {
+            Ok(true) => {}
+            Err(e) if soft_skip_gnu_tar_commit(&e) => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            other => {
+                panic!("GNU TAR copy commit (compressed_sidecar={compressed_sidecar}): {other:?}")
+            }
+        }
+        assert!(
+            !ratarmount_index::default_index_path(&archive).exists(),
+            "GNU TAR copy commit left a stale sibling index"
+        );
+        for path in &companions {
+            assert!(!path.exists(), "stale companion {}", path.display());
+        }
+
+        let after_len = fs::metadata(&archive).unwrap().len();
+        let after_edges = ratarmount_index::archive_edge_hashes(&archive).unwrap();
+        if before_len == after_len && before_edges == after_edges {
+            let stale = SqliteIndex::open_read_only(&saved_sidecar).unwrap();
+            let stored = stale.tarstats().unwrap().unwrap();
+            assert!(stored.full_sha256.is_none());
+            let mtime =
+                std::time::UNIX_EPOCH + Duration::from_secs(stored.st_mtime.try_into().unwrap());
+            File::options()
+                .write(true)
+                .open(&archive)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(mtime))
+                .unwrap();
+            stale.check_tarstats_matches_archive(&archive).unwrap();
+        } else {
+            eprintln!(
+                "skip: fingerprint collision pin: host GNU tar changed size or edges \
+                 ({before_len} -> {after_len} bytes)"
+            );
+        }
+
+        let base = open_uncompressed_tar_base(&archive, false);
+        assert_eq!(
+            read_member(base.as_ref(), "/prefix.txt"),
+            b"untouched prefix\n"
+        );
+        assert!(base.lookup("/old.bin", 0).is_none());
+        assert_eq!(read_member(base.as_ref(), "/renamed.bin"), large);
+        assert_eq!(
+            read_member(base.as_ref(), "/added.txt"),
+            b"small addition\n"
+        );
+    }
+}
+
 /// Regression: successful append followed by reopen failure must refuse stale reads.
 #[test]
 fn live_commit_append_reopen_failure_refuses_base_reads() {
