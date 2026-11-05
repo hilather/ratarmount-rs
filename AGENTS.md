@@ -91,6 +91,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 
 | Symptom / fix | Commands |
 |---------------|----------|
+| #261: offline GNU TAR Copy commit leaves a stale warm sidecar when archive size, whole-second mtime and edge hashes match after rename/add; remove the sibling index and SQLite companions before publication | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount-compositing --lib regression_261_` |
 | #259: offline Copy/Append and live commits must avoid nested TAR self-hardlinks, preserve new directory modes (including recent parents of idle children) and existing parent metadata, retain empty raw-overlay directories in TAR/ZIP/zstd, and refuse unreadable overlay subtrees | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount-compositing --lib regression_259_` |
 | #257: leading zstd skippables misdetected as LZ4; prefixed seek-table offsets and truncated skippables | `CARGO_BUILD_JOBS=2 TMPDIR=/var/tmp flock /tmp/muse-cargo.lock cargo test -p ratarmount-compress --lib regression_257_` |
 | #254: implied TAR parent directories fail live/offline chmod or delete commits; successful idle chmod must clear pending metadata | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount-compositing --lib regression_254_implied_parent_dir_commit` |
