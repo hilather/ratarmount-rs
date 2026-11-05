@@ -2722,6 +2722,466 @@ fn commit_overlay_append_uncompressed_zero_tail_without_tools() {
     assert_eq!(read_member(base.as_ref(), "/new"), b"new bytes");
 }
 
+/// Regression: #259 nested overlay adds must not become self-hardlinks or read
+/// as 0 B on remount. This checks a cold index rebuild, not a warm sidecar reopen.
+#[test]
+fn regression_259_commit_overlay_nested_file_no_self_hardlink() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for mode in [CommitMode::Copy, CommitMode::Append] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        fs::write(
+            &archive,
+            pack_tar(&[ustar_file("a/b/g.txt", b"original\n")]),
+        )
+        .unwrap();
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(overlay.join("a/b")).unwrap();
+        fs::write(overlay.join("a/b/new.txt"), b"hello\n").unwrap();
+
+        match commit_overlay(
+            &overlay,
+            &archive,
+            &CommitOverlayOptions {
+                mode,
+                ..yes_commit_opts()
+            },
+        ) {
+            Ok(true) => {}
+            Err(e) if soft_skip_gnu_tar_commit(&e) => {
+                eprintln!("skip: {mode:?}: {e}");
+                return;
+            }
+            other => panic!("commit_overlay ({mode:?}): {other:?}"),
+        }
+
+        let list = tar_env_command()
+            .arg("-tvf")
+            .arg(&archive)
+            .output()
+            .unwrap();
+        assert!(
+            list.status.success(),
+            "tar listing ({mode:?}): {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        let text = String::from_utf8_lossy(&list.stdout);
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.contains("a/b/new.txt") && line.contains("link to")),
+            "nested add became a hardlink ({mode:?}): {text}"
+        );
+        let base = open_uncompressed_tar_base(&archive, false);
+        assert_eq!(read_member(base.as_ref(), "/a/b/new.txt"), b"hello\n");
+        assert_eq!(read_member(base.as_ref(), "/a/b/g.txt"), b"original\n");
+    }
+}
+
+/// Regression: #259 non-recursive append needs intentional directory headers,
+/// including recent parents of idle children, while materializing an archive
+/// parent must not overwrite its metadata.
+#[test]
+fn regression_259_commit_plan_includes_populated_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let ov = WriteOverlay::new_for_tests(Arc::new(MemBase::with_dir("/a")), dir.path()).unwrap();
+    ov.mkdir("/a/b", 0o700).unwrap();
+    ov.mkdir("/a/empty", 0o700).unwrap();
+    fs::create_dir(dir.path().join("a/changed")).unwrap();
+    ov.db
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO overlay_metadata(path,mode) VALUES ('/a/changed',?1)",
+            [0o700],
+        )
+        .unwrap();
+    fs::write(dir.path().join("a/file"), b"parent").unwrap();
+    fs::write(dir.path().join("a/b/child"), b"child").unwrap();
+    drop(ov);
+
+    let plan = collect_overlay_commit_plan(dir.path()).unwrap();
+    let mut appends: Vec<_> = plan
+        .appends_nul
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| std::str::from_utf8(path).unwrap())
+        .collect();
+    appends.sort_unstable();
+    assert_eq!(
+        appends,
+        ["a/b", "a/b/child", "a/changed", "a/empty", "a/file"]
+    );
+
+    // Pure planner coverage for both mkdir rows and pending mode changes, even
+    // when GNU tar is unavailable to the live regression below.
+    fs::write(dir.path().join("a/b/hot"), b"hot").unwrap();
+    fs::write(dir.path().join("a/changed/child"), b"changed child").unwrap();
+    fs::write(dir.path().join("a/changed/hot"), b"hot").unwrap();
+    for child in ["a/b/child", "a/changed/child"] {
+        set_mtime_age(&dir.path().join(child), Duration::from_secs(7200));
+    }
+    let conn = Connection::open(dir.path().join(HIDDEN_DB)).unwrap();
+    let plan = collect_overlay_commit_plan_from_conn(
+        dir.path(),
+        Some(&conn),
+        Some(
+            SystemTime::now()
+                .checked_sub(Duration::from_secs(3600))
+                .unwrap(),
+        ),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let mut appends = plan.append_entries;
+    appends.sort_unstable();
+    assert_eq!(
+        appends,
+        [
+            ("a/b".to_string(), true),
+            ("a/b/child".to_string(), false),
+            ("a/changed".to_string(), true),
+            ("a/changed/child".to_string(), false),
+        ]
+    );
+    assert_eq!(plan.metadata["a/changed"].mode, Some(0o700));
+}
+
+/// Regression: #259 public raw-directory TAR commits must retain empty
+/// directories without a database recording their ownership.
+#[test]
+fn regression_259_raw_dir_tar_preserves_empty_dir() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for mode in [CommitMode::Copy, CommitMode::Append] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        fs::write(&archive, pack_tar(&[ustar_file("keep.txt", b"original\n")])).unwrap();
+        let overlay = dir.path().join("raw");
+        fs::create_dir_all(overlay.join("empty")).unwrap();
+        assert!(!overlay.join(HIDDEN_DB).exists());
+
+        match commit_overlay_raw_dir(
+            &overlay,
+            &archive,
+            &CommitOverlayOptions {
+                mode,
+                ..yes_commit_opts()
+            },
+        ) {
+            Ok(result) => assert_eq!(
+                result,
+                RawDirCommit {
+                    committed: true,
+                    identity_checked: false,
+                }
+            ),
+            Err(e) if soft_skip_gnu_tar_commit(&e) => {
+                eprintln!("skip: {mode:?}: {e}");
+                return;
+            }
+            other => panic!("commit_overlay_raw_dir ({mode:?}): {other:?}"),
+        }
+
+        let base = open_uncompressed_tar_base(&archive, false);
+        assert!(ratarmount_core::is_dir_mode(
+            base.lookup("/empty", 0)
+                .expect("committed empty directory")
+                .mode
+        ));
+        assert!(base.list_dirents("/empty").unwrap().is_empty());
+        assert_eq!(read_member(base.as_ref(), "/keep.txt"), b"original\n");
+    }
+}
+
+/// Regression: #259 the shared planner must retain empty raw-overlay
+/// directories through the public ZIP rebuild path.
+#[test]
+fn regression_259_raw_dir_zip_preserves_empty_dir() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("base.zip");
+    write_sample_zip(
+        &archive,
+        &[("keep.txt", b"original\n", CompressionMethod::Stored)],
+    );
+    let overlay = dir.path().join("raw");
+    fs::create_dir_all(overlay.join("empty")).unwrap();
+    assert!(!overlay.join(HIDDEN_DB).exists());
+
+    assert_eq!(
+        commit_overlay_raw_dir(&overlay, &archive, &yes_commit_opts()).unwrap(),
+        RawDirCommit {
+            committed: true,
+            identity_checked: false,
+        }
+    );
+    let mut zip = ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+    assert!(zip
+        .by_name("empty/")
+        .expect("committed empty directory")
+        .is_dir());
+    let mut payload = Vec::new();
+    zip.by_name("keep.txt")
+        .unwrap()
+        .read_to_end(&mut payload)
+        .unwrap();
+    assert_eq!(payload, b"original\n");
+}
+
+/// Regression: #259 the shared planner must retain empty raw-overlay
+/// directories through public zstd TAR Copy and Append commits.
+#[test]
+fn regression_259_raw_dir_zstd_preserves_empty_dir() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for mode in [CommitMode::Copy, CommitMode::Append] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("keep.txt", b"original\n")]);
+        let overlay = dir.path().join("raw");
+        fs::create_dir_all(overlay.join("empty")).unwrap();
+        assert!(!overlay.join(HIDDEN_DB).exists());
+
+        assert_eq!(
+            commit_overlay_raw_dir(
+                &overlay,
+                &archive,
+                &CommitOverlayOptions {
+                    mode,
+                    ..yes_commit_opts()
+                },
+            )
+            .unwrap(),
+            RawDirCommit {
+                committed: true,
+                identity_checked: false,
+            }
+        );
+        let base = open_tar_zst_base(&archive, false);
+        assert!(ratarmount_core::is_dir_mode(
+            base.lookup("/empty", 0)
+                .expect("committed empty directory")
+                .mode
+        ));
+        assert!(base.list_dirents("/empty").unwrap().is_empty());
+        assert_eq!(read_member(base.as_ref(), "/keep.txt"), b"original\n");
+    }
+}
+
+/// Regression: #259 offline Copy/Append must not restamp an explicit private
+/// archive parent when adding a child. Check metadata and payloads on cold reopen.
+#[cfg(unix)]
+#[test]
+fn regression_259_commit_overlay_preserves_existing_dir() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for mode in [CommitMode::Copy, CommitMode::Append] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        fs::write(
+            &archive,
+            pack_tar(&[
+                ustar_file("a/keep.txt", b"original\n"),
+                UstarMember {
+                    path: "a/",
+                    payload: UstarPayload::Directory,
+                    mode: 0o700,
+                    uid: 123,
+                    gid: 456,
+                    mtime: 1_000_000_000,
+                    xattrs: &[],
+                },
+            ]),
+        )
+        .unwrap();
+        let overlay = dir.path().join("ov");
+        let base = open_uncompressed_tar_base(&archive, false);
+        assert_eq!(
+            base.lookup("/a", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o700
+        );
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
+        let fd = ov.create_file("/a/extra.txt", 0o644).unwrap();
+        ov.close_overlay_fd(fd);
+        fs::write(overlay.join("a/extra.txt"), b"extra child\n").unwrap();
+        drop(ov);
+        assert!(!collect_overlay_commit_plan(&overlay)
+            .unwrap()
+            .has_metadata_changes());
+
+        match commit_overlay(
+            &overlay,
+            &archive,
+            &CommitOverlayOptions {
+                mode,
+                ..yes_commit_opts()
+            },
+        ) {
+            Ok(true) => {}
+            Err(e) if soft_skip_gnu_tar_commit(&e) => {
+                eprintln!("skip: {mode:?}: {e}");
+                return;
+            }
+            other => panic!("commit_overlay ({mode:?}): {other:?}"),
+        }
+
+        let list = tar_env_command()
+            .arg("-tvf")
+            .arg(&archive)
+            .output()
+            .unwrap();
+        assert!(
+            list.status.success(),
+            "tar listing ({mode:?}): {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        let text = String::from_utf8_lossy(&list.stdout);
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.contains("a/extra.txt") && line.contains("link to")),
+            "new child became a hardlink ({mode:?}): {text}"
+        );
+        let base = open_uncompressed_tar_base(&archive, false);
+        let parent = base.lookup("/a", 0).expect("existing directory");
+        assert_eq!(parent.mode, ratarmount_core::S_IFDIR | 0o700, "{mode:?}");
+        assert_eq!((parent.uid, parent.gid), (123, 456), "{mode:?}");
+        assert_eq!(parent.mtime, 1_000_000_000.0, "{mode:?}");
+        assert_eq!(read_member(base.as_ref(), "/a/extra.txt"), b"extra child\n");
+        assert_eq!(read_member(base.as_ref(), "/a/keep.txt"), b"original\n");
+    }
+}
+
+/// Regression: #259 an unreadable nested overlay directory must fail offline
+/// Copy/Append and live planning, leaving the archive and pending payload intact.
+#[cfg(unix)]
+#[test]
+fn regression_259_commit_unreadable_subtree_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skip: euid 0 ignores mode 000");
+        return;
+    }
+    struct RestoreMode(PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for (live, mode) in [
+        (false, CommitMode::Copy),
+        (false, CommitMode::Append),
+        (true, CommitMode::Copy),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        let before = pack_tar(&[ustar_file("keep.txt", b"original\n")]);
+        fs::write(&archive, &before).unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = WriteOverlay::new_for_tests(open_uncompressed_tar_base(&archive, false), &overlay)
+            .unwrap();
+        ov.mkdir("/a", 0o700).unwrap();
+        ov.mkdir("/a/locked", 0o700).unwrap();
+        let locked = overlay.join("a/locked");
+        fs::write(locked.join("file"), b"pending child\n").unwrap();
+        let restore = RestoreMode(locked.clone());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = if live {
+            ov.commit_uncompressed_tar_atomic(&archive)
+        } else {
+            drop(ov);
+            commit_overlay(
+                &overlay,
+                &archive,
+                &CommitOverlayOptions {
+                    mode,
+                    ..yes_commit_opts()
+                },
+            )
+        };
+        drop(restore);
+        let err = result.expect_err("commit must not silently omit the unreadable child");
+        assert!(
+            matches!(&err, OverlayError::Io(e) if e.kind() == io::ErrorKind::PermissionDenied),
+            "live={live}, {mode:?}: {err}"
+        );
+        assert_eq!(fs::read(&archive).unwrap(), before, "live={live}, {mode:?}");
+        assert_eq!(fs::read(locked.join("file")).unwrap(), b"pending child\n");
+    }
+}
+
+/// Regression: #259 offline Copy/Append must preserve a new populated directory's
+/// 0700 mode on cold reopen, without self-hardlinks or lost child payloads.
+#[cfg(unix)]
+#[test]
+fn regression_259_commit_overlay_populated_dir_mode() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for mode in [CommitMode::Copy, CommitMode::Append] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        fs::write(
+            &archive,
+            pack_tar(&[ustar_file("a/keep.txt", b"original\n")]),
+        )
+        .unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = WriteOverlay::new_for_tests(open_uncompressed_tar_base(&archive, false), &overlay)
+            .unwrap();
+        ov.mkdir("/a/b", 0o700).unwrap();
+        fs::write(overlay.join("a/b/new.txt"), b"private child\n").unwrap();
+        drop(ov);
+        // Keep the offline commit on the GNU path, without provenance overrides.
+        assert!(!collect_overlay_commit_plan(&overlay)
+            .unwrap()
+            .has_metadata_changes());
+
+        match commit_overlay(
+            &overlay,
+            &archive,
+            &CommitOverlayOptions {
+                mode,
+                ..yes_commit_opts()
+            },
+        ) {
+            Ok(true) => {}
+            Err(e) if soft_skip_gnu_tar_commit(&e) => {
+                eprintln!("skip: {mode:?}: {e}");
+                return;
+            }
+            other => panic!("commit_overlay ({mode:?}): {other:?}"),
+        }
+
+        let list = tar_env_command()
+            .arg("-tvf")
+            .arg(&archive)
+            .output()
+            .unwrap();
+        assert!(
+            list.status.success(),
+            "tar listing ({mode:?}): {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        let text = String::from_utf8_lossy(&list.stdout);
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.contains("a/b/new.txt") && line.contains("link to")),
+            "nested add became a hardlink ({mode:?}): {text}"
+        );
+        let base = open_uncompressed_tar_base(&archive, false);
+        assert_eq!(
+            base.lookup("/a/b", 0).expect("new directory").mode,
+            ratarmount_core::S_IFDIR | 0o700,
+            "populated directory permissions widened ({mode:?})"
+        );
+        assert_eq!(
+            read_member(base.as_ref(), "/a/b/new.txt"),
+            b"private child\n"
+        );
+        assert_eq!(read_member(base.as_ref(), "/a/keep.txt"), b"original\n");
+    }
+}
+
 /// Regression: auto must not mutate another hard link, or append replacements.
 #[test]
 fn commit_overlay_append_auto_hardlink_and_replacement_fallback() {
@@ -4319,6 +4779,7 @@ fn overlay_internal_names_refused_beneath_any_component() {
     // never appended by commit.
     fs::create_dir_all(overlay.join("sub").join(OVERLAY_MARKER)).unwrap();
     fs::write(overlay.join("sub").join(OVERLAY_MARKER).join("foo"), b"x").unwrap();
+    fs::write(overlay.join("sub/keep.txt"), b"visible").unwrap();
     assert!(ov.lookup(&p, 0).is_none());
     assert!(ov.list(&format!("/sub/{OVERLAY_MARKER}")).is_none());
     drop(ov);
@@ -5491,6 +5952,288 @@ fn rename_keeps_destination_when_source_cow_fails() {
         "destination must survive a failed rename"
     );
     assert!(ov.lookup("/dst", 0).is_some(), "dst still listed");
+}
+
+/// Regression: #259 live nested overlay adds must not become self-hardlinks or
+/// read as 0 B on remount. This checks a cold index rebuild, not a warm sidecar reopen.
+#[test]
+fn regression_259_live_commit_nested_file_no_self_hardlink() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("base.tar");
+    fs::write(
+        &archive,
+        pack_tar(&[ustar_file("a/b/g.txt", b"original\n")]),
+    )
+    .unwrap();
+    let overlay = dir.path().join("ov");
+    let ov =
+        WriteOverlay::new_for_tests(open_uncompressed_tar_base(&archive, false), &overlay).unwrap();
+    fs::create_dir_all(overlay.join("a/b")).unwrap();
+    fs::write(overlay.join("a/b/new.txt"), b"hello\n").unwrap();
+
+    match ov.commit_uncompressed_tar_atomic(&archive) {
+        Ok(true) => {}
+        Err(e) if soft_skip_gnu_tar_commit(&e) => {
+            eprintln!("skip: {e}");
+            return;
+        }
+        other => panic!("commit_uncompressed_tar_atomic: {other:?}"),
+    }
+
+    let list = tar_env_command()
+        .arg("-tvf")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "tar listing: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let text = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.contains("a/b/new.txt") && line.contains("link to")),
+        "nested add became a hardlink: {text}"
+    );
+    let base = open_uncompressed_tar_base(&archive, false);
+    assert_eq!(read_member(base.as_ref(), "/a/b/new.txt"), b"hello\n");
+    assert_eq!(read_member(base.as_ref(), "/a/b/g.txt"), b"original\n");
+}
+
+/// Regression: #259 live append must not restamp an explicit private archive
+/// parent when adding a child. Check metadata and payloads on cold reopen.
+#[cfg(unix)]
+#[test]
+fn regression_259_live_commit_preserves_existing_dir() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("base.tar");
+    fs::write(
+        &archive,
+        pack_tar(&[
+            ustar_file("a/keep.txt", b"original\n"),
+            UstarMember {
+                path: "a/",
+                payload: UstarPayload::Directory,
+                mode: 0o700,
+                uid: 123,
+                gid: 456,
+                mtime: 1_000_000_000,
+                xattrs: &[],
+            },
+        ]),
+    )
+    .unwrap();
+    let overlay = dir.path().join("ov");
+    let base = open_uncompressed_tar_base(&archive, false);
+    assert_eq!(
+        base.lookup("/a", 0).unwrap().mode,
+        ratarmount_core::S_IFDIR | 0o700
+    );
+    let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
+    let fd = ov.create_file("/a/extra.txt", 0o644).unwrap();
+    ov.close_overlay_fd(fd);
+    fs::write(overlay.join("a/extra.txt"), b"extra child\n").unwrap();
+    assert!(!ov
+        .plan_for_commit(None, &HashSet::new())
+        .unwrap()
+        .has_metadata_changes());
+
+    match ov.commit_uncompressed_tar_atomic(&archive) {
+        Ok(true) => {}
+        Err(e) if soft_skip_gnu_tar_commit(&e) => {
+            eprintln!("skip: {e}");
+            return;
+        }
+        other => panic!("commit_uncompressed_tar_atomic: {other:?}"),
+    }
+
+    let list = tar_env_command()
+        .arg("-tvf")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "tar listing: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let text = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.contains("a/extra.txt") && line.contains("link to")),
+        "new child became a hardlink: {text}"
+    );
+    let base = open_uncompressed_tar_base(&archive, false);
+    let parent = base.lookup("/a", 0).expect("existing directory");
+    assert_eq!(parent.mode, ratarmount_core::S_IFDIR | 0o700);
+    assert_eq!((parent.uid, parent.gid), (123, 456));
+    assert_eq!(parent.mtime, 1_000_000_000.0);
+    assert_eq!(read_member(base.as_ref(), "/a/extra.txt"), b"extra child\n");
+    assert_eq!(read_member(base.as_ref(), "/a/keep.txt"), b"original\n");
+}
+
+/// Regression: #259 live non-recursive append must preserve a populated directory's
+/// 0700 mode on cold reopen, without self-hardlinks or lost child payloads.
+#[cfg(unix)]
+#[test]
+fn regression_259_live_commit_populated_dir_mode() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("base.tar");
+    fs::write(
+        &archive,
+        pack_tar(&[ustar_file("a/keep.txt", b"original\n")]),
+    )
+    .unwrap();
+    let overlay = dir.path().join("ov");
+    let ov =
+        WriteOverlay::new_for_tests(open_uncompressed_tar_base(&archive, false), &overlay).unwrap();
+    ov.mkdir("/a/b", 0o700).unwrap();
+    fs::write(overlay.join("a/b/new.txt"), b"private child\n").unwrap();
+
+    match ov.commit_uncompressed_tar_atomic(&archive) {
+        Ok(true) => {}
+        Err(e) if soft_skip_gnu_tar_commit(&e) => {
+            eprintln!("skip: {e}");
+            return;
+        }
+        other => panic!("commit_uncompressed_tar_atomic: {other:?}"),
+    }
+
+    let list = tar_env_command()
+        .arg("-tvf")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "tar listing: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let text = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.contains("a/b/new.txt") && line.contains("link to")),
+        "nested add became a hardlink: {text}"
+    );
+    let base = open_uncompressed_tar_base(&archive, false);
+    assert_eq!(
+        base.lookup("/a/b", 0).expect("new directory").mode,
+        ratarmount_core::S_IFDIR | 0o700,
+        "populated directory permissions widened"
+    );
+    assert_eq!(
+        read_member(base.as_ref(), "/a/b/new.txt"),
+        b"private child\n"
+    );
+    assert_eq!(read_member(base.as_ref(), "/a/keep.txt"), b"original\n");
+}
+
+/// Regression: #259 an idle child moved into recent private directories must
+/// commit their modes before pruning can discard pending rows. Cold-index reopen
+/// must retain payloads and avoid self-hardlinks, including with a hot sibling.
+#[cfg(unix)]
+#[test]
+fn regression_259_live_commit_idle_preserves_recent_parent_mode() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for hot_sibling in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        fs::write(
+            &archive,
+            pack_tar(&[ustar_file("a/keep.txt", b"original\n")]),
+        )
+        .unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = WriteOverlay::new_for_tests(open_uncompressed_tar_base(&archive, false), &overlay)
+            .unwrap();
+        let fd = ov.create_file("/staged.txt", 0o644).unwrap();
+        ov.close_overlay_fd(fd);
+        fs::write(overlay.join("staged.txt"), b"private child\n").unwrap();
+        set_mtime_age(&overlay.join("staged.txt"), Duration::from_secs(7200));
+        ov.mkdir("/a/b", 0o700).unwrap();
+        ov.mkdir("/a/b/private", 0o700).unwrap();
+        ov.rename("/staged.txt", "/a/b/private/new.txt").unwrap();
+        if hot_sibling {
+            fs::write(overlay.join("a/b/private/hot.txt"), b"still hot\n").unwrap();
+        }
+        let idle_for = Duration::from_secs(3600);
+        let cutoff = SystemTime::now().checked_sub(idle_for).unwrap();
+        assert!(overlay_entry_is_idle(
+            &overlay.join("a/b/private/new.txt"),
+            cutoff,
+            &HashSet::new()
+        ));
+        for parent in ["a/b", "a/b/private"] {
+            assert!(!overlay_entry_is_idle(
+                &overlay.join(parent),
+                cutoff,
+                &HashSet::new()
+            ));
+        }
+
+        match ov.commit_live_idle(&archive, idle_for, |p| {
+            Ok(open_uncompressed_tar_base(p, false))
+        }) {
+            Ok(true) => {}
+            Err(e) if soft_skip_gnu_tar_commit(&e) => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            other => panic!("commit_live_idle (hot sibling={hot_sibling}): {other:?}"),
+        }
+
+        let base = open_uncompressed_tar_base(&archive, false);
+        for parent in ["/a/b", "/a/b/private"] {
+            assert_eq!(
+                base.lookup(parent, 0)
+                    .expect("committed private directory")
+                    .mode,
+                ratarmount_core::S_IFDIR | 0o700,
+                "parent mode lost for {parent} (hot sibling={hot_sibling})"
+            );
+        }
+        assert_eq!(
+            read_member(base.as_ref(), "/a/b/private/new.txt"),
+            b"private child\n"
+        );
+        assert_eq!(read_member(base.as_ref(), "/a/keep.txt"), b"original\n");
+        assert!(base.lookup("/a/b/private/hot.txt", 0).is_none());
+        assert!(!overlay.join("a/b/private/new.txt").exists());
+        assert_eq!(overlay.join("a/b").exists(), hot_sibling);
+        if hot_sibling {
+            assert_eq!(
+                fs::read(overlay.join("a/b/private/hot.txt")).unwrap(),
+                b"still hot\n"
+            );
+        }
+        let list = tar_env_command()
+            .arg("-tvf")
+            .arg(&archive)
+            .output()
+            .unwrap();
+        assert!(
+            list.status.success(),
+            "tar listing: {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        let text = String::from_utf8_lossy(&list.stdout);
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.contains("a/b/private/new.txt") && line.contains("link to")),
+            "idle child became a hardlink: {text}"
+        );
+        assert!(!ov
+            .commit_live_idle(&archive, idle_for, |_| panic!("nothing else is idle"))
+            .unwrap());
+    }
 }
 
 #[test]
