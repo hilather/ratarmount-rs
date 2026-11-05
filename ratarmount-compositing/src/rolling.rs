@@ -766,7 +766,7 @@ mod tests {
             Arc::new(RollingMountSource::open(&base, "1B".parse().unwrap(), open_tar).unwrap());
         let ov = overlay(dir.path(), &series, CommitMode::Copy);
         fs::write(ov.root().join("old"), b"old").unwrap();
-        fs::create_dir(ov.root().join("empty")).unwrap();
+        ov.mkdir("/empty", 0o755).unwrap();
         commit(&ov, &base);
         fs::write(ov.root().join("new"), b"new").unwrap();
         commit(&ov, &base);

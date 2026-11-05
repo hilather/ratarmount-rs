@@ -5074,7 +5074,7 @@ impl WriteOverlay {
         }
         if !plan.appends_nul.is_empty() {
             let status = tar_env_command()
-                .args(["--append", "--ignore-zeros", "-C"])
+                .args(["--append", "--ignore-zeros", "--no-recursion", "-C"])
                 .arg(&self.root)
                 .args([
                     "--null",
@@ -7802,6 +7802,9 @@ fn collect_overlay_commit_plan_from_conn(
     let mut deleted_paths: HashSet<String> = HashSet::new();
     let mut append_entries: Vec<(String, bool)> = Vec::new();
     let mut skipped: HashSet<String> = HashSet::new();
+    let mut required_parents = HashSet::new();
+    let mut directory_members = HashSet::new();
+    let mut has_metadata = false;
 
     if let Some(conn) = conn {
         let mut stmt = conn.prepare(r#"SELECT path, name FROM "files" WHERE deleted = 1"#)?;
@@ -7820,6 +7823,28 @@ fn collect_overlay_commit_plan_from_conn(
                 deleted_paths.insert(norm);
             }
             add_deletion_variants(&mut deletions_nul, &rel);
+        }
+        // mkdir records intentional directory additions. ensure_parent only
+        // materializes archive parents using host defaults, which must not
+        // replace their archived permissions, ownership or timestamps.
+        let mut stmt =
+            conn.prepare("SELECT path,name FROM files WHERE deleted = 0 AND (mode & ?1) = ?2")?;
+        for row in stmt.query_map(
+            params![ratarmount_core::S_IFMT, ratarmount_core::S_IFDIR],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )? {
+            let (path, name) = row?;
+            directory_members.insert(normalize_archive_rel_path(&join_rel(&path, &name)));
+        }
+        has_metadata = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='overlay_metadata')", [], |r| r.get(0),
+        )?;
+        if has_metadata {
+            let mut stmt =
+                conn.prepare("SELECT path FROM overlay_metadata WHERE mode IS NOT NULL")?;
+            for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                directory_members.insert(normalize_archive_rel_path(&row?));
+            }
         }
     }
 
@@ -7863,14 +7888,34 @@ fn collect_overlay_commit_plan_from_conn(
             continue;
         }
         let norm = normalize_archive_rel_path(&rel);
+        // Raw directories have no ownership rows: retain the directories on disk.
+        if is_dir && conn.is_some() && !directory_members.contains(&norm) {
+            continue;
+        }
         if let Some(cutoff) = idle_cutoff {
-            if !overlay_entry_is_idle(&full, cutoff, busy_inodes) {
-                skipped.insert(norm);
-                continue;
+            // Children precede parents in the walk. A selected child's new or
+            // changed parents must be persisted before cleanup can prune them,
+            // even if the rename or creation refreshed their host mtime.
+            if !(is_dir && required_parents.contains(&norm)) {
+                if !overlay_entry_is_idle(&full, cutoff, busy_inodes) {
+                    skipped.insert(norm);
+                    continue;
+                }
+                // Without a selected child, a hot subtree must not turn its
+                // parent into an empty member. Required headers are safe with
+                // non-recursive append; cleanup leaves any hot children intact.
+                if is_dir && skipped.iter().any(|s| path_is_under_rel(&norm, s)) {
+                    continue;
+                }
+            }
+            let mut child = norm.as_str();
+            while let Some((parent, _)) = child.rsplit_once('/') {
+                required_parents.insert(parent.to_string());
+                child = parent;
             }
         }
         if is_dir {
-            // Empty dirs only (walkdir_files_and_empty_dirs already filters)
+            // Explicit directory headers preserve modes with non-recursive append.
             appends_nul.extend(rel.as_bytes());
             appends_nul.push(0);
             append_entries.push((norm, true));
@@ -7883,28 +7928,9 @@ fn collect_overlay_commit_plan_from_conn(
         }
     }
 
-    if idle_cutoff.is_some() && !skipped.is_empty() {
-        // A hot file under dir/ must not persist dir/ as an empty member
-        // (and must not wipe that parent from the overlay).
-        append_entries.retain(|(p, is_dir)| {
-            if !is_dir {
-                return true;
-            }
-            !skipped.iter().any(|s| s == p || path_is_under_rel(p, s))
-        });
-        appends_nul.clear();
-        for (rel, _) in &append_entries {
-            appends_nul.extend(rel.as_bytes());
-            appends_nul.push(0);
-        }
-    }
-
     let mut metadata = BTreeMap::new();
     let mut xattrs = BTreeMap::<String, BTreeMap<String, Option<Vec<u8>>>>::new();
     if let Some(conn) = conn {
-        let has_metadata: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='overlay_metadata')", [], |r| r.get(0),
-        )?;
         if has_metadata {
             let mut stmt = conn.prepare("SELECT path,mode,atime,mtime FROM overlay_metadata")?;
             for row in stmt.query_map([], |r| {
@@ -8808,7 +8834,7 @@ fn commit_overlay_tar(
         }
         if !plan.appends_nul.is_empty() {
             println!(
-                "    tar --append --ignore-zeros -C '{}' --null --files-from='{}' --file '{}'",
+                "    tar --append --ignore-zeros --no-recursion -C '{}' --null --files-from='{}' --file '{}'",
                 write_overlay.display(),
                 append_list.display(),
                 work_tar.display()
@@ -8864,7 +8890,7 @@ fn commit_overlay_tar(
 
     if !plan.appends_nul.is_empty() {
         let status = tar_env_command()
-            .args(["--append", "--ignore-zeros", "-C"])
+            .args(["--append", "--ignore-zeros", "--no-recursion", "-C"])
             .arg(write_overlay)
             .args([
                 "--null",
@@ -9773,19 +9799,22 @@ struct WalkEntry {
     is_dir: bool,
 }
 
-/// Files + empty directories under `root` (topdown=False equivalent for empty dirs).
+/// Files and directories under `root`, with children emitted before parents.
 fn walkdir_files_and_empty_dirs(root: &Path) -> Result<Vec<WalkEntry>> {
     let mut out = Vec::new();
     fn walk(dir: &Path, root: &Path, out: &mut Vec<WalkEntry>) -> Result<()> {
         let mut files = Vec::new();
         let mut dirs = Vec::new();
-        let rd = match fs::read_dir(dir) {
-            Ok(r) => r,
-            Err(_) => return Ok(()),
-        };
-        for ent in rd.flatten() {
+        let rd = fs::read_dir(dir)
+            .map_err(|e| io_with_path(e, "cannot read overlay directory for commit", dir))?;
+        for ent in rd {
+            let ent = ent.map_err(|e| {
+                io_with_path(e, "cannot read overlay directory entry for commit", dir)
+            })?;
             let p = ent.path();
-            let ft = ent.file_type()?;
+            let ft = ent.file_type().map_err(|e| {
+                io_with_path(e, "cannot stat overlay directory entry for commit", &p)
+            })?;
             if ft.is_dir() {
                 dirs.push(p);
             } else if ft.is_file() || ft.is_symlink() {
@@ -9801,35 +9830,12 @@ fn walkdir_files_and_empty_dirs(root: &Path) -> Result<Vec<WalkEntry>> {
                 is_dir: false,
             });
         }
-        // Empty directory (no files; may still have subdirs already walked)
-        if dirs.is_empty() {
-            // re-check: empty of files and dirs
-            let empty = fs::read_dir(dir)?.next().is_none();
-            if empty && dir != root {
-                out.push(WalkEntry {
-                    path: dir.to_path_buf(),
-                    is_dir: true,
-                });
-            }
-        } else {
-            // Python: if not filenames and dirpath: append empty folder
-            // Only when this dir has no filenames (even if it has subdirs that had content)
-            let has_file = fs::read_dir(dir)?.any(|e| {
-                e.ok()
-                    .map(|e| {
-                        e.file_type()
-                            .map(|t| t.is_file() || t.is_symlink())
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false)
+        // Planning selects intentional directory headers for --no-recursion.
+        if dir != root {
+            out.push(WalkEntry {
+                path: dir.to_path_buf(),
+                is_dir: true,
             });
-            if !has_file && dir != root {
-                // Still append dirpath if no files directly — matches Python "not filenames"
-                out.push(WalkEntry {
-                    path: dir.to_path_buf(),
-                    is_dir: true,
-                });
-            }
         }
         Ok(())
     }
