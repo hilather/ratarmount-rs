@@ -1555,9 +1555,14 @@ for independent episodes, choose a fresh top over the same sealed lower.
 
 Tests use `test-harness/sandbox-run/runtime.sh`, a Bash runtime stand-in that
 executes commands inside the bind path with a separate process group. Its
-`kill` and `rm` compare the recorded leader's start time before signalling the
-group by number; the comparison narrows but does not close the reuse race in
-this test-only stub. Run
+`kill` and `rm` compare the recorded leader's start time before signalling its
+group. If the leader has exited, they find live group members in `/proc`, require
+start times no earlier than the recorded leader's, and recheck each member's
+group and start time before signalling it individually. Linux does not reuse a
+PID while it remains a process group's id; a replacement leader proves the old
+group is empty. These checks narrow but do not close PID reuse races in this
+test-only stub. `run` preserves state when descendants outlive the leader;
+`kill`/`rm` keep it and fail if live members remain after five seconds. Run
 `cargo test -p ratarmount --test sandbox_run` on a host with FUSE and
 `user_allow_other`. Set `RATARMOUNT_TEST_DOCKER=1` to also exercise a real local
 Docker daemon with the `busybox` image.

@@ -337,6 +337,7 @@ fn regression_run_stub_executes_in_bind_and_preserves_environment() {
         .unwrap();
     assert_eq!(output.status.code(), Some(7));
     assert_eq!(fs::read(temp.path().join("output")).unwrap(), b"a b;$x");
+    assert!(!temp.path().join("state/test").exists());
 }
 
 #[test]
@@ -603,6 +604,171 @@ fn regression_run_stub_kill_removes_sleeping_process_group() {
             .success());
         assert!(!wait(&mut child).success());
         assert!(!state.join("test").exists());
+    }
+}
+
+/// State, process group and start time from the whole stat file: comm can contain
+/// spaces, newlines and ')', so only the last ')' delimits the numeric fields.
+fn stub_process_stat(pid: i32) -> Option<(u8, i32, u64)> {
+    let stat = fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.iter().rposition(|&byte| byte == b')')?;
+    let fields: Vec<_> = std::str::from_utf8(stat.get(end + 2..)?)
+        .ok()?
+        .split_whitespace()
+        .collect();
+    Some((
+        *fields.first()?.as_bytes().first()?,
+        fields.get(2)?.parse().ok()?,
+        fields.get(19)?.parse().ok()?,
+    ))
+}
+
+fn stub_process_record(path: &Path) -> Option<(i32, u64)> {
+    let record = fs::read_to_string(path).ok()?;
+    let mut fields = record.split_whitespace();
+    let pid = fields.next()?.parse().ok()?;
+    let start = fields.next()?.parse().ok()?;
+    (pid > 1).then_some((pid, start))
+}
+
+struct StubSurvivorGuard {
+    client: Child,
+    leader_record: PathBuf,
+    child_record: PathBuf,
+}
+
+impl Drop for StubSurvivorGuard {
+    fn drop(&mut self) {
+        let _ = self.client.kill();
+        let _ = self.client.wait();
+        // The child marker survives even if an old runtime deletes the leader
+        // record. Only signal the child if its start time still matches.
+        for record in [&self.child_record, &self.leader_record] {
+            if let Some((pid, start)) = stub_process_record(record) {
+                if let Some((_, group, current)) = stub_process_stat(pid) {
+                    if current == start {
+                        // A live owned leader also covers a failure before the
+                        // background child's marker was published.
+                        let target = if record == &self.leader_record && group == pid {
+                            -pid
+                        } else {
+                            pid
+                        };
+                        unsafe { libc::kill(target, libc::SIGKILL) };
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn stub_reaps_survivor(verb: &str, crash_client: bool) {
+    if Command::new("setsid").arg("--version").output().is_err() {
+        eprintln!("skip: setsid unavailable");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let mut run = StubSurvivorGuard {
+        client: Command::new("bash")
+            .arg(stub())
+            .args(["run", "--rm", "--name", "test", "-v"])
+            .arg(format!("{}:/repo", temp.path().display()))
+            .args([
+                "busybox",
+                "bash",
+                "-c",
+                r#"sleep 60 &
+child=$!
+IFS= read -r -d '' stat < "/proc/$child/stat" || true
+fields=(${stat##*) })
+printf '%s %s\n' "$child" "${fields[19]}" > child.tmp
+mv child.tmp child
+wait"#,
+            ])
+            .env("RATARMOUNT_STUB_STATE", &state)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        leader_record: state.join("test"),
+        child_record: temp.path().join("child"),
+    };
+    wait_for(&run.leader_record, &mut run.client);
+    wait_for(&run.child_record, &mut run.client);
+    let (leader, leader_start) = stub_process_record(&run.leader_record).unwrap();
+    let (child, child_start) = stub_process_record(&run.child_record).unwrap();
+    let child_is_live = || {
+        stub_process_stat(child).is_some_and(|(status, group, start)| {
+            status != b'Z' && status != b'X' && group == leader && start == child_start
+        })
+    };
+    assert!(child_is_live(), "{verb}: child never joined the group");
+    assert!(child_start >= leader_start);
+    if crash_client {
+        run.client.kill().unwrap();
+        assert!(!run.client.wait().unwrap().success());
+    }
+    assert!(stub_process_stat(leader).is_some_and(|(_, _, start)| start == leader_start));
+    // Kill only the leader; the background child must survive this crash.
+    assert_eq!(unsafe { libc::kill(leader, libc::SIGKILL) }, 0);
+    if !crash_client {
+        assert!(!wait(&mut run.client).success());
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while stub_process_stat(leader).is_some_and(|(_, _, start)| start == leader_start) {
+        assert!(Instant::now() < deadline, "{verb}: leader was not reaped");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(child_is_live(), "{verb}: child did not survive its leader");
+    assert!(
+        run.leader_record.exists(),
+        "{verb}: run discarded a live descendant's recovery record"
+    );
+    let output = Command::new("bash")
+        .arg(stub())
+        .args([verb, "test"])
+        .env("RATARMOUNT_STUB_STATE", &state)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{verb}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // Require the original child's /proc identity to disappear, even if it is
+    // briefly a zombie while its new parent reaps it.
+    while stub_process_stat(child).is_some_and(|(_, _, start)| start == child_start) {
+        assert!(
+            Instant::now() < deadline,
+            "{verb}: descendant was not reaped"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!run.leader_record.exists(), "{verb}: kept an empty group");
+}
+
+/// Regression: kill discarded state without stopping a live child after both
+/// the runtime client and its process-group leader crashed.
+#[test]
+fn regression_run_stub_survivors_kill_after_client_crash() {
+    stub_reaps_survivor("kill", true);
+}
+
+/// Regression: rm discarded state without stopping a live child after both
+/// the runtime client and its process-group leader crashed.
+#[test]
+fn regression_run_stub_survivors_rm_after_client_crash() {
+    stub_reaps_survivor("rm", true);
+}
+
+/// Regression: run removed its state after wait even though the leader's
+/// background child still ran, preventing later kill/rm from finding it.
+#[test]
+fn regression_run_stub_survivors_retain_state_after_wait() {
+    for verb in ["kill", "rm"] {
+        stub_reaps_survivor(verb, false);
     }
 }
 

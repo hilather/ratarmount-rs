@@ -2006,9 +2006,18 @@ mod tests {
     #[test]
     fn regression_run_stop_runtime_retains_record_when_signal_fails() {
         use std::os::unix::process::ExitStatusExt;
+
+        struct LiveChild(Child);
+        impl Drop for LiveChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
         let _processes = ratarmount_index::test_process::exclusive();
         let temp = tempfile::tempdir().unwrap();
-        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+        let mut child = LiveChild(Command::new("sleep").arg("60").spawn().unwrap());
         let top = temp.path().join("top");
         let pid = pid_path(&top);
         let mut cleanup = Cleanup {
@@ -2022,7 +2031,7 @@ mod tests {
                 container: "ratarmount-run-runtime-fault".into(),
                 runtime: "/bin/true".into(),
                 mount_child: None,
-                runtime_child: Some(ProcessIdentity::new(child.id())),
+                runtime_child: Some(ProcessIdentity::new(child.0.id())),
                 ram_top: None,
             },
             pid_file: pid.clone(),
@@ -2033,16 +2042,26 @@ mod tests {
             runtime_stopped: false,
         };
         cleanup.save().unwrap();
-        let fault = cleanup_test_hooks::Guard::arm(child.id(), libc::SIGKILL, None);
+        let fault = cleanup_test_hooks::Guard::arm(child.0.id(), libc::SIGKILL, None);
         let result = cleanup.stop_runtime();
         let runtime_stopped = cleanup.runtime_stopped;
         drop(cleanup); // Fault stays armed through the full cleanup retry.
         let retained = pid.exists();
         drop(fault);
-        // Stop and reap our child even if an assertion below will fail.
+        // Observe recovery's exit before the guard's emergency cleanup can
+        // signal anything, so a failed recovery cannot pass this assertion.
         let retry = recover(&pid, &top);
-        let _ = child.kill();
-        let status = child.wait().unwrap();
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "recovery left the runtime client running"
+            );
+            std::thread::sleep(POLL);
+        };
         assert_eq!(result.unwrap_err().to_string(), "injected-signal");
         assert!(!runtime_stopped);
         assert!(retained);
