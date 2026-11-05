@@ -208,7 +208,18 @@ fn check_manifest(manifest: &Path, before: &Snapshot, after: &Snapshot) {
         assert_eq!(row["status"], status, "{path}");
         assert_eq!(row["type"], new.or(old).unwrap()["type"], "{path}");
         if let Some(new) = new {
+            // Canonical manifests omit symlink mode (format 2 / docs/sandbox.md):
+            // Linux reports 120777 and macOS a umask-dependent mode, so mode is
+            // not part of the row. Kernel snapshots still carry it for the view
+            // comparison below.
             for key in ["mode", "size", "hash", "target"] {
+                if key == "mode" && row["type"] == "symlink" {
+                    assert!(
+                        row[key].is_null(),
+                        "{path}: symlink manifest mode must be omitted"
+                    );
+                    continue;
+                }
                 assert_eq!(row[key], new[key], "{path}: {key}");
             }
         }

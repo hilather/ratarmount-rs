@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
 # Minimal docker/podman stand-in. Each command gets a process group so timeout
 # and crash recovery kill descendants as well as the shell running the command.
+# The state file records the group leader's pid and start time: kill and rm
+# compare the leader's start time, then signal the group by number. This
+# test-only check narrows but does not close the PID reuse race.
 set -eu
 state=${RATARMOUNT_STUB_STATE:?set RATARMOUNT_STUB_STATE}
 mkdir -p "$state"
+# Start time (field 22 of /proc/PID/stat) of a live process; empty when PID is
+# gone or a zombie. comm (field 2) may contain spaces, ')', and newlines.
+start_time() {
+  local stat fields
+  # Whole file: comm (field 2) may embed newlines, spaces, and ')'.
+  # Parsing from the last ')' keeps field 22 (starttime) correct.
+  stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 0
+  fields=(${stat##*) })
+  [[ ${fields[0]-} == Z ]] || printf '%s\n' "${fields[19]-}"
+}
 verb=$1
 shift
 case "$verb" in
@@ -24,7 +37,10 @@ case "$verb" in
     printf "%s\n" "${argv[@]}" > "$state/$name.argv"
     setsid env "${envs[@]}" bash -c '
       state=$1; name=$2; mount=$3; shift 3
-      printf "%s\n" "$$" > "$state/$name.tmp"
+      # Whole /proc/$$/stat: same newline-in-comm rule as start_time.
+      stat=$(cat "/proc/$$/stat")
+      fields=(${stat##*) })
+      printf "%s %s\n" "$$" "${fields[19]}" > "$state/$name.tmp"
       mv "$state/$name.tmp" "$state/$name"
       cd "$mount"; exec "$@"
     ' _ "$state" "$name" "$mount" "$@" &
@@ -37,8 +53,13 @@ case "$verb" in
   kill|rm)
     [[ ${1:-} != -f ]] || shift
     if [[ -f "$state/$1" ]]; then
-      read -r pid < "$state/$1"
-      kill -KILL -- "-$pid" 2>/dev/null || true
+      pid= start=
+      read -r pid start < "$state/$1" || true
+      # Never 0 or 1: `kill -- -1` signals every process this user may signal.
+      if [[ $pid =~ ^[1-9][0-9]*$ && $pid != 1 && -n $start \
+        && $(start_time "$pid") == "$start" ]]; then
+        kill -KILL -- "-$pid" 2>/dev/null || true
+      fi
       rm -f "$state/$1"
     fi
     ;;

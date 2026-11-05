@@ -156,6 +156,162 @@ fn process_start(pid: u32) -> Option<String> {
     Some(fields.split_whitespace().nth(19)?.into())
 }
 
+/// Send `signal` to the recorded process; returns whether it was sent. On Linux
+/// with pidfds (5.3+), open the pidfd before comparing start times and signal
+/// through it, so a reused PID cannot receive the signal. On ENOSYS (older
+/// kernels), compare then kill(2), narrowing but not closing the reuse race.
+/// Without a usable recorded or current start time (e.g. no /proc, macOS),
+/// never signal the recorded PID.
+fn signal_recorded(identity: &ProcessIdentity, signal: libc::c_int) -> io::Result<bool> {
+    #[cfg(all(test, target_os = "linux"))]
+    cleanup_test_hooks::signal(identity.pid, signal)?;
+    let (Some(start), Ok(pid @ 1..)) = (identity.start.as_deref(), i32::try_from(identity.pid))
+    else {
+        return Ok(false);
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::io::Errno;
+        use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
+        let named = Signal::from_named_raw(signal)
+            .ok_or_else(|| io::Error::other(format!("unnamed signal {signal}")))?;
+        let Some(pid) = Pid::from_raw(pid) else {
+            return Ok(false);
+        };
+        match pidfd_open(pid, PidfdFlags::empty()) {
+            Ok(pidfd) if process_start(identity.pid).as_deref() == Some(start) => {
+                return match pidfd_send_signal(&pidfd, named) {
+                    Ok(()) => Ok(true),
+                    Err(Errno::SRCH) => Ok(false),
+                    Err(error) => Err(error.into()),
+                };
+            }
+            // Another process has the PID now, or the recorded one exited. EINVAL
+            // (before Linux 6.9) means the PID names a thread, never a recorded
+            // process: records hold process IDs (`Child::id()`).
+            Ok(_) | Err(Errno::SRCH | Errno::INVAL) => return Ok(false),
+            // No pidfds before Linux 5.3: compare and signal by number below.
+            Err(Errno::NOSYS) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if process_start(identity.pid).as_deref() != Some(start) {
+        return Ok(false);
+    }
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        return Ok(true);
+    }
+    match io::Error::last_os_error() {
+        error if error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        error => Err(error),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod cleanup_test_hooks {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum Event {
+        StopEntry,
+        Runtime(String),
+        Signal {
+            pid: u32,
+            signal: i32,
+            injected: bool,
+        },
+        Unmount {
+            path: PathBuf,
+            occurrence: usize,
+            injected: bool,
+        },
+        Warning(String),
+    }
+
+    struct State {
+        signal: (u32, i32),
+        unmount_fault: Option<usize>,
+        unmount_count: usize,
+        events: Vec<Event>,
+    }
+
+    thread_local! {
+        static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    }
+
+    pub struct Guard;
+    impl Guard {
+        pub fn arm(pid: u32, signal: i32, unmount_fault: Option<usize>) -> Self {
+            STATE.with_borrow_mut(|state| {
+                assert!(state.is_none(), "cleanup fault guards must not nest");
+                *state = Some(State {
+                    signal: (pid, signal),
+                    unmount_fault,
+                    unmount_count: 0,
+                    events: Vec::new(),
+                });
+            });
+            Self
+        }
+
+        pub fn events(&self) -> Vec<Event> {
+            STATE.with_borrow(|state| state.as_ref().unwrap().events.clone())
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            STATE.with_borrow_mut(|state| *state = None);
+        }
+    }
+
+    pub fn record(event: Event) {
+        STATE.with_borrow_mut(|state| {
+            if let Some(state) = state {
+                if event == Event::StopEntry {
+                    state.unmount_count = 0;
+                }
+                state.events.push(event);
+            }
+        });
+    }
+
+    pub fn signal(pid: u32, signal: i32) -> io::Result<()> {
+        STATE.with_borrow_mut(|state| {
+            if let Some(state) = state {
+                let injected = state.signal == (pid, signal);
+                state.events.push(Event::Signal {
+                    pid,
+                    signal,
+                    injected,
+                });
+                if injected {
+                    return Err(io::Error::other("injected-signal"));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn unmount(path: &Path) -> io::Result<()> {
+        STATE.with_borrow_mut(|state| {
+            if let Some(state) = state {
+                state.unmount_count += 1;
+                let injected = state.unmount_fault == Some(state.unmount_count);
+                state.events.push(Event::Unmount {
+                    path: path.into(),
+                    occurrence: state.unmount_count,
+                    injected,
+                });
+                if injected {
+                    return Err(io::Error::other("injected-unmount"));
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PidRecord {
     #[serde(flatten)]
@@ -388,6 +544,8 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> 
     }
 }
 fn runtime_control(record: &PidRecord, verb: &str) -> io::Result<()> {
+    #[cfg(all(test, target_os = "linux"))]
+    cleanup_test_hooks::record(cleanup_test_hooks::Event::Runtime(verb.into()));
     #[expect(
         clippy::disallowed_methods,
         reason = r###"internal-read:v1 {"id":"IR-B0120-M01","item":"ratarmount::sandbox::run::runtime_control","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
@@ -433,6 +591,8 @@ fn mounted(path: &Path) -> io::Result<bool> {
     Ok(super::process::mountpoints()?.iter().any(|p| p == path))
 }
 fn unmount(path: &Path) -> io::Result<()> {
+    #[cfg(all(test, target_os = "linux"))]
+    cleanup_test_hooks::unmount(path)?;
     if !mounted(path)? {
         return Ok(());
     }
@@ -591,6 +751,14 @@ impl Cleanup {
     }
 
     fn stop_runtime(&mut self) -> io::Result<()> {
+        let mut signal_error = None;
+        let result = self.stop_runtime_steps(&mut signal_error);
+        signal_error.map_or(result, Err)
+    }
+
+    // Keep signal errors separate so stop() can prefer the first one even if
+    // another cleanup step fails. A failed signal leaves runtime_stopped false.
+    fn stop_runtime_steps(&mut self, signal_error: &mut Option<io::Error>) -> io::Result<()> {
         if self.runtime_stopped {
             return Ok(());
         }
@@ -600,11 +768,7 @@ impl Cleanup {
         if let Some(mut child) = self.runtime_child.take() {
             let _ = wait_bounded(&mut child, CLEANUP_TIMEOUT);
         } else if let Some(child) = &self.record.runtime_child {
-            if child.start.is_some() && child.alive() {
-                unsafe {
-                    libc::kill(child.pid as i32, libc::SIGKILL);
-                }
-            }
+            *signal_error = signal_recorded(child, libc::SIGKILL).err();
         }
         if had_client {
             // A timeout can fire before `run` has created the container. Reap
@@ -614,39 +778,51 @@ impl Cleanup {
         } else {
             kill_result.and(rm_result)?;
         }
-        self.runtime_stopped = true;
+        if signal_error.is_none() {
+            self.runtime_stopped = true;
+        }
         Ok(())
     }
 
     fn stop(&mut self) -> io::Result<()> {
+        #[cfg(all(test, target_os = "linux"))]
+        cleanup_test_hooks::record(cleanup_test_hooks::Event::StopEntry);
         if self.stopped {
             return Ok(());
         }
         // Attempt all cleanup steps even if the runtime is broken.
-        let runtime_result = self.stop_runtime();
+        let mut signal_error = None;
+        let runtime_result = self.stop_runtime_steps(&mut signal_error);
         let unmount_result = unmount(&self.record.mountpoint);
         if let Some(mut child) = self.mount_child.take() {
             let _ = wait_bounded(&mut child, CLEANUP_TIMEOUT);
         } else if let Some(child) = &self.record.mount_child {
-            // A stale foreground child may still be initializing. Never signal a reused PID.
-            if child.start.is_some() && child.alive() {
-                unsafe {
-                    libc::kill(child.pid as i32, libc::SIGTERM);
-                }
-                let start = Instant::now();
-                while child.alive() && start.elapsed() < CLEANUP_TIMEOUT {
-                    std::thread::sleep(POLL);
-                }
-                if child.alive() {
-                    unsafe {
-                        libc::kill(child.pid as i32, libc::SIGKILL);
+            // A stale foreground child may still be initializing.
+            match signal_recorded(child, libc::SIGTERM) {
+                Ok(true) => {
+                    let start = Instant::now();
+                    while child.alive() && start.elapsed() < CLEANUP_TIMEOUT {
+                        std::thread::sleep(POLL);
                     }
+                    if let Err(error) = signal_recorded(child, libc::SIGKILL) {
+                        signal_error.get_or_insert(error);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    signal_error.get_or_insert(error);
                 }
             }
         }
         // Catch a mount that completed while the stale child was being stopped.
+        let second_unmount_result = unmount(&self.record.mountpoint);
+        // Return the first signal failure after the remaining stop steps, and
+        // before marking success, so Drop retries and retains the PID record.
+        if let Some(error) = signal_error {
+            return Err(error);
+        }
         unmount_result?;
-        unmount(&self.record.mountpoint)?;
+        second_unmount_result?;
         runtime_result?;
         let source = self.record.ram_top.as_deref().unwrap_or(&self.top);
         wait_database(source)?;
@@ -677,7 +853,12 @@ impl Drop for Cleanup {
             Ok(()) => {
                 let _ = fs::remove_file(&self.pid_file);
             }
-            Err(error) => eprintln!("{}", cleanup_warning(&error, &self.pid_file)),
+            Err(error) => {
+                let warning = cleanup_warning(&error, &self.pid_file);
+                #[cfg(all(test, target_os = "linux"))]
+                cleanup_test_hooks::record(cleanup_test_hooks::Event::Warning(warning.clone()));
+                eprintln!("{warning}");
+            }
         }
     }
 }
@@ -1703,6 +1884,378 @@ mod tests {
             std::thread::sleep(POLL);
         }
         assert!(!child.alive(), "child outlived its killed supervisor");
+    }
+
+    /// Regression: stale-run recovery signals only the process a record names:
+    /// never a live process at the recorded PID with another start time (a
+    /// reused PID), a record without a start time, PID 0 (this process group),
+    /// a PID outside `pid_t`, or a reaped child. `signal_recorded` also opens
+    /// its pidfd before comparing start times, which closes the window between
+    /// the comparison and the signal; no test can force that window.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_run_signal_recorded_requires_the_recorded_identity() {
+        use std::os::unix::process::ExitStatusExt;
+        let _processes = ratarmount_index::test_process::spawning();
+        if !Path::new("/bin/sleep").exists() {
+            eprintln!("skip: /bin/sleep unavailable");
+            return;
+        }
+        let mut child = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let recorded = ProcessIdentity::new(child.id());
+        assert!(recorded.start.is_some());
+        for other in [
+            ProcessIdentity {
+                pid: child.id(),
+                start: Some("0".into()),
+            },
+            ProcessIdentity {
+                pid: child.id(),
+                start: None,
+            },
+            ProcessIdentity {
+                pid: 0,
+                start: recorded.start.clone(),
+            },
+            ProcessIdentity {
+                pid: u32::MAX,
+                start: recorded.start.clone(),
+            },
+        ] {
+            assert!(
+                !signal_recorded(&other, libc::SIGKILL).unwrap(),
+                "{other:?}"
+            );
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a record that does not name the child signalled it"
+        );
+        assert!(signal_recorded(&recorded, libc::SIGTERM).unwrap());
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+        assert!(!signal_recorded(&recorded, libc::SIGKILL).unwrap());
+    }
+
+    /// Regression: stale-run recovery stops the recorded mount child (SIGTERM)
+    /// and runtime client (SIGKILL), and leaves alone live processes that hold
+    /// a recorded PID with another start time (the PID was reused).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_run_stale_recovery_never_signals_a_reused_pid() {
+        use std::os::unix::process::ExitStatusExt;
+        let _processes = ratarmount_index::test_process::exclusive();
+        if !Path::new("/bin/sleep").exists() {
+            eprintln!("skip: /bin/sleep unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        fs::write(&runtime, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        for reused in [true, false] {
+            let mut mount = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+            let mut client = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+            let identity = |child: &Child| ProcessIdentity {
+                pid: child.id(),
+                start: if reused {
+                    Some("0".into())
+                } else {
+                    process_start(child.id())
+                },
+            };
+            let top = temp.path().join(format!("top-{reused}"));
+            let pid = pid_path(&top);
+            let record = PidRecord {
+                owner: ProcessIdentity {
+                    pid: 0,
+                    start: None,
+                },
+                mountpoint: temp.path().join(format!("mount-{reused}")),
+                container: "ratarmount-run-stale".into(),
+                runtime: runtime.clone(),
+                mount_child: Some(identity(&mount)),
+                runtime_child: Some(identity(&client)),
+                ram_top: None,
+            };
+            fs::write(&pid, serde_json::to_vec(&record).unwrap()).unwrap();
+            recover(&pid, &top).unwrap();
+            assert!(!pid.exists());
+            if reused {
+                assert!(
+                    mount.try_wait().unwrap().is_none(),
+                    "reused mount PID signalled"
+                );
+                assert!(
+                    client.try_wait().unwrap().is_none(),
+                    "reused client PID signalled"
+                );
+                for mut child in [mount, client] {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                }
+            } else {
+                assert_eq!(mount.wait().unwrap().signal(), Some(libc::SIGTERM));
+                assert_eq!(client.wait().unwrap().signal(), Some(libc::SIGKILL));
+            }
+        }
+    }
+
+    /// Regression: stopping the runtime alone discarded a stale client's signal
+    /// failure and set runtime_stopped, preventing the later cleanup retry.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_run_stop_runtime_retains_record_when_signal_fails() {
+        use std::os::unix::process::ExitStatusExt;
+        let _processes = ratarmount_index::test_process::exclusive();
+        let temp = tempfile::tempdir().unwrap();
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+        let top = temp.path().join("top");
+        let pid = pid_path(&top);
+        let mut cleanup = Cleanup {
+            control_dir: None,
+            record: PidRecord {
+                owner: ProcessIdentity {
+                    pid: 0,
+                    start: None,
+                },
+                mountpoint: temp.path().join("not-mounted"),
+                container: "ratarmount-run-runtime-fault".into(),
+                runtime: "/bin/true".into(),
+                mount_child: None,
+                runtime_child: Some(ProcessIdentity::new(child.id())),
+                ram_top: None,
+            },
+            pid_file: pid.clone(),
+            top: top.clone(),
+            mount_child: None,
+            runtime_child: None,
+            stopped: false,
+            runtime_stopped: false,
+        };
+        cleanup.save().unwrap();
+        let fault = cleanup_test_hooks::Guard::arm(child.id(), libc::SIGKILL, None);
+        let result = cleanup.stop_runtime();
+        let runtime_stopped = cleanup.runtime_stopped;
+        drop(cleanup); // Fault stays armed through the full cleanup retry.
+        let retained = pid.exists();
+        drop(fault);
+        // Stop and reap our child even if an assertion below will fail.
+        let retry = recover(&pid, &top);
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        assert_eq!(result.unwrap_err().to_string(), "injected-signal");
+        assert!(!runtime_stopped);
+        assert!(retained);
+        retry.unwrap();
+        assert!(!pid.exists());
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    /// Regression: a failed stale-child signal was discarded, retiring the PID
+    /// record. Keep it across Drop's retry, finish the runtime/unmount steps,
+    /// and prefer the signal error over a later rm or second-unmount failure.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_run_stale_recovery_retains_record_when_signal_fails() {
+        use cleanup_test_hooks::{Event, Guard};
+        use std::os::unix::process::ExitStatusExt;
+
+        struct LiveChild(Child);
+        impl Drop for LiveChild {
+            fn drop(&mut self) {
+                if self.0.try_wait().unwrap().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+
+        // Exclude other spawns before writing the executable fixture and keep
+        // the guard through both recoveries, including Cleanup's Drop retries.
+        let _processes = ratarmount_index::test_process::exclusive();
+        for (case, runtime_child, ignore_term, fail_rm, fail_unmount) in [
+            ("a", true, false, false, false),
+            ("b", false, false, false, false),
+            ("c", false, true, false, false),
+            ("d", true, false, true, false),
+            ("e", false, false, false, true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let runtime = temp.path().join("runtime");
+            let mut script = String::from("#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$0.log\"\n");
+            if fail_rm {
+                script.push_str(
+                    "if [ \"$1\" = rm ]; then\n n=0\n if [ -f \"$0.rm-count\" ]; then read -r n < \"$0.rm-count\"; fi\n n=$((n + 1))\n printf '%s\\n' \"$n\" > \"$0.rm-count\"\n if [ \"$n\" = 2 ]; then : > \"$0.rm-failed\"; exit 1; fi\nfi\n",
+                );
+            }
+            script.push_str("exit 0\n");
+            fs::write(&runtime, script).unwrap();
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+            let readyfile = temp.path().join("ready");
+            let mut child = LiveChild(if ignore_term {
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(r#"trap "" TERM; : > "$1"; exec sleep 60"#)
+                    .arg("sh")
+                    .arg(&readyfile)
+                    .spawn()
+                    .unwrap()
+            } else {
+                Command::new("sleep").arg("60").spawn().unwrap()
+            });
+            if ignore_term {
+                let start = Instant::now();
+                while !readyfile.exists() {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(10),
+                        "case {case}: child readiness timed out"
+                    );
+                    std::thread::sleep(POLL);
+                }
+            }
+            let identity = ProcessIdentity::new(child.0.id());
+            assert!(
+                identity.start.is_some(),
+                "case {case}: missing child start time"
+            );
+            let signal = if runtime_child || ignore_term {
+                libc::SIGKILL
+            } else {
+                libc::SIGTERM
+            };
+            let child_pid = child.0.id();
+            let signal_event = |signal, injected| Event::Signal {
+                pid: child_pid,
+                signal,
+                injected,
+            };
+            let top = temp.path().join("top");
+            let pid = pid_path(&top);
+            let mountpoint = temp.path().join("not-mounted");
+            fs::create_dir(&mountpoint).unwrap();
+            let mut record = PidRecord {
+                owner: ProcessIdentity {
+                    pid: 0,
+                    start: None,
+                },
+                mountpoint: mountpoint.clone(),
+                container: "ratarmount-run-fault".into(),
+                runtime,
+                mount_child: None,
+                runtime_child: None,
+                ram_top: None,
+            };
+            if runtime_child {
+                record.runtime_child = Some(identity);
+            } else {
+                record.mount_child = Some(identity);
+            }
+            fs::write(&pid, serde_json::to_vec(&record).unwrap()).unwrap();
+            let fault = Guard::arm(child.0.id(), signal, fail_unmount.then_some(2));
+            let error = recover(&pid, &top).unwrap_err();
+            assert_eq!(error.to_string(), "injected-signal", "case {case}");
+            assert!(
+                pid.exists(),
+                "case {case}: failed signal retired the record"
+            );
+            assert!(
+                mountpoint.exists(),
+                "case {case}: failed signal removed recovery paths"
+            );
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "case {case}: child was signalled despite the fault"
+            );
+
+            let events = fault.events();
+            let attempts: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter_map(|(i, event)| (*event == Event::StopEntry).then_some(i))
+                .collect();
+            assert_eq!(
+                attempts.len(),
+                2,
+                "case {case}: Drop did not retry: {events:?}"
+            );
+            let mut expected = vec![Event::Runtime("kill".into()), Event::Runtime("rm".into())];
+            if runtime_child {
+                expected.extend([
+                    signal_event(libc::SIGKILL, true),
+                    Event::Runtime("kill".into()),
+                    Event::Runtime("rm".into()),
+                ]);
+            }
+            expected.push(Event::Unmount {
+                path: mountpoint.clone(),
+                occurrence: 1,
+                injected: false,
+            });
+            if !runtime_child {
+                expected.push(signal_event(libc::SIGTERM, !ignore_term));
+                if ignore_term {
+                    expected.push(signal_event(libc::SIGKILL, true));
+                }
+            }
+            expected.push(Event::Unmount {
+                path: mountpoint.clone(),
+                occurrence: 2,
+                injected: fail_unmount,
+            });
+            assert_eq!(
+                &events[attempts[0] + 1..attempts[1]],
+                expected,
+                "case {case}: first attempt stopped early"
+            );
+            assert_eq!(
+                &events[attempts[1] + 1..events.len() - 1],
+                if runtime_child {
+                    &expected[..]
+                } else {
+                    &expected[2..]
+                },
+                "case {case}: Drop stopped early"
+            );
+            assert_eq!(
+                events.last(),
+                Some(&Event::Warning(cleanup_warning(
+                    &io::Error::other("injected-signal"),
+                    &pid
+                ))),
+                "case {case}: Drop lost the signal error"
+            );
+            let verbs = fs::read_to_string(record.runtime.with_extension("log")).unwrap();
+            assert_eq!(
+                record.runtime.with_extension("rm-failed").exists(),
+                fail_rm,
+                "case {case}: the fixture must fail exactly the second rm"
+            );
+            let attempt_verbs = if runtime_child {
+                "kill\nrm\nkill\nrm\n"
+            } else {
+                "kill\nrm\n"
+            };
+            assert_eq!(
+                verbs,
+                attempt_verbs.repeat(if runtime_child { 2 } else { 1 }),
+                "case {case}: runtime steps did not execute"
+            );
+
+            // Keep faults armed through recover() and Cleanup::drop, then
+            // remove both and prove a fresh recovery can retire the record.
+            drop(fault);
+            recover(&pid, &top).unwrap();
+            assert!(
+                !pid.exists(),
+                "case {case}: successful recovery kept the record"
+            );
+            assert!(!mountpoint.exists());
+            assert_eq!(
+                child.0.wait().unwrap().signal(),
+                Some(signal),
+                "case {case}"
+            );
+        }
     }
 
     /// Regression: persisted RAM overlays must preserve DB bytes, modes and symlinks without following them.

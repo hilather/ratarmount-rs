@@ -567,29 +567,33 @@ fn regression_run_stub_kill_removes_sleeping_process_group() {
         eprintln!("skip: setsid unavailable");
         return;
     }
-    let temp = tempfile::tempdir().unwrap();
-    let state = temp.path().join("state");
-    let mut child = Command::new("bash")
-        .arg(stub())
-        .args(["run", "--rm", "--name", "test", "-v"])
-        .arg(format!("{}:/repo", temp.path().display()))
-        .args(["busybox", "sleep", "60"])
-        .env("RATARMOUNT_STUB_STATE", &state)
-        .spawn()
-        .unwrap();
-    wait_for(&state.join("test"), &mut child);
-    // Wait for setsid to create the process group, not just the PID file.
-    let pid: i32 = fs::read_to_string(state.join("test"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    let start = Instant::now();
-    while unsafe { libc::getpgid(pid) } != pid {
-        assert!(start.elapsed() < Duration::from_secs(5));
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    // Regression: each verb must stop a fresh live group; kill removes the
+    // state file, so rm after kill would exercise only an absent record.
     for verb in ["kill", "rm"] {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let mut child = Command::new("bash")
+            .arg(stub())
+            .args(["run", "--rm", "--name", "test", "-v"])
+            .arg(format!("{}:/repo", temp.path().display()))
+            .args(["busybox", "sleep", "60"])
+            .env("RATARMOUNT_STUB_STATE", &state)
+            .spawn()
+            .unwrap();
+        wait_for(&state.join("test"), &mut child);
+        // Wait for setsid to create the process group, not just the PID file.
+        let pid: i32 = fs::read_to_string(state.join("test"))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let start = Instant::now();
+        while unsafe { libc::getpgid(pid) } != pid {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(Command::new("bash")
             .arg(stub())
             .args([verb, "test"])
@@ -597,9 +601,132 @@ fn regression_run_stub_kill_removes_sleeping_process_group() {
             .status()
             .unwrap()
             .success());
+        assert!(!wait(&mut child).success());
+        assert!(!state.join("test").exists());
     }
-    assert!(!wait(&mut child).success());
-    assert!(!state.join("test").exists());
+}
+
+/// Regression: the stub runtime's `kill`/`rm` sent SIGKILL to the process group its state file
+/// named without checking that the recorded leader still ran, so a stale file whose pid was
+/// reused could kill an unrelated group. A group whose leader has another start time (or a
+/// record without one) is left alone, and the stale file is still removed.
+#[test]
+fn regression_run_stub_kill_skips_reused_pid() {
+    use std::os::unix::process::CommandExt;
+    if Command::new("setsid").arg("--version").output().is_err() {
+        eprintln!("skip: setsid unavailable");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    fs::create_dir(&state).unwrap();
+    // A live group led by the recorded pid, but not the process the record describes.
+    let mut unrelated = Command::new("sleep")
+        .arg("60")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    for record in [
+        format!("{} 0\n", unrelated.id()),
+        format!("{}\n", unrelated.id()),
+    ] {
+        for verb in ["kill", "rm"] {
+            fs::write(state.join("test"), &record).unwrap();
+            assert!(Command::new("bash")
+                .arg(stub())
+                .args([verb, "test"])
+                .env("RATARMOUNT_STUB_STATE", &state)
+                .status()
+                .unwrap()
+                .success());
+            assert!(!state.join("test").exists(), "{verb} kept {record:?}");
+        }
+    }
+    let alive = unrelated.try_wait().unwrap().is_none();
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+    assert!(
+        alive,
+        "the stub signalled a group its state file does not describe"
+    );
+}
+
+/// Regression: `/proc/PID/stat` embeds `comm` between parentheses; a newline in
+/// `comm` made `read -r` truncate the record so `start_time` returned empty and
+/// both `kill` and `rm` skipped signalling while still deleting the state file.
+#[test]
+fn regression_run_stub_kill_signals_leader_with_newline_in_comm() {
+    if Command::new("setsid").arg("--version").output().is_err() {
+        eprintln!("skip: setsid unavailable");
+        return;
+    }
+    if Command::new("python3").arg("-V").output().is_err() {
+        eprintln!("skip: python3 unavailable");
+        return;
+    }
+    for verb in ["kill", "rm"] {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        // Child sets its own comm (embedded newline via prctl) then sleeps under
+        // the same PID the stub recorded, so start_time must parse a multi-line
+        // /proc/PID/stat.
+        let mut child = Command::new("bash")
+            .arg(stub())
+            .args(["run", "--rm", "--name", "test", "-v"])
+            .arg(format!("{}:/repo", temp.path().display()))
+            .args([
+                "busybox",
+                "python3",
+                "-c",
+                "import ctypes,time; ctypes.CDLL(None, use_errno=True).prctl(15, b'line\\nbreak', 0, 0, 0); time.sleep(60)",
+            ])
+            .env("RATARMOUNT_STUB_STATE", &state)
+            .spawn()
+            .unwrap();
+        wait_for(&state.join("test"), &mut child);
+        let pid: i32 = fs::read_to_string(state.join("test"))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let start = Instant::now();
+        while unsafe { libc::getpgid(pid) } != pid {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // /proc/PID/comm always ends with a newline when read; wait until the
+        // name itself embeds one (multi-line /proc/PID/stat before the last ')').
+        let start = Instant::now();
+        loop {
+            let stat = fs::read(format!("/proc/{pid}/stat")).unwrap_or_default();
+            let has_embedded = match (
+                stat.iter().position(|&b| b == b'('),
+                stat.iter().rposition(|&b| b == b')'),
+            ) {
+                (Some(a), Some(b)) if b > a => stat[a..b].contains(&b'\n'),
+                _ => false,
+            };
+            if has_embedded {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "leader never took a newline-bearing comm; stat={stat:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(Command::new("bash")
+            .arg(stub())
+            .args([verb, "test"])
+            .env("RATARMOUNT_STUB_STATE", &state)
+            .status()
+            .unwrap()
+            .success());
+        assert!(!wait(&mut child).success(), "{verb} left the group running");
+        assert!(!state.join("test").exists());
+    }
 }
 
 /// Regression: `sandbox run --top` inside a directory `--base` would change

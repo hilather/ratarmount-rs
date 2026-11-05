@@ -86,7 +86,7 @@ libc.workspace = true
 flate2 = "1"
 sha1 = "0.10"
 tar = { version = "0.4", default-features = false }
-rustix = { version = "1.1", features = ["fs", "net"] }
+rustix = { version = "1.1", features = ["fs", "net", "process"] }
 
 [dev-dependencies]
 ratarmount-compositing = { workspace = true, features = ["test-hooks"] }

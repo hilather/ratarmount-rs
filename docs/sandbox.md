@@ -1542,13 +1542,22 @@ window between spawning a child and recording its PID. A sibling `.lock`
 file remains as a stable advisory-lock inode to serialize runs on the same top.
 After SIGKILL, a subsequent run stops the recorded container, detaches the stale
 mount, stops the recorded mount child if its process identity still matches,
-waits for the database lock to clear, and recovers a RAM copy if present. Failed
+waits for the database lock to clear, and recovers a RAM copy if present. A
+recorded child on Linux with pidfds (5.3+) is signalled through a pidfd opened
+before its start time is compared, so a reused PID cannot be signalled. On
+ENOSYS (older kernels), recovery compares the start time then calls kill(2),
+narrowing but not closing the reuse race. Without a usable recorded or current
+start time (e.g. no `/proc`, macOS), no recorded PID is signalled. A signal
+error is returned after the remaining runtime and unmount steps, and failed
 cleanup retains the record for retry. Recovery requires the recorded runtime to
 remain executable. Reusing a sealed top requires explicitly unsealing it first;
 for independent episodes, choose a fresh top over the same sealed lower.
 
 Tests use `test-harness/sandbox-run/runtime.sh`, a Bash runtime stand-in that
-executes commands inside the bind path with a separate process group. Run
+executes commands inside the bind path with a separate process group. Its
+`kill` and `rm` compare the recorded leader's start time before signalling the
+group by number; the comparison narrows but does not close the reuse race in
+this test-only stub. Run
 `cargo test -p ratarmount --test sandbox_run` on a host with FUSE and
 `user_allow_other`. Set `RATARMOUNT_TEST_DOCKER=1` to also exercise a real local
 Docker daemon with the `busybox` image.
