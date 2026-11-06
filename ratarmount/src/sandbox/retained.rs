@@ -1,6 +1,6 @@
 //! Retained attempts (R1c-1 §5.5–§5.8): `retain` on `new`, the commit of a
 //! finalized attempt into `state/retained/ID`, `retained.jsonl` (the
-//! state-log engine's second instance), the in-run retained map, the `held`
+//! state-log engine's second instance), the retained map, the `held`
 //! set behind `--max-retained` and the reserved IDs, and the
 //! `retained/ID/overlay` lower exception.
 //!
@@ -41,6 +41,8 @@ pub const DIR: &str = "retained";
 thread_local! {
     // One-shot fault points; the next `RetainedLog::open` on this thread takes them.
     pub static TEST_FAULTS: std::cell::RefCell<Vec<Fault>> = const { std::cell::RefCell::new(Vec::new()) };
+    // Installed before `Supervisor::open`; consumed by that startup only.
+    pub static TEST_STARTUP_SEAMS: std::cell::RefCell<Option<super::finalize::Seams>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -413,13 +415,120 @@ pub struct RetainedEntry {
     pub acknowledged: bool,
 }
 
+/// Validate without creating paths, recovering a database, or opening any
+/// lower. A bad or unreadable top is kept and reserved, but not served.
+fn restore_entry(dir: &Path, record: &Retained) -> Option<RetainedEntry> {
+    let root = dir.join(&record.id);
+    let overlay = root.join("overlay");
+    for path in [&root, &overlay] {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return None,
+            Err(error) => {
+                if error.kind() != io::ErrorKind::NotFound {
+                    log::warn!("cannot inspect retained path {}: {error}", path.display());
+                }
+                return None;
+            }
+        }
+    }
+    let report = &record.report;
+    let attempt: Attempt = serde_json::from_value(report.get("attempt")?.clone()).ok()?;
+    let optional_number = |value: &Value| value.is_null() || value.as_u64().is_some();
+    let optional_string = |value: &Value| value.is_null() || value.is_string();
+    let stack = report.get("stack_digest")?;
+    let hash = report.get("patch_hash")?.as_object()?;
+    if report.get("status")?.as_str()? != "retained"
+        || hash.get("patch")?.as_str().is_none()
+        || !optional_string(hash.get("base")?)
+        || hash.get("stack")? != stack
+        || hash.get("files")?.as_u64().is_none()
+        || hash.get("normalize")?.as_str()? != "strict"
+        || hash.get("algo")?.as_str()? != "sha256"
+        || !hash.get("excludes")?.is_array()
+        || !hash.get("sealed")?.as_bool()?
+        || hash.get("base_pending")?.as_bool().is_none()
+        || hash.get("base_digest_state")?.as_str().is_none()
+        || report.get("fsck_result")?.as_str().is_none()
+        || !optional_string(stack)
+        || !optional_number(report.get("bytes_written")?)
+        || !optional_number(report.get("erofs_denied")?)
+        || attempt.id != record.id
+        || attempt.base != record.base
+        || attempt.status != "retained"
+        || attempt.path.as_os_str() != root.join("mnt").as_os_str()
+        || attempt.overlay_dir.as_os_str() != overlay.as_os_str()
+        || record.paths.overlay.as_os_str() != overlay.as_os_str()
+        || report.get("layer_digest")?.as_str()? != record.layer_digest
+        || report.get("sealed_at")?.as_str()? != record.sealed_at
+        || report.get("manifest_path")? != &json!(root.join("manifest.jsonl"))
+    {
+        return None;
+    }
+    let bundle = report.get("bundle")?;
+    if bundle.is_null() {
+        if record.paths.bundle.is_some() {
+            return None;
+        }
+    } else if bundle != &json!(root.join("bundle.tar.zst"))
+        || record.paths.bundle.as_ref().map(|p| p.as_os_str())
+            != Some(root.join("bundle.tar.zst").as_os_str())
+    {
+        return None;
+    }
+    let summary = report.get("journal_summary")?;
+    if !summary.is_null() {
+        if summary.get("path")? != &json!(root.join("journal.summary.json")) {
+            return None;
+        }
+        for key in [
+            "files_read",
+            "files_read_then_written",
+            "files_written_blind",
+        ] {
+            summary.get(key)?.as_u64()?;
+        }
+    }
+    let meta = match OverlayMeta::read_no_recovery(&overlay) {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return None,
+        Err(error) => {
+            log::warn!(
+                "cannot read retained overlay {}: {error}",
+                overlay.display()
+            );
+            return None;
+        }
+    };
+    let prefix = meta.lower_layers().ok()?;
+    if !meta.layer_sealed()
+        || meta.get("layer_digest") != Some(record.layer_digest.as_str())
+        || meta.get("sealed_at") != Some(record.sealed_at.as_str())
+        || prefix.len() != record.prefix.len()
+        || prefix.iter().zip(&record.prefix).any(|(actual, saved)| {
+            actual.path.as_os_str() != saved.path.as_os_str()
+                || actual.layer_digest != saved.layer_digest
+                || actual.sealed_at != saved.sealed_at
+        })
+    {
+        return None;
+    }
+    Some(RetainedEntry {
+        attempt,
+        instance: record.instance.clone(),
+        report: record.report.clone(),
+        records: (!record.prefix.is_empty()).then(|| record.prefix.clone()),
+        acknowledged: false,
+    })
+}
+
 /// The not-served refusal of an ID a retained record holds that names no
 /// live attempt and no retained-map entry.
 fn not_served_error(id: &str) -> ApiError {
     ApiError::new(
         "invalid_request",
         format!(
-            "attempt {id} has a retained record that this daemon does not serve: it was retained before a restart, or its commit did not complete; this release cannot serve it"
+            "attempt {id} is reserved as retained but this daemon does not serve it: its retained record or tree could not be validated, or its commit did not complete"
         ),
     )
 }
@@ -497,8 +606,8 @@ impl<M: Mounter> Supervisor<M> {
         })
     }
 
-    /// Whether `target` was retained and is kept but not served (the daemon
-    /// restarted since): a live record holds its ID and instance, and
+    /// Whether `target` was retained and is kept but not served: a live
+    /// record holds its ID and instance, and
     /// `retained/ID/overlay` is that record's layer, sealed with its
     /// `layer_digest` and `sealed_at`. A stray directory proves nothing. A
     /// metadata read that fails is the check's own error, never "not the
@@ -557,7 +666,7 @@ impl<M: Mounter> Supervisor<M> {
         Err(ApiError::new("not_found", "unknown attempt"))
     }
 
-    /// v2 `list` with `all`: the attempts, then this run's retained entries
+    /// v2 `list` with `all`: the attempts, then the served retained entries
     /// in ID order (`finalizing` until their commit is acknowledged).
     pub(super) fn list_all(&self, base: Option<String>) -> Result<Value> {
         if let Some(name) = &base {
@@ -934,13 +1043,19 @@ impl<M: Mounter> Supervisor<M> {
         Ok(report)
     }
 
-    /// R4: `retained/`, then `attempts/`, synced; the entry becomes
-    /// `retained`. A failed fsync poisons the state filesystem.
-    fn acknowledge(&mut self, id: &str) -> Result<()> {
+    /// R4: `retained/`, then `attempts/`, synced. A failed fsync poisons the
+    /// state filesystem. Startup uses one R4 for the whole restored batch.
+    fn sync_rename_dirs(&mut self) -> Result<()> {
         let retained = self.retained_dir();
         let attempts = self.root.join("attempts");
         self.sync_dir_strict(&retained)?;
         self.sync_dir_strict(&attempts)?;
+        Ok(())
+    }
+
+    /// Complete R4 for one in-run commit or retry.
+    fn acknowledge(&mut self, id: &str) -> Result<()> {
+        self.sync_rename_dirs()?;
         #[cfg(test)]
         self.commit_point("after_acknowledge");
         if let Some(entry) = self.retained.get_mut(id) {
@@ -980,6 +1095,40 @@ impl<M: Mounter> Supervisor<M> {
             self.acknowledge(&id)?;
         }
         Ok(report)
+    }
+
+    /// Restore only records whose exact retained tree, report and top seal
+    /// agree. The record precedes the rename, so a record alone proves
+    /// nothing. Reconcile runs later and may remove a stale attempts/ID even
+    /// when a fully validated retained/ID also exists.
+    pub(super) fn restore_retained(&mut self) {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let ids: Vec<_> = self.retained_log.live_ids().cloned().collect();
+        for id in ids {
+            if let Some(entry) = self
+                .retained_log
+                .live(&id)
+                .and_then(|record| restore_entry(&self.retained_dir(), record))
+            {
+                self.retained.insert(id, entry);
+            }
+        }
+        if self.retained.is_empty() {
+            return;
+        }
+        match self.sync_rename_dirs() {
+            Ok(()) => {
+                for entry in self.retained.values_mut() {
+                    entry.acknowledged = true;
+                }
+            }
+            Err(error) => log::warn!(
+                "cannot acknowledge restored retained attempts: {}; they remain finalizing",
+                error.message
+            ),
+        }
     }
 
     #[cfg(test)]

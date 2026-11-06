@@ -237,7 +237,7 @@ fn retained_lower(lower: &str, roots: &Roots<'_>) -> Result<Option<PathBuf>, Api
     let id = id.to_str().ok_or_else(refused)?;
     if !roots.retained.contains(id) {
         return Err(invalid(format!(
-            "lower {lower}: attempt {id} is not a retained attempt this daemon serves (unknown, retained before a restart, or its commit not yet acknowledged)"
+            "lower {lower}: attempt {id} is not a retained attempt this daemon serves (unknown, not validated, or its commit not yet acknowledged)"
         )));
     }
     for path in [dir.clone(), dir.join(id), expected.clone()] {

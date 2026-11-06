@@ -2850,7 +2850,7 @@ recorded attempt and never resolves `id` again:
 | A try returned a report | Gets the stored report, byte for byte; nothing runs, not even the durability step. |
 | The last try failed (`writers_active`, `lower_changed`, `in_use`, `io`, …) and the recorded attempt still exists | Runs again on that attempt and resumes; if another finalize completed it meanwhile, the retry gets that stored report after the durability step. |
 | The recorded attempt is gone (destroyed, or discarded by a restart), also when a new attempt has drawn its ID or a bare name remains under `retained/` | `not_found`: "attempt ID that this request finalizes is gone (destroyed, or discarded by a restart); a retry never acts on another attempt of the same name". Nothing is appended, and every later retry answers the same. |
-| A live retained record identifies the recorded attempt, its retained tree matches the record, and the daemon restarted since | The not-served `invalid_request` of [retained attempts](#retained-attempts); nothing is appended. |
+| A live retained record identifies the recorded attempt and its tree, but startup could not validate it for service | The not-served `invalid_request` of [retained attempts](#retained-attempts); nothing is appended. An unreadable top can instead return its read error. |
 | A try was cut off by a supervisor restart | `interrupted`: "finalize was cut off by a supervisor restart before it finished; an attempt that was not retained was discarded, and a retained one is kept on disk". |
 
 Every finalize error is retryable, since nothing needs undoing; only a restart
@@ -2940,7 +2940,7 @@ once: one with a live `retained.jsonl` record, a name under `retained/` without
 one, or a live attempt created with `retain`. A `new` needs room for its whole
 `count`. Retained attempts do not count toward `--max-attempts`.
 
-In the daemon run that retained it, a retained attempt:
+A served retained attempt, including one restored after a restart:
 
 - is never destroyed: `destroy {id}` answers `retained` ("attempt ID is
   retained; retained attempts are never destroyed"), in version 1 too, and
@@ -2966,19 +2966,32 @@ In the daemon run that retained it, a retained attempt:
   base records a `weak` base identity, which lowers refuse, while layers
   retained over TAR and Git bases branch.
 
-**After a restart.** Retained trees survive a restart, and their IDs stay
-reserved and counted by `--max-retained`, but this release does not serve them:
-`list` omits them; `diff`, `stats` and `finalize` answer `invalid_request`
-("attempt ID has a retained record that this daemon does not serve: it was
-retained before a restart, or its commit did not complete; this release cannot
-serve it"), and so does a `new` that names one as a lower ("lower X: attempt ID
-is not a retained attempt this daemon serves (unknown, retained before a
-restart, or its commit not yet acknowledged)"); `destroy` answers `retained`.
-A later release adds restart recovery. A retain cut off between its
-`retained.jsonl` record and its rename leaves a live record that holds its ID
-and one `--max-retained` slot until then, so with `--max-retained 1` one such
-crash blocks every retain. This release has no operation that removes a
-retained attempt.
+**After a restart.** The supervisor validates each live retained record against
+its exact tree, report and sealed top, then serves matching attempts again.
+It does not reopen their bases or lower contents during startup: `diff` and
+`finalize` perform their usual checks when requested, while `stats` remains
+offline. It syncs `retained/` and then `attempts/` once for the restored batch;
+until both succeed the entries are listed as `finalizing` and cannot be used as
+lowers. A fresh finalize retries the durability step and these directory syncs.
+An fsync failure during startup poisons that filesystem until the next restart,
+just like an fsync failure during finalize. The startup R4 syncs are skipped
+when there are no candidates.
+
+A bare name under `retained/`, or a live record whose tree or report is
+inconsistent or unreadable, remains reserved and counted by `--max-retained`,
+but is not served. A missing tree is treated the same way. A bare name cannot
+establish an attempt's identity. Fresh `diff`, `stats` and `finalize`
+answer `invalid_request` ("attempt ID is reserved as retained but this daemon
+does not serve it: its retained record or tree could not be validated, or its
+commit did not complete"); `destroy` still answers `retained`. A retain cut
+off between its record and rename likewise holds its ID and one capacity slot.
+If both a valid retained tree and `attempts/ID` exist, the retained tree is
+restored and restart cleanup removes the stale attempt. This release has no
+operation that removes a retained attempt.
+
+A finalize request cut off by restart keeps its `interrupted` answer even when
+its retained attempt is restored. Use a fresh `request_id` to obtain the stored
+report; replaying the interrupted ID returns `interrupted` again.
 
 **`retained.jsonl`** sits in the state directory beside `retained/` and is
 written like `requests.jsonl`: a private (0600), owned regular file with one
@@ -3211,8 +3224,8 @@ reserved; set a quota. State records the RAM location for restart cleanup.
 
 After daemon restart, registered bases and caches survive; **all abandoned
 attempts are unmounted and discarded**, including disk overlays and finalized
-attempts. They are never re-adopted. Retained attempts survive in `retained/`
-with their IDs, but this release does not serve them after a restart (see
+attempts. They are never re-adopted. Valid retained attempts survive in `retained/`
+with their IDs and are served again after a restart (see
 [retained attempts](#retained-attempts)). Cleanup must succeed before requests
 are served. Linux children receive SIGKILL if their supervisor dies (including
 during startup); restart then removes disconnected mounts and directories.

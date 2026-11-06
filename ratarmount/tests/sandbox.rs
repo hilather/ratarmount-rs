@@ -2446,3 +2446,66 @@ fn regression_sandbox_v2_retain_fuse() {
     expected.sort_unstable();
     assert_eq!(retained, expected, "{all}");
 }
+
+/// Regression: a retained layered FUSE attempt became inaccessible after a
+/// supervisor restart even though its record and tree survived.
+#[test]
+fn regression_sandbox_restart_serve_retained_fuse() {
+    if !prepared_fuse() {
+        return;
+    }
+    let mut daemon = Daemon::start();
+    let tar = daemon.base_tar_zst();
+    let root = daemon.root.as_ref().unwrap().path().to_path_buf();
+    let lower = authored_a(&root, &tar);
+    let attempt = daemon
+        .call(json!({"version":2, "op":"new", "base":"task", "lowers":[lower], "retain":true}))[0]
+        .clone();
+    let id = attempt["id"].as_str().unwrap().to_owned();
+    let mnt = PathBuf::from(attempt["path"].as_str().unwrap());
+    fs::write(mnt.join("restart.txt"), b"survives restart\n").unwrap();
+    let report = finalize_done(
+        &daemon,
+        &json!({"version":2, "op":"finalize", "id":id, "pack":true, "request_id":"done"}),
+        &mnt,
+    );
+    let patch = daemon.call(json!({"op":"diff", "id":id, "git":true}));
+    let stats = daemon.call(json!({"op":"stats", "id":id}));
+    let tree = root.join("state/retained").join(&id);
+    daemon.restart();
+    assert_eq!(
+        daemon.call(json!({"version":2,"op":"list","all":true})),
+        json!([report["attempt"]])
+    );
+    for version in [1, 2] {
+        assert_eq!(
+            daemon.call(json!({"version":version,"op":"diff","id":id,"git":true})),
+            patch
+        );
+        assert_eq!(
+            daemon.call(json!({"version":version,"op":"stats","id":id})),
+            stats
+        );
+        let refusal = daemon.envelope(json!({"version":version,"op":"destroy","id":id}));
+        assert_eq!(refusal["error"]["code"], "retained", "{refusal}");
+    }
+    assert_eq!(
+        daemon.call(json!({"version":2,"op":"finalize","id":id,"pack":true,"request_id":"fresh"})),
+        report
+    );
+    let child = daemon.call(json!({"version":2,"op":"new","base":"task","lowers":[lower,report["attempt"]["overlay_dir"]]}));
+    let child_path = Path::new(child[0]["path"].as_str().unwrap());
+    assert_eq!(
+        fs::read(child_path.join("restart.txt")).unwrap(),
+        b"survives restart\n"
+    );
+    daemon.call(json!({"op":"destroy","base":"task"}));
+    assert!(tree.join("overlay").is_dir());
+    daemon.restart();
+    assert!(tree.join("overlay").is_dir());
+    assert_eq!(
+        daemon.call(json!({"version":2,"op":"finalize","id":id,"pack":true})),
+        report
+    );
+    assert_eq!(daemon.call(json!({"op":"diff","id":id,"git":true})), patch);
+}

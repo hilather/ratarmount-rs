@@ -192,7 +192,8 @@ direct CLI mounts and a remount without preparation. Once an attempt's
 container has stopped, `sandbox finalize ID` unmounts it, seals and hashes its
 layer, syncs it and prints a report (`--pack` adds a bundle). An attempt
 created with `sandbox new --retain` is then kept in the state directory's
-`retained/ID`, where later attempts of the same daemon run can stack on it.
+`retained/ID`, where later attempts over TAR or Git bases can stack on it,
+including after a daemon restart restores it.
 [Finalize](sandbox.md#finalize) covers its scope (Linux; local TAR, directory
 and Git bases) and the storage it needs.
 

@@ -346,11 +346,11 @@ pub struct Supervisor<M: Mounter> {
     /// every later finalize that would sync anything there answers `io`
     /// until a restart. Never persisted.
     pub poisoned: std::collections::BTreeSet<u64>,
-    /// This run's retained attempts (§5.7), by ID.
+    /// Served retained attempts, by ID.
     pub retained: BTreeMap<String, super::retained::RetainedEntry>,
     pub retained_log: super::retained::RetainedLog,
     /// Names found under `retained/` at start without a live record: kept,
-    /// never entered or served (R1c-2's recovery plugs in there).
+    /// never entered or served.
     pub bare_retained: std::collections::BTreeSet<String>,
     /// `--max-retained` (set after `open`; `retained::MAX_RETAINED` by default).
     pub max_retained: usize,
@@ -455,7 +455,7 @@ impl<M: Mounter> Supervisor<M> {
         // Refusals of the request log come before reconcile touches attempts.
         let requests = RequestLog::open(&root, requests::limits())?;
         // Then `retained/` and its log, also before reconcile, which never
-        // enters `retained/` (R1c-1 §5.7; R1c-2's recovery plugs in here).
+        // enters `retained/`.
         let (retained_log, bare_retained) = Self::open_retained(&root)?;
         let mut supervisor = Self {
             root,
@@ -480,9 +480,11 @@ impl<M: Mounter> Supervisor<M> {
             #[cfg(test)]
             test_ids: None,
             #[cfg(test)]
-            seams: Default::default(),
+            seams: super::retained::TEST_STARTUP_SEAMS
+                .with(|seams| seams.take().unwrap_or_default()),
             _lock: guard,
         };
+        supervisor.restore_retained();
         supervisor.reconcile()?;
         // Every attempt is gone now; only a retained attempt's target still
         // exists: its finalize records stay pinned (approval note (a)). A live
