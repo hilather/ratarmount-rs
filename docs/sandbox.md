@@ -2901,7 +2901,8 @@ any mount process exists, so a retry under the same `request_id` runs again:
 - `invalid_request`: a platform other than Linux; a base outside the
   [finalize](#finalize) scope (binds, `recursive`, a source that is not local,
   `git_synthetic_head`, an archive that is not TAR); a local source whose
-  metadata cannot be read; `overlay: "tmpfs"`
+  metadata cannot be read or that is neither a regular file nor a directory;
+  `overlay: "tmpfs"`
   ("retain needs a disk overlay: a RAM overlay lives outside attempts/ID, so the
   commit could not move it into retained/"); storage that the
   [durability](#durability) rule refuses, checked at `new` for `attempts/`,
@@ -2921,6 +2922,11 @@ any mount process exists, so a retry under the same `request_id` runs again:
 - `io`: while `retained.jsonl` cannot be written ("retained log unavailable
   since …; restart the daemon"). A finalize of an attempt created with `retain`
   answers the same, before its stop.
+
+Local Git bases may use `git:///absolute/repo#REV` or `/absolute/repo@REV`.
+An existing literal path containing `@` takes precedence over the inline
+revision form. The source type check follows symlinks, so a symlink to a TAR
+file or directory remains valid.
 
 `sandbox daemon --max-retained N` (default and maximum 4096; 0 refuses every
 `retain`) bounds the attempt IDs that retained records may hold. Each ID counts

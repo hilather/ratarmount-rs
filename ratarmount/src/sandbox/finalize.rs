@@ -16,6 +16,7 @@ use ratarmount_core::MountSource;
 use serde_json::{json, Value};
 use std::fs::{self, File};
 use std::io::{self, BufReader};
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -452,8 +453,9 @@ impl Scope {
 /// local base without binds or recursion and without `git_synthetic_head`;
 /// a regular-file source must be a TAR archive by its prepared index's
 /// `backendName`. Directory and Git sources need no index. Retain refuses
-/// a local source it cannot stat before creating an attempt; a Git URL is
-/// an alias rather than a pathname.
+/// a local source it cannot stat, or that is neither a regular file nor a
+/// directory, before creating an attempt. Git URLs and inline revisions are
+/// aliases rather than pathnames.
 pub(super) fn scope_preflight(base: &Base, indexes: &Path, scope: Scope) -> ApiResult<()> {
     let name = &base.name;
     lowers::check_base_for(base, scope.name())?;
@@ -475,14 +477,43 @@ pub(super) fn scope_preflight(base: &Base, indexes: &Path, scope: Scope) -> ApiR
         match fs::metadata(source) {
             Ok(metadata) => Some(metadata),
             Err(error) if matches!(scope, Scope::Retain) => {
-                return Err(invalid(format!(
-                    "base {name} source {} cannot be inspected for retain: {error}",
-                    source.display()
-                )))
+                // The factory accepts a missing literal pathname as an inline
+                // Git reference only when its repository exists. Preserve
+                // other stat failures, and the helper's literal-path priority.
+                if error.kind() == io::ErrorKind::NotFound
+                    && ratarmount_formats_git::split_inline_reference(source).is_some()
+                {
+                    None
+                } else {
+                    return Err(invalid(format!(
+                        "base {name} source {} cannot be inspected for retain: {error}",
+                        source.display()
+                    )));
+                }
             }
             Err(_) => None,
         }
     };
+    if let Some(meta) = &metadata {
+        if matches!(scope, Scope::Retain) && !meta.is_file() && !meta.is_dir() {
+            let file_type = meta.file_type();
+            let kind = if file_type.is_fifo() {
+                "FIFO"
+            } else if file_type.is_socket() {
+                "socket"
+            } else if file_type.is_char_device() {
+                "character device"
+            } else if file_type.is_block_device() {
+                "block device"
+            } else {
+                "special file"
+            };
+            return Err(invalid(format!(
+                "base {name} source {} is a {kind}, neither a regular file nor a directory; retain supports regular TAR files and directories",
+                source.display()
+            )));
+        }
+    }
     if metadata.is_some_and(|meta| meta.is_file()) {
         let tar_only = "finalize and retain support TAR archives only";
         let index = match ratarmount_index::resolve_prepared_index_location(

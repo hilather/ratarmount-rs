@@ -4022,9 +4022,9 @@ fn stack_in(env: &Env, parent: &Path, count: usize) -> Vec<PathBuf> {
     layers
 }
 
-/// Regression: a failed source stat let retain skip the TAR check and start
-/// an attempt for a prepared ZIP. Refuse before even drawing an attempt ID,
-/// whether the source is inaccessible or gone; Git URLs remain admissible.
+/// Regression: a failed source stat, or a successful stat of a special file,
+/// let retain skip the TAR check and start an attempt. Refuse before drawing
+/// an attempt ID; Git URLs remain admissible.
 #[test]
 fn regression_supervisor_retain_source_stat_failure_before_allocation() {
     if !linux() {
@@ -4141,6 +4141,76 @@ fn regression_supervisor_retain_source_stat_failure_before_allocation() {
         "attempt-proof"
     );
 
+    // The source can be replaced after create_base. A successful stat of a
+    // FIFO, socket or device must not make retain treat it like a directory.
+    let saved_zip = parent.join("saved.zip");
+    fs::rename(&zip, &saved_zip).unwrap();
+    let fifo = std::ffi::CString::new(zip.to_str().unwrap()).unwrap();
+    // SAFETY: mkfifo reads this NUL-terminated path and does not retain it.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    for (kind, request_id) in [("FIFO", None), ("FIFO", Some("zip-fifo"))] {
+        let error = env
+            .new_v2("zip", &[], Overlay::Disk, true, request_id)
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_request", "{}", error.message);
+        assert!(
+            error.message.contains(zip.to_str().unwrap()),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains(kind), "{}", error.message);
+        nothing_started(&env, spawns);
+        assert_eq!(
+            env.sup.test_ids.as_ref().unwrap().queue.front().unwrap(),
+            "attempt-proof"
+        );
+    }
+    fs::remove_file(&zip).unwrap();
+    let socket = std::os::unix::net::UnixListener::bind(&zip).unwrap();
+    for request_id in [None, Some("zip-socket")] {
+        let error = env
+            .new_v2("zip", &[], Overlay::Disk, true, request_id)
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_request", "{}", error.message);
+        assert!(
+            error.message.contains(zip.to_str().unwrap()),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("socket"), "{}", error.message);
+        nothing_started(&env, spawns);
+        assert_eq!(
+            env.sup.test_ids.as_ref().unwrap().queue.front().unwrap(),
+            "attempt-proof"
+        );
+    }
+    drop(socket);
+    fs::remove_file(&zip).unwrap();
+    std::os::unix::fs::symlink("/dev/null", &zip).unwrap();
+    for request_id in [None, Some("zip-device")] {
+        let error = env
+            .new_v2("zip", &[], Overlay::Disk, true, request_id)
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_request", "{}", error.message);
+        assert!(
+            error.message.contains(zip.to_str().unwrap()),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("character device"),
+            "{}",
+            error.message
+        );
+        nothing_started(&env, spawns);
+        assert_eq!(
+            env.sup.test_ids.as_ref().unwrap().queue.front().unwrap(),
+            "attempt-proof"
+        );
+    }
+    fs::remove_file(&zip).unwrap();
+    fs::rename(&saved_zip, &zip).unwrap();
+
     // A missing directory base must fail at the same point as a missing
     // archive, rather than reaching the worker.
     let moved_base = env.dir().join("moved-base");
@@ -4171,6 +4241,170 @@ fn regression_supervisor_retain_source_stat_failure_before_allocation() {
         .unwrap();
     env.new_v2("git", &[], Overlay::Disk, true, None).unwrap();
     assert_eq!(env.fake.0.lock().unwrap().spawns, spawns + 1);
+
+    // A symlink to a regular TAR remains admissible: the source stat follows
+    // it, just as the worker does.
+    let tar = parent.join("base.tar");
+    let link = parent.join("link.tar");
+    fs::write(&tar, tar_bytes(b"symlinked TAR\n")).unwrap();
+    std::os::unix::fs::symlink(&tar, &link).unwrap();
+    env.sup
+        .handle(Operation::CreateBase {
+            name: "tar-link".into(),
+            source: link.to_str().unwrap().into(),
+            options: BaseOptions::default(),
+        })
+        .unwrap();
+    prepare_index(&link, &env.sup.root.join("indexes/tar-link"));
+    env.new_v2("tar-link", &[], Overlay::Disk, true, None)
+        .unwrap();
+    assert_eq!(env.fake.0.lock().unwrap().spawns, spawns + 2);
+}
+
+/// Regression: retain treated `/repo@REV` as a missing literal path. Git
+/// aliases must be admitted, but existing literal `@` paths still win and
+/// real stat errors must not become aliases.
+#[test]
+fn regression_supervisor_retain_inline_git_and_literal_at_paths() {
+    if !linux() {
+        return;
+    }
+    let mut env = Env::new();
+    let repo_path = env.dir().join("repo");
+    let repo = git2::Repository::init(&repo_path).unwrap();
+    let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+    let mut builder = repo.treebuilder(None).unwrap();
+    builder
+        .insert("file", repo.blob(b"base").unwrap(), 0o100644)
+        .unwrap();
+    let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+    repo.commit(Some("HEAD"), &signature, &signature, "base", &tree, &[])
+        .unwrap();
+
+    let literal = env.dir().join("repo@literal");
+    fs::write(&literal, stored_zip("hello.txt", b"literal archive\n")).unwrap();
+    env.sup
+        .handle(Operation::CreateBase {
+            name: "literal".into(),
+            source: literal.to_str().unwrap().into(),
+            options: BaseOptions::default(),
+        })
+        .unwrap();
+    prepare_index(&literal, &env.sup.root.join("indexes/literal"));
+    env.sup
+        .test_ids
+        .as_mut()
+        .unwrap()
+        .queue
+        .push_back("attempt-proof".into());
+    let spawns = env.fake.0.lock().unwrap().spawns;
+    // If `@literal` is wrongly split off, this ZIP would be admitted as Git.
+    for request_id in [None, Some("literal-zip")] {
+        let error = env
+            .new_v2("literal", &[], Overlay::Disk, true, request_id)
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_request", "{}", error.message);
+        assert!(
+            error.message.contains("ZipMountSource"),
+            "{}",
+            error.message
+        );
+        nothing_started(&env, spawns);
+        assert_eq!(
+            env.sup.test_ids.as_ref().unwrap().queue.front().unwrap(),
+            "attempt-proof"
+        );
+    }
+
+    // A non-ENOENT stat failure cannot be reinterpreted as a Git revision.
+    let blocked = literal.join("child");
+    assert_eq!(
+        fs::metadata(&blocked).unwrap_err().kind(),
+        std::io::ErrorKind::NotADirectory
+    );
+    env.sup
+        .handle(Operation::CreateBase {
+            name: "blocked".into(),
+            source: blocked.to_str().unwrap().into(),
+            options: BaseOptions::default(),
+        })
+        .unwrap();
+    for request_id in [None, Some("blocked-stat")] {
+        let error = env
+            .new_v2("blocked", &[], Overlay::Disk, true, request_id)
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_request", "{}", error.message);
+        assert!(
+            error.message.contains(blocked.to_str().unwrap()),
+            "{}",
+            error.message
+        );
+        nothing_started(&env, spawns);
+        assert_eq!(
+            env.sup.test_ids.as_ref().unwrap().queue.front().unwrap(),
+            "attempt-proof"
+        );
+    }
+
+    fs::remove_file(&literal).unwrap();
+    let literal_repo = git2::Repository::init_bare(&literal).unwrap();
+    let mut literal_builder = literal_repo.treebuilder(None).unwrap();
+    literal_builder
+        .insert("file", literal_repo.blob(b"literal").unwrap(), 0o100644)
+        .unwrap();
+    let literal_tree = literal_repo
+        .find_tree(literal_builder.write().unwrap())
+        .unwrap();
+    literal_repo
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "literal",
+            &literal_tree,
+            &[],
+        )
+        .unwrap();
+    assert!(ratarmount_formats_git::split_inline_reference(&literal).is_none());
+
+    let inline = format!("{}@HEAD", repo_path.display());
+    let url = format!("git://{}#HEAD", repo_path.display());
+    for (name, source) in [("inline", inline), ("url", url)] {
+        env.sup
+            .handle(Operation::CreateBase {
+                name: name.into(),
+                source,
+                options: BaseOptions::default(),
+            })
+            .unwrap();
+    }
+    // Open each admitted spelling with the factory and the same read-only
+    // options as the supervisor. The literal repository has different bytes,
+    // so treating its @ as a revision of `repo` cannot pass this assertion.
+    for (name, expected) in [
+        ("inline", &b"base"[..]),
+        ("url", &b"base"[..]),
+        ("literal", &b"literal"[..]),
+    ] {
+        let base = env.sup.base(name).unwrap();
+        let options = super::daemon::base_open_options(base, &env.sup.indexes(name));
+        let source =
+            ratarmount_session::factory::open_path(Path::new(&base.source), &options, false)
+                .unwrap();
+        let file = source.lookup("/file", 0).unwrap();
+        assert_eq!(source.read(&file, 99, 0).unwrap(), expected);
+    }
+    for (i, name) in ["inline", "url", "literal"].into_iter().enumerate() {
+        for request_id in [None, Some(name)] {
+            env.new_v2(name, &[], Overlay::Disk, true, request_id)
+                .unwrap();
+        }
+        assert_eq!(env.fake.0.lock().unwrap().spawns, spawns + 2 * (i + 1));
+    }
+    assert_eq!(
+        env.sup.base("literal").unwrap().source,
+        literal.to_str().unwrap()
+    );
 }
 
 /// Regression (R1c-1 T12, ruling 4 and the scope rule): `retain` must be
