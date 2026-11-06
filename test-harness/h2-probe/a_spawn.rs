@@ -9,7 +9,7 @@ fn main() {
     std::fs::write("/proc/self/uid_map", format!("0 {u} 1")).unwrap();
     std::fs::write("/proc/self/gid_map", format!("0 {g} 1")).unwrap();
     assert_eq!(unsafe { unshare(NEWPID) }, 0, "unshare pid: {}", std::io::Error::last_os_error());
-    let mut c = Command::new("sh").arg("-c").arg("grep NSpid /proc/self/status").spawn().unwrap();
+    let mut c = Command::new("sh").arg("-c").arg("exec grep NSpid /proc/self/status").spawn().unwrap();
     println!("Child::id()={}", c.id());
     c.wait().unwrap();
 }

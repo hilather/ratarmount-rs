@@ -54,7 +54,12 @@ def tree(d):
     return iv, ov, R, host, {k: os.pidfd_open(v) for k, v in host.items()}
 def run(mode, base):
     d = os.path.join(base, mode); os.makedirs(d, exist_ok=True)
-    c = subprocess.Popen([PY, ME, 'client', d]); iv, ov, R, host, fds = tree(d)
+    c = subprocess.Popen([PY, ME, 'client', d])
+    try:
+        iv, ov, R, host, fds = tree(d)
+    except Exception:
+        c.kill(); c.wait()  # owner failed (e.g. userns denied): don't leave the client holding stdout
+        raise
     res = {'mode': mode, 'host': host, 'owner_threads': rfile(d, 'owner_threads'), 'init_view': iv, 'owner_view': ov}
     res['a_child_id_eq_init_hostpid'] = ov['child_id'] == iv['init_nspid'][0]
     res['a_init_nspid_ends_1'] = iv['init_nspid'][-1] == 1
@@ -84,4 +89,11 @@ def probe_e():
     return {'single_thread': one.stdout.strip() or one.stderr.strip(), 'two_threads': two.stdout.strip() or two.stderr.strip()}
 if __name__ == '__main__' and role == 'main':
     base = sys.argv[2] if len(sys.argv) > 2 else '/var/tmp/muse-h2-probe/run'
-    print(json.dumps({'kernel': os.uname().release, 'b': run('b', base), 'c': run('c', base), 'e': probe_e()}, indent=1))
+    out = {'kernel': os.uname().release}
+    try:
+        out['b'] = run('b', base); out['c'] = run('c', base)
+    except Exception as ex:
+        out['error'] = f'{type(ex).__name__}: {ex} (owner stderr above names the failing syscall)'
+    out['e'] = probe_e()
+    print(json.dumps(out, indent=1))
+    sys.exit(2 if 'error' in out else 0)

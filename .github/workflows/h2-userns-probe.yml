@@ -22,11 +22,13 @@ jobs:
       - name: set apparmor_restrict_unprivileged_userns=${{ matrix.restrict }}
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=${{ matrix.restrict }}
       - name: probe.py (a,b,c,e)
+        timeout-minutes: 3
         run: |
           set -o pipefail
           python3 test-harness/h2-probe/probe.py main /tmp/h2run 2>&1 | tee probe-${{ matrix.restrict }}.txt
       - name: a_spawn.rs (Rust Command::spawn)
         if: always()
+        timeout-minutes: 3
         run: |
           set -o pipefail
           rustc -O -o /tmp/a_spawn test-harness/h2-probe/a_spawn.rs
