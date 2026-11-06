@@ -134,5 +134,5 @@
     "root_declarations_sha256": "d674593a4565bea341347649d4a659633d8e53f233ccf7fa1dd01a99f0df45a8",
     "schema": 1
   },
-  "reviewer": "PR #251 renewal: rustix `net` feature added for the sandbox inspection status deadline (stalled-socket timeout); no configured policy method is in rustix::net, availability witnesses rerun unchanged"
+  "reviewer": "#246 PR1 renewal: rustix `process` feature added to ratarmount for pidfd_open/pidfd_send_signal in sandbox run crash recovery (signal_recorded); no configured policy method is in rustix::process, availability witnesses rerun unchanged"
 }
