@@ -451,7 +451,9 @@ impl Scope {
 /// The base and archive rules of the scope preflight (§5.5, ruling 4): a
 /// local base without binds or recursion and without `git_synthetic_head`;
 /// a regular-file source must be a TAR archive by its prepared index's
-/// `backendName`. Directory and Git sources need no index.
+/// `backendName`. Directory and Git sources need no index. Retain refuses
+/// a local source it cannot stat before creating an attempt; a Git URL is
+/// an alias rather than a pathname.
 pub(super) fn scope_preflight(base: &Base, indexes: &Path, scope: Scope) -> ApiResult<()> {
     let name = &base.name;
     lowers::check_base_for(base, scope.name())?;
@@ -462,7 +464,26 @@ pub(super) fn scope_preflight(base: &Base, indexes: &Path, scope: Scope) -> ApiR
         )));
     }
     let source = Path::new(&base.source);
-    if fs::metadata(source).is_ok_and(|meta| meta.is_file()) {
+    let is_git = matches!(scope, Scope::Retain)
+        && ratarmount_formats_git::parse_git_url(&base.source)
+            .ok()
+            .flatten()
+            .is_some();
+    let metadata = if is_git {
+        None
+    } else {
+        match fs::metadata(source) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if matches!(scope, Scope::Retain) => {
+                return Err(invalid(format!(
+                    "base {name} source {} cannot be inspected for retain: {error}",
+                    source.display()
+                )))
+            }
+            Err(_) => None,
+        }
+    };
+    if metadata.is_some_and(|meta| meta.is_file()) {
         let tar_only = "finalize and retain support TAR archives only";
         let index = match ratarmount_index::resolve_prepared_index_location(
             source,

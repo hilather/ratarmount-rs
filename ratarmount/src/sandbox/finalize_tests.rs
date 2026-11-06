@@ -4022,6 +4022,157 @@ fn stack_in(env: &Env, parent: &Path, count: usize) -> Vec<PathBuf> {
     layers
 }
 
+/// Regression: a failed source stat let retain skip the TAR check and start
+/// an attempt for a prepared ZIP. Refuse before even drawing an attempt ID,
+/// whether the source is inaccessible or gone; Git URLs remain admissible.
+#[test]
+fn regression_supervisor_retain_source_stat_failure_before_allocation() {
+    if !linux() {
+        return;
+    }
+    let mut env = Env::new();
+    let parent = env.dir().join("source");
+    fs::create_dir(&parent).unwrap();
+    let zip = parent.join("base.zip");
+    fs::write(&zip, stored_zip("hello.txt", b"zip base\n")).unwrap();
+    env.sup
+        .handle(Operation::CreateBase {
+            name: "zip".into(),
+            source: zip.to_str().unwrap().into(),
+            options: BaseOptions::default(),
+        })
+        .unwrap();
+    prepare_index(&zip, &env.sup.root.join("indexes/zip"));
+    env.sup
+        .test_ids
+        .as_mut()
+        .unwrap()
+        .queue
+        .push_back("attempt-proof".into());
+    let spawns = env.fake.0.lock().unwrap().spawns;
+    let zip_error = env
+        .new_v2("zip", &[], Overlay::Disk, true, None)
+        .unwrap_err();
+    assert_eq!(zip_error.code, "invalid_request");
+    assert!(zip_error.message.contains("ZipMountSource"));
+
+    let original_mode = fs::metadata(&parent).unwrap().permissions();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+    let stat_error = fs::metadata(&zip).err();
+    let inaccessible = if stat_error
+        .as_ref()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    {
+        Some([
+            env.new_v2("zip", &[], Overlay::Disk, true, None),
+            env.new_v2("zip", &[], Overlay::Disk, true, Some("zip-permission")),
+        ])
+    } else {
+        None
+    };
+    fs::set_permissions(&parent, original_mode).unwrap();
+    if let Some(error) = stat_error.as_ref() {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{error}"
+        );
+    } else {
+        eprintln!(
+            "skip: this user can search a mode-000 directory; the missing-source case still runs"
+        );
+    }
+    if let Some(results) = inaccessible {
+        let stat_message = stat_error.unwrap().to_string();
+        for result in results {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, "invalid_request", "{}", error.message);
+            assert!(
+                error.message.contains(zip.to_str().unwrap()),
+                "{}",
+                error.message
+            );
+            assert!(error.message.contains(&stat_message), "{}", error.message);
+            nothing_started(&env, spawns);
+            assert_eq!(
+                env.sup.test_ids.as_ref().unwrap().queue.front().unwrap(),
+                "attempt-proof"
+            );
+        }
+        assert_eq!(
+            env.sup.requests.status("zip-permission"),
+            Some(super::requests::Status::Retryable)
+        );
+    }
+
+    fs::rename(&parent, env.dir().join("moved-source")).unwrap();
+    for request_id in [None, Some("zip-missing")] {
+        let error = env
+            .new_v2("zip", &[], Overlay::Disk, true, request_id)
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_request", "{}", error.message);
+        assert!(
+            error.message.contains(zip.to_str().unwrap()),
+            "{}",
+            error.message
+        );
+        nothing_started(&env, spawns);
+        assert_eq!(
+            env.sup.test_ids.as_ref().unwrap().queue.front().unwrap(),
+            "attempt-proof"
+        );
+    }
+    assert_eq!(
+        env.sup.requests.status("zip-missing"),
+        Some(super::requests::Status::Retryable)
+    );
+    fs::rename(env.dir().join("moved-source"), &parent).unwrap();
+    let error = env
+        .new_v2("zip", &[], Overlay::Disk, true, Some("zip-missing"))
+        .unwrap_err();
+    assert!(
+        error.message.contains("ZipMountSource"),
+        "{}",
+        error.message
+    );
+    nothing_started(&env, spawns);
+    assert_eq!(
+        env.sup.test_ids.as_ref().unwrap().queue.front().unwrap(),
+        "attempt-proof"
+    );
+
+    // A missing directory base must fail at the same point as a missing
+    // archive, rather than reaching the worker.
+    let moved_base = env.dir().join("moved-base");
+    fs::rename(&env.base, &moved_base).unwrap();
+    let missing_directory = env.new_v2("task", &[], Overlay::Disk, true, None);
+    fs::rename(&moved_base, &env.base).unwrap();
+    let error = missing_directory.unwrap_err();
+    assert_eq!(error.code, "invalid_request", "{}", error.message);
+    assert!(
+        error.message.contains(env.base.to_str().unwrap()),
+        "{}",
+        error.message
+    );
+    nothing_started(&env, spawns);
+    assert_eq!(
+        env.sup.test_ids.as_ref().unwrap().queue.front().unwrap(),
+        "attempt-proof"
+    );
+
+    // A Git URL is an alias, not a path to pass to fs::metadata. The Fake
+    // worker lets this assert admission without depending on a Git CLI.
+    env.sup
+        .handle(Operation::CreateBase {
+            name: "git".into(),
+            source: format!("git://{}#main", env.base.display()),
+            options: BaseOptions::default(),
+        })
+        .unwrap();
+    env.new_v2("git", &[], Overlay::Disk, true, None).unwrap();
+    assert_eq!(env.fake.0.lock().unwrap().spawns, spawns + 1);
+}
+
 /// Regression (R1c-1 T12, ruling 4 and the scope rule): `retain` must be
 /// refused, before any attempt exists, on what finalize cannot retain: a
 /// non-TAR archive judged by its prepared index's `backendName` (v1 on that

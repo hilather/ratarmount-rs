@@ -2900,7 +2900,8 @@ any mount process exists, so a retry under the same `request_id` runs again:
 
 - `invalid_request`: a platform other than Linux; a base outside the
   [finalize](#finalize) scope (binds, `recursive`, a source that is not local,
-  `git_synthetic_head`, an archive that is not TAR); `overlay: "tmpfs"`
+  `git_synthetic_head`, an archive that is not TAR); a local source whose
+  metadata cannot be read; `overlay: "tmpfs"`
   ("retain needs a disk overlay: a RAM overlay lives outside attempts/ID, so the
   commit could not move it into retained/"); storage that the
   [durability](#durability) rule refuses, checked at `new` for `attempts/`,
@@ -3053,6 +3054,12 @@ else `~/.cache/ratarmount/layers`) and every lower on a volume mounted at or
 above the directory that holds them. A lower mounted as its own volume
 (`-v /srv/layers/A:/layers/A`) under an overlayfs root is refused, because its
 parent `/layers` is synced too; mount `-v /srv/layers:/layers` instead.
+For a `new` with `retain` and a bundle lower, the cache preflight also checks
+the parent of the cache directory, or of its deepest existing ancestor if the
+cache does not yet exist, even across a filesystem boundary. For example, if
+an empty cache volume is mounted at `$XDG_CACHE_HOME` under overlayfs,
+create `$XDG_CACHE_HOME/ratarmount/layers` first. If `layers` itself is a
+volume mount with an overlayfs parent, mount the volume at its parent or above.
 
 **Checked before anything stops.** Finalize checks the storage before its stop,
 and a `new` with `retain` before anything starts; a plain attempt on such

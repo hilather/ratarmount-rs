@@ -1051,7 +1051,7 @@ impl<M: Mounter> Supervisor<M> {
                 &lowers::Roots {
                     state: &self.root,
                     ram: self.ram_root.as_deref(),
-                    retained: Some(&self.retained_lowers()),
+                    retained: &self.retained_lowers(),
                 },
                 self.lower_decode_budget,
             )?

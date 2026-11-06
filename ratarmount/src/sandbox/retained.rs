@@ -559,7 +559,7 @@ impl<M: Mounter> Supervisor<M> {
 
     /// v2 `list` with `all`: the attempts, then this run's retained entries
     /// in ID order (`finalizing` until their commit is acknowledged).
-    pub(super) fn list_all(&mut self, base: Option<String>) -> Result<Value> {
+    pub(super) fn list_all(&self, base: Option<String>) -> Result<Value> {
         if let Some(name) = &base {
             self.base(name)?;
         }

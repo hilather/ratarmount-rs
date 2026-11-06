@@ -113,7 +113,7 @@ pub struct Roots<'a> {
     pub state: &'a Path,
     pub ram: Option<&'a Path>,
     /// The acknowledged retained attempts this daemon run serves.
-    pub retained: Option<&'a BTreeSet<String>>,
+    pub retained: &'a BTreeSet<String>,
 }
 
 impl Roots<'_> {
@@ -235,7 +235,7 @@ fn retained_lower(lower: &str, roots: &Roots<'_>) -> Result<Option<PathBuf>, Api
         return Err(refused());
     }
     let id = id.to_str().ok_or_else(refused)?;
-    if !roots.retained.is_some_and(|retained| retained.contains(id)) {
+    if !roots.retained.contains(id) {
         return Err(invalid(format!(
             "lower {lower}: attempt {id} is not a retained attempt this daemon serves (unknown, retained before a restart, or its commit not yet acknowledged)"
         )));
