@@ -613,6 +613,10 @@ struct Args {
     #[arg(long, hide = true, requires_all = ["write_overlay", "foreground"])]
     sandbox_inspection_socket: Option<PathBuf>,
 
+    // The supervisor's preflighted bundle cache for a retained attempt.
+    #[arg(long, hide = true, requires = "sandbox_inspection_socket")]
+    sandbox_bundle_cache: Option<PathBuf>,
+
     /// Commit write-overlay changes into a TAR (uncompressed / gzip / bzip2 / xz via GNU tar,
     /// or `.tar.zst` via frame splice) or ZIP (full rebuild). Does not mount; requires
     /// `--write-overlay` and a single archive path.
@@ -2514,7 +2518,7 @@ fn main() {
         lower_key.as_deref(),
         &args.lower,
         args.allow_unsealed_lower,
-        None,
+        args.sandbox_bundle_cache.as_deref(),
         &bottom_identity(&lower_identity),
         &lower_stack_services(),
     )

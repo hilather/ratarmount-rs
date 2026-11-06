@@ -134,39 +134,57 @@ impl Daemon {
 
     fn base(&self) {
         let tar = self.root.as_ref().unwrap().path().join("base.tar");
-        let mut file = fs::File::create(&tar).unwrap();
-        write_ustar_members(
-            &mut file,
-            &[
-                UstarMember {
-                    path: "delete-me.txt",
-                    mode: 0o644,
-                    uid: 0,
-                    gid: 0,
-                    mtime: 0,
-                    xattrs: &[],
-                    payload: UstarPayload::File {
-                        bytes: b"delete me\n",
-                    },
-                },
-                UstarMember {
-                    path: "base.txt",
-                    mode: 0o644,
-                    uid: 0,
-                    gid: 0,
-                    mtime: 0,
-                    xattrs: &[],
-                    payload: UstarPayload::File {
-                        bytes: b"original\n",
-                    },
-                },
-            ],
-        )
-        .unwrap();
-        write_tar_eof(&mut file).unwrap();
-        drop(file);
+        fs::write(&tar, base_tar_bytes()).unwrap();
         self.call(json!({"op":"create_base", "name":"task", "source":tar}));
     }
+
+    /// `base()` as `base.tar.zst`, one frame of the repository's seekable
+    /// zstd frame writer, registered as `task` (whose `create_base` prepares
+    /// its index).
+    fn base_tar_zst(&self) -> PathBuf {
+        let path = self.root.as_ref().unwrap().path().join("base.tar.zst");
+        let mut writer =
+            ratarmount_compress::ZstdFrameWriter::new(fs::File::create(&path).unwrap(), 3);
+        writer.write_frame(&base_tar_bytes()[..]).unwrap();
+        writer.finish().unwrap();
+        self.call(json!({"op":"create_base", "name":"task", "source":path}));
+        path
+    }
+}
+
+/// The TAR `Daemon::base` registers: `delete-me.txt` and `base.txt`.
+fn base_tar_bytes() -> Vec<u8> {
+    let mut tar = Vec::new();
+    write_ustar_members(
+        &mut tar,
+        &[
+            UstarMember {
+                path: "delete-me.txt",
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                xattrs: &[],
+                payload: UstarPayload::File {
+                    bytes: b"delete me\n",
+                },
+            },
+            UstarMember {
+                path: "base.txt",
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                xattrs: &[],
+                payload: UstarPayload::File {
+                    bytes: b"original\n",
+                },
+            },
+        ],
+    )
+    .unwrap();
+    write_tar_eof(&mut tar).unwrap();
+    tar
 }
 
 impl Drop for Daemon {
@@ -190,8 +208,8 @@ impl Drop for Daemon {
                     root.keep().display()
                 );
             } else {
-                // Sealed layers and bundle cache entries have no write
-                // bits, which TempDir's removal needs.
+                // Sealed layers, retained attempts and bundle cache entries
+                // have no write bits, which TempDir's removal needs.
                 make_writable(root.path());
             }
         }
@@ -438,12 +456,13 @@ fn regression_sandbox_envelope_errors_match_golden_over_socket() {
 }
 
 /// Regression: `Daemon::envelope` really sends version 2: the daemon answers
-/// v2 requests, accepted or refused, in v2 envelopes (old blocker 6).
+/// v2 requests, accepted or refused, in v2 envelopes (old blocker 6). The
+/// refused field is one no slice defines (`retain` is R1c-1's, plan §6 step 4).
 #[test]
 fn regression_sandbox_v2_envelopes_over_socket() {
     let daemon = Daemon::start();
     assert_eq!(daemon.call(json!({"version":2, "op":"list"})), json!([]));
-    let refused = daemon.envelope(json!({"version":2, "op":"new", "base":"task", "retain":true}));
+    let refused = daemon.envelope(json!({"version":2, "op":"new", "base":"t", "bogus":1}));
     assert_eq!(refused["error"]["code"], "invalid_request", "{refused}");
     assert_eq!(daemon.call(json!({"op":"list"})), json!([]));
 }
@@ -1591,8 +1610,8 @@ fn regression_prepared_index_mixed_tar_and_unindexed_bind() {
 }
 
 // ---------------------------------------------------------------------------
-// R1c-1: the supervisor's finalize with the real binary (plan
-// `docs/tasks/plans/localai-r1c1-finalize-retain.md` §7 T5b, F1, F2).
+// R1c-1: the supervisor's finalize and retained attempts with the real binary
+// (plan `docs/tasks/plans/localai-r1c1-finalize-retain.md` §7 T5b, F1–F3).
 // ---------------------------------------------------------------------------
 
 /// Writes the executable `/bin/sh` script `dir/name`: it appends one record
@@ -2174,4 +2193,256 @@ fn regression_sandbox_v2_finalize_writers_active_fuse() {
     let meta = meta_unlocked(&overlay);
     assert_eq!(json!(meta["sealed_at"]), report["sealed_at"]);
     assert_eq!(json!(meta["layer_digest"]), report["layer_digest"]);
+}
+
+/// The live records of `STATE/retained.jsonl`, by attempt ID.
+fn retained_records(state: &Path) -> std::collections::BTreeMap<String, Value> {
+    let mut live = std::collections::BTreeMap::new();
+    for line in fs::read_to_string(state.join("retained.jsonl"))
+        .unwrap()
+        .lines()
+    {
+        let record: Value = serde_json::from_str(line).unwrap();
+        let id = record["id"].as_str().unwrap().to_owned();
+        match record["t"].as_str() {
+            Some("retained") => live.insert(id, record),
+            Some("aborted") => live.remove(&id),
+            other => panic!("unexpected record type {other:?}: {line}"),
+        };
+    }
+    live
+}
+
+/// The lower paths a retained record's prefix names, bottom first.
+fn prefix_paths(record: &Value) -> Vec<PathBuf> {
+    record["prefix"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|lower| PathBuf::from(lower["path"].as_str().unwrap()))
+        .collect()
+}
+
+/// A foreground read-only mount of the real binary, `--lower` by `--lower`
+/// over `base`, ready once `ready` is visible; `Authoring` unmounts it.
+fn lower_mount(base: &Path, lowers: &[&Path], mnt: &Path, home: &Path, ready: &str) -> Authoring {
+    fs::create_dir_all(home).unwrap();
+    fs::create_dir(mnt).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    command
+        .env("HOME", home)
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .args(["-f", "--passthrough", "off", "--index-file", ":memory:"]);
+    for lower in lowers {
+        command.arg("--lower").arg(lower);
+    }
+    let child = command
+        .arg(base)
+        .arg(mnt)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut mount = Authoring {
+        child,
+        mnt: mnt.into(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !mnt.join(ready).exists() {
+        assert!(
+            mount.child.try_wait().unwrap().is_none(),
+            "the mount of {} exited",
+            mnt.display()
+        );
+        assert!(Instant::now() < deadline, "mount timeout");
+        thread::sleep(Duration::from_millis(50));
+    }
+    mount
+}
+
+/// Regression (R1c-1 F3): an attempt created with `retain` over a prepared
+/// `.tar.zst` base and a sealed lower must, once finalized with `pack`, be
+/// kept in `retained/ID` (listed by `list {all}` only) as a layer whose
+/// bundle mounts with a direct `--lower`, whose `retained/ID/overlay` a new
+/// attempt stacks on, and two retained attempts over one bundle lower (the
+/// second a cache hit of the entry the first filled) must both retain.
+#[test]
+fn regression_sandbox_v2_retain_fuse() {
+    if !prepared_fuse() {
+        return;
+    }
+    let daemon = Daemon::start();
+    let tar = daemon.base_tar_zst();
+    let root = daemon.root.as_ref().unwrap().path().to_path_buf();
+    let state = root.join("state").canonicalize().unwrap();
+    let a = authored_a(&root, &tar);
+    let attempts = daemon.call(json!({
+        "version": 2, "op": "new", "base": "task", "lowers": [a], "retain": true,
+        "request_id": "r"
+    }));
+    let id = attempts[0]["id"].as_str().unwrap().to_owned();
+    let mnt = PathBuf::from(attempts[0]["path"].as_str().unwrap());
+    assert_eq!(fs::read(mnt.join("base.txt")).unwrap(), b"original\n");
+    assert_eq!(fs::read(mnt.join("a.txt")).unwrap(), b"from a\n");
+    fs::write(mnt.join("kept.txt"), b"kept by retain\n").unwrap();
+    let report = finalize_done(
+        &daemon,
+        &json!({"version": 2, "op": "finalize", "id": id, "pack": true, "request_id": "f"}),
+        &mnt,
+    );
+    assert_eq!(report["status"], "retained", "{report}");
+    // Every path names the retained tree; the attempt left `attempts/`.
+    let kept = state.join("retained").join(&id);
+    let overlay = kept.join("overlay");
+    let bundle = kept.join("bundle.tar.zst");
+    assert_eq!(
+        report["attempt"],
+        json!({"id": id, "base": "task", "path": kept.join("mnt"), "overlay_dir": overlay, "status": "retained"})
+    );
+    assert_eq!(report["manifest_path"], json!(kept.join("manifest.jsonl")));
+    assert_eq!(report["bundle"], json!(bundle));
+    assert!(report["journal_summary"].is_null(), "{report}");
+    assert!(kept.join("manifest.jsonl").is_file() && bundle.is_file());
+    assert!(!state.join("attempts").join(&id).exists());
+    let meta = ratarmount_compositing::OverlayMeta::read_no_recovery(&overlay)
+        .unwrap()
+        .unwrap();
+    assert!(meta.layer_sealed());
+    assert_eq!(meta.get("layer_digest"), report["layer_digest"].as_str());
+    let digest = report["layer_digest"].as_str().unwrap().to_owned();
+    let records = retained_records(&state);
+    let record = &records[&id];
+    assert_eq!(record["layer_digest"], report["layer_digest"], "{record}");
+    assert_eq!(record["sealed_at"], report["sealed_at"], "{record}");
+    assert_eq!(
+        record["paths"],
+        json!({"overlay": overlay, "bundle": bundle}),
+        "{record}"
+    );
+    assert_eq!(prefix_paths(record), [a.canonicalize().unwrap()]);
+    assert_eq!(record["report"], report);
+    // Only `list {all}` shows it, as retained.
+    let all = daemon.call(json!({"version": 2, "op": "list", "all": true}));
+    let listed: Vec<&Value> = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["id"] == id.as_str())
+        .collect();
+    assert_eq!(listed, [&report["attempt"]], "{all}");
+    assert!(
+        !daemon
+            .call(json!({"op": "list"}))
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == id.as_str()),
+        "a retained attempt is listed only with all"
+    );
+    // The retained bundle mounts with a direct `--lower`.
+    let direct = lower_mount(
+        &tar,
+        &[&a, &bundle],
+        &root.join("direct"),
+        &root.join("direct-home"),
+        "kept.txt",
+    );
+    assert_eq!(
+        fs::read(root.join("direct/kept.txt")).unwrap(),
+        b"kept by retain\n"
+    );
+    assert_eq!(fs::read(root.join("direct/a.txt")).unwrap(), b"from a\n");
+    assert_eq!(
+        fs::read(root.join("direct/base.txt")).unwrap(),
+        b"original\n"
+    );
+    direct.finish();
+    // A new attempt stacks on A and the retained layer, by exactly
+    // `retained/ID/overlay`.
+    let stacked = daemon.call(json!({
+        "version": 2, "op": "new", "base": "task",
+        "lowers": [a, report["attempt"]["overlay_dir"]]
+    }));
+    let path = PathBuf::from(stacked[0]["path"].as_str().unwrap());
+    assert_eq!(fs::read(path.join("base.txt")).unwrap(), b"original\n");
+    assert_eq!(fs::read(path.join("a.txt")).unwrap(), b"from a\n");
+    assert_eq!(
+        fs::read(path.join("kept.txt")).unwrap(),
+        b"kept by retain\n"
+    );
+    let layers: Value = serde_json::from_str(&root_xattr(&path, "user.ratarmount.layers")).unwrap();
+    let taken: Vec<_> = layers
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|layer| layer["layer_digest"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(taken, [layer_digest(&a), digest]);
+    daemon.call(json!({"op": "destroy", "id": stacked[0]["id"]}));
+    // Two retained attempts over one bundle lower (a copy of the retained
+    // bundle outside the state directory): the first child fills the cache
+    // entry, the second finds it there, and both retain. The cache directory
+    // itself is a symlink, so the worker must accept the resolved directory
+    // passed by the retain preflight.
+    let cache_parent = root.join("cache/ratarmount");
+    fs::create_dir_all(&cache_parent).unwrap();
+    let resolved_cache = root.join("resolved-bundle-cache");
+    fs::create_dir(&resolved_cache).unwrap();
+    std::os::unix::fs::symlink(&resolved_cache, cache_parent.join("layers")).unwrap();
+    let copy = root.join("layers/kept.tar.zst");
+    fs::copy(&bundle, &copy).unwrap();
+    let entry = resolved_cache.join(&sha256_of(&copy)["sha256:".len()..]);
+    let mut filled = None;
+    let mut siblings = Vec::new();
+    for name in ["first", "second"] {
+        let attempts = daemon.call(json!({
+            "version": 2, "op": "new", "base": "task", "lowers": [a, copy], "retain": true
+        }));
+        let attempt = attempts[0].clone();
+        let mnt = PathBuf::from(attempt["path"].as_str().unwrap());
+        assert_eq!(fs::read(mnt.join("kept.txt")).unwrap(), b"kept by retain\n");
+        fs::write(mnt.join(format!("{name}.txt")), name).unwrap();
+        // The second `new` kept the entry the first one published.
+        let inode = fs::symlink_metadata(&entry).unwrap().ino();
+        assert_eq!(
+            *filled.get_or_insert(inode),
+            inode,
+            "the cache entry was replaced"
+        );
+        siblings.push(attempt);
+    }
+    let entry = entry.canonicalize().unwrap();
+    for attempt in &siblings {
+        let id = attempt["id"].as_str().unwrap();
+        let report = finalize_done(
+            &daemon,
+            &json!({"version": 2, "op": "finalize", "id": id}),
+            Path::new(attempt["path"].as_str().unwrap()),
+        );
+        assert_eq!(report["status"], "retained", "{report}");
+        assert_eq!(
+            report["attempt"]["overlay_dir"],
+            json!(state.join("retained").join(id).join("overlay"))
+        );
+        // Its record names the shared cache entry as its bundle lower.
+        let records = retained_records(&state);
+        assert_eq!(
+            prefix_paths(&records[id]),
+            [a.canonicalize().unwrap(), entry.clone()]
+        );
+    }
+    let all = daemon.call(json!({"version": 2, "op": "list", "all": true}));
+    let retained: Vec<&str> = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["status"] == "retained")
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    let mut expected: Vec<&str> = siblings
+        .iter()
+        .map(|attempt| attempt["id"].as_str().unwrap())
+        .chain([id.as_str()])
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(retained, expected, "{all}");
 }

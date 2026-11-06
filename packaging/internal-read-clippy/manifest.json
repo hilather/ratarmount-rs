@@ -704,7 +704,7 @@
         "disposition": "output-owner",
         "id": "IR-E0144-M01",
         "item": "<ratarmount::sandbox::state_log::StateLog<T0>>::write_compacted",
-        "reason": "Stage the compacted sandbox request log beside requests.jsonl before an atomic rename."
+        "reason": "Stage a compacted sandbox state log (requests.jsonl or retained.jsonl) beside it before an atomic rename."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -714,7 +714,7 @@
         "cli-no-default",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0144-M01\",\"item\":\"<ratarmount::sandbox::state_log::StateLog<T0>>::write_compacted\",\"disposition\":\"output-owner\",\"category\":\"request-log-compaction\",\"reason\":\"Stage the compacted sandbox request log beside requests.jsonl before an atomic rename.\",\"creation\":{\"policy\":\"exclusive-new-file\",\"basis\":\"tempfile creates the name with O_EXCL, mode 0600 and append inside the 0700 state directory; persist renames it over the log.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-E0144-M01\",\"item\":\"<ratarmount::sandbox::state_log::StateLog<T0>>::write_compacted\",\"disposition\":\"output-owner\",\"category\":\"request-log-compaction\",\"reason\":\"Stage a compacted sandbox state log (requests.jsonl or retained.jsonl) beside it before an atomic rename.\",\"creation\":{\"policy\":\"exclusive-new-file\",\"basis\":\"tempfile creates the name with O_EXCL, mode 0600 and append inside the 0700 state directory; persist renames it over the log.\"}}",
       "resolved": "<tempfile::Builder<'L0,'L1>>::tempfile_in",
       "rule_reason": "inventory-op:tempfile"
     },
@@ -10267,7 +10267,7 @@
         "disposition": "output-owner",
         "id": "IR-E0143-M02",
         "item": "ratarmount::sandbox::state_log::open_checked",
-        "reason": "Permit creating the sandbox request log while preserving an existing log inode."
+        "reason": "Permit creating a sandbox state log (requests.jsonl or retained.jsonl) while preserving an existing log inode."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -10277,7 +10277,7 @@
         "cli-no-default",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0143-M02\",\"item\":\"ratarmount::sandbox::state_log::open_checked\",\"disposition\":\"output-owner\",\"category\":\"request-log\",\"reason\":\"Permit creating the sandbox request log while preserving an existing log inode.\",\"creation\":{\"policy\":\"append-or-create\",\"basis\":\"Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-E0143-M02\",\"item\":\"ratarmount::sandbox::state_log::open_checked\",\"disposition\":\"output-owner\",\"category\":\"request-log\",\"reason\":\"Permit creating a sandbox state log (requests.jsonl or retained.jsonl) while preserving an existing log inode.\",\"creation\":{\"policy\":\"append-or-create\",\"basis\":\"Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor.\"}}",
       "resolved": "<std::fs::OpenOptions>::create",
       "rule_reason": "inventory-op:OpenOptions"
     },
@@ -10295,7 +10295,7 @@
         "disposition": "output-owner",
         "id": "IR-E0143-M03",
         "item": "ratarmount::sandbox::state_log::open_checked",
-        "reason": "Open the sandbox request log once per daemon start; compaction keeps its own persisted descriptor."
+        "reason": "Open a sandbox state log (requests.jsonl or retained.jsonl) once per daemon start; compaction keeps its own persisted descriptor."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -10305,7 +10305,7 @@
         "cli-no-default",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0143-M03\",\"item\":\"ratarmount::sandbox::state_log::open_checked\",\"disposition\":\"output-owner\",\"category\":\"request-log\",\"reason\":\"Open the sandbox request log once per daemon start; compaction keeps its own persisted descriptor.\",\"creation\":{\"policy\":\"append-or-create\",\"basis\":\"Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-E0143-M03\",\"item\":\"ratarmount::sandbox::state_log::open_checked\",\"disposition\":\"output-owner\",\"category\":\"request-log\",\"reason\":\"Open a sandbox state log (requests.jsonl or retained.jsonl) once per daemon start; compaction keeps its own persisted descriptor.\",\"creation\":{\"policy\":\"append-or-create\",\"basis\":\"Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor.\"}}",
       "resolved": "<std::fs::OpenOptions>::open",
       "rule_reason": "inventory-op:OpenOptions"
     },
@@ -10323,7 +10323,7 @@
         "disposition": "support",
         "id": "IR-E0143-T01",
         "item": "ratarmount::sandbox::state_log::open_checked",
-        "reason": "Builder type support: Open the sandbox request log for append."
+        "reason": "Builder type support: Open a sandbox state log (requests.jsonl or retained.jsonl) for append."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -10333,7 +10333,7 @@
         "cli-no-default",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0143-T01\",\"item\":\"ratarmount::sandbox::state_log::open_checked\",\"disposition\":\"support\",\"category\":\"builder-type-support\",\"reason\":\"Builder type support: Open the sandbox request log for append.\",\"creation\":{\"policy\":\"none\",\"basis\":\"This is a type/import reference; it acquires no file or directory.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-E0143-T01\",\"item\":\"ratarmount::sandbox::state_log::open_checked\",\"disposition\":\"support\",\"category\":\"builder-type-support\",\"reason\":\"Builder type support: Open a sandbox state log (requests.jsonl or retained.jsonl) for append.\",\"creation\":{\"policy\":\"none\",\"basis\":\"This is a type/import reference; it acquires no file or directory.\"}}",
       "resolved": "std::fs::OpenOptions",
       "rule_reason": "inventory-op:OpenOptions"
     },
@@ -10351,7 +10351,7 @@
         "disposition": "out-of-family",
         "id": "IR-E0145-M01",
         "item": "ratarmount::sandbox::state_log::open_dir",
-        "reason": "fsync a directory of the state, attempts/, or the parent or an ancestor of a tree a finalize syncs; O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC handle, no content read"
+        "reason": "fsync a directory of the state, attempts/, retained/, or the parent or an ancestor of a tree a finalize syncs; O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC handle, no content read"
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -10361,7 +10361,7 @@
         "cli-no-default",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0145-M01\",\"item\":\"ratarmount::sandbox::state_log::open_dir\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"fsync a directory of the state, attempts/, or the parent or an ancestor of a tree a finalize syncs; O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC handle, no content read\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-E0145-M01\",\"item\":\"ratarmount::sandbox::state_log::open_dir\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"fsync a directory of the state, attempts/, retained/, or the parent or an ancestor of a tree a finalize syncs; O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC handle, no content read\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname.\"}}",
       "resolved": "<std::fs::OpenOptions>::open",
       "rule_reason": "inventory-op:OpenOptions"
     },
@@ -21615,7 +21615,7 @@
     }
   ],
   "policy": {
-    "configuration": "b307204e6fb8d649c0d8a588549bbc072dae45253aa9e41a2b99c501b693e13b",
+    "configuration": "2ec098f615ea1dfff57afd4bfda70e68088af7c1fe60cfe4a44d900d0a3c0dc4",
     "profiles": "f04aa50122d4ae1f0504b6411c5b47cacf3a97a9e3080e175166f3b744aa4bd8",
     "toolchain": {
       "compiler_revision": "88d9e12ae178fab0fb5cc050a94da85685d449ea",

@@ -217,15 +217,12 @@ fn request<T: serde::de::DeserializeOwned>(
 /// On Linux a connect to a listener whose backlog is full (a child that
 /// stopped accepting, with earlier connects still queued) waits until the
 /// listener accepts or closes, for as long as the socket's send timeout
-/// allows, so that timeout is set before connecting. `FD_CLOEXEC` is set
-/// right after `socket()` because `SOCK_CLOEXEC` does not exist on macOS: the
-/// supervisor's serve thread, the only caller, is also the only thread that
-/// spawns children, so none can inherit the socket in between.
+/// allows, so that timeout is set before connecting. The socket comes from
+/// `process::stream_socket` for the CLOEXEC alternative's reviewed reasons.
 fn connect(path: &Path, left: &dyn Fn() -> io::Result<Duration>) -> io::Result<UnixStream> {
-    use rustix::net::{sockopt, AddressFamily, SocketAddrUnix, SocketType};
+    use rustix::net::{sockopt, SocketAddrUnix};
     let address = SocketAddrUnix::new(path)?;
-    let socket = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
-    rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
+    let socket = super::process::stream_socket()?;
     loop {
         sockopt::set_socket_timeout(&socket, sockopt::Timeout::Send, Some(left()?))?;
         match rustix::net::connect(&socket, &address) {

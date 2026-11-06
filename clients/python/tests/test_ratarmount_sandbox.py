@@ -21,16 +21,28 @@ class Requests(list):
         self.raw = []
 
 
+def reply_error(stream, request, code, message):
+    """Send a structured error in the request's version."""
+    reply = dict(version=request["version"], ok=False, error=dict(code=code, message=message))
+    stream.sendall((json.dumps(reply) + "\n").encode())
+
+
 def fake_daemon(tmp_path, stale_replay=False):
     """A fake daemon answering in the request's version.
 
     With stale_replay, a new() with request_id returns attempts the fake does
     not hold, as a replay after a daemon restart does, and destroy of an
-    unknown ID answers not_found.
+    unknown ID answers not_found. Otherwise a repeated request_id replays the
+    stored new() answer. New IDs skip IDs in use or retained. finalize of an
+    attempt created with retain moves it to retained/ID/, which list(all=True)
+    appends and destroy refuses with retained.
     """
     address = str(tmp_path / "api.sock")
     requests = Requests()
     attempts = {}
+    retained = {}
+    retain = {}
+    answers = {}
     stopped = threading.Event()
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(address)
@@ -60,17 +72,47 @@ def fake_daemon(tmp_path, stale_replay=False):
                     if request["base"] == "old-ok":
                         stream.sendall(b'{"version":1,"ok":true,"result":[]}\n')
                         continue
-                    result = [dict(id=str(i), base=request["base"], path=f"/mnt/{i}",
-                                   overlay_dir=f"/overlay/{i}", status="ready")
-                              for i in range(request["count"])]
-                    if not (stale_replay and "request_id" in request):
-                        attempts.update((a["id"], a) for a in result)
+                    if request.get("request_id") in answers:
+                        result = [dict(a) for a in answers[request["request_id"]]]
+                    else:
+                        taken = set(attempts) | set(retained)
+                        ids = [str(i) for i in range(len(taken) + request["count"])
+                               if str(i) not in taken][:request["count"]]
+                        result = [dict(id=i, base=request["base"], path=f"/mnt/{i}",
+                                       overlay_dir=f"/overlay/{i}", status="ready")
+                                  for i in ids]
+                        if not (stale_replay and "request_id" in request):
+                            attempts.update((a["id"], a) for a in result)
+                            retain.update((i, request.get("retain", False)) for i in ids)
+                        if "request_id" in request:
+                            answers[request["request_id"]] = [dict(a) for a in result]
+                elif op == "destroy" and request.get("id") in retained:
+                    reply_error(stream, request, "retained", f"attempt {request['id']} is "
+                                "retained; retained attempts are never destroyed")
+                    continue
                 elif op == "destroy" and stale_replay and request.get("id") \
                         and request["id"] not in attempts:
-                    reply = dict(version=request["version"], ok=False,
-                                 error=dict(code="not_found", message="unknown attempt"))
-                    stream.sendall((json.dumps(reply) + "\n").encode())
+                    reply_error(stream, request, "not_found", "unknown attempt")
                     continue
+                elif op == "finalize":
+                    key = request["id"]
+                    if key in attempts and retain.get(key):
+                        retained[key] = dict(attempts.pop(key), status="retained",
+                                             path=f"/state/retained/{key}/mnt",
+                                             overlay_dir=f"/state/retained/{key}/overlay")
+                    elif key in attempts:
+                        attempts[key] = dict(attempts[key], status="finalized")
+                    attempt = attempts.get(key) or retained.get(key)
+                    if attempt is None:
+                        reply_error(stream, request, "not_found", "unknown attempt")
+                        continue
+                    root = os.path.dirname(attempt["path"])
+                    result = dict(status=attempt["status"], attempt=attempt,
+                                  patch_hash={"files": 1}, layer_digest="sha256:" + "0" * 64,
+                                  stack_digest=None, fsck_result="ok", bytes_written=6,
+                                  erofs_denied=None, manifest_path=f"{root}/manifest.jsonl",
+                                  journal_summary=None,
+                                  bundle=f"{root}/bundle.tar.zst" if request.get("pack") else None)
                 elif op == "list":
                     if request.get("base") == "bad-version":
                         stream.sendall(b'{"version":9,"ok":true,"result":[]}\n')
@@ -79,6 +121,8 @@ def fake_daemon(tmp_path, stale_replay=False):
                         stream.sendall(b'{"version":1')
                         continue
                     result = list(attempts.values())
+                    if request.get("all"):
+                        result += retained.values()
                 elif op == "diff":
                     result = {"patch": "diff --git a/a b/a\n+snowman: ☃\n"}
                 elif op == "stats":
@@ -338,3 +382,126 @@ def test_regression_stale_replay_attempt_context_cleanup(stale_daemon):
     assert not second._destroyed
     client.close()
     assert client._owned == {}
+
+
+def test_regression_finalize_and_retain_send_v2(daemon):
+    """Regression: finalize() and new(retain=True) send protocol v2 with only the
+    keys given (never null or false), a new() without v2 arguments keeps the v1
+    bytes, and Attempt.finalize takes status, paths and journal_path from the
+    report; a finalized attempt that was not retained is still destroyed."""
+    client, requests, _ = daemon
+    plain = client.new("task", retain=False)[0]
+    assert requests.raw[-1] == (
+        b'{"version": 1, "op": "new", "base": "task", "count": 1, "overlay": "disk", '
+        b'"quota": null, "readonly_globs": []}\n'
+    )
+    kept = client.new("task", journal={}, retain=True)[0]
+    assert requests.raw[-1] == (
+        b'{"version": 2, "op": "new", "base": "task", "count": 1, "overlay": "disk", '
+        b'"quota": null, "readonly_globs": [], "journal": {}, "retain": true}\n'
+    )
+    client.new("task", request_id="n", retain=True)
+    assert requests.raw[-1] == (
+        b'{"version": 2, "op": "new", "base": "task", "count": 1, "overlay": "disk", '
+        b'"quota": null, "readonly_globs": [], "request_id": "n", "retain": true}\n'
+    )
+    report = plain.finalize()
+    assert requests.raw[-1] == b'{"version": 2, "op": "finalize", "id": "0"}\n'
+    assert report["status"] == "finalized"
+    assert (plain.status, plain.path, plain.overlay_dir, plain.journal_path) == (
+        "finalized", "/mnt/0", "/overlay/0", None)
+    client.finalize("0", pack=True)
+    assert requests.raw[-1] == b'{"version": 2, "op": "finalize", "id": "0", "pack": true}\n'
+    client.finalize("0", request_id="f")
+    assert requests.raw[-1] == (
+        b'{"version": 2, "op": "finalize", "id": "0", "request_id": "f"}\n')
+    plain.finalize(pack=True, request_id="g")
+    assert requests.raw[-1] == (
+        b'{"version": 2, "op": "finalize", "id": "0", "pack": true, "request_id": "g"}\n')
+    assert kept.journal_path == "/mnt/journal.jsonl"
+    report = kept.finalize()
+    assert requests.raw[-1] == b'{"version": 2, "op": "finalize", "id": "1"}\n'
+    assert report["status"] == "retained"
+    assert report["attempt"] == dict(id="1", base="task", path="/state/retained/1/mnt",
+                                     overlay_dir="/state/retained/1/overlay", status="retained")
+    assert (kept.status, kept.path, kept.overlay_dir, kept.journal_path) == (
+        "retained", "/state/retained/1/mnt", "/state/retained/1/overlay",
+        "/state/retained/1/journal.jsonl")
+    for request in requests:
+        for key in ("retain", "pack", "request_id", "all"):
+            assert request.get(key, "absent") not in (None, False)
+    client.close()
+    assert sorted(r["id"] for r in requests if r["op"] == "destroy") == ["0", "2"]
+
+
+def test_regression_replay_does_not_reown_retained_attempt(daemon):
+    """Regression: a replayed new() re-owned an attempt this client had retained
+    (Codex note #6), so leaving the context sent it a destroy."""
+    client, requests, _ = daemon
+    with client:
+        created = client.new("task", count=2, request_id="r", retain=True)
+        assert client.finalize(created[0].id)["status"] == "retained"
+        assert (created[0].status, created[0].path) == ("retained", "/state/retained/0/mnt")
+        assert client._retained == {"0"} and set(client._owned) == {"1"}
+        replayed = client.new("task", count=2, request_id="r", retain=True)
+        assert requests.raw[-1] == requests.raw[0]
+        assert [(a.id, a.status) for a in replayed] == [("0", "ready"), ("1", "ready")]
+        assert "0" not in client._owned
+        with created[0], replayed[0]:
+            pass
+        assert not created[0]._destroyed and not replayed[0]._destroyed
+    assert client._owned == {}
+    assert [r["id"] for r in requests if r["op"] == "destroy"] == ["1"]
+
+
+def test_regression_fresh_client_replay_exits_cleanly(daemon):
+    """Regression: a fresh client that replays new() owns an attempt another
+    client retained, and leaving its context raised destroy's retained error;
+    cleanup treats retained like not_found, an explicit destroy() raises it."""
+    first, requests, _ = daemon
+    with first:
+        for attempt in first.new("task", count=2, request_id="r", retain=True):
+            assert attempt.finalize()["status"] == "retained"
+    fresh = RatarmountSandbox(first.socket, timeout=2)
+    with fresh:
+        replayed = fresh.new("task", count=2, request_id="r", retain=True)
+        assert [(a.id, a.status) for a in replayed] == [("0", "ready"), ("1", "ready")]
+        assert sorted(fresh._owned) == ["0", "1"]
+        with pytest.raises(SandboxError) as error:
+            replayed[1].destroy()
+        assert error.value.code == "retained"
+        assert not replayed[1]._destroyed
+    assert fresh._owned == {}
+    assert all(attempt._destroyed for attempt in replayed)
+    with pytest.raises(SandboxError) as error:
+        fresh.destroy(id="0")
+    assert error.value.code == "retained"
+    assert [r["id"] for r in requests if r["op"] == "destroy"] == ["1", "0", "1", "0"]
+    # Once it saw them retained, a further replay does not own them again.
+    fresh.new("task", count=2, request_id="r", retain=True)
+    assert fresh._owned == {}
+    assert [(a.id, a.status) for a in fresh.list(all=True)] == [
+        ("0", "retained"), ("1", "retained")]
+
+
+def test_regression_list_all_includes_retained(daemon):
+    """Regression: list(all=True) sends v2 {"op": "list", "all": true} and builds
+    the retained entries without KeyError; list() keeps the v1 bytes."""
+    client, requests, _ = daemon
+    created = client.new("task", count=2, retain=True)
+    created[0].finalize()
+    listed = client.list(all=True)
+    assert requests.raw[-1] == b'{"version": 2, "op": "list", "all": true}\n'
+    assert [(a.id, a.status, a.path, a.overlay_dir) for a in listed] == [
+        ("1", "ready", "/mnt/1", "/overlay/1"),
+        ("0", "retained", "/state/retained/0/mnt", "/state/retained/0/overlay")]
+    client.list("task", all=True)
+    assert requests.raw[-1] == b'{"version": 2, "op": "list", "base": "task", "all": true}\n'
+    assert [a.id for a in client.list()] == ["1"]
+    assert requests.raw[-1] == b'{"version": 1, "op": "list", "base": null}\n'
+    client.list("task", all=False)
+    assert requests.raw[-1] == b'{"version": 1, "op": "list", "base": "task"}\n'
+    with listed[1]:
+        pass
+    client.close()
+    assert [r["id"] for r in requests if r["op"] == "destroy"] == ["1"]

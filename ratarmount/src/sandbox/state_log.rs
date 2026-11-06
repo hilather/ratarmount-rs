@@ -1,6 +1,6 @@
 //! The durable append-log engine behind the supervisor's state files (R1c-1
-//! §5.2): `requests.jsonl` (protocol v2 request IDs, R1a) is its instance;
-//! another durable log instantiates it rather than copying it.
+//! §5.2): `requests.jsonl` (protocol v2 request IDs, R1a) and
+//! `retained.jsonl` (retained attempts) are its two instances, never copies.
 //!
 //! The engine owns the file: the checked open, the open-time file and
 //! directory syncs, the bounded streaming replay with torn-tail truncation
@@ -50,6 +50,10 @@ pub enum Append {
     /// `requests.jsonl`: a pinned finalize record's line appended again so a
     /// new line does not evict it (approval note (a)).
     Rotation,
+    /// `retained.jsonl`: a commit records a retained attempt.
+    Retained,
+    /// `retained.jsonl`: a commit whose rename did not happen ends its record.
+    Aborted,
 }
 
 /// Why open refused a line.
@@ -120,7 +124,7 @@ fn open_checked(path: &Path, name: &str) -> Result<File> {
     let file = {
         #[expect(
             clippy::disallowed_types,
-            reason = r###"internal-read:v1 {"id":"IR-E0143-T01","item":"ratarmount::sandbox::state_log::open_checked","disposition":"support","category":"builder-type-support","reason":"Builder type support: Open the sandbox request log for append.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-E0143-T01","item":"ratarmount::sandbox::state_log::open_checked","disposition":"support","category":"builder-type-support","reason":"Builder type support: Open a sandbox state log (requests.jsonl or retained.jsonl) for append.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
         )]
         #[expect(
             clippy::disallowed_methods,
@@ -129,12 +133,12 @@ fn open_checked(path: &Path, name: &str) -> Result<File> {
         let mut __inventory_value_0 = fs::OpenOptions::new();
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0143-M02","item":"ratarmount::sandbox::state_log::open_checked","disposition":"output-owner","category":"request-log","reason":"Permit creating the sandbox request log while preserving an existing log inode.","creation":{"policy":"append-or-create","basis":"Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-E0143-M02","item":"ratarmount::sandbox::state_log::open_checked","disposition":"output-owner","category":"request-log","reason":"Permit creating a sandbox state log (requests.jsonl or retained.jsonl) while preserving an existing log inode.","creation":{"policy":"append-or-create","basis":"Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor."}}"###
         )]
         let __inventory_value_1 = __inventory_value_0.read(true).append(true).create(true);
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0143-M03","item":"ratarmount::sandbox::state_log::open_checked","disposition":"output-owner","category":"request-log","reason":"Open the sandbox request log once per daemon start; compaction keeps its own persisted descriptor.","creation":{"policy":"append-or-create","basis":"Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-E0143-M03","item":"ratarmount::sandbox::state_log::open_checked","disposition":"output-owner","category":"request-log","reason":"Open a sandbox state log (requests.jsonl or retained.jsonl) once per daemon start; compaction keeps its own persisted descriptor.","creation":{"policy":"append-or-create","basis":"Read and append with NOFOLLOW/CLOEXEC, 0600 and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor."}}"###
         )]
         let __inventory_value_2 = __inventory_value_1
             .truncate(false)
@@ -171,8 +175,8 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 /// The engine's directory open for an fsync: `O_RDONLY | O_DIRECTORY |
 /// O_NOFOLLOW | O_CLOEXEC`, so a symlink or anything but a directory put in
 /// its place is refused. [`sync_dir`] fsyncs it at once; finalize's step S
-/// first checks the descriptor (its device and filesystem) and then fsyncs
-/// it, poisoning the filesystem on a failure (§5.6).
+/// and its commit first check the descriptor (its device and filesystem)
+/// and then fsync it, poisoning the filesystem on a failure (§5.6).
 pub(super) fn open_dir(dir: &Path) -> io::Result<File> {
     let directory = {
         #[expect(
@@ -186,7 +190,7 @@ pub(super) fn open_dir(dir: &Path) -> io::Result<File> {
         let mut __inventory_value_0 = fs::OpenOptions::new();
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0145-M01","item":"ratarmount::sandbox::state_log::open_dir","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"fsync a directory of the state, attempts/, or the parent or an ancestor of a tree a finalize syncs; O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC handle, no content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-E0145-M01","item":"ratarmount::sandbox::state_log::open_dir","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"fsync a directory of the state, attempts/, retained/, or the parent or an ancestor of a tree a finalize syncs; O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC handle, no content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname."}}"###
         )]
         let __inventory_value_1 = __inventory_value_0
             .read(true)
@@ -553,7 +557,7 @@ impl<R: Records> StateLog<R> {
     fn write_compacted(&mut self) -> io::Result<(tempfile::NamedTempFile, u64)> {
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0144-M01","item":"<ratarmount::sandbox::state_log::StateLog<T0>>::write_compacted","disposition":"output-owner","category":"request-log-compaction","reason":"Stage the compacted sandbox request log beside requests.jsonl before an atomic rename.","creation":{"policy":"exclusive-new-file","basis":"tempfile creates the name with O_EXCL, mode 0600 and append inside the 0700 state directory; persist renames it over the log."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-E0144-M01","item":"<ratarmount::sandbox::state_log::StateLog<T0>>::write_compacted","disposition":"output-owner","category":"request-log-compaction","reason":"Stage a compacted sandbox state log (requests.jsonl or retained.jsonl) beside it before an atomic rename.","creation":{"policy":"exclusive-new-file","basis":"tempfile creates the name with O_EXCL, mode 0600 and append inside the 0700 state directory; persist renames it over the log."}}"###
         )]
         let mut temp = tempfile::Builder::new()
             .prefix(&format!("{}.", R::NAME))

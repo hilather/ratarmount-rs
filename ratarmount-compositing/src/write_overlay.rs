@@ -8937,19 +8937,28 @@ fn commit_overlay_tar(
             || {
                 // GNU tar can preserve the size, mtime and edge hashes that
                 // validate a warm index, even though its catalog is stale.
-                let side = ratarmount_index::default_index_path(tar_file);
-                match fs::remove_file(&side) {
-                    Ok(()) => log::info!(
-                        "commit: removed sidecar {} before offline GNU TAR publish (rebuild on remount)",
-                        side.display()
-                    ),
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
-                }
-                for suffix in ["-wal", "-shm", "-journal"] {
-                    let mut companion = side.clone().into_os_string();
-                    companion.push(suffix);
-                    let _ = fs::remove_file(PathBuf::from(companion));
+                let sibling = ratarmount_index::default_index_path(tar_file);
+                for side in ratarmount_index::possible_index_paths(
+                    tar_file,
+                    &ratarmount_index::default_index_folders(),
+                ) {
+                    // Flattened cache names can exceed NAME_MAX for deep archives.
+                    if side != sibling && !side.is_file() {
+                        continue;
+                    }
+                    match fs::remove_file(&side) {
+                        Ok(()) => log::info!(
+                            "commit: removed sidecar {} before offline GNU TAR publish (rebuild on remount)",
+                            side.display()
+                        ),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
+                    }
+                    for suffix in ["-wal", "-shm", "-journal"] {
+                        let mut companion = side.clone().into_os_string();
+                        companion.push(suffix);
+                        let _ = fs::remove_file(PathBuf::from(companion));
+                    }
                 }
                 tmp.persist(tar_file).map(drop).map_err(|e| e.error)
             },
