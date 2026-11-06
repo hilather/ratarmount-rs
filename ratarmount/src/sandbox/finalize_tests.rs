@@ -4026,6 +4026,82 @@ fn stack_in(env: &Env, parent: &Path, count: usize) -> Vec<PathBuf> {
     layers
 }
 
+/// Regression: create-base opened a FIFO until timeout, or admitted special
+/// files with the Fake mounter. Refuse local paths and file URLs before prepare
+/// or index-directory creation, while still accepting directory sources.
+#[test]
+fn regression_supervisor_create_base_refuses_fifo_socket_device() {
+    if !linux() {
+        return;
+    }
+    let mut env = Env::new();
+    let fifo = env.dir().join("source fifo");
+    let fifo_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: mkfifo reads this NUL-terminated path and does not retain it.
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    let socket = env.dir().join("source.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let device = env.dir().join("device");
+    std::os::unix::fs::symlink("/dev/null", &device).unwrap();
+    let fifo_url = url::Url::from_file_path(&fifo).unwrap().to_string();
+    assert!(fifo_url.contains("%20"));
+    let mixed_fifo_url = fifo_url.replacen("file://", "FiLe://localhost", 1);
+    let socket_url = url::Url::from_file_path(&socket).unwrap().to_string();
+    for (name, source, kind) in [
+        ("fifo", fifo.to_str().unwrap().to_owned(), "FIFO"),
+        ("socket", socket.to_str().unwrap().to_owned(), "socket"),
+        (
+            "device",
+            device.to_str().unwrap().to_owned(),
+            "character device",
+        ),
+        ("fifo-url", fifo_url, "FIFO"),
+        ("socket-url", socket_url, "socket"),
+        ("fifo-url-mixed", mixed_fifo_url, "FIFO"),
+    ] {
+        let prepares = env.fake.0.lock().unwrap().prepares;
+        let error = env
+            .sup
+            .handle(Operation::CreateBase {
+                name: name.into(),
+                source: source.clone(),
+                options: BaseOptions::default(),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_request", "{}", error.message);
+        assert!(error.message.contains(kind), "{}", error.message);
+        assert!(error.message.contains(&source), "{}", error.message);
+        assert_eq!(env.fake.0.lock().unwrap().prepares, prepares, "{name}");
+        assert!(env.sup.base(name).is_err(), "{name} was registered");
+        assert_eq!(
+            fs::symlink_metadata(env.sup.indexes(name))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound,
+            "{name} index directory was created"
+        );
+    }
+
+    let directory = env.base.to_str().unwrap().to_owned();
+    let directory_url = url::Url::from_directory_path(&env.base)
+        .unwrap()
+        .to_string();
+    for (name, source) in [("directory", directory), ("directory-url", directory_url)] {
+        let prepares = env.fake.0.lock().unwrap().prepares;
+        let result = env
+            .sup
+            .handle(Operation::CreateBase {
+                name: name.into(),
+                source: source.clone(),
+                options: BaseOptions::default(),
+            })
+            .unwrap();
+        assert_eq!(env.fake.0.lock().unwrap().prepares, prepares + 1);
+        assert_eq!(result["source"], source);
+        assert_eq!(env.sup.base(name).unwrap().source, source);
+    }
+}
+
 /// Regression: a failed source stat, or a successful stat of a special file,
 /// let retain skip the TAR check and start an attempt. Refuse before drawing
 /// an attempt ID; Git URLs remain admissible.

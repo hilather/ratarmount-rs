@@ -14,7 +14,7 @@ use ratarmount_compositing::overlay_seal::{SealOperation, SealOutcome};
 use ratarmount_compositing::{overlay_fsck, ClassifiedBase, OverlayMeta};
 use ratarmount_core::MountSource;
 use serde_json::{json, Value};
-use std::fs::{self, File};
+use std::fs::{self, File, Metadata};
 use std::io::{self, BufReader};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -449,6 +449,25 @@ impl Scope {
     }
 }
 
+/// Describe sources that cannot be opened as regular files or directories.
+pub(super) fn special_source_kind(meta: &Metadata) -> Option<&'static str> {
+    if meta.is_file() || meta.is_dir() {
+        return None;
+    }
+    let file_type = meta.file_type();
+    Some(if file_type.is_fifo() {
+        "FIFO"
+    } else if file_type.is_socket() {
+        "socket"
+    } else if file_type.is_char_device() {
+        "character device"
+    } else if file_type.is_block_device() {
+        "block device"
+    } else {
+        "special file"
+    })
+}
+
 /// The base and archive rules of the scope preflight (§5.5, ruling 4): a
 /// local base without binds or recursion and without `git_synthetic_head`;
 /// a regular-file source must be a TAR archive by its prepared index's
@@ -494,20 +513,8 @@ pub(super) fn scope_preflight(base: &Base, indexes: &Path, scope: Scope) -> ApiR
             Err(_) => None,
         }
     };
-    if let Some(meta) = &metadata {
-        if matches!(scope, Scope::Retain) && !meta.is_file() && !meta.is_dir() {
-            let file_type = meta.file_type();
-            let kind = if file_type.is_fifo() {
-                "FIFO"
-            } else if file_type.is_socket() {
-                "socket"
-            } else if file_type.is_char_device() {
-                "character device"
-            } else if file_type.is_block_device() {
-                "block device"
-            } else {
-                "special file"
-            };
+    if matches!(scope, Scope::Retain) {
+        if let Some(kind) = metadata.as_ref().and_then(special_source_kind) {
             return Err(invalid(format!(
                 "base {name} source {} is a {kind}, neither a regular file nor a directory; retain supports regular TAR files and directories",
                 source.display()

@@ -2334,7 +2334,7 @@ are errors. Each request includes integer `version: 1` and an `op` string:
 
 | Operation | Fields and result |
 | --- | --- |
-| `create_base` | Required `name`, `source`; optional `options` object. Validates by opening/indexing without mounting, then durably records and returns `{name,source,options}`. An existing name returns `already_exists`. |
+| `create_base` | Required `name`, `source`; optional `options` object. A local or `file://` source that is neither a regular file nor a directory (FIFO, socket or device) returns `invalid_request` before opening/indexing. Validates by opening/indexing without mounting, then durably records and returns `{name,source,options}`. An existing name returns `already_exists`. |
 | `new` | Required `base`; `count` defaults to 1, `overlay` to `"disk"`; optional integer `quota` in bytes and `readonly_globs` string array. Returns an array of attempts only after all mounts are ready. |
 | `list` | Optional `base` filters the attempt array. Status is `"ready"` or `"crashed"` (`"starting"` is internal to setup), and for an attempt a version 2 client [finalizes](#finalize), `"finalizing"` (from its unmount until the finalize completes) or `"finalized"`. Retained attempts are not listed (see version 2 `list` with `all`). An unknown base is an error. |
 | `diff` | Required `id`; boolean `git` defaults to false. Returns `{"patch":"..."}` using the in-process diff renderer and the same composed base, including recursive sources and binds, and for an attempt started with version 2 `lowers`, the lowers it mounted. A finalized or retained attempt is read offline after its base was classified and gated: a changed base is `diff_failed`. |
