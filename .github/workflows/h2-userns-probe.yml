@@ -1,0 +1,38 @@
+# H2 D1 feasibility probe on ubuntu-24.04 (probe branch only; not for main). — Muse
+name: h2-userns-probe
+on:
+  push:
+    branches: [muse/h2-ubuntu2404-probe]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        restrict: ["1", "0"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: environment
+        run: |
+          uname -r
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces || true
+      - name: set apparmor_restrict_unprivileged_userns=${{ matrix.restrict }}
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=${{ matrix.restrict }}
+      - name: probe.py (a,b,c,e)
+        run: |
+          set -o pipefail
+          python3 test-harness/h2-probe/probe.py main /tmp/h2run 2>&1 | tee probe-${{ matrix.restrict }}.txt
+      - name: a_spawn.rs (Rust Command::spawn)
+        if: always()
+        run: |
+          set -o pipefail
+          rustc -O -o /tmp/a_spawn test-harness/h2-probe/a_spawn.rs
+          /tmp/a_spawn 2>&1 | tee a_spawn-${{ matrix.restrict }}.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-${{ matrix.restrict }}
+          path: "*-${{ matrix.restrict }}.txt"
