@@ -2286,8 +2286,9 @@ refused by the daemon, never resolved by the client. `--retain` sends version 2
 too (see [retained attempts](#retained-attempts)). Without these flags, `new`
 sends exactly the version 1 request. `finalize ID [--pack] [--request-id ID]`
 (version 2, Linux only) prints the [finalize](#finalize) report, and
-`list --all` sends a version 2 `list` with `all`, which adds this run's retained
-attempts; without `--all`, `list` sends the version 1 request. `--socket` works
+`list --all` sends a version 2 `list` with `all`, which adds served retained
+attempts, including ones restored after a restart; without `--all`, `list`
+sends the version 1 request. `--socket` works
 before or after the subcommand.
 `daemon --timeout SECONDS` sets base-validation and batch-readiness deadlines
 (default 120, range 1–3600); finalize waits for at most the smaller of it and
@@ -2430,8 +2431,9 @@ with `invalid_request`, so an older daemon fails closed on a newer client.
 - **`finalize` and `retain`** stop, seal and hash an attempt and keep it in
   `retained/ID` (Linux only); see [finalize](#finalize),
   [retained attempts](#retained-attempts) and [durability](#durability).
-- **`all`** (`list` only, default false) also lists this run's retained
-  attempts. Without it a version 2 `list` answers exactly as version 1's.
+- **`all`** (`list` only, default false) also lists served retained
+  attempts, including ones restored after a restart. Without it a version 2
+  `list` answers exactly as version 1's.
 
 ```json
 {"version":2,"op":"new","base":"task","count":8,"request_id":"task-17-pass-2"}
