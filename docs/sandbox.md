@@ -1542,7 +1542,13 @@ window between spawning a child and recording its PID. A sibling `.lock`
 file remains as a stable advisory-lock inode to serialize runs on the same top.
 After SIGKILL, a subsequent run stops the recorded container, detaches the stale
 mount, stops the recorded mount child if its process identity still matches,
-waits for the database lock to clear, and recovers a RAM copy if present. Failed
+waits for the database lock to clear, and recovers a RAM copy if present. A
+recorded child on Linux with pidfds (5.3+) is signalled through a pidfd opened
+before its start time is compared, so a reused PID cannot be signalled. On
+ENOSYS (older kernels), recovery compares the start time then calls kill(2),
+narrowing but not closing the reuse race. Without a usable recorded or current
+start time (e.g. no `/proc`, macOS), no recorded PID is signalled. A signal
+error is returned after the remaining runtime and unmount steps, and failed
 cleanup retains the record for retry. Recovery requires the recorded runtime to
 remain executable. Reusing a sealed top requires explicitly unsealing it first;
 for independent episodes, choose a fresh top over the same sealed lower.

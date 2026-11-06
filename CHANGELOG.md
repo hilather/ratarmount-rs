@@ -12,6 +12,7 @@
 
 ### Fixes
 
+- `sandbox run` crash recovery opens a pidfd before comparing a recorded child's start time and signals through it on Linux with pidfds (5.3+), so a reused PID cannot receive SIGTERM or SIGKILL. On ENOSYS (older kernels), it compares the start time then calls kill(2), narrowing but not closing the race. Without a usable recorded or current start time (e.g. no `/proc`, macOS), the recorded PID is never signalled. Signal errors retain the recovery record for retry after the remaining runtime and unmount steps. (#246)
 - Warm indexes compare `st_mtime_ns` when stored, and offline GNU TAR copy commits also remove existing indexes and SQLite companions in the default lookup folders before publication. Fixes #263.
 - Offline GNU TAR copy commits remove the sibling index before publishing the updated archive, so a warm remount sees renamed, deleted and added members even when archive size, mtime and edge hashes match. Fixes #261.
 - Live and offline uncompressed TAR overlay commits disable GNU tar append recursion so nested additions no longer become self-hardlinks that read as 0 B on remount. Commits preserve new directory modes, including recent parents of idle children, without overwriting existing parent metadata and refuse unreadable overlay subtrees. Raw-directory commits retain empty directories in TAR, ZIP and zstd archives. Fixes #259.
