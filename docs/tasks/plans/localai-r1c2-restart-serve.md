@@ -96,24 +96,24 @@ All citations are to main `56fc9ce2284314245286f52c613d3fa6c1683bcb`.
    establish provenance by digest alone. Do not require the base or lower
    contents to be available at startup; their existing request-time checks
    must still decide the answer.
-2. If the matching retained tree and `attempts/ID` both exist, refuse startup
-   before reconcile and preserve both: the rename outcome is ambiguous. A bare
-   name, missing tree, malformed/inconsistent report or mismatched seal is not
-   restored; leave its tree and live record untouched, reserved and counted.
+2. If the matching retained tree and `attempts/ID` both exist, validate the
+   retained tree first; if valid, restore it and let reconcile remove the stale
+   source. A bare name, missing tree, malformed/inconsistent report or
+   mismatched seal is not restored; leave its tree and live record untouched,
+   reserved and counted.
    Fresh diff/stats/finalize requests get the existing not-served
    `invalid_request`, and destroy gets `retained`; stored requests retain
    their existing replay and instance-checked retry rules. An error reading
-   metadata other than absence refuses startup before reconcile with a
-   path-bearing error; retry startup after fixing the read failure. Do not
-   append `aborted`, move trees, invent a damage state, or guess from a bare
-   directory. The existing reconcile behavior for an unrenamed `attempts/ID`
-   is unchanged.
+   one top leaves that entry unserved and logs the path; retry startup after
+   fixing the read failure. Do not append `aborted`, move trees, invent a
+   damage state, or guess from a bare directory. The existing reconcile
+   behavior for an unrenamed `attempts/ID` is unchanged.
 3. Rebuild each valid `RetainedEntry` from the report's attempt, original
    instance and report, and ordered recorded prefix (`None` for an empty
    prefix). Start unacknowledged: the log does not record whether R4 finished.
-   Once candidates are checked, repeat R1c-1's commit step R4 once for the batch
-   using the existing strict helper: sync `retained/`, then `attempts/`; only
-   after both succeed mark candidates acknowledged. The durable commit record
+   Once candidates are checked, repeat R1c-1's commit step R4 once for a
+   nonempty batch using the existing strict helper: sync `retained/`, then
+   `attempts/`; only after both succeed mark candidates acknowledged. The durable commit record
    was written only after S; these syncs make an observed rename durable. If R4
    fails and the rest of startup succeeds, keep entries unacknowledged and
    served as in the original run: `list --all` shows `finalizing`, use as a
@@ -194,7 +194,7 @@ real supervisor/FUSE case.
 - A record written before rename is indistinguishable from an orphan without
   a matching tree; this slice leaves it reserved, including its capacity slot.
   No reconciliation or automatic deletion is proposed. An inaccessible top
-  delays startup; a missing or changed lower instead keeps its existing
+  remains unserved; a missing or changed lower instead keeps its existing
   request-time error. State moved to a different absolute path cannot pass the
   recorded path checks without a separate migration design.
 - Startup now reads one top metadata record per candidate, up to the existing
@@ -214,6 +214,12 @@ real supervisor/FUSE case.
 
 ## Review log
 
+- 2026-11-06: R1c-2 as built (restart-serve): validate a retained tree even
+  when `attempts/ID` also exists; a valid tree is restored and reconciliation
+  removes the stale attempt. An unreadable top remains reserved but unserved.
+  Directory checks use `symlink_metadata` without creating paths. Startup R4
+  is skipped without candidates; an R4 fsync failure poisons its filesystem
+  until restart, as it does during an in-run retain.
 - 2026-11-06: Author inspection against `56fc9ce`; no out-of-scope extra was
   found necessary for this design. The supplied `review-plan` guidance says
   not to use it from Codex, so no skeptic-plan review is claimed here.

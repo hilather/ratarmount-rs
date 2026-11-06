@@ -164,7 +164,7 @@ pub enum OperationV2 {
     List {
         #[serde(default)]
         base: Option<String>,
-        /// Also list this run's retained attempts, after the attempts map.
+        /// Also list served retained attempts, after the attempts map.
         /// Without it the answer is exactly v1 `list`'s.
         #[serde(default, skip_serializing_if = "is_false")]
         all: bool,

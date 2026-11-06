@@ -118,7 +118,7 @@ ratarmount sandbox destroy --socket "$SANDBOX_SOCKET" --base "$TASK_ID"
 ratarmount sandbox shutdown --socket "$SANDBOX_SOCKET"
 ```
 
-A supervisor restart discards all attempts. It retains bases and warmed
+A supervisor restart discards unretained attempts. It retains bases and warmed
 indexes. For large teacher passes (for example, 12,000 attempts), process tasks
 in bounded batches and destroy each batch after collecting its patches; the
 attempt limit includes crashed mounts. After a client timeout, retry `new`
@@ -139,11 +139,12 @@ manifest and journal summary: copy them out first, or retain the attempt.
 
 With `new(..., retain=True)`, a successful finalize keeps the attempt in the
 daemon's `retained/ID/`. Retained attempts are never destroyed (the client
-hands them off instead), and within the same daemon run their
+hands them off instead), and their
 `report['attempt']['overlay_dir']` (`retained/ID/overlay`) can be passed in
-`lowers` of later attempts, which branch from that state. After a supervisor
-restart they stay on disk, but this release does not serve them. Finalize and
-retain run on Linux only and support local TAR, directory and Git bases;
+`lowers` of later attempts, which branch from that state. Valid retained
+attempts are served again after a supervisor restart. A cut-off finalize
+request ID stays `interrupted`; use a fresh request ID for its stored report.
+Finalize and retain run on Linux only and support local TAR, directory and Git bases;
 branching needs a TAR or Git base. Both refuse a base registered with
 `git_synthetic_head`, as in the example above, so register a separate base
 without it for attempts you finalize.

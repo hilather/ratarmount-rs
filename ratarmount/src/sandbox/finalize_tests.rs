@@ -85,6 +85,10 @@ impl Env {
     /// A restart: the supervisor is dropped (releasing `daemon.lock`) and
     /// opened again on the same state with the same Fake.
     pub(super) fn reopen(self) -> Self {
+        self.reopen_max(64)
+    }
+
+    pub(super) fn reopen_max(self, max_attempts: usize) -> Self {
         let Self {
             sup,
             fake,
@@ -94,7 +98,7 @@ impl Env {
         } = self;
         let timeout = sup.timeout;
         drop(sup);
-        let mut sup = Supervisor::open(state.path(), 64, timeout, fake.clone()).unwrap();
+        let mut sup = Supervisor::open(state.path(), max_attempts, timeout, fake.clone()).unwrap();
         sup.test_ids = Some(TestIds::default());
         Self {
             sup,
@@ -4839,11 +4843,12 @@ fn regression_supervisor_retained_diff_gates_base() {
     assert_eq!(diff(&mut env).unwrap(), rendered);
 }
 
-/// Regression (R1c-1 T14, ruling 3): a retained attempt is a lower within
-/// the run by exactly `retained/ID/overlay` (R1b's reserved exception) once
+/// Regression: a retained lower was refused after restart or accepted by an
+/// unsafe path (R1c-1 T14, ruling 3). It is a lower by exactly
+/// `retained/ID/overlay` (R1b's reserved exception) once
 /// its commit is acknowledged; the bundle, other paths under `retained/`,
 /// `…/overlay/.`, a symlink into it, and unknown, unacknowledged or
-/// preserved IDs are refused; R1b's stack and base rules still apply; `over`
+/// unserved IDs are refused; R1b's stack and base rules still apply; `over`
 /// comes from the requested paths, never from a digest (two empty layers
 /// share one).
 #[test]
@@ -4950,17 +4955,9 @@ fn regression_supervisor_retained_as_lower() {
         env.sup.attempt_state[&over_e1.id].over,
         std::slice::from_ref(&e1.id)
     );
-    // Preserved: retained before a restart, it is no lower of this run.
+    // Restored and acknowledged: it remains usable as a lower after restart.
     let mut env = env.reopen();
-    let error = env
-        .new_v2("tar", &[&a_overlay], Overlay::Disk, false, None)
-        .unwrap_err();
-    assert_eq!(error.code, "invalid_request", "{}", error.message);
-    assert!(
-        error.message.contains("before a restart"),
-        "{}",
-        error.message
-    );
+    env.archive_new("tar", &[&a_overlay], false, false).unwrap();
 }
 
 /// Regression (R1c-1 T15, ruling 3): the retained record must hold the
@@ -5098,15 +5095,16 @@ fn force_retained_compaction(sup: &mut Supervisor<Fake>) {
     panic!("retained.jsonl never compacted");
 }
 
-/// Regression (R1c-1 T16, Keystone #2): a real SIGKILL at each commit point
+/// Regression: a restart mishandled a retain interrupted at a commit point
+/// (R1c-1 T16, Keystone #2). A real SIGKILL at each commit point
 /// of a retain, after R1 (S), R2 (the record), R3 (the rename) and R4 (the
 /// syncs) before `done`. After the reopen `attempts/` is empty and the
 /// request is a `v: 2` `failed interrupted` line with its target. After R1
 /// nothing reserves the ID; after R2 the live record alone reserves it
 /// (also after a compaction) and takes a `--max-retained` slot; after R3 and
-/// R4 `retained/ID` is kept byte and mode for byte and mode, reserved, not
-/// listed, not served (`invalid_request`, writing no request line) and never
-/// destroyed, also as a bare name once `retained.jsonl` is moved aside.
+/// R4 `retained/ID` is kept byte and mode for byte and mode, reserved and
+/// served again, while the interrupted request stays interrupted. A bare
+/// name is still not served once `retained.jsonl` is moved aside.
 #[test]
 fn regression_supervisor_retain_crash_points() {
     if let Ok(point) = std::env::var(KILL_POINT) {
@@ -5217,6 +5215,36 @@ fn regression_supervisor_retain_crash_points() {
                 assert!(sup.retained_log.live(&id).is_some(), "{point}");
                 assert!(retained.join(&id).join("overlay").is_dir(), "{point}");
                 assert_eq!(snapshot(&retained), before, "{point}: kept as it was");
+                let served = |sup: &mut Supervisor<Fake>| {
+                    assert!(sup.held().contains(&id));
+                    assert!(sup.retained[&id].acknowledged);
+                    let listed: Value = serde_json::from_slice(&super::daemon::respond(
+                        sup,
+                        br#"{"version":2,"op":"list","all":true}"#,
+                    ))
+                    .unwrap();
+                    assert_eq!(listed["result"][0]["id"], id, "{point}");
+                    assert_eq!(listed["result"][0]["status"], "retained", "{point}");
+                    let interrupted = sup
+                        .handle(OperationV2::Finalize {
+                            id: id.clone(),
+                            pack: false,
+                            request_id: Some("k".into()),
+                        })
+                        .unwrap_err();
+                    assert_eq!(interrupted.code, "interrupted");
+                    let report = sup
+                        .handle(OperationV2::Finalize {
+                            id: id.clone(),
+                            pack: false,
+                            request_id: Some("fresh".into()),
+                        })
+                        .unwrap();
+                    assert_eq!(report, sup.retained_log.live(&id).unwrap().report);
+                    assert_eq!(sup.destroy(&id).unwrap_err().code, "retained");
+                    assert_redrawn(sup, &id);
+                    assert_eq!(snapshot(&retained), before, "{point}: still as it was");
+                };
                 let not_served = |sup: &mut Supervisor<Fake>| {
                     assert!(sup.held().contains(&id));
                     let listed: Value = serde_json::from_slice(&super::daemon::respond(
@@ -5253,19 +5281,19 @@ fn regression_supervisor_retain_crash_points() {
                         .handle(OperationV2::Finalize {
                             id: id.clone(),
                             pack: false,
-                            request_id: Some("fresh".into()),
+                            request_id: Some("bare-fresh".into()),
                         })
                         .unwrap_err();
                     assert_eq!(error.code, "invalid_request", "{}", error.message);
                     assert_eq!(fs::metadata(&log).unwrap().len(), len);
-                    assert_eq!(sup.requests.status("fresh"), None);
+                    assert_eq!(sup.requests.status("bare-fresh"), None);
                     assert_redrawn(sup, &id);
                     assert_eq!(snapshot(&retained), before, "{point}: still as it was");
                 };
-                not_served(&mut sup);
+                served(&mut sup);
                 drop(sup);
                 let mut sup = open();
-                not_served(&mut sup);
+                served(&mut sup);
                 drop(sup);
                 // `retained.jsonl` moved aside: a bare name, no instance.
                 fs::rename(
@@ -5500,15 +5528,15 @@ fn regression_supervisor_retain_rename_failure() {
     assert!(!attempt.path.parent().unwrap().exists());
 }
 
-/// Regression (R1c-1 T17r, rulings 1+2 and 6, retain half): a retain must
+/// Regression: R4 failures lost or wrongly acknowledged a retained result
+/// (R1c-1 T17r, rulings 1+2 and 6, retain half). A retain must
 /// leave no `retained` line and no rename when S fails (an injected fsync
 /// error of any errno, which poisons, or a node on another device, which
 /// does not). An fsync failure at R4 leaves the entry listed `finalizing`
 /// only by `list` with `all`, poisons the state filesystem, keeps it refused
-/// as a lower and never destroyed; after a restart its retry answers the
-/// not-served `invalid_request` without appending; the request log still
-/// compacts and serves. An open failure at R4 poisons nothing, and the same
-/// request then completes R4 and R5.
+/// as a lower and never destroyed; after a restart its retry completes; the
+/// request log still compacts and serves. An open failure at R4 poisons
+/// nothing, and the same request then completes R4 and R5.
 #[test]
 fn regression_supervisor_retain_sync_poison() {
     if !linux() {
@@ -5606,17 +5634,17 @@ fn regression_supervisor_retain_sync_poison() {
     assert!(env.sup.requests.events.borrow().contains(&"compact"));
     assert!(!env.sup.requests.is_broken());
     new_with_id(&mut env, "after").unwrap();
-    // A kept result is never reported as gone.
+    // A kept result is restored and the matching retry can finish.
     let mut env = env.reopen();
-    let len = env.requests_len();
-    let error = env.finalize(&attempt.id, false, Some("q")).unwrap_err();
-    assert_eq!(error.code, "invalid_request", "{}", error.message);
-    assert!(
-        error.message.contains("does not serve"),
-        "{}",
-        error.message
+    let report = env.finalize(&attempt.id, false, Some("q")).unwrap();
+    assert_eq!(
+        report,
+        env.sup.retained_log.live(&attempt.id).unwrap().report
     );
-    assert_eq!(env.requests_len(), len);
+    assert_eq!(
+        env.sup.requests.status("q"),
+        Some(super::requests::Status::Done)
+    );
     assert_eq!(snapshot(&kept), before);
     drop(env.reopen());
 
@@ -5645,12 +5673,13 @@ fn regression_supervisor_retain_sync_poison() {
     );
 }
 
-/// Regression (sweep 1 review, kept-target retry contract): a retry under a
+/// Regression: an unreadable kept target was reported as gone (sweep 1,
+/// kept-target retry contract). A retry under a
 /// stored target whose kept overlay's database cannot be read (another
 /// connection holds it under `BEGIN EXCLUSIVE`) is the check's failure,
 /// never `not_found`: it answers `writers_active`, appends nothing and
 /// stays `retryable`; once the database reads again the same retry answers
-/// the not-served `invalid_request`, as T17r expects. Discarding the
+/// the not-served `invalid_request` until a restart restores it. Discarding the
 /// metadata read's error used to turn the failure into "not the record's
 /// layer" and reported the kept result as gone.
 #[test]
@@ -5672,8 +5701,7 @@ fn regression_supervisor_retain_kept_target_unreadable_is_not_not_found() {
         env.sup.requests.status("q"),
         Some(super::requests::Status::Retryable)
     );
-    // After a restart the kept tree is not served; its record holds the ID.
-    let mut env = env.reopen();
+    // Lock before restart so the startup read cannot restore this one top.
     let db = env
         .kept(&attempt.id)
         .join("overlay")
@@ -5684,6 +5712,8 @@ fn regression_supervisor_retain_kept_target_unreadable_is_not_not_found() {
     let holder = rusqlite::Connection::open(&db).unwrap();
     fs::set_permissions(&db, fs::Permissions::from_mode(mode)).unwrap();
     holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let mut env = env.reopen();
+    assert!(!env.sup.retained.contains_key(&attempt.id));
     let len = env.requests_len();
     let error = env.finalize(&attempt.id, false, Some("q")).unwrap_err();
     assert_eq!(error.code, "writers_active", "{}", error.message);
@@ -5701,6 +5731,11 @@ fn regression_supervisor_retain_kept_target_unreadable_is_not_not_found() {
         error.message
     );
     assert_eq!(env.requests_len(), len, "nothing appended");
+    let mut env = env.reopen();
+    assert_eq!(
+        env.finalize(&attempt.id, false, Some("q")).unwrap()["status"],
+        "retained"
+    );
 }
 
 /// Regression: a stray retained path makes R3 fail with EEXIST; after the
@@ -6297,8 +6332,9 @@ fn regression_supervisor_retain_rechecks_lower_identity_at_sync() {
         .contains(&a.join(ratarmount_compositing::HIDDEN_DB)));
 }
 
-/// Regression (R1c-1 T26, Keystone approval note (a) across a restart): a
-/// retained attempt still exists after a restart (kept, not served), so its
+/// Regression: retained finalize records were evicted after restart (R1c-1
+/// T26, Keystone approval note (a)). A
+/// retained attempt still exists and is served after a restart, so its
 /// finalize records must stay pinned, never evicted to make room: with the
 /// record cap filled by them a new request is `capacity` with nothing
 /// written, before and after the restart, and with `retained.jsonl` moved
@@ -6343,7 +6379,7 @@ fn regression_supervisor_retain_finalize_record_pinned_across_restart() {
     };
     full(&mut env);
     let mut env = env.reopen();
-    assert!(env.sup.retained.is_empty(), "kept, not served");
+    assert!(env.sup.retained.contains_key(&x.id), "restored");
     full(&mut env);
     let aside = env.dir().join("aside.jsonl");
     fs::rename(env.sup.root.join(super::retained::NAME), &aside).unwrap();

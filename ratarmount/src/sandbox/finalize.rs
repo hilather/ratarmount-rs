@@ -633,9 +633,8 @@ impl<M: Mounter> Supervisor<M> {
         {
             return Ok(());
         }
-        // Kept in `retained/` but not served (it was retained, and the
-        // daemon restarted since): the not-served answer, never "gone". A
-        // metadata read that fails is the check's own error, not absence.
+        // Kept in `retained/` but not served: the not-served answer, never
+        // "gone". A failed metadata read is the check's own error, not absence.
         let kept = self.kept_unserved(target).map_err(|error| {
             let error = meta_error(error);
             if error.kind() == io::ErrorKind::WouldBlock {

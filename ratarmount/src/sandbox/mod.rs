@@ -5,6 +5,8 @@ mod finalize;
 #[cfg(test)]
 mod finalize_tests;
 mod inspection;
+#[cfg(test)]
+mod restart_tests;
 pub(crate) use inspection::start as start_inspection;
 mod lowers;
 #[cfg(test)]
@@ -119,7 +121,7 @@ enum Command {
     List {
         #[arg(long)]
         base: Option<String>,
-        /// Also list this run's retained attempts (protocol version 2).
+        /// Also list served retained attempts (protocol version 2).
         #[arg(long)]
         all: bool,
     },
