@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 type Result<T> = std::result::Result<T, ApiError>;
 
@@ -655,8 +655,17 @@ impl<M: Mounter> Supervisor<M> {
         base: &Base,
         layered: &[lowers::Lower],
         over: &[String],
-    ) -> Result<()> {
-        let cache = self.cache_root();
+    ) -> Result<Option<PathBuf>> {
+        // Resolve once: the estimate, durability check and every child in a
+        // batch must all use exactly the same bundle cache directory.
+        let cache = if layered
+            .iter()
+            .any(|lower| lower.kind == lowers::Kind::Bundle)
+        {
+            Some(self.retain_cache_path()?)
+        } else {
+            None
+        };
         let mut prefix = Vec::new();
         for lower in layered {
             match lower.kind {
@@ -669,55 +678,11 @@ impl<M: Mounter> Supervisor<M> {
                     });
                 }
                 lowers::Kind::Bundle => {
-                    let layers = cache.as_ref().map(|c| c.join("ratarmount/layers"));
-                    let Some(layers) = layers else {
-                        return Err(ApiError::new(
-                            "invalid_request",
-                            "a bundle lower needs a cache directory: neither XDG_CACHE_HOME nor HOME is set",
-                        ));
-                    };
-                    // The child resolves a relative cache root against the
-                    // working directory it inherits; so does this check. The
-                    // ancestor walk needs the absolute path: no ancestor of
-                    // an absent relative path exists, and substituting `/`
-                    // would drop the configured path from every check below.
-                    let layers = if layers.is_absolute() {
-                        layers
-                    } else {
-                        std::env::current_dir()
-                            .map_err(|e| io_error("the bundle cache path", &layers, e))?
-                            .join(layers)
-                    };
-                    // The child creates it under its deepest existing ancestor,
-                    // following a symlinked cache root; so does this check.
-                    let existing = layers
-                        .ancestors()
-                        .find(|dir| dir.is_dir())
-                        .unwrap_or(Path::new("/"))
-                        .to_path_buf();
-                    let resolved = existing.canonicalize().unwrap_or_else(|_| existing.clone());
-                    // A mount can lie inside the eventual cache directory
-                    // only when the directory exists, which is when
-                    // `resolved` names it; mounts under an earlier
-                    // ancestor are outside the future tree.
-                    self.retain_trees_preflight(resolved.as_path(), existing == layers)?;
-                    let canonical =
-                        resolved.join(layers.strip_prefix(&existing).unwrap_or(Path::new("")));
-                    // The record names the position by its cache path, which
-                    // serde writes as UTF-8: a cache path that is not UTF-8
-                    // (the configured root, or a symlink it resolved through)
-                    // is refused like R1b's lower paths.
-                    if canonical.to_str().is_none() {
-                        return Err(ApiError::new(
-                            "invalid_request",
-                            format!(
-                                "the bundle cache path {} is not UTF-8, so a retained record cannot name it",
-                                layers.display()
-                            ),
-                        ));
-                    }
                     prefix.push(LowerLayerRecord {
-                        path: canonical.join("f".repeat(64)),
+                        path: cache
+                            .as_ref()
+                            .expect("bundle cache resolved")
+                            .join("f".repeat(64)),
                         layer_digest: lower.layer_digest().into(),
                         sealed_at: lower.sealed_at().into(),
                     });
@@ -758,7 +723,74 @@ impl<M: Mounter> Supervisor<M> {
                 ),
             ));
         }
-        Ok(())
+        Ok(cache)
+    }
+
+    /// Resolve the existing portion before judging the future cache tree.
+    /// A missing component followed by `..` cannot be normalized safely:
+    /// creating the missing directory may lead to a different filesystem.
+    fn retain_cache_path(&self) -> Result<PathBuf> {
+        let root = self.cache_root().ok_or_else(|| {
+            ApiError::new(
+                "invalid_request",
+                "a bundle lower needs a cache directory: neither XDG_CACHE_HOME nor HOME is set",
+            )
+        })?;
+        let layers = root.join("ratarmount/layers");
+        let layers = if layers.is_absolute() {
+            layers
+        } else {
+            std::env::current_dir()
+                .map_err(|e| io_error("the bundle cache path", &layers, e))?
+                .join(layers)
+        };
+        let mut existing = layers.as_path();
+        let resolved = loop {
+            match existing.canonicalize() {
+                Ok(path) => break path,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    existing = existing.parent().ok_or_else(|| {
+                        ApiError::new(
+                            "invalid_request",
+                            "the bundle cache has no existing ancestor",
+                        )
+                    })?;
+                }
+                Err(error) => {
+                    return Err(ApiError::new(
+                        "invalid_request",
+                        format!(
+                            "the bundle cache path {} cannot be resolved: {error}",
+                            layers.display()
+                        ),
+                    ));
+                }
+            }
+        };
+        let suffix = layers.strip_prefix(existing).expect("cache ancestor");
+        if suffix.components().any(|part| part == Component::ParentDir) {
+            return Err(ApiError::new(
+                "invalid_request",
+                format!(
+                    "the unresolved bundle cache path {} contains '..'",
+                    layers.display()
+                ),
+            ));
+        }
+        let canonical = resolved.join(suffix);
+        if canonical.to_str().is_none() {
+            return Err(ApiError::new(
+                "invalid_request",
+                format!(
+                    "the bundle cache path {} is not UTF-8, so a retained record cannot name it",
+                    layers.display()
+                ),
+            ));
+        }
+        // Only the eventual cache tree itself can contain a mount relevant
+        // to this check; mounts elsewhere below an ancestor are unrelated.
+        self.retain_trees_preflight(&resolved, existing == layers)?;
+        Ok(canonical)
     }
 
     /// The bundle cache root the child will use (`XDG_CACHE_HOME`, else

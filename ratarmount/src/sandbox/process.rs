@@ -52,6 +52,8 @@ pub struct SpawnSpec<'a> {
     pub readonly: &'a [String],
     /// Canonical lower paths, bottom first.
     pub lowers: &'a [PathBuf],
+    /// Preflighted bundle cache directory, for a retained attempt.
+    pub bundle_cache: Option<&'a Path>,
     /// The journal file the supervisor chose, and its options.
     pub journal: Option<(&'a Path, &'a JournalSpec)>,
 }
@@ -179,6 +181,12 @@ pub fn mount_args(
         "--sandbox-inspection-socket".into(),
         super::inspection::socket_path(attempt).into_os_string(),
     ]);
+    if let Some(cache) = spec.bundle_cache {
+        args.extend([
+            "--sandbox-bundle-cache".into(),
+            cache.as_os_str().to_owned(),
+        ]);
+    }
     args.extend(["-w".into(), attempt.overlay_dir.as_os_str().to_owned()]);
     if let Some(quota) = spec.quota {
         args.extend(["--overlay-quota".into(), quota.to_string().into()]);

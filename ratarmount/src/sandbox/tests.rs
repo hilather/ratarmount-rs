@@ -85,8 +85,8 @@ fn regression_private_tempdir_judges_the_resolved_root() {
             < 104,
         "{resolved:?}"
     );
-    // A short real directory is still used as is (resolved).
-    let direct = private_tempdir();
+    // Use a known-short root, even when the caller's TMPDIR is 45–55 bytes.
+    let direct = private_tempdir_in(Path::new("/tmp"));
     let dir = private_tempdir_in(direct.path());
     assert!(
         dir.path()
@@ -95,6 +95,21 @@ fn regression_private_tempdir_judges_the_resolved_root() {
         dir.path(),
         direct.path()
     );
+    // At these lengths the first tempdir fits, but adding another tempdir
+    // does not. The second call must use the fallback rather than assume it
+    // can stay under the first one.
+    for length in 45..=55 {
+        let name = "m".repeat(length - direct.path().as_os_str().len() - 1);
+        let mid = direct.path().join(name);
+        fs::create_dir(&mid).unwrap();
+        let first = private_tempdir_in(&mid);
+        assert!(first.path().starts_with(&mid));
+        let second = private_tempdir_in(first.path());
+        assert!(!second.path().starts_with(first.path()));
+        assert!(second
+            .path()
+            .starts_with(Path::new("/tmp").canonicalize().unwrap()));
+    }
 }
 
 #[derive(Default)]
@@ -175,6 +190,7 @@ pub(super) struct SpawnRecord {
     pub(super) quota: Option<u64>,
     pub(super) readonly: Vec<String>,
     pub(super) lowers: Vec<PathBuf>,
+    pub(super) bundle_cache: Option<PathBuf>,
     pub(super) journal: Option<(PathBuf, protocol::JournalSpec)>,
 }
 
@@ -192,7 +208,11 @@ impl Fake {
     /// A child's two opens of its lowers: it captures each lower's metadata
     /// (a bundle is first extracted into its cache, unverified), then
     /// composes them, which the Fake does not need to do.
-    fn capture(&self, lowers: &[PathBuf]) -> Result<Vec<LowerLayerRecord>, String> {
+    fn capture(
+        &self,
+        lowers: &[PathBuf],
+        preflight_cache: Option<&Path>,
+    ) -> Result<Vec<LowerLayerRecord>, String> {
         self.run(|state| &mut state.before_capture);
         let cache = self.0.lock().unwrap().bundle_cache.clone();
         let real = self.0.lock().unwrap().real_cache.clone();
@@ -210,10 +230,15 @@ impl Fake {
                     .collect();
                 let view = ratarmount_compositing::compose_stack(base.clone(), &layers)
                     .map_err(|e| e.to_string())?;
-                crate::overlay_pack::cached_lower_in(lower, cache, view, None)
-                    .map_err(|e| e.to_string())?
-                    .canonicalize()
-                    .unwrap()
+                crate::overlay_pack::cached_lower_in(
+                    lower,
+                    preflight_cache.unwrap_or(cache),
+                    view,
+                    None,
+                )
+                .map_err(|e| e.to_string())?
+                .canonicalize()
+                .unwrap()
             } else if lower.is_file() {
                 let cache = cache.as_ref().expect("bundle lowers need a bundle cache");
                 let layer = cache.join(format!("layer-{}", fs::read_dir(cache).unwrap().count()));
@@ -269,13 +294,14 @@ impl Mounter for Fake {
             quota: spec.quota,
             readonly: spec.readonly.into(),
             lowers: spec.lowers.into(),
+            bundle_cache: spec.bundle_cache.map(Path::to_path_buf),
             journal: spec
                 .journal
                 .map(|(path, journal)| (path.into(), journal.clone())),
         });
         drop(state);
         if !spec.lowers.is_empty() {
-            match self.capture(spec.lowers) {
+            match self.capture(spec.lowers, spec.bundle_cache) {
                 Ok(records) => {
                     let mut state = self.0.lock().unwrap();
                     state.records.insert(attempt.path.clone(), records);

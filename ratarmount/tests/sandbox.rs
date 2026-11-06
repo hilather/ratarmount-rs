@@ -2380,12 +2380,17 @@ fn regression_sandbox_v2_retain_fuse() {
     daemon.call(json!({"op": "destroy", "id": stacked[0]["id"]}));
     // Two retained attempts over one bundle lower (a copy of the retained
     // bundle outside the state directory): the first child fills the cache
-    // entry, the second finds it there, and both retain.
+    // entry, the second finds it there, and both retain. The cache directory
+    // itself is a symlink, so the worker must accept the resolved directory
+    // passed by the retain preflight.
+    let cache_parent = root.join("cache/ratarmount");
+    fs::create_dir_all(&cache_parent).unwrap();
+    let resolved_cache = root.join("resolved-bundle-cache");
+    fs::create_dir(&resolved_cache).unwrap();
+    std::os::unix::fs::symlink(&resolved_cache, cache_parent.join("layers")).unwrap();
     let copy = root.join("layers/kept.tar.zst");
     fs::copy(&bundle, &copy).unwrap();
-    let entry = root
-        .join("cache/ratarmount/layers")
-        .join(&sha256_of(&copy)["sha256:".len()..]);
+    let entry = resolved_cache.join(&sha256_of(&copy)["sha256:".len()..]);
     let mut filled = None;
     let mut siblings = Vec::new();
     for name in ["first", "second"] {

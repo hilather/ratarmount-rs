@@ -1059,9 +1059,11 @@ impl<M: Mounter> Supervisor<M> {
         // The retained attempts the stack names, by the paths requested
         // (ruling 3: never by digest).
         let over = self.over(&layered);
-        if retain {
-            self.retain_lower_preflight(&base, &layered, &over)?;
-        }
+        let bundle_cache = if retain {
+            self.retain_lower_preflight(&base, &layered, &over)?
+        } else {
+            None
+        };
         let lower_paths: Vec<PathBuf> = layered.iter().map(|lower| lower.path.clone()).collect();
         if !layered.is_empty() || journal.is_some() {
             // The parser takes these, but no argv can carry them: spawning
@@ -1095,6 +1097,7 @@ impl<M: Mounter> Supervisor<M> {
                     quota,
                     readonly: &readonly,
                     lowers: &lower_paths,
+                    bundle_cache: bundle_cache.as_deref(),
                     journal: journal.map(|spec| (probe, spec)),
                 },
             )?;
@@ -1191,6 +1194,7 @@ impl<M: Mounter> Supervisor<M> {
                         quota,
                         readonly: &readonly,
                         lowers: &lower_paths,
+                        bundle_cache: bundle_cache.as_deref(),
                         journal: journal.map(|spec| (journal_path.as_path(), spec)),
                     },
                 )?;

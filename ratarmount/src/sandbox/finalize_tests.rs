@@ -37,7 +37,7 @@ pub(super) fn check_tmp(dir: &Path) {
     let kind = super::daemon::fs_type(root.as_fd()).unwrap();
     assert!(
         [0xEF53, 0x5846_5342, 0x9123_683E, 0x0102_1994].contains(&kind),
-        "the finalize tests need the temporary directory ({}) on ext4, xfs, btrfs or tmpfs (TMPDIR selects it), not filesystem type {kind:#x}",
+        "the finalize tests need the temporary directory ({}) on ext4, xfs, btrfs or tmpfs (TMPDIR selects it, with a /tmp fallback for long paths), not filesystem type {kind:#x}",
         dir.display()
     );
 }
@@ -5318,15 +5318,62 @@ fn regression_supervisor_retain_kept_target_unreadable_is_not_not_found() {
     assert_eq!(env.requests_len(), len, "nothing appended");
 }
 
-/// Regression (sweep 5 review): a retry of a retain commit that failed at
-/// R4 must not report its kept tree as gone once `retained.jsonl` is moved
-/// aside. The bare name under `retained/` still holds the ID, as it does for
-/// a fresh `finalize` of the same ID: the stored target answers the
-/// not-served `invalid_request`, appends nothing and stays `retryable`;
-/// before this, `kept_unserved` found no live record and the retry answered
-/// `not_found` for a tree still on disk.
+/// Regression: a stray retained path makes R3 fail with EEXIST; after the
+/// aborted record and the attempt's destruction or restart, the stray
+/// reserves the ID but must not make a retry of the gone target not-served.
 #[test]
-fn regression_supervisor_retain_retry_of_bare_kept_tree_is_not_served() {
+fn regression_supervisor_retain_aborted_rename_retry_after_restart_is_not_found() {
+    if !linux() {
+        return;
+    }
+    for destroy_first in [false, true] {
+        let mut env = Env::new();
+        let attempt = env.attempt(true, false);
+        let stray = env.kept(&attempt.id);
+        fs::create_dir(&stray).unwrap();
+        fs::write(stray.join("stray"), b"unrelated").unwrap();
+        let before = snapshot(&stray);
+        let error = env.finalize(&attempt.id, false, Some("r")).unwrap_err();
+        assert_eq!(error.code, "io", "{}", error.message);
+        let lines = env.retained_lines_of(&attempt.id);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line["t"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["retained", "aborted"]
+        );
+        assert!(env.sup.retained_log.live(&attempt.id).is_none());
+        let target = env.sup.requests.target("r").unwrap().clone();
+        assert_eq!(
+            env.sup.requests.status("r"),
+            Some(super::requests::Status::Retryable)
+        );
+        if destroy_first {
+            env.sup.destroy(&attempt.id).unwrap();
+        }
+        let mut env = env.reopen();
+        assert!(!attempt.path.parent().unwrap().exists());
+        assert!(env.sup.bare_retained.contains(&attempt.id));
+        let len = env.requests_len();
+        for _ in 0..2 {
+            let error = env.finalize(&attempt.id, false, Some("r")).unwrap_err();
+            assert_eq!(error.code, "not_found", "{}", error.message);
+            assert_eq!(env.requests_len(), len);
+            assert_eq!(
+                env.sup.requests.status("r"),
+                Some(super::requests::Status::Retryable)
+            );
+            assert_eq!(env.sup.requests.target("r"), Some(&target));
+            assert_eq!(snapshot(&stray), before);
+        }
+    }
+}
+
+/// Regression: a bare retained name reserves its ID, but cannot identify a
+/// retry's stored instance, even if the directory happens to be sealed.
+#[test]
+fn regression_supervisor_retain_retry_of_bare_kept_tree_is_not_found() {
     if !linux() {
         return;
     }
@@ -5352,18 +5399,13 @@ fn regression_supervisor_retain_retry_of_bare_kept_tree_is_not_served() {
     assert!(env.sup.retained_log.live(&attempt.id).is_none());
     let len = env.requests_len();
     let error = env.finalize(&attempt.id, false, Some("q")).unwrap_err();
-    assert_eq!(error.code, "invalid_request", "{}", error.message);
-    assert!(
-        error.message.contains("does not serve"),
-        "{}",
-        error.message
-    );
+    assert_eq!(error.code, "not_found", "{}", error.message);
     assert_eq!(env.requests_len(), len, "nothing appended");
     assert_eq!(
         env.sup.requests.status("q"),
         Some(super::requests::Status::Retryable)
     );
-    // A fresh `finalize` of the same ID answers it the same way.
+    // A fresh request still sees the reserved name as not served.
     let error = env.finalize(&attempt.id, false, Some("fresh")).unwrap_err();
     assert_eq!(error.code, "invalid_request", "{}", error.message);
     assert!(
@@ -7125,6 +7167,144 @@ fn regression_supervisor_retain_absent_relative_cache_path() {
     assert_eq!(
         env.sup.requests.status("relcache"),
         Some(super::requests::Status::Retryable)
+    );
+}
+
+/// Regression: a missing cache component followed by `..` made preflight
+/// inspect the wrong filesystem, then the worker created the component and
+/// filled a cache on a refused filesystem. Refuse before spawn or creation.
+#[test]
+fn regression_supervisor_retain_unresolved_cache_parent_is_refused() {
+    if !linux() {
+        return;
+    }
+    let mut env = Env::new();
+    let (_, bundle) = env.bundle("B", &[("b.txt", "b\n")]);
+    let missing = env.dir().join("missing");
+    let refused = env.dir().join("overlay-view");
+    fs::create_dir(&refused).unwrap();
+    env.sup
+        .seams
+        .fs_types
+        .borrow_mut()
+        .insert(refused.clone(), 0x794c_7630);
+    env.cache_at(&missing.join("../overlay-view/cache"));
+    let spawns = env.fake.0.lock().unwrap().spawns;
+    for request in [None, Some("parent-cache")] {
+        let error = env
+            .new_v2("task", &[&bundle], Overlay::Disk, true, request)
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_request", "{}", error.message);
+        assert!(error.message.contains(".."), "{}", error.message);
+        nothing_started(&env, spawns);
+        assert!(!missing.exists());
+        assert!(!refused.join("cache").exists());
+    }
+    assert_eq!(
+        env.sup.requests.status("parent-cache"),
+        Some(super::requests::Status::Retryable)
+    );
+    // Once the component exists, `..` belongs to the resolved prefix. Its
+    // actual destination must be checked, then the same retry can proceed.
+    fs::create_dir(&missing).unwrap();
+    let error = env
+        .new_v2(
+            "task",
+            &[&bundle],
+            Overlay::Disk,
+            true,
+            Some("parent-cache"),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "invalid_request", "{}", error.message);
+    assert!(error.message.contains("overlayfs"), "{}", error.message);
+    nothing_started(&env, spawns);
+    env.sup.seams.fs_types.borrow_mut().clear();
+    env.new_v2(
+        "task",
+        &[&bundle],
+        Overlay::Disk,
+        true,
+        Some("parent-cache"),
+    )
+    .unwrap();
+    let expected = refused
+        .canonicalize()
+        .unwrap()
+        .join("cache/ratarmount/layers");
+    assert_eq!(
+        env.fake
+            .0
+            .lock()
+            .unwrap()
+            .specs
+            .last()
+            .unwrap()
+            .bundle_cache
+            .as_ref(),
+        Some(&expected)
+    );
+}
+
+/// Regression: a symlink inside the configured cache path could make the
+/// worker use a different cache than the one preflight checked and sized.
+/// Pass the one resolved directory through the sandbox child interface.
+#[test]
+fn regression_supervisor_retain_uses_the_preflighted_cache_path() {
+    if !linux() {
+        return;
+    }
+    let mut env = Env::new();
+    let (_, bundle) = env.bundle("B", &[("b.txt", "b\n")]);
+    let xdg = env.dir().join("xdg");
+    fs::create_dir_all(xdg.join("ratarmount")).unwrap();
+    let real = env.dir().join("cache-real");
+    let other = env.dir().join("cache-other");
+    fs::create_dir(&real).unwrap();
+    fs::create_dir(&other).unwrap();
+    let link = xdg.join("ratarmount/layers");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    env.cache_at(&xdg);
+    let changed_link = link.clone();
+    let changed_target = other.clone();
+    env.fake.0.lock().unwrap().before_capture = Some(Box::new(move || {
+        fs::remove_file(&changed_link).unwrap();
+        std::os::unix::fs::symlink(&changed_target, &changed_link).unwrap();
+    }));
+    let attempt = env.layered(&[&bundle], true);
+    let canonical = real.canonicalize().unwrap();
+    let recorded = env.sup.taken_lowers[&attempt.id].clone().unwrap();
+    assert!(recorded[0].path.starts_with(&canonical));
+    assert_eq!(fs::read_dir(&other).unwrap().count(), 0);
+    let state = env.fake.0.lock().unwrap();
+    assert_eq!(
+        state.specs.last().unwrap().bundle_cache.as_ref(),
+        Some(&canonical)
+    );
+    drop(state);
+    let spec = super::process::SpawnSpec {
+        lowers: std::slice::from_ref(&bundle),
+        bundle_cache: Some(&canonical),
+        ..Default::default()
+    };
+    let argv = super::process::mount_args(
+        env.sup.base("task").unwrap(),
+        &env.sup.indexes("task"),
+        &attempt,
+        &spec,
+    );
+    let parsed =
+        crate::parse_args_from(std::iter::once(std::ffi::OsString::from("ratarmount")).chain(argv))
+            .unwrap();
+    assert_eq!(
+        parsed.sandbox_bundle_cache.as_deref(),
+        Some(canonical.as_path())
+    );
+    let report = env.finalize(&attempt.id, false, None).unwrap();
+    assert_eq!(report["status"], "retained");
+    assert_eq!(
+        env.retained_lines_of(&attempt.id).last().unwrap()["prefix"][0]["path"],
+        json!(recorded[0].path)
     );
 }
 
