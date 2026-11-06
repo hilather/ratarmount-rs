@@ -705,6 +705,7 @@ impl<M: Mounter> Supervisor<M> {
                         "base already exists; choose a new name",
                     ));
                 }
+                check_base_source_kind(&base)?;
                 private_dir(&indexes)?;
                 self.mounter.prepare(&base, &indexes, self.timeout)?;
                 self.bases.insert(base.name.clone(), base.clone());
@@ -1429,6 +1430,54 @@ fn absolute_source(source: &str) -> Result<String> {
         .into_os_string()
         .into_string()
         .map_err(|_| invalid("source path must be UTF-8"))
+}
+
+/// Refuse special local sources before prepare can open them (and block on a
+/// FIFO). Decode file URLs only for inspection, keeping the registered source.
+fn check_base_source_kind(base: &Base) -> Result<()> {
+    let source = &base.source;
+    if ratarmount_formats_git::parse_git_url(source)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return Ok(());
+    }
+    let path = if source
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("file"))
+    {
+        let Some(path) = url::Url::parse(source)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+        else {
+            return Ok(());
+        };
+        path
+    } else {
+        // Match absolute_source's scheme-only predicate: a joined local path
+        // containing rclone+ must not be treated as a remote URL.
+        let remote = source
+            .get(..7)
+            .is_some_and(|s| s.eq_ignore_ascii_case("restic:"))
+            || source.split_once("://").is_some_and(|(scheme, _)| {
+                scheme.is_ascii() && ratarmount_remote::is_remote_url(&format!("{scheme}://"))
+            });
+        if remote {
+            return Ok(());
+        }
+        PathBuf::from(source)
+    };
+    // Leave stat failures to prepare, including missing inline Git revisions.
+    if let Ok(meta) = fs::metadata(&path) {
+        if let Some(kind) = super::finalize::special_source_kind(&meta) {
+            return Err(invalid(format!(
+                "base {} source {source} is a {kind}, neither a regular file nor a directory; create-base supports regular files and directories",
+                base.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_base(base: &Base, indexes: &Path) -> Result<()> {

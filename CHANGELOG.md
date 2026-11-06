@@ -12,6 +12,7 @@
 
 ### Fixes
 
+- Sandbox `create-base` refuses FIFO, socket and device sources, including `file://` URLs to them, with `invalid_request` before opening or indexing, avoiding a FIFO open that waited until timeout. Fixes #269.
 - `sandbox run` crash recovery opens a pidfd before comparing a recorded child's start time and signals through it on Linux with pidfds (5.3+), so a reused PID cannot receive SIGTERM or SIGKILL. On ENOSYS (older kernels), it compares the start time then calls kill(2), narrowing but not closing the race. Without a usable recorded or current start time (e.g. no `/proc`, macOS), the recorded PID is never signalled. Signal errors retain the recovery record for retry after the remaining runtime and unmount steps. (#246)
 - Warm indexes compare `st_mtime_ns` when stored, and offline GNU TAR copy commits also remove existing indexes and SQLite companions in the default lookup folders before publication. Fixes #263.
 - Offline GNU TAR copy commits remove the sibling index before publishing the updated archive, so a warm remount sees renamed, deleted and added members even when archive size, mtime and edge hashes match. Fixes #261.
