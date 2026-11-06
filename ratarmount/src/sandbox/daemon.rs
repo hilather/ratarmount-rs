@@ -44,7 +44,7 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn private_dir(path: &Path) -> Result<()> {
+pub(super) fn private_dir(path: &Path) -> Result<()> {
     {
         let __inventory_condition_1232 = {
             #[expect(
@@ -346,6 +346,14 @@ pub struct Supervisor<M: Mounter> {
     /// every later finalize that would sync anything there answers `io`
     /// until a restart. Never persisted.
     pub poisoned: std::collections::BTreeSet<u64>,
+    /// This run's retained attempts (§5.7), by ID.
+    pub retained: BTreeMap<String, super::retained::RetainedEntry>,
+    pub retained_log: super::retained::RetainedLog,
+    /// Names found under `retained/` at start without a live record: kept,
+    /// never entered or served (R1c-2's recovery plugs in there).
+    pub bare_retained: std::collections::BTreeSet<String>,
+    /// `--max-retained` (set after `open`; `retained::MAX_RETAINED` by default).
+    pub max_retained: usize,
     #[cfg(test)]
     pub test_ids: Option<TestIds>,
     #[cfg(test)]
@@ -359,8 +367,12 @@ pub struct AttemptState {
     /// 32 lowercase hex digits drawn at `new`; with the ID it names one
     /// attempt (ruling 5).
     pub instance: String,
+    /// Created with `retain`: a successful finalize commits it to `retained/`.
+    pub retain: bool,
     /// Created with a journal (`attempts/ID/journal.jsonl`).
     pub journal: bool,
+    /// The IDs whose `retained/<ID>/overlay` it took as lowers, in order.
+    pub over: Vec<String>,
     pub finalize: FinalizeState,
 }
 
@@ -442,6 +454,9 @@ impl<M: Mounter> Supervisor<M> {
         }
         // Refusals of the request log come before reconcile touches attempts.
         let requests = RequestLog::open(&root, requests::limits())?;
+        // Then `retained/` and its log, also before reconcile, which never
+        // enters `retained/` (R1c-1 §5.7; R1c-2's recovery plugs in here).
+        let (retained_log, bare_retained) = Self::open_retained(&root)?;
         let mut supervisor = Self {
             root,
             mounter,
@@ -458,6 +473,10 @@ impl<M: Mounter> Supervisor<M> {
             instance_keys: Default::default(),
             instance_counter: 0,
             poisoned: Default::default(),
+            retained: BTreeMap::new(),
+            retained_log,
+            bare_retained,
+            max_retained: super::retained::MAX_RETAINED,
             #[cfg(test)]
             test_ids: None,
             #[cfg(test)]
@@ -465,6 +484,21 @@ impl<M: Mounter> Supervisor<M> {
             _lock: guard,
         };
         supervisor.reconcile()?;
+        // Every attempt is gone now; only a retained attempt's target still
+        // exists: its finalize records stay pinned (approval note (a)). A live
+        // record pins its ID and instance; a bare name every instance.
+        supervisor.requests.set_pins(requests::Pins {
+            targets: supervisor
+                .retained_log
+                .live_ids()
+                .filter_map(|id| supervisor.retained_log.live(id))
+                .map(|record| requests::Target {
+                    id: record.id.clone(),
+                    instance: record.instance.clone(),
+                })
+                .collect(),
+            ids: supervisor.bare_retained.iter().cloned().collect(),
+        });
         // Every attempt is gone now, so a request a restart cut off is resolved.
         supervisor.requests.resolve_interrupted()?;
         Ok(supervisor)
@@ -493,8 +527,8 @@ impl<M: Mounter> Supervisor<M> {
         })
     }
 
-    /// Ruling 7: finalize runs on Linux only. `serve` refuses to start
-    /// elsewhere already; this guards in-process callers.
+    /// Ruling 7: finalize and retain run on Linux only. `serve` refuses to
+    /// start elsewhere already; this guards in-process callers.
     pub(super) fn platform_rule(&self) -> Result<()> {
         #[cfg(test)]
         let linux = cfg!(target_os = "linux") && !self.seams.not_linux;
@@ -504,7 +538,7 @@ impl<M: Mounter> Supervisor<M> {
             Ok(())
         } else {
             Err(invalid(
-                "finalize is supported on Linux only; the sandbox supervisor is Linux only",
+                "finalize and retain are supported on Linux only; the sandbox supervisor is Linux only",
             ))
         }
     }
@@ -598,8 +632,8 @@ impl<M: Mounter> Supervisor<M> {
 
     /// Runs a v1 operation, or for a v2 one the same v1 operation; a v2 `new`
     /// with a `request_id` goes through the request-ID layer (§5.3), and every
-    /// v2 `new` passes its `lowers` and `journal` on: without them, and without
-    /// a `request_id`, it is a v1 `new`.
+    /// v2 `new` passes its `lowers`, `journal` and `retain` on: without them,
+    /// and without a `request_id`, it is a v1 `new`.
     pub fn handle(&mut self, operation: impl Into<Op>) -> Result<Value> {
         self.supervise();
         let operation = match operation.into() {
@@ -624,6 +658,7 @@ impl<M: Mounter> Supervisor<M> {
                 request_id: None,
                 lowers,
                 journal,
+                retain,
             }) => {
                 return self
                     .new_attempts(
@@ -634,11 +669,13 @@ impl<M: Mounter> Supervisor<M> {
                         readonly_globs,
                         &lowers,
                         journal.as_ref(),
+                        retain,
                         None,
                     )
                     .map(|(_, result)| result)
                     .map_err(|failed| failed.error)
             }
+            Op::V2(OperationV2::List { base, all: true }) => return self.list_all(base),
             Op::V2(operation) => operation.into_v1(),
         };
         match operation {
@@ -690,6 +727,7 @@ impl<M: Mounter> Supervisor<M> {
                     readonly_globs,
                     &[],
                     None,
+                    false,
                     None,
                 )
                 .map(|(_, result)| result)
@@ -705,10 +743,10 @@ impl<M: Mounter> Supervisor<M> {
                     .collect::<Vec<_>>()))
             }
             Operation::Diff { id, git } => {
-                let attempt = self.attempt(&id)?.clone();
+                let (attempt, lowers) = self.served(&id)?;
                 // A layered attempt is rendered against base + lowers, never
                 // against the bare base (§5.5).
-                let layers = match self.taken_lowers.get(&id) {
+                let layers = match lowers {
                     None => Vec::new(),
                     Some(None) => {
                         return Err(ApiError::new(
@@ -716,16 +754,17 @@ impl<M: Mounter> Supervisor<M> {
                             format!("lower stack of attempt {id} was never verified; destroy it"),
                         ))
                     }
-                    Some(Some(records)) => lowers::recorded_layers(records)
+                    Some(Some(records)) => lowers::recorded_layers(&records)
                         .map_err(|e| ApiError::new("diff_failed", e))?,
                 };
                 let deleted = self.mounter.deleted_paths(&attempt)?;
                 let base = self.base(&attempt.base)?.clone();
                 let indexes = self.indexes(&base.name);
-                // A finalized attempt is read offline, after its base was
-                // classified and gated (which writes nothing), as the CLI
-                // `diff` gates (R1c-1 §5.7).
-                let (_keep, source) = if attempt.status == "finalized" {
+                // A finalized or retained attempt is read offline, after its
+                // base was classified and gated (which writes nothing), as
+                // the CLI `diff` gates (R1c-1 §5.7).
+                let (_keep, source) = if matches!(attempt.status.as_str(), "finalized" | "retained")
+                {
                     let classified = super::finalize::classify_supervised(&base, &indexes)
                         .map_err(|e| ApiError::new("base_open_failed", e))?;
                     let recorded =
@@ -760,7 +799,7 @@ impl<M: Mounter> Supervisor<M> {
                 Ok(serde_json::Value::Object(response))
             }
             Operation::Stats { id } => {
-                let attempt = self.attempt(&id)?.clone();
+                let (attempt, _) = self.served(&id)?;
                 let stats = if let Some(deleted) = self.mounter.deleted_paths(&attempt)? {
                     // Named, never a bare io error (Keystone note (1)).
                     let usage = ratarmount_compositing::OverlayUsage::scan(&attempt.overlay_dir)
@@ -831,10 +870,16 @@ impl<M: Mounter> Supervisor<M> {
             request_id: Some(id),
             lowers,
             journal,
+            retain,
         } = &operation
         else {
             unreachable!("only a v2 new with a request_id is routed here");
         };
+        // Ruling 7, before anything is looked up or recorded: it needs only
+        // the request body.
+        if *retain {
+            self.platform_rule()?;
+        }
         // A malformed ID is refused before anything is recorded.
         validate_name(id).map_err(|_| {
             invalid("request_id must start with an ASCII letter or digit, then letters, digits, dot, underscore or hyphen (max 128)")
@@ -861,6 +906,7 @@ impl<M: Mounter> Supervisor<M> {
             readonly_globs.clone(),
             lowers,
             journal.as_ref(),
+            *retain,
             Some((id, &hash)),
         );
         self.requests.finish(id, &hash, outcome)
@@ -959,8 +1005,13 @@ impl<M: Mounter> Supervisor<M> {
         readonly: Vec<String>,
         lowers: &[String],
         journal: Option<&JournalSpec>,
+        retain: bool,
         request: Option<(&str, &str)>,
     ) -> requests::Outcome {
+        if retain {
+            // Ruling 7: before anything is resolved (an ID-less `new`).
+            self.platform_rule()?;
+        }
         let base = self.base(name)?.clone();
         if count == 0 || count > self.max_attempts.saturating_sub(self.attempts.len()) {
             return Err(ApiError::new(
@@ -984,6 +1035,12 @@ impl<M: Mounter> Supervisor<M> {
         ratarmount_compositing::ReadOnlyGlobs::with_allow(&readonly, &base.options.allow_globs)
             .map_err(|e| invalid(e.to_string()))?;
         let indexes = self.indexes(name);
+        // R1c-1 §5.5: the scope, platform and durability rules of `retain`,
+        // before any lower is read, the RAM root, any attempt directory or
+        // child.
+        if retain {
+            self.retain_preflight(&base, overlay, count)?;
+        }
         // Before the RAM root, any attempt directory or child (§5.2).
         let layered = if lowers.is_empty() {
             Vec::new()
@@ -994,9 +1051,18 @@ impl<M: Mounter> Supervisor<M> {
                 &lowers::Roots {
                     state: &self.root,
                     ram: self.ram_root.as_deref(),
+                    retained: &self.retained_lowers(),
                 },
                 self.lower_decode_budget,
             )?
+        };
+        // The retained attempts the stack names, by the paths requested
+        // (ruling 3: never by digest).
+        let over = self.over(&layered);
+        let bundle_cache = if retain {
+            self.retain_lower_preflight(&base, &layered, &over)?
+        } else {
+            None
         };
         let lower_paths: Vec<PathBuf> = layered.iter().map(|lower| lower.path.clone()).collect();
         if !layered.is_empty() || journal.is_some() {
@@ -1031,6 +1097,7 @@ impl<M: Mounter> Supervisor<M> {
                     quota,
                     readonly: &readonly,
                     lowers: &lower_paths,
+                    bundle_cache: bundle_cache.as_deref(),
                     journal: journal.map(|spec| (probe, spec)),
                 },
             )?;
@@ -1043,6 +1110,7 @@ impl<M: Mounter> Supervisor<M> {
             self.record_preflight(request, name, count, ram.as_deref())?;
         }
         let mut ids = Vec::new();
+        let held = self.held();
         let deadline = Instant::now() + self.timeout;
         let result = (|| {
             for _ in 0..count {
@@ -1066,7 +1134,9 @@ impl<M: Mounter> Supervisor<M> {
                     #[cfg(test)]
                     let dir = self.test_attempt_dir(dir);
                     let drawn = dir.file_name().and_then(|name| name.to_str());
-                    if !drawn.is_some_and(|id| self.requests.is_reserved(id)) {
+                    // Also never an ID a retained record or name holds
+                    // (R1c-1 §5.7).
+                    if !drawn.is_some_and(|id| self.requests.is_reserved(id) || held.contains(id)) {
                         break dir;
                     }
                     // Still empty, and never recorded as an attempt.
@@ -1105,7 +1175,9 @@ impl<M: Mounter> Supervisor<M> {
                     id.clone(),
                     AttemptState {
                         instance,
+                        retain,
                         journal: journal.is_some(),
+                        over: over.clone(),
                         finalize: Default::default(),
                     },
                 );
@@ -1122,6 +1194,7 @@ impl<M: Mounter> Supervisor<M> {
                         quota,
                         readonly: &readonly,
                         lowers: &lower_paths,
+                        bundle_cache: bundle_cache.as_deref(),
                         journal: journal.map(|spec| (journal_path.as_path(), spec)),
                     },
                 )?;
@@ -1236,6 +1309,9 @@ impl<M: Mounter> Supervisor<M> {
     }
 
     pub fn destroy(&mut self, id: &str) -> Result<()> {
+        // A retained attempt, or an ID a retained record holds, is never
+        // destroyed (R1c-1 §5.6).
+        self.refuse_retained_destroy(id)?;
         let attempt = self.attempt(id)?.clone();
         self.mounter.cleanup(&attempt.path)?;
         let root = attempt.path.parent().expect("attempt root");
@@ -1478,7 +1554,13 @@ fn send(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-pub fn serve(socket: &Path, root: &Path, limit: usize, timeout: Duration) -> Result<()> {
+pub fn serve(
+    socket: &Path,
+    root: &Path,
+    limit: usize,
+    timeout: Duration,
+    max_retained: usize,
+) -> Result<()> {
     if !cfg!(target_os = "linux") {
         return Err(ApiError::new(
             "unsupported",
@@ -1495,6 +1577,8 @@ pub fn serve(socket: &Path, root: &Path, limit: usize, timeout: Duration) -> Res
         timeout,
         ProcessMounter::new(std::env::current_exe()?),
     )?;
+    // `Supervisor::open`'s signature is R1a's; the cap is set after it.
+    supervisor.max_retained = max_retained;
     crate::overlay_commit::install_term_signal_flag();
     let mut connections: Vec<Connection> = Vec::new();
     while !supervisor.stopping && !crate::overlay_commit::term_requested() {

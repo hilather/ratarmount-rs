@@ -52,6 +52,8 @@ pub struct SpawnSpec<'a> {
     pub readonly: &'a [String],
     /// Canonical lower paths, bottom first.
     pub lowers: &'a [PathBuf],
+    /// Preflighted bundle cache directory, for a retained attempt.
+    pub bundle_cache: Option<&'a Path>,
     /// The journal file the supervisor chose, and its options.
     pub journal: Option<(&'a Path, &'a JournalSpec)>,
 }
@@ -85,6 +87,10 @@ pub trait Mounter {
     fn status(&mut self, attempt: &Attempt, timeout: Duration) -> Result<u64>;
     /// Whether a recorded child of the attempt is still running.
     fn child_alive(&mut self, attempt: &Attempt) -> bool;
+    /// Forgets the attempt's child entry and kept exit status (the child has
+    /// exited); unmounts and signals nothing. Called when a retained
+    /// attempt's tree moved, so no entry outlives its path.
+    fn forget_child(&mut self, path: &Path);
     /// Every mount point of this process's mount namespace.
     fn mount_points(&self) -> Result<Vec<PathBuf>>;
 }
@@ -175,6 +181,12 @@ pub fn mount_args(
         "--sandbox-inspection-socket".into(),
         super::inspection::socket_path(attempt).into_os_string(),
     ]);
+    if let Some(cache) = spec.bundle_cache {
+        args.extend([
+            "--sandbox-bundle-cache".into(),
+            cache.as_os_str().to_owned(),
+        ]);
+    }
     args.extend(["-w".into(), attempt.overlay_dir.as_os_str().to_owned()]);
     if let Some(quota) = spec.quota {
         args.extend(["--overlay-quota".into(), quota.to_string().into()]);
@@ -544,6 +556,11 @@ impl Mounter for ProcessMounter {
         }
     }
 
+    fn forget_child(&mut self, path: &Path) {
+        self.children.remove(path);
+        self.exits.remove(path);
+    }
+
     fn mount_points(&self) -> Result<Vec<PathBuf>> {
         Ok(self.mounted()?)
     }
@@ -656,6 +673,31 @@ pub fn mountpoints() -> io::Result<Vec<PathBuf>> {
     ))
 }
 
+/// A blocking Unix stream socket with CLOEXEC. `SOCK_CLOEXEC` is taken
+/// atomically at `socket()` on Linux, where it exists; on macOS `FD_CLOEXEC`
+/// is set right after `socket()` because no `SOCK_CLOEXEC` exists: the
+/// supervisor's serve thread, the only caller, is also the only thread that
+/// spawns children, so none can inherit the socket in between.
+pub(crate) fn stream_socket() -> io::Result<rustix::fd::OwnedFd> {
+    use rustix::net::{AddressFamily, SocketType};
+    #[cfg(target_os = "linux")]
+    {
+        rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            rustix::net::SocketFlags::CLOEXEC,
+            None,
+        )
+        .map_err(Into::into)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let socket = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+        rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
+        Ok(socket)
+    }
+}
+
 /// Decode the `\ooo` octal escapes of one mountinfo path field, bytewise.
 /// `None` when an escape is out of byte range.
 #[cfg(any(target_os = "linux", test))]
@@ -753,6 +795,18 @@ mod tests {
         if std::env::var_os("RATARMOUNT_SANDBOX_WAITING_CHILD").is_some() {
             thread::sleep(Duration::from_secs(30));
         }
+    }
+
+    /// Regression (R1c-1 carry-in 1, Keystone note 1): the inspection socket
+    /// must be CLOEXEC — a dropped `SocketFlags::CLOEXEC` would leak it into
+    /// every later child. `stream_socket` takes the flag atomically at
+    /// `socket()` on Linux and sets `FD_CLOEXEC` right after elsewhere; the
+    /// test guards only that the flag is set, not how it got there.
+    #[test]
+    fn regression_inspection_socket_cloexec() {
+        let socket = stream_socket().unwrap();
+        let flags = rustix::io::fcntl_getfd(&socket).unwrap();
+        assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
     }
 
     /// A `ProcessMounter` whose unmount helper is the script `body` (run as

@@ -1129,10 +1129,17 @@ fn unlink_if_same(dir: &OwnedFd, name: &str, locked: &File) -> bool {
     })
 }
 
-/// `renameat` that fails with `EEXIST` instead of replacing `to`.
+/// `renameat` of `old_dir`/`from` to `new_dir`/`to` that fails with `EEXIST`
+/// instead of replacing `to`. Pass `rustix::fs::CWD` with absolute paths to
+/// rename across directories by name (the retain commit, R1c-1 §5.8).
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn rename_no_replace(dir: &OwnedFd, from: &str, to: &str) -> rustix::io::Result<()> {
-    host::renameat_with(dir, from, dir, to, host::RenameFlags::NOREPLACE)
+pub(crate) fn rename_no_replace(
+    old_dir: impl std::os::fd::AsFd,
+    from: &str,
+    new_dir: impl std::os::fd::AsFd,
+    to: &str,
+) -> rustix::io::Result<()> {
+    host::renameat_with(old_dir, from, new_dir, to, host::RenameFlags::NOREPLACE)
 }
 
 /// No atomic no-replace rename on this platform (e.g. BSD). `linkat` followed
@@ -1141,7 +1148,12 @@ fn rename_no_replace(dir: &OwnedFd, from: &str, to: &str) -> rustix::io::Result<
 /// and stale temps are left for manual deletion; see
 /// [`no_replace_rename_available`].
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn rename_no_replace(_: &OwnedFd, _: &str, _: &str) -> rustix::io::Result<()> {
+pub(crate) fn rename_no_replace(
+    _: impl std::os::fd::AsFd,
+    _: &str,
+    _: impl std::os::fd::AsFd,
+    _: &str,
+) -> rustix::io::Result<()> {
     Err(rustix::io::Errno::NOSYS)
 }
 
@@ -1185,7 +1197,7 @@ fn unlink_if_same_named(
     let mut quarantine = None;
     for _ in 0..QUARANTINE_ATTEMPTS {
         let candidate = next_name();
-        match rename_no_replace(dir, name, &candidate) {
+        match rename_no_replace(dir, name, dir, &candidate) {
             Ok(()) => {
                 quarantine = Some(candidate);
                 break;

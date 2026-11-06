@@ -8,15 +8,108 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub(super) fn private_tempdir() -> tempfile::TempDir {
-    tempfile::Builder::new()
+    // TMPDIR selects the root; a relative one is no root.
+    let requested = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    private_tempdir_in(&requested)
+}
+
+/// `private_tempdir` at `requested`. `Supervisor::open` canonicalizes the
+/// state root, so room for attempts/ID/inspect.sock within Darwin's 104-byte
+/// `sun_path` is judged on the resolved path: a short `TMPDIR` symlink to a
+/// long directory (macOS /var/folders resolves under /private) would
+/// otherwise pass the check and overflow the socket path. Falls back to
+/// `/tmp` (resolved) when the resolved root leaves no room.
+fn private_tempdir_in(requested: &Path) -> tempfile::TempDir {
+    let resolved = requested
+        .canonicalize()
+        .unwrap_or_else(|_| requested.to_path_buf());
+    // tempfile names each directory `.tmp` + 6 characters.
+    let socket = "/.tmpXXXXXX/attempts/attempt-000000/inspect.sock".len();
+    let root = if resolved.as_os_str().len() + socket < 104 {
+        resolved
+    } else {
+        Path::new("/tmp")
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    };
+    let dir = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
-        // Leave room for attempts/ID/inspect.sock within Darwin's 104-byte sun_path.
-        .tempdir_in("/tmp")
-        .unwrap()
+        .tempdir_in(&root)
+        .unwrap();
+    assert!(
+        dir.path()
+            .join("attempts/attempt-000000/inspect.sock")
+            .as_os_str()
+            .len()
+            < 104,
+        "temporary root {} leaves no room for attempts/ID/inspect.sock within a 104-byte sun_path ({})",
+        root.display(),
+        dir.path().display()
+    );
+    dir
+}
+
+/// Regression (sweep 5 review): the socket-length check measured `TMPDIR` as
+/// written, but `Supervisor::open` canonicalizes the state root, so a short
+/// `TMPDIR` symlink to a long directory passed the check and the real socket
+/// path overflowed `sun_path` (macOS /var/folders -> /private/var/folders).
+/// The check must use the resolved path and fall back to `/tmp`.
+#[test]
+fn regression_private_tempdir_judges_the_resolved_root() {
+    let anchor = private_tempdir();
+    let mut long = anchor.path().canonicalize().unwrap();
+    while long.as_os_str().len() < 120 {
+        long.push("a_long_directory_component");
+    }
+    fs::create_dir_all(&long).unwrap();
+    let short = anchor.path().join("s");
+    symlink(&long, &short).unwrap();
+    let dir = private_tempdir_in(&short);
+    let resolved = dir.path().canonicalize().unwrap();
+    assert!(
+        !resolved.starts_with(&long),
+        "{resolved:?} is under the long dir"
+    );
+    assert!(
+        resolved
+            .join("attempts/attempt-000000/inspect.sock")
+            .as_os_str()
+            .len()
+            < 104,
+        "{resolved:?}"
+    );
+    // Use a known-short root, even when the caller's TMPDIR is 45–55 bytes.
+    let direct = private_tempdir_in(Path::new("/tmp"));
+    let dir = private_tempdir_in(direct.path());
+    assert!(
+        dir.path()
+            .starts_with(direct.path().canonicalize().unwrap()),
+        "{:?} not under {:?}",
+        dir.path(),
+        direct.path()
+    );
+    // At these lengths the first tempdir fits, but adding another tempdir
+    // does not. The second call must use the fallback rather than assume it
+    // can stay under the first one.
+    for length in 45..=55 {
+        let name = "m".repeat(length - direct.path().as_os_str().len() - 1);
+        let mid = direct.path().join(name);
+        fs::create_dir(&mid).unwrap();
+        let first = private_tempdir_in(&mid);
+        assert!(first.path().starts_with(&mid));
+        let second = private_tempdir_in(first.path());
+        assert!(!second.path().starts_with(first.path()));
+        assert!(second
+            .path()
+            .starts_with(Path::new("/tmp").canonicalize().unwrap()));
+    }
 }
 
 #[derive(Default)]
@@ -75,6 +168,9 @@ pub(super) struct FakeState {
     pub(super) status_held: Vec<Duration>,
     /// Children still alive after a `Detaching` stop.
     pub(super) alive: BTreeSet<PathBuf>,
+    /// Every mount point `forget_child` dropped (R1c-1: the retained
+    /// attempt's mount table entry, removed when its tree is renamed).
+    pub(super) forgotten: Vec<PathBuf>,
     /// Mount points besides the attempts' own (the durability preflight's
     /// mount check).
     pub(super) extra_mounts: Vec<PathBuf>,
@@ -94,6 +190,7 @@ pub(super) struct SpawnRecord {
     pub(super) quota: Option<u64>,
     pub(super) readonly: Vec<String>,
     pub(super) lowers: Vec<PathBuf>,
+    pub(super) bundle_cache: Option<PathBuf>,
     pub(super) journal: Option<(PathBuf, protocol::JournalSpec)>,
 }
 
@@ -111,7 +208,11 @@ impl Fake {
     /// A child's two opens of its lowers: it captures each lower's metadata
     /// (a bundle is first extracted into its cache, unverified), then
     /// composes them, which the Fake does not need to do.
-    fn capture(&self, lowers: &[PathBuf]) -> Result<Vec<LowerLayerRecord>, String> {
+    fn capture(
+        &self,
+        lowers: &[PathBuf],
+        preflight_cache: Option<&Path>,
+    ) -> Result<Vec<LowerLayerRecord>, String> {
         self.run(|state| &mut state.before_capture);
         let cache = self.0.lock().unwrap().bundle_cache.clone();
         let real = self.0.lock().unwrap().real_cache.clone();
@@ -129,10 +230,15 @@ impl Fake {
                     .collect();
                 let view = ratarmount_compositing::compose_stack(base.clone(), &layers)
                     .map_err(|e| e.to_string())?;
-                crate::overlay_pack::cached_lower_in(lower, cache, view, None)
-                    .map_err(|e| e.to_string())?
-                    .canonicalize()
-                    .unwrap()
+                crate::overlay_pack::cached_lower_in(
+                    lower,
+                    preflight_cache.unwrap_or(cache),
+                    view,
+                    None,
+                )
+                .map_err(|e| e.to_string())?
+                .canonicalize()
+                .unwrap()
             } else if lower.is_file() {
                 let cache = cache.as_ref().expect("bundle lowers need a bundle cache");
                 let layer = cache.join(format!("layer-{}", fs::read_dir(cache).unwrap().count()));
@@ -188,13 +294,14 @@ impl Mounter for Fake {
             quota: spec.quota,
             readonly: spec.readonly.into(),
             lowers: spec.lowers.into(),
+            bundle_cache: spec.bundle_cache.map(Path::to_path_buf),
             journal: spec
                 .journal
                 .map(|(path, journal)| (path.into(), journal.clone())),
         });
         drop(state);
         if !spec.lowers.is_empty() {
-            match self.capture(spec.lowers) {
+            match self.capture(spec.lowers, spec.bundle_cache) {
                 Ok(records) => {
                     let mut state = self.0.lock().unwrap();
                     state.records.insert(attempt.path.clone(), records);
@@ -325,6 +432,12 @@ impl Mounter for Fake {
 
     fn child_alive(&mut self, attempt: &Attempt) -> bool {
         self.0.lock().unwrap().alive.contains(&attempt.path)
+    }
+
+    fn forget_child(&mut self, path: &Path) {
+        let mut state = self.0.lock().unwrap();
+        state.forgotten.push(path.into());
+        state.alive.remove(path);
     }
 
     fn mount_points(&self) -> Result<Vec<PathBuf>, ApiError> {
@@ -1616,12 +1729,11 @@ fn regression_protocol_v2_dispatch_and_envelope_versions() {
             2,
             "invalid_request",
         ),
-        // R1c-1 defines `finalize`: an unknown operation stays refused.
+        // R1c-1 defines `finalize` and `retain`: an unknown operation and
+        // an unknown `new` field stay refused.
         (r#"{"version":2,"op":"bogus"}"#, 2, "invalid_request"),
-        // `retain` is still refused (R1c-1's PR B adds it); R1b accepts
-        // `lowers`.
         (
-            r#"{"version":2,"op":"new","base":"t","retain":true}"#,
+            r#"{"version":2,"op":"new","base":"t","bogus":1}"#,
             2,
             "invalid_request",
         ),
@@ -1973,9 +2085,10 @@ fn generate_cli_v1_requests() {
 }
 
 /// Regression: every v1 CLI subcommand still sends the baseline bytes;
-/// `new --request-id`, `--lower` and `--journal`, and `finalize`, send v2
-/// (R1b C1, R1c-1 C1a), and `call` accepts only its request's version, or a
-/// v1 error answering v2 (how an older daemon refuses v2).
+/// `new --request-id`, `--lower`, `--journal` and `--retain`, `finalize` and
+/// `list --all` send v2 (R1b C1, R1c-1 C1), and `call` accepts only its
+/// request's version, or a v1 error answering v2 (how an older daemon refuses
+/// v2).
 #[test]
 fn regression_cli_v1_request_bytes_unchanged() {
     let expected: Vec<serde_json::Value> = fs::read_to_string(CLI_V1_REQUESTS)
@@ -2030,9 +2143,13 @@ fn regression_cli_v1_request_bytes_unchanged() {
         assert_eq!(String::from_utf8(recorder.line()).unwrap(), line);
         recorder.finish();
     }
-    // R1c-1 (C1a): finalize sends v2; the v1 argv above keep their fixture
-    // bytes.
+    // R1c-1 (C1): --retain, finalize and list --all send v2; the v1 argv
+    // above keep their fixture bytes.
     for (argv, line) in [
+        (
+            &["new", "task", "--retain"][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"retain\":true}\n",
+        ),
         (
             &["finalize", "attempt-a1B2c3", "--pack", "--request-id", "r"][..],
             "{\"version\":2,\"op\":\"finalize\",\"id\":\"attempt-a1B2c3\",\"pack\":true,\"request_id\":\"r\"}\n",
@@ -2040,6 +2157,10 @@ fn regression_cli_v1_request_bytes_unchanged() {
         (
             &["finalize", "attempt-a1B2c3"][..],
             "{\"version\":2,\"op\":\"finalize\",\"id\":\"attempt-a1B2c3\"}\n",
+        ),
+        (
+            &["list", "--all"][..],
+            "{\"version\":2,\"op\":\"list\",\"base\":null,\"all\":true}\n",
         ),
     ] {
         let recorder = Recorder::start(vec![
@@ -2124,6 +2245,7 @@ fn regression_cli_v1_request_bytes_unchanged() {
             request_id: Some("r".into()),
             lowers: vec![],
             journal: None,
+            retain: false,
         }),
     )
     .unwrap();

@@ -14,6 +14,7 @@ mod protocol;
 mod requests;
 #[cfg(test)]
 mod requests_tests;
+mod retained;
 mod run;
 mod state_log;
 #[cfg(test)]
@@ -57,6 +58,9 @@ enum Command {
         max_attempts: u32,
         #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
+        /// Most attempt IDs retained records may hold (0 refuses `retain`).
+        #[arg(long, default_value_t = retained::MAX_RETAINED as u32, value_parser = clap::value_parser!(u32).range(0..=retained::MAX_RETAINED as i64))]
+        max_retained: u32,
     },
     CreateBase {
         name: String,
@@ -93,12 +97,15 @@ enum Command {
         /// Fsync the journal at unmount.
         #[arg(long, requires = "journal")]
         journal_sync: bool,
+        /// Keep each attempt in retained/ID once a finalize succeeds (protocol version 2; Linux, TAR, directory and git:/// bases).
+        #[arg(long)]
+        retain: bool,
     },
     /// Stop, check, seal and hash an attempt, optionally packing it (protocol version 2; Linux only).
     ///
-    /// Unmounts the attempt with a normal unmount (never lazy or forced), fscks, seals and hashes its layer, syncs everything it references, and prints the JSON report. A busy mount answers writers_active: stop the processes using it (its container) and retry after at least a second, backing off.
+    /// Unmounts the attempt with a normal unmount (never lazy or forced), fscks, seals and hashes its layer, syncs everything it references, and prints the JSON report. An attempt created with --retain is then kept in retained/ID. A busy mount answers writers_active: stop the processes using it (its container) and retry after at least a second, backing off.
     #[command(
-        after_help = "Example: ratarmount sandbox --socket api.sock finalize attempt-a1B2c3 --pack --request-id run-17-final\n\nExit status:\n  0  Finalized; stdout is the JSON report.\n  1  Refused or failed (see the JSON error: writers_active, lower_changed,\n     invalid_request, not_found, io, ...); retry writers_active."
+        after_help = "Example: ratarmount sandbox --socket api.sock finalize attempt-a1B2c3 --pack --request-id run-17-final\n\nExit status:\n  0  Finalized (or retained); stdout is the JSON report.\n  1  Refused or failed (see the JSON error: writers_active, lower_changed,\n     invalid_request, not_found, io, ...); retry writers_active."
     )]
     Finalize {
         id: String,
@@ -112,6 +119,9 @@ enum Command {
     List {
         #[arg(long)]
         base: Option<String>,
+        /// Also list this run's retained attempts (protocol version 2).
+        #[arg(long)]
+        all: bool,
     },
     Diff {
         id: String,
@@ -141,12 +151,14 @@ pub fn run(args: &SandboxArgs) -> Result<(), String> {
             state_dir,
             max_attempts,
             timeout,
+            max_retained,
         } => {
             return daemon::serve(
                 socket,
                 state_dir,
                 *max_attempts as usize,
                 Duration::from_secs(*timeout),
+                *max_retained as usize,
             )
             .map_err(|e| format!("{}: {}", e.code, e.message));
         }
@@ -160,8 +172,8 @@ pub fn run(args: &SandboxArgs) -> Result<(), String> {
             options: serde_json::from_str::<BaseOptions>(options).map_err(|e| e.to_string())?,
         }
         .into(),
-        // Without --request-id, --lower and --journal `new` sends exactly
-        // the v1 bytes.
+        // Without --request-id, --lower, --journal and --retain `new` sends
+        // exactly the v1 bytes.
         Command::New {
             base,
             count,
@@ -174,13 +186,14 @@ pub fn run(args: &SandboxArgs) -> Result<(), String> {
             journal_exclude,
             journal_reads,
             journal_sync,
+            retain,
         } => {
             let journal = journal.then(|| JournalSpec {
                 exclude: journal_exclude.clone(),
                 reads: journal_reads.unwrap_or_default(),
                 sync: *journal_sync,
             });
-            if request_id.is_none() && lowers.is_empty() && journal.is_none() {
+            if request_id.is_none() && lowers.is_empty() && journal.is_none() && !retain {
                 Operation::New {
                     base: base.clone(),
                     count: *count,
@@ -199,6 +212,7 @@ pub fn run(args: &SandboxArgs) -> Result<(), String> {
                     request_id: request_id.clone(),
                     lowers: lowers.clone(),
                     journal,
+                    retain: *retain,
                 }
                 .into()
             }
@@ -213,7 +227,13 @@ pub fn run(args: &SandboxArgs) -> Result<(), String> {
             request_id: request_id.clone(),
         }
         .into(),
-        Command::List { base } => Operation::List { base: base.clone() }.into(),
+        // Without --all, today's v1 bytes.
+        Command::List { base, all: false } => Operation::List { base: base.clone() }.into(),
+        Command::List { base, all: true } => OperationV2::List {
+            base: base.clone(),
+            all: true,
+        }
+        .into(),
         Command::Diff { id, git } => Operation::Diff {
             id: id.clone(),
             git: *git,
