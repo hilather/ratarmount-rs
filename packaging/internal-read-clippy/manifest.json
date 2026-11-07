@@ -17741,6 +17741,58 @@
       "rule_reason": "inventory-op:libc::open"
     },
     {
+      "configured_path": "libc::open",
+      "item": "ratarmount_index::checked_open::native_fs::linux::open_parent",
+      "leaf_digest": "3ce7c04f1ab35d2ee1cc7555217ecc7c4a36efb8326b809dab21354866c511c6",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "directory-handle-or-durability",
+        "creation": {
+          "basis": "O_RDONLY|O_DIRECTORY|O_CLOEXEC without create/truncate; owned directory close cannot release a database inode lock.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-A1-LINUX-DIR",
+        "item": "ratarmount_index::checked_open::native_fs::linux::open_parent",
+        "reason": "Own only O_DIRECTORY read-only CLOEXEC parent; follows parent aliases, never opens/closes a regular-file alias or creates a pathname."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-A1-LINUX-DIR\",\"item\":\"ratarmount_index::checked_open::native_fs::linux::open_parent\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"Own only O_DIRECTORY read-only CLOEXEC parent; follows parent aliases, never opens/closes a regular-file alias or creates a pathname.\",\"creation\":{\"policy\":\"none\",\"basis\":\"O_RDONLY|O_DIRECTORY|O_CLOEXEC without create/truncate; owned directory close cannot release a database inode lock.\"}}",
+      "resolved": "libc::unix::open",
+      "rule_reason": "inventory-op:libc::open"
+    },
+    {
+      "configured_path": "std::os::fd::FromRawFd::from_raw_fd",
+      "item": "ratarmount_index::checked_open::native_fs::linux::open_parent",
+      "leaf_digest": "67cdf1e3488ae69c8c30b95e0b04f12e8dbcf6e2b8c8994bb7a8d9f04ef19b95",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "descriptor-handoff",
+        "creation": {
+          "basis": "from_raw_fd retypes the preceding successful read-only directory open; it creates no pathname or acquisition.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-A1-LINUX-OWN",
+        "item": "ratarmount_index::checked_open::native_fs::linux::open_parent",
+        "reason": "Transfer the already inventoried O_DIRECTORY descriptor into unique directory-only File ownership, without any new open or regular-file alias close."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-A1-LINUX-OWN\",\"item\":\"ratarmount_index::checked_open::native_fs::linux::open_parent\",\"disposition\":\"out-of-family\",\"category\":\"descriptor-handoff\",\"reason\":\"Transfer the already inventoried O_DIRECTORY descriptor into unique directory-only File ownership, without any new open or regular-file alias close.\",\"creation\":{\"policy\":\"none\",\"basis\":\"from_raw_fd retypes the preceding successful read-only directory open; it creates no pathname or acquisition.\"}}",
+      "resolved": "std::os::fd::raw::FromRawFd::from_raw_fd",
+      "rule_reason": "inventory-op:from_raw_fd"
+    },
+    {
       "configured_path": "ratarmount_index::managed_read::ManagedReadCursor::open",
       "item": "ratarmount_index::digest_cache::cached_archive_digest",
       "leaf_digest": "ac525f603adb60ef6f84f094c2098aecf995af3e1965eb90e8409d38f305ac78",
@@ -21615,7 +21667,7 @@
     }
   ],
   "policy": {
-    "configuration": "2ec098f615ea1dfff57afd4bfda70e68088af7c1fe60cfe4a44d900d0a3c0dc4",
+    "configuration": "7cf152f0cb9365f6940258376e39f351ac5e0d45b95f026f9853596ee5581ad9",
     "profiles": "f04aa50122d4ae1f0504b6411c5b47cacf3a97a9e3080e175166f3b744aa4bd8",
     "toolchain": {
       "compiler_revision": "88d9e12ae178fab0fb5cc050a94da85685d449ea",
