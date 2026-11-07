@@ -143,7 +143,7 @@ fn regression_235_part2_a1_macos_attribute_errors() {
     let t = tempfile::tempdir().unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::create_dir(t.path().join("denied")).unwrap();
-    fs::set_permissions(t.path().join("denied"), fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(t.path().join("denied"), fs::Permissions::from_mode(0o0)).unwrap();
     let result = NativeDirectory::open_parent(&t.path().join("denied"));
     fs::set_permissions(t.path().join("denied"), fs::Permissions::from_mode(0o700)).unwrap();
     if unsafe { libc::geteuid() } == 0 {

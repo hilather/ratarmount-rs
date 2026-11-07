@@ -58,7 +58,7 @@ impl Attributes {
     ) -> Result<Self, NativeFsError> {
         let volume = volume & !libc::ATTR_VOL_INFO; // Selector, not returned data.
         let end = u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as usize;
-        if !(24..=128).contains(&end) || end % 4 != 0 {
+        if !(24..=128).contains(&end) || !end.is_multiple_of(4) {
             return Err(error("attribute length", NativeFsErrorKind::MalformedData));
         }
         let mut r = Self { bytes, pos: 4, end };
