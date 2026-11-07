@@ -45,7 +45,7 @@ Current-main grounding (all at the base above; proposed symbols are future work)
 
 ## Staged PR sequence with per-PR diff budgets
 
-**Hard caps:** touched files and additions + deletions against each PR's declared base, including tests, generated data/manifests, lockfile, CI, docs and deletions. Freeze a path allowlist. No formatting churn, hidden payloads, blanket approvals or test-line exemption. Each PR builds/tests against its predecessor and receives normal plus independent skeptical review. Repeated waves have separate caps, never pooled. Breach stops for decomposition/review. Do not resume paused agent-skills or run codex-workflows; no gate waiver/extra sweep is created here.
+**Hard caps:** touched files and additions + deletions against each PR's declared base, including tests, generated data/manifests, lockfile, CI, docs and deletions. Freeze a path allowlist. No formatting churn, hidden payloads, blanket approvals or test-line exemption. Each PR builds/tests against its predecessor and receives normal plus independent skeptical review. Repeated waves have separate caps, never pooled. Breach stops for decomposition/review. Every staged PR must pass the live origin-agent-skills gates: the plan gate (review-plan plus a fresh skeptic-plan-review each sweep, cap 6) and the code gate (review-pr/review-uncommitted plus a fresh skeptic-code-review each sweep, cap 3). Do not run codex-workflows; no gate waiver/extra sweep is created here.
 
 Crate names below abbreviate ratarmount-*.
 
