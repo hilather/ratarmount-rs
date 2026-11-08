@@ -91,6 +91,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 
 | Symptom / fix | Commands |
 |---------------|----------|
+| #276 E1: A1 evidence validators rejected canonical `0 failed;` summaries; ordinary lock control lacked identity/running/status checks | `python3 -I test-harness/test-a1-evidence.py` |
 | #269: sandbox create-base refuses FIFO/socket/device sources, including `file://` URLs, before prepare or index-directory creation | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --bin ratarmount regression_supervisor_create_base_refuses_fifo_socket_device` |
 | #263: warm indexes reject differing stored mtime nanoseconds (legacy stats remain compatible); offline GNU TAR copy clears default lookup-folder indexes before remount | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount-index --lib check_tarstats_matches_archive_rejects_mtime_ns` · `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount-compositing --lib regression_263_` |
 | #261: offline GNU TAR Copy commit leaves a stale warm sidecar when archive size, whole-second mtime and edge hashes match after rename/add; remove the sibling index and SQLite companions before publication | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount-compositing --lib regression_261_` |
