@@ -40,6 +40,34 @@ jobs:
       - name: cargo fmt
         run: CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo fmt --all -- --check
 
+      - name: A1 evidence checker regressions
+        run: python3 -I test-harness/test-a1-evidence.py
+
+      # Defer the required status until after uploading raw logs. The wrapper
+      # records failure; the final status step makes it a required job failure.
+      - name: A1 owned Linux native evidence
+        env:
+          RRS_A1_APPROVED_NATIVE_CI: "1"
+        run: |
+          mkdir -p "$RUNNER_TEMP/a1-linux"
+          set +e
+          bash test-harness/a1-linux-fixtures.sh "$RUNNER_TEMP/a1-linux" 2>&1 | tee "$RUNNER_TEMP/a1-linux/runner.log"
+          statuses=("${PIPESTATUS[@]}")
+          code=${statuses[0]}
+          test "${statuses[1]}" -eq 0 || code=1
+          printf '%s\n' "$code" > "$RUNNER_TEMP/a1-linux/runner.exit-code"
+          exit 0
+
+      - name: A1 Linux raw evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: a1-linux-${{ runner.arch }}
+          path: ${{ runner.temp }}/a1-linux
+          if-no-files-found: error
+
+      - name: A1 native evidence status
+        run: test "$(cat "$RUNNER_TEMP/a1-linux/runner.exit-code")" -eq 0
+
       - name: windows-lib workflow + stable Windows API guard
         run: ./packaging/test-windows-lib-ci.sh
 
@@ -124,6 +152,8 @@ jobs:
     name: checked open (linux aarch64)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@v4
 
@@ -138,6 +168,29 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: A1 owned Linux native evidence
+        env:
+          RRS_A1_APPROVED_NATIVE_CI: "1"
+        run: |
+          mkdir -p "$RUNNER_TEMP/a1-linux"
+          set +e
+          bash test-harness/a1-linux-fixtures.sh "$RUNNER_TEMP/a1-linux" 2>&1 | tee "$RUNNER_TEMP/a1-linux/runner.log"
+          statuses=("${PIPESTATUS[@]}")
+          code=${statuses[0]}
+          test "${statuses[1]}" -eq 0 || code=1
+          printf '%s\n' "$code" > "$RUNNER_TEMP/a1-linux/runner.exit-code"
+          exit 0
+
+      - name: A1 Linux raw evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: a1-linux-${{ runner.arch }}
+          path: ${{ runner.temp }}/a1-linux
+          if-no-files-found: error
+
+      - name: A1 native evidence status
+        run: test "$(cat "$RUNNER_TEMP/a1-linux/runner.exit-code")" -eq 0
 
       - name: cargo test (checked open, native aarch64)
         run: |
