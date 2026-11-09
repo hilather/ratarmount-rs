@@ -311,6 +311,18 @@
       "reason": "Reviewed supported ABI module activation and test-hooks; unsupported targets never claim wrappers are installed."
     },
     {
+      "file": "ratarmount-index/src/checked_open/native_fs/mod.rs",
+      "reviewer": "#276 L2 full resulting-tree code gate (normal + fresh skeptic); PENDING on the exact candidate, not yet passed",
+      "provenance": "#276 L2 over parent E1 1ef91abc; round 1 (tree 32eb783f) found B1, fixed; native qualification HELD",
+      "reason": "Exact additive native adapter/unsupported-platform dispatch and test predicates reviewed; no caller migration. Inactive native execution remains unverified."
+    },
+    {
+      "file": "ratarmount-index/src/checked_open/native_fs/tests.rs",
+      "reviewer": "#276 L2 full resulting-tree code gate (normal + fresh skeptic); PENDING on the exact candidate, not yet passed",
+      "provenance": "#276 L2 over parent E1 1ef91abc; round 1 (tree 32eb783f) found B1, fixed; native qualification HELD",
+      "reason": "Exact Unix link/lock fixture and Linux filesystem fixture predicates reviewed; sentinel/raw-close experiments are test-only."
+    },
+    {
       "file": "ratarmount-index/src/digest_cache.rs",
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",

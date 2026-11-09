@@ -65,6 +65,9 @@ mod host;
     allow(dead_code)
 )]
 mod install;
+/// Independent existing-object observations; not acquisition/admission evidence.
+#[cfg(target_os = "linux")]
+pub mod native_fs;
 
 /// Thread-local seams inside the acquisition, for other crates' tests
 /// (`test-hooks` feature; never in a normal build).

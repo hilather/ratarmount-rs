@@ -267,6 +267,92 @@ class TranscriptControls(unittest.TestCase):
             EVIDENCE.validate_root_control(skipped, 101, "RRS_A1_TMPFS_ROOT", "linux.tmpfs", test, "/missing-root", False)
 
 
+class NativeCiContract(unittest.TestCase):
+    def assert_required_status_after_upload(self, workflow):
+        contracts = {
+            "check": ('test "$(cat "$RUNNER_TEMP/a1-linux/runner.exit-code")" -eq 0',),
+            "checked-open-aarch64": ('test "$(cat "$RUNNER_TEMP/a1-linux/runner.exit-code")" -eq 0',),
+        }
+        for job, statements in contracts.items():
+            match = re.search(r"(?ms)^  " + re.escape(job) + r":\n(.*?)(?=^  [A-Za-z0-9_-]+:|\Z)", workflow)
+            self.assertIsNotNone(match, job)
+            body = match.group(1)
+            start = body.index("      - name: A1 owned")
+            upload = body.index("uses: actions/upload-artifact@v4", start)
+            status = body.index("      - name: A1 native evidence status", start)
+            self.assertLess(start, upload)
+            self.assertLess(upload, status)
+            status_step = body[status:].split("\n      - ", 1)[0]
+            for statement in statements:
+                self.assertIn(statement, status_step, job)
+            self.assertNotIn("continue-on-error", body[start:status] + status_step)
+            self.assertNotRegex(body[start:status] + status_step, r"(?m)^\s+if:")
+            self.assertIn("exit 0", body[start:upload])
+            for statement in ('statuses=("${PIPESTATUS[@]}")', 'code=${statuses[0]}',
+                              'test "${statuses[1]}" -eq 0 || code=1', 'RRS_A1_APPROVED_NATIVE_CI: "1"'):
+                self.assertIn(statement, body[start:upload])
+
+    def test_regression_ci_upload_cannot_swallow_native_failure(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assert_required_status_after_upload(workflow)
+        for statement in (
+            'test "$(cat "$RUNNER_TEMP/a1-linux/runner.exit-code")" -eq 0',
+            'test "${statuses[1]}" -eq 0 || code=1',
+            'code=${statuses[0]}',
+            'RRS_A1_APPROVED_NATIVE_CI: "1"',
+        ):
+            with self.subTest(statement=statement):
+                mutated = workflow.replace(statement, "true", 1)
+                self.assertNotEqual(mutated, workflow)
+                with self.assertRaises(AssertionError):
+                    self.assert_required_status_after_upload(mutated)
+
+    def test_regression_existing_jobs_and_arm_failure_contract(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        arm = workflow.split("  checked-open-aarch64:\n", 1)[1].split("\n  nfsv4:", 1)[0]
+        self.assertNotIn("if:", arm)
+        self.assertNotIn("continue-on-error", arm)
+        self.assertIn("a1-linux-fixtures.sh", arm)
+        self.assertIn("actions/upload-artifact@v4", arm)
+        self.assertIn("A1 native evidence status", arm)
+        self.assertIn("runs-on: ubuntu-latest", workflow.split("  check:\n", 1)[1].split("  checked-open-aarch64:", 1)[0])
+
+    def test_regression_required_ci_never_uses_partial_profile(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertNotIn("local-linux-partial", workflow)
+        for script, profile in (
+            ("a1-linux-fixtures.sh", "strict-linux"),
+        ):
+            text = (ROOT / "test-harness" / script).read_text()
+            self.assertEqual(profile, "strict-linux")
+            self.assertIn("run-engines", text)
+            self.assertIn("verify-engines", text)
+            self.assertIn("RRS_A1_REQUIRE_FIXTURES", text)
+            self.assertIn("--nocapture", EVIDENCE.A1_RUN_ARGS)
+            self.assertIn("--test-threads=1", EVIDENCE.A1_RUN_ARGS)
+            self.assertIn("CARGO_BUILD_JOBS", text)
+
+    def test_regression_workflow_pipeline_preserves_native_and_tee_status(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        block = workflow.split("      - name: A1 owned Linux native evidence\n", 1)[1]
+        run = textwrap.dedent(block.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0])
+        for native, tee in ((0, 0), (73, 0), (0, 2), (73, 2)):
+            with self.subTest(native=native, tee=tee), tempfile.TemporaryDirectory(prefix="a1-pipeline-") as directory:
+                program = '''RUNNER_TEMP=$1
+native=$2; tee_status=$3
+bash() { return "$native"; }
+tee() { cat >/dev/null; return "$tee_status"; }
+''' + run
+                result = subprocess.run(["bash", "-c", program, "a1-workflow", directory, str(native), str(tee)],
+                                        cwd=ROOT, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                code = int((Path(directory) / "a1-linux/runner.exit-code").read_text())
+                self.assertEqual(code, native if tee == 0 else 1)
+                status = subprocess.run(["bash", "-c", 'RUNNER_TEMP=$1\ntest "$(cat "$RUNNER_TEMP/a1-linux/runner.exit-code")" -eq 0',
+                                         "a1-workflow-status", directory], capture_output=True, timeout=30)
+                self.assertEqual(status.returncode, 0 if native == tee == 0 else 1)
+
+
 def reseal(record):
     for stream in ("stdout", "stderr"):
         record[stream + "_sha256"] = EVIDENCE.digest(record[stream].encode())
@@ -953,6 +1039,276 @@ class StreamOrderingControls(unittest.TestCase):
             for text in (split["stdout"], split["stdout"] + split["stderr"]):
                 with self.assertRaisesRegex(EVIDENCE.EvidenceError, "nested harness outside lock parent"):
                     EVIDENCE.check(text, "strict-linux", 0)
+
+
+class NativeOwnershipControls(unittest.TestCase):
+    script = ROOT / "test-harness/a1-linux-fixtures.sh"
+
+    def shell(self, body, *arguments):
+        # Privileged names are always functions in these isolated subprocesses.
+        # No real mount/sudo/losetup or approved native fixture is used.
+        program = '''source "$1"
+sudo() { echo 'unexpected privileged command' >&2; return 97; }
+mount() { return 97; }
+umount() { return 97; }
+losetup() { return 97; }
+mkfs.ext4() { return 97; }
+''' + body
+        return subprocess.run(["bash", "-c", program, "a1-contract", str(self.script), *map(str, arguments)],
+                              cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+
+    def test_regression_root_and_nonapproved_context_are_refused_before_setup(self):
+        for uid, diagnostic in ((0, "unprivileged runner UID/GID required"),
+                                (12345, "requires approved GitHub hosted CI")):
+            with self.subTest(uid=uid):
+                result = self.shell(f'id() {{ echo {uid}; }}\nGITHUB_ACTIONS=false\nrunner_context\n')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+                self.assertNotIn("unexpected privileged command", result.stderr)
+        result = self.shell('id() { if [[ $1 == -u ]]; then echo 12345; else echo 0; fi; }\nrunner_context\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unprivileged runner UID/GID required", result.stderr)
+
+    def test_regression_build_failure_stops_main_before_any_privileged_setup(self):
+        with tempfile.TemporaryDirectory(prefix="a1-build-stop-") as directory:
+            result = self.shell(r'''set -euo pipefail
+RUNNER_TEMP=$2
+runner_context() { runner_uid=$(id -u); runner_gid=$(id -g); }
+python3() { printf '%s\n' "$*"; [[ $* != *' build-engines '* ]] || return 23; }
+main "$RUNNER_TEMP/output"
+echo unexpectedly-accepted
+''', directory)
+            self.assertEqual(result.returncode, 23, result.stderr)
+            self.assertIn("build-engines", result.stdout)
+            self.assertNotIn("unexpected privileged command", result.stderr)
+            self.assertNotIn("unexpectedly-accepted", result.stdout)
+
+    def test_regression_uid_gid_mode_mount_commands_use_the_actual_runner(self):
+        # Regression: tmpfs uid/gid/mode remount left the root 0:0:700. Mount
+        # options set ownership state only at mount; remount never changes it.
+        mock = r"""set -euo pipefail
+runner_uid=12345; runner_gid=23456; transfer=$2
+ext_mount=/owned/ext4; tmp_mount=/owned/tmpfs; loop_device=/dev/loop-owned; tmp_source=owned-tmpfs
+declare -A owner=([/owned/ext4]=0:0:755)
+verify_mount() { echo "VERIFY $1"; }
+sudo() {
+    shift; printf '<%s> ' "$@"; printf '\n'
+    if [[ $1 == mount ]]; then
+        [[ $* == *remount* || ! $* =~ uid=([0-9]+),gid=([0-9]+),mode=0([0-7]+) ]] ||
+            owner[${@: -1}]=${BASH_REMATCH[1]}:${BASH_REMATCH[2]}:${BASH_REMATCH[3]}
+        return 0
+    fi
+    [[ $1 == install && $transfer != fail ]] || return 1
+    local path; for path in "${@:10}"; do
+        [[ $transfer == new-only && -n ${owner[$path]:-} ]] || owner[$path]=$6:$8:$4
+    done
+}
+stat() {
+    local path=${@: -1}; local parent=${path%/*}
+    [[ ${owner[$parent]:-} != *:700 || ${owner[$parent]} == "$runner_uid:$runner_gid:"* ]] || return 1
+    [[ -n ${owner[$path]:-} ]] && echo "${owner[$path]}"
+}
+mount_owned
+echo "BEFORE $(stat -c '%u:%g:%a' -- "$tmp_mount")"
+"""
+        result = self.shell(mock + '''assign_runner_roots
+echo "AFTER $(stat -- "$tmp_mount") $(stat -- "$tmp_mount/owned")"
+printf 'ROOTS %s %s %s\\n' "$RRS_A1_EXT4_ROOT" "$RRS_A1_TMPFS_ROOT" "$RRS_A1_REQUIRE_FIXTURES"
+''', "ok")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("<nodev,nosuid,uid=0,gid=0,mode=0700,size=256m>", result.stdout)
+        # The old-root negative runs between mount_owned and the transfer.
+        self.assertIn("BEFORE 0:0:700", result.stdout)
+        self.assertIn("VERIFY /owned/tmpfs\n<install> <-d> <-m> <700> <-o> <12345> <-g> <23456> <--> "
+                      "</owned/tmpfs> </owned/ext4/owned> </owned/tmpfs/owned>", result.stdout)
+        self.assertIn("AFTER 12345:23456:700 12345:23456:700", result.stdout)
+        self.assertIn("ROOTS /owned/ext4/owned /owned/tmpfs/owned 1", result.stdout)
+        self.assertNotIn("remount", result.stdout)
+        self.assertNotIn("remount,", self.script.read_text())
+        # A failed or missing transfer, or the deprecated remount, never succeeds.
+        deprecated = '''assign_runner_roots() {
+    sudo -n mount -o "remount,uid=$runner_uid,gid=$runner_gid,mode=0700" -- "$tmp_mount"
+    sudo -n install -d -m 700 -o "$runner_uid" -g "$runner_gid" -- "$ext_mount/owned" "$tmp_mount/owned"
+    [[ $(stat -c '%u:%g:%a' -- "$tmp_mount") == "$runner_uid:$runner_gid:700" ]]
+}
+'''
+        for transfer, body in (("fail", ""), ("new-only", ""), ("ok", deprecated)):
+            with self.subTest(transfer=transfer, deprecated=bool(body)):
+                result = self.shell(mock + body + "assign_runner_roots\necho unexpectedly-accepted\n", transfer)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertNotIn("unexpectedly-accepted", result.stdout)
+
+    def test_regression_fixture_ownership_traversal_create_use_and_mount_negatives(self):
+        with tempfile.TemporaryDirectory(prefix="a1-owner-") as directory:
+            mount = Path(directory)
+            root = mount / "owned"
+            root.mkdir(mode=0o700)
+            device = root.stat().st_dev
+            line = f"1 0 {os.major(device)}:{os.minor(device)} / {mount} rw - tmpfs owned-source rw\n"
+            with mock.patch.object(Path, "read_text", return_value=line):
+                result = EVIDENCE.verify_linux_fixture(root, mount, "owned-source", "tmpfs")
+                self.assertTrue(result["create_use"])
+                self.assertEqual((result["uid"], result["gid"], result["mode"]), (os.geteuid(), os.getegid(), "0700"))
+                self.assertEqual(list(root.iterdir()), [])
+                root.chmod(0o755)
+                with self.assertRaisesRegex(EVIDENCE.EvidenceError, "UID/GID/mode0700"):
+                    EVIDENCE.verify_linux_fixture(root, mount, "owned-source", "tmpfs")
+                root.chmod(0o700)
+                with mock.patch.object(EVIDENCE.os, "geteuid", return_value=os.geteuid() + 1):
+                    with self.assertRaisesRegex(EVIDENCE.EvidenceError, "UID/GID/mode0700"):
+                        EVIDENCE.verify_linux_fixture(root, mount, "owned-source", "tmpfs")
+                with mock.patch.object(EVIDENCE.os, "getegid", return_value=os.getegid() + 1):
+                    with self.assertRaisesRegex(EVIDENCE.EvidenceError, "UID/GID/mode0700"):
+                        EVIDENCE.verify_linux_fixture(root, mount, "owned-source", "tmpfs")
+                with mock.patch.object(EVIDENCE.tempfile, "TemporaryDirectory", side_effect=PermissionError("traversal/create denied")):
+                    with self.assertRaisesRegex(PermissionError, "traversal/create denied"):
+                        EVIDENCE.verify_linux_fixture(root, mount, "owned-source", "tmpfs")
+            for data in (line.replace("owned-source", "foreign"), line.replace("- tmpfs", "- ext4"), line + line,
+                         line.replace(f"{os.major(device)}:{os.minor(device)}", "999:999")):
+                with self.subTest(mountinfo=data), mock.patch.object(Path, "read_text", return_value=data):
+                    with self.assertRaisesRegex(EVIDENCE.EvidenceError, "mount source/fs/device mismatch"):
+                        EVIDENCE.verify_linux_fixture(root, mount, "owned-source", "tmpfs")
+
+    cleanup_mock = r'''set -uo pipefail
+state=$2
+base="$state/base"; image="$base/ext4.img"; ext_mount="$base/ext4"; tmp_mount="$base/tmpfs"
+attempt_output="$state/receipt"; tmp_source=owned-tmpfs; loop_device=/dev/loop-owned
+fixture_probe_complete=1; original=73; failure=$3
+rm() {
+    [[ $failure != image || ${@: -1} != "$image" ]] || return 6
+    command rm "$@"
+}
+mountpoint() {
+    if [[ ${@: -1} == "$tmp_mount" ]]; then test -e "$state/tmp-mounted"
+    elif [[ ${@: -1} == "$ext_mount" ]]; then test -e "$state/ext-mounted"
+    else return 1; fi
+}
+findmnt() {
+    if [[ $* == *'-S '* ]]; then
+        [[ $failure == in-use ]] && { echo /foreign; return 0; }
+        if test -e "$state/ext-mounted"; then echo "$ext_mount"; return 0; fi
+        return 1
+    fi
+    local target kind source column=${@: -1}
+    if [[ $* == *"$tmp_mount"* ]]; then target=$tmp_mount; kind=tmpfs; source=$tmp_source
+    else target=$ext_mount; kind=ext4; source=$loop_device; fi
+    [[ $failure == foreign-tmpfs && $kind == tmpfs ]] && source=foreign
+    [[ $failure == foreign-ext4 && $kind == ext4 ]] && source=/dev/loop-foreign
+    case $column in TARGET) echo "$target";; SOURCE) echo "$source";; FSTYPE) echo "$kind";; esac
+    [[ $failure == stacked && $* == *'-Rrn '* && $kind == tmpfs ]] && echo "$target/nested"
+    return 0
+}
+sudo() {
+    shift
+    printf '%s\n' "$*" >> "$state/commands"
+    case $1 in
+        umount)
+            [[ $failure == unmount ]] && return 6
+            if [[ ${@: -1} == "$tmp_mount" ]]; then rm -f "$state/tmp-mounted"
+            else rm -f "$state/ext-mounted"; fi ;;
+        losetup)
+            case $2 in
+                -ln)
+                    test -e "$state/attached" || return 1
+                    if [[ $failure == foreign-loop ]]; then echo "$image.foreign"; else echo "$image"; fi ;;
+                # Ubuntu 24.04 util-linux 2.39.3 getopt "d:": -d's argument is the next word, even `--`.
+                -d) [[ $# -eq 3 && $3 == "$loop_device" ]] || { echo "losetup: $3: failed to use device: No such device" >&2; return 1; }
+                    [[ $failure == detach ]] && return 6; rm -f "$state/attached" ;;
+                -j) test ! -e "$state/attached" || echo /dev/loop-owned ;;
+                *) return 97 ;;
+            esac ;;
+        *) return 97 ;;
+    esac
+    return 0
+}
+'''
+
+    def test_regression_cleanup_source_verification_and_forced73(self):
+        for failure in ("none", "foreign-tmpfs", "foreign-ext4", "foreign-loop", "stacked", "in-use", "unmount", "detach", "image", "forced-cleanup"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(prefix="a1-cleanup-") as directory:
+                root = Path(directory)
+                for path in (root / "base/ext4", root / "base/tmpfs", root / "receipt"):
+                    path.mkdir(parents=True)
+                for name in ("tmp-mounted", "ext-mounted", "attached", "base/ext4.img", "commands"):
+                    (root / name).touch()
+                # The real trap/cleanup code sees status 73 after the actual
+                # fixture_probe entrypoint, with every privileged command mocked.
+                body = self.cleanup_mock + r'''
+if [[ $failure == none || $failure == forced-cleanup ]]; then
+    python3() { printf '%s\n' "$*" >> "$state/probe-commands"; return 0; }
+    fixture_probe_complete=0
+    fixture_probe
+    [[ $failure != forced-cleanup ]] || failure=foreign-loop
+    trap cleanup EXIT
+    finish_attempt forced
+else
+    cleanup_owned
+fi
+'''
+                result = self.shell(body, root, failure)
+                commands = (root / "commands").read_text()
+                if failure == "none":
+                    self.assertEqual(result.returncode, 73, result.stderr)
+                    self.assertIn("original=73 cleanup_status=0 probe_complete=1", result.stdout)
+                    self.assertEqual((root / "receipt/cleanup.exit-code").read_text().strip(), "0")
+                    self.assertEqual((root / "receipt/fixture.exit-code").read_text().strip(), "73")
+                    self.assertIn("linux-fixture --root", (root / "probe-commands").read_text())
+                    self.assertFalse((root / "base").exists())
+                    self.assertEqual(commands.count("umount -- "), 2)
+                    # Regression: hosted cleanup failed with "losetup: --: failed to use device".
+                    self.assertIn("losetup -d /dev/loop-owned\n", commands)
+                    self.assertNotIn("failed to use device", result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual((root / "receipt/cleanup.exit-code").read_text().strip(), "1")
+                    self.assertTrue((root / "base/ext4.img").exists())
+                    if failure == "forced-cleanup":
+                        self.assertEqual((root / "receipt/fixture.exit-code").read_text().strip(), "1")
+                        self.assertEqual((root / "receipt/original.exit-code").read_text().strip(), "73")
+                    if failure not in ("detach", "image"):
+                        self.assertNotIn("losetup -d", commands)
+                    if failure in ("foreign-tmpfs", "stacked"):
+                        self.assertNotIn("umount -- " + str(root / "base/tmpfs"), commands)
+                    if failure == "foreign-ext4":
+                        self.assertNotIn("umount -- " + str(root / "base/ext4"), commands)
+
+    def test_regression_no_forced73_before_probe_and_required_helper_failures_propagate(self):
+        result = self.shell('fixture_probe_complete=0\nfinish_attempt forced\n')
+        self.assertEqual(result.returncode, 1)
+        for phase in ("root-controls", "run-engines", "verify-engines", "engine-mutations"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory(prefix="a1-status-") as directory:
+                result = self.shell(r'''set -euo pipefail
+fixture_probe_complete=1
+engines=/owned/engines; attempt_output=/owned/receipt
+RRS_A1_TMPFS_ROOT=/owned/tmpfs; RRS_A1_EXT4_ROOT=/owned/ext4
+failed_phase=$3
+python3() { printf '%s\n' "$*"; [[ $* != *" $failed_phase "* ]]; }
+finish_attempt normal
+echo unexpectedly-accepted
+''', directory, phase)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(phase, result.stdout)
+                self.assertNotIn("unexpectedly-accepted", result.stdout)
+
+    def test_regression_normal_forced_probe_and_cleanup_receipts_are_all_required(self):
+        expected = {"normal/fixture.exit-code": "0", "forced/fixture.exit-code": "73",
+                    "forced/original.exit-code": "73", "normal/cleanup.exit-code": "0",
+                    "forced/cleanup.exit-code": "0", "normal/probe.complete": "1", "forced/probe.complete": "1"}
+        with tempfile.TemporaryDirectory(prefix="a1-receipts-") as directory:
+            root = Path(directory)
+            for path, value in expected.items():
+                destination = root / path
+                destination.parent.mkdir(exist_ok=True)
+                destination.write_text(value + "\n")
+            program = 'output=$2\nassert_attempt_status "$3" "$4"\n'
+            self.assertEqual(self.shell(program, root, 0, 73).returncode, 0)
+            for path, original in expected.items():
+                with self.subTest(path=path):
+                    (root / path).write_text("99\n")
+                    self.assertEqual(self.shell(program, root, 0, 73).returncode, 1)
+                    (root / path).write_text(original + "\n")
+            self.assertEqual(self.shell(program, root, 1, 73).returncode, 1)
+            self.assertEqual(self.shell(program, root, 0, 0).returncode, 1)
 
 
 if __name__ == "__main__":
