@@ -55,7 +55,7 @@ class CiContract(unittest.TestCase):
 
     def test_regression_inventory_policy_is_linux_only(self):
         """Regression: #201 must not enable unapproved native-only operations."""
-        self.assertIn("runs-on: ubuntu-latest", self.check)
+        self.assertRegex(self.check, r"(?m)^    runs-on: ubuntu-24\.04[ \t]*(?:#.*)?$")
         self.assertIn("native.py --fixtures", self.check)
         self.assertNotIn("internal-read-windows:", self.jobs)
         for job in ("macos", "windows-lib"):
