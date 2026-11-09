@@ -57,7 +57,7 @@ cleanup_owned() {
         }
         if [[ $cleanup_status -eq 0 && -z $mounted ]] &&
            [[ $(sudo -n losetup -ln -O BACK-FILE "$loop_device") == "$image" ]]; then
-            sudo -n losetup -d -- "$loop_device" || cleanup_status=1
+            sudo -n losetup -d "$loop_device" || cleanup_status=1
             attached=$(sudo -n losetup -ln -O BACK-FILE "$loop_device") || {
                 [[ $? -eq 1 ]] || cleanup_status=1
             }

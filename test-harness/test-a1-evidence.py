@@ -1211,7 +1211,9 @@ sudo() {
                 -ln)
                     test -e "$state/attached" || return 1
                     if [[ $failure == foreign-loop ]]; then echo "$image.foreign"; else echo "$image"; fi ;;
-                -d) [[ $failure == detach ]] && return 6; rm -f "$state/attached" ;;
+                # Ubuntu 24.04 util-linux 2.39.3 getopt "d:": -d's argument is the next word, even `--`.
+                -d) [[ $# -eq 3 && $3 == "$loop_device" ]] || { echo "losetup: $3: failed to use device: No such device" >&2; return 1; }
+                    [[ $failure == detach ]] && return 6; rm -f "$state/attached" ;;
                 -j) test ! -e "$state/attached" || echo /dev/loop-owned ;;
                 *) return 97 ;;
             esac ;;
@@ -1253,7 +1255,9 @@ fi
                     self.assertIn("linux-fixture --root", (root / "probe-commands").read_text())
                     self.assertFalse((root / "base").exists())
                     self.assertEqual(commands.count("umount -- "), 2)
-                    self.assertIn("losetup -d -- /dev/loop-owned", commands)
+                    # Regression: hosted cleanup failed with "losetup: --: failed to use device".
+                    self.assertIn("losetup -d /dev/loop-owned\n", commands)
+                    self.assertNotIn("failed to use device", result.stderr)
                 else:
                     self.assertEqual(result.returncode, 1, result.stderr)
                     self.assertEqual((root / "receipt/cleanup.exit-code").read_text().strip(), "1")
