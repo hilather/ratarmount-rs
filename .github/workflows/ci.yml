@@ -12,7 +12,7 @@ env:
 jobs:
   check:
     name: fmt + clippy + test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -21,7 +21,7 @@ jobs:
         run: |
           sudo apt-get update -o Acquire::Retries=5
           sudo apt-get install -y -o Acquire::Retries=5 \
-            libfuse3-dev fuse3 pkg-config libarchive-dev zlib1g-dev xorriso
+            libfuse3-dev fuse3 pkg-config libarchive-dev zlib1g-dev xorriso btrfs-progs
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -161,7 +161,7 @@ jobs:
         run: |
           sudo apt-get update -o Acquire::Retries=5
           sudo apt-get install -y -o Acquire::Retries=5 \
-            pkg-config libarchive-dev zlib1g-dev
+            pkg-config libarchive-dev zlib1g-dev btrfs-progs
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable

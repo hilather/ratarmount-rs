@@ -1,8 +1,13 @@
 //! Observations of existing objects, not content IDs, leases or name comparators.
-//! IDs may be reused after deletion. No absent-name rule has been accepted (ADR-1).
+//! IDs may be reused after deletion. Reviewed Linux byte-exact absent-name rules
+//! exist as an inactive capability with no consumer; other platforms stay pending
+//! (ADR-1). There is no Boolean or comparison-key outcome, and a rule is neither an
+//! acquisition nor an admission.
 
 use std::ffi::OsString;
 
+/// Observations only, never durable or persistent keys: btrfs devices are
+/// per-mount anonymous devices, and IDs can be reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeIdentity {
     Linux {
@@ -42,6 +47,8 @@ pub enum CapabilityUnavailable {
     FullIdentityUnavailable(Option<NativeCode>),
     NotApplicable,
     NotQueried,
+    /// A reviewed query failed with this native code; it is not a filesystem fact.
+    QueryFailed(NativeCode),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +81,9 @@ pub enum LinuxFilesystem {
     Tmpfs,
     /// Shared ext2/3/4 magic; this alone does not establish ext4.
     ExtFamily,
+    /// Its rule is reviewed against upstream source only; native qualification is
+    /// pending, and any activation needs native evidence.
+    Btrfs,
     RecognizedUnreviewed,
     Unknown,
 }
@@ -96,10 +106,31 @@ pub enum AbsentNameDecision {
     Adr1,
 }
 
-/// Deliberately has no supported/Boolean/comparison-key outcome.
+/// A reviewed rule for names that do not exist yet. Inactive: nothing consumes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewedNameRule {
+    /// Names match only as identical bytes, each at most `name_max` bytes.
+    LinuxByteExact {
+        filesystem: LinuxFilesystem,
+        name_max: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameEquivalenceUnavailable {
+    Casefold,
+    Uninspectable(CapabilityUnavailable),
+    Unreviewed(CapabilityUnavailable),
+}
+
+/// Deliberately has no Boolean or comparison-key outcome. Linux reports reviewed
+/// byte-exact rules as an inactive capability; other platforms stay pending (ADR-1).
+/// A rule is not an acquisition or an admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AbsentNameCapability {
     Pending { decision: AbsentNameDecision },
+    Reviewed(ReviewedNameRule),
+    Unavailable(NameEquivalenceUnavailable),
 }
 
 impl Default for AbsentNameCapability {
@@ -108,6 +139,33 @@ impl Default for AbsentNameCapability {
             decision: AbsentNameDecision::Adr1,
         }
     }
+}
+
+/// Members of a protected family, each the requested main name plus a literal suffix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FamilyRole {
+    Main,
+    Wal,
+    Shm,
+    Journal,
+    InstallState,
+}
+
+/// A name-only decision over two complete families. Nothing is looked up or created.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FamilyComparison {
+    Disjoint {
+        rule: ReviewedNameRule,
+    },
+    Overlapping {
+        rule: ReviewedNameRule,
+        a: FamilyRole,
+        b: FamilyRole,
+    },
+    Unavailable(NameEquivalenceUnavailable),
+    Pending {
+        decision: AbsentNameDecision,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,6 +226,12 @@ pub enum NativeFsErrorKind {
     ChangedDuringQuery,
     ResourceLimit,
     Io,
+    /// The reviewed rule says a derived family member cannot be represented. This is
+    /// a name-only decision with no native code; a kernel refusal of an actual call
+    /// stays `Io` with `ENAMETOOLONG`.
+    NameTooLong,
+    /// A requested main name ends with the reserved install-state suffix.
+    ReservedName,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
