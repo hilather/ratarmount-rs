@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Compatibility notes
+
+- Linux mounting requires libfuse3; the former build-time fallback to libfuse2 is removed. Other targets retain fuser's libfuse backend.
+
+### Fixes
+
+- Linux binaries, including portable tarballs, load libfuse3 when mounting, trying `libfuse3.so.4` then `libfuse3.so.3`. ratarmount starts without libfuse installed; mounting without it fails immediately with a message naming both candidates. This fixes portable startup on hosts with the new SONAME, including Arch. Both v0.1.37 and v0.2.0 portable binaries were affected; this was not a v0.2.0 regression.
+
 ## 0.2.0 (2026-11-09)
 
 ### Compatibility notes
