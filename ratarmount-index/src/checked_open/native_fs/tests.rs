@@ -537,6 +537,222 @@ fn regression_235_part2_a1_unix_queries_preserve_locks() {
     );
 }
 
+fn os(bytes: &[u8]) -> &OsStr {
+    use std::os::unix::ffi::OsStrExt;
+    OsStr::from_bytes(bytes)
+}
+
+fn byte_rule(name_max: u32) -> ReviewedNameRule {
+    ReviewedNameRule::LinuxByteExact {
+        filesystem: LinuxFilesystem::Tmpfs,
+        name_max,
+    }
+}
+
+fn synthetic(absent_names: AbsentNameCapability) -> DirectoryCapabilities {
+    DirectoryCapabilities {
+        identity: Capability::Known(NativeIdentity::Linux {
+            device: 1,
+            inode: 2,
+        }),
+        filesystem: FilesystemKind::Linux {
+            magic: 0x0102_1994,
+            kind: LinuxFilesystem::Tmpfs,
+        },
+        case_sensitive: Capability::Known(CaseMode::Sensitive),
+        case_preserving: Capability::Known(true),
+        existing_short_names: Capability::Unavailable(CapabilityUnavailable::NotApplicable),
+        linux_flags: Capability::Known(0),
+        absent_names,
+    }
+}
+
+/// Drives `families` with counting snapshot/capability closures over a sequence.
+fn counted(
+    a: &[u8],
+    b: &[u8],
+    snapshots: &[AbsentNameCapability],
+    caps: AbsentNameCapability,
+) -> (Result<FamilyComparison, NativeFsError>, usize, usize) {
+    let (mut snapshot_calls, mut caps_calls) = (0, 0);
+    let result = families(
+        os(a),
+        os(b),
+        || {
+            snapshot_calls += 1;
+            Ok(synthetic(snapshots[(snapshot_calls - 1) % snapshots.len()]))
+        },
+        || {
+            caps_calls += 1;
+            Ok(synthetic(caps))
+        },
+    );
+    (result, snapshot_calls, caps_calls)
+}
+
+/// Regression: absent family names are byte-exact under a reviewed rule; case,
+/// NFC/NFD and raw bytes never fold, and a capability flipped between reads never decides.
+#[test]
+fn regression_235_part2_a1_family_equivalence() {
+    let rule = byte_rule(255);
+    let decide =
+        |a: &[u8], b: &[u8]| decide(AbsentNameCapability::Reviewed(rule), os(a), os(b)).unwrap();
+    for (a, b) in [
+        (&b"db"[..], &b"DB"[..]),
+        ("\u{e9}".as_bytes(), "e\u{301}".as_bytes()),
+        (&b"\xff"[..], &b"\xfe"[..]),
+    ] {
+        assert_eq!(decide(a, b), FamilyComparison::Disjoint { rule });
+    }
+    let overlap = |a, b| FamilyComparison::Overlapping { rule, a, b };
+    assert_eq!(
+        decide(b"db", b"db"),
+        overlap(FamilyRole::Main, FamilyRole::Main)
+    );
+    assert_eq!(
+        decide(b"\xff", b"\xff"),
+        overlap(FamilyRole::Main, FamilyRole::Main)
+    );
+    for (main, role) in [
+        (&b"db-wal"[..], FamilyRole::Wal),
+        (&b"db-shm"[..], FamilyRole::Shm),
+        (&b"db-journal"[..], FamilyRole::Journal),
+    ] {
+        assert_eq!(decide(main, b"db"), overlap(FamilyRole::Main, role));
+        assert_eq!(decide(b"db", main), overlap(role, FamilyRole::Main));
+    }
+    for cause in [
+        NameEquivalenceUnavailable::Casefold,
+        NameEquivalenceUnavailable::Uninspectable(CapabilityUnavailable::UnsupportedAbi),
+        NameEquivalenceUnavailable::Unreviewed(CapabilityUnavailable::UnknownFilesystem),
+    ] {
+        assert_eq!(
+            super::decide(
+                AbsentNameCapability::Unavailable(cause),
+                os(b"db"),
+                os(b"db")
+            )
+            .unwrap(),
+            FamilyComparison::Unavailable(cause)
+        );
+    }
+    assert_eq!(
+        super::decide(AbsentNameCapability::default(), os(b"db"), os(b"db")).unwrap(),
+        FamilyComparison::Pending {
+            decision: AbsentNameDecision::Adr1
+        }
+    );
+    // Decide only when before == capabilities == after.
+    let reviewed = AbsentNameCapability::Reviewed(rule);
+    let casefold = AbsentNameCapability::Unavailable(NameEquivalenceUnavailable::Casefold);
+    let (result, snapshots, caps) = counted(b"db", b"DB", &[reviewed], reviewed);
+    assert_eq!(
+        (result.unwrap(), snapshots, caps),
+        (FamilyComparison::Disjoint { rule }, 2, 1)
+    );
+    for (sequence, caps_value, expected) in [
+        (&[casefold][..], reviewed, (1, 1)),
+        (&[reviewed][..], casefold, (1, 1)),
+        (&[reviewed, casefold][..], reviewed, (6, 3)),
+    ] {
+        let (result, snapshots, caps) = counted(b"db", b"db", sequence, caps_value);
+        assert_eq!(
+            result.unwrap_err().kind,
+            NativeFsErrorKind::ChangedDuringQuery
+        );
+        assert_eq!((snapshots, caps), expected);
+    }
+    complete(
+        "checked_open::native_fs::tests::regression_235_part2_a1_family_equivalence",
+        &["seam.family_equivalence"],
+    );
+}
+
+/// Regression: a main ending with the install-state suffix (any ASCII case, nonempty
+/// stem) is refused before any capability query; nothing else is folded.
+#[test]
+fn regression_235_part2_a1_family_reserved_suffix() {
+    let reviewed = AbsentNameCapability::Reviewed(byte_rule(255));
+    for reserved_name in [
+        &b"m.ratarmount-install-state"[..],
+        &b"m.RATARMOUNT-INSTALL-STATE"[..],
+        &b"m.Ratarmount-Install-State"[..],
+    ] {
+        for (a, b, operation) in [
+            (reserved_name, &b"x"[..], "family a reserved"),
+            (&b"x"[..], reserved_name, "family b reserved"),
+        ] {
+            let error = reserved(os(a), os(b)).unwrap_err();
+            assert_eq!(
+                (error.operation, error.kind, error.code),
+                (operation, NativeFsErrorKind::ReservedName, None)
+            );
+            let (result, snapshots, caps) = counted(a, b, &[reviewed], reviewed);
+            assert_eq!(result.unwrap_err(), error);
+            assert_eq!((snapshots, caps), (0, 0));
+        }
+    }
+    for allowed in [
+        &b".ratarmount-install-state"[..],
+        &b"m.ratarmount-install-state-x"[..],
+        &b"ratarmount-install-state"[..],
+    ] {
+        reserved(os(allowed), os(b"x")).unwrap();
+        reserved(os(b"x"), os(allowed)).unwrap();
+        let (result, snapshots, caps) = counted(allowed, b"x", &[reviewed], reviewed);
+        assert!(matches!(result.unwrap(), FamilyComparison::Disjoint { .. }));
+        assert_eq!((snapshots, caps), (2, 1));
+    }
+    let (result, snapshots, caps) = counted(b"DB", b"db", &[reviewed], reviewed);
+    assert!(matches!(result.unwrap(), FamilyComparison::Disjoint { .. }));
+    assert_eq!((snapshots, caps), (2, 1));
+    complete(
+        "checked_open::native_fs::tests::regression_235_part2_a1_family_reserved_suffix",
+        &["seam.family_reserved_suffix"],
+    );
+}
+
+/// Regression: every derived family member must fit the reviewed `name_max`; the
+/// length refusal names its side and wins over an equal-name overlap.
+#[test]
+fn regression_235_part2_a1_family_name_length() {
+    let decide = |name_max, a: &[u8], b: &[u8]| {
+        decide(
+            AbsentNameCapability::Reviewed(byte_rule(name_max)),
+            os(a),
+            os(b),
+        )
+    };
+    let (fits, long) = ([b'a'; 230], [b'a'; 231]);
+    assert!(matches!(
+        decide(255, &fits, b"b").unwrap(),
+        FamilyComparison::Disjoint { .. }
+    ));
+    for (a, b, operation) in [
+        (&long[..], &b"b"[..], "family a length"),
+        (&b"b"[..], &long[..], "family b length"),
+        (&long[..], &long[..], "family a length"),
+    ] {
+        let error = decide(255, a, b).unwrap_err();
+        assert_eq!(
+            (error.operation, error.kind, error.code),
+            (operation, NativeFsErrorKind::NameTooLong, None)
+        );
+    }
+    assert_eq!(
+        decide(30, b"abcdef", b"x").unwrap_err().kind,
+        NativeFsErrorKind::NameTooLong
+    );
+    assert!(matches!(
+        decide(30, b"abcde", b"x").unwrap(),
+        FamilyComparison::Disjoint { .. }
+    ));
+    complete(
+        "checked_open::native_fs::tests::regression_235_part2_a1_family_name_length",
+        &["seam.family_name_length"],
+    );
+}
+
 #[cfg(target_os = "linux")]
 mod linux_tests {
     use super::super::linux::*;
@@ -587,10 +803,10 @@ mod linux_tests {
         assert_identity(t.path(), &c);
         assert_eq!(
             c.case_sensitive,
-            if expected == LinuxFilesystem::Tmpfs {
-                Capability::Unavailable(CapabilityUnavailable::UnreviewedFilesystem)
-            } else {
-                Capability::Known(CaseMode::Sensitive)
+            match (&c.linux_flags, expected) {
+                (_, LinuxFilesystem::ExtFamily) => Capability::Known(CaseMode::Sensitive),
+                (Capability::Known(flags), _) => Capability::Known(case_mode(*flags)),
+                (Capability::Unavailable(cause), _) => Capability::Unavailable(*cause),
             }
         );
         if expected == LinuxFilesystem::ExtFamily {
@@ -637,10 +853,10 @@ mod linux_tests {
     fn corroborate(root: &Path, expected: LinuxFilesystem) -> Result<(), String> {
         let mounts = fs::read_to_string("/proc/self/mountinfo")
             .map_err(|e| format!("mountinfo unavailable: {e}"))?;
-        let kind = if expected == LinuxFilesystem::Tmpfs {
-            "tmpfs"
-        } else {
-            "ext4"
+        let kind = match expected {
+            LinuxFilesystem::Tmpfs => "tmpfs",
+            LinuxFilesystem::Btrfs => "btrfs",
+            _ => "ext4",
         };
         if mounted_fs(&mounts, root) != Some(kind) {
             return Err(format!(
@@ -659,11 +875,28 @@ mod linux_tests {
                 let (a, _) = line.split_once(" - ")?;
                 let fields: Vec<_> = a.split_whitespace().collect();
                 let mount = mount_path(fields.get(4)?);
-                root.starts_with(&mount)
-                    .then_some((mount.as_os_str().len(), *fields.get(2)?))
+                root.starts_with(&mount).then_some((
+                    mount.as_os_str().len(),
+                    *fields.get(2)?,
+                    mount,
+                ))
             })
-            .max_by_key(|(len, _)| *len);
-        if deepest.map(|(_, dev)| dev) != Some(device.as_str()) {
+            .max_by_key(|(len, _, _)| *len);
+        if expected == LinuxFilesystem::Btrfs {
+            // mountinfo prints sb->s_dev; btrfs stat reports the subvolume's anonymous
+            // device. Only the same subvolume as the mount target is required.
+            let (_, recorded, mount) = deepest.ok_or("btrfs mount target missing")?;
+            let target = fs::metadata(&mount).map_err(|e| e.to_string())?.dev();
+            if target != metadata.dev() {
+                return Err(format!(
+                    "btrfs root st_dev {device} differs from mount {mount:?} st_dev {}:{}; mountinfo {recorded}",
+                    libc::major(target),
+                    libc::minor(target)
+                ));
+            }
+            return Ok(());
+        }
+        if deepest.map(|(_, dev, _)| dev) != Some(device.as_str()) {
             return Err("mountinfo device differs from root metadata".into());
         }
         Ok(())
@@ -732,6 +965,18 @@ mod linux_tests {
             return;
         }
         let caps = d.capabilities().unwrap();
+        let refused = |d: &NativeDirectory| {
+            assert_eq!(
+                d.capabilities().unwrap().absent_names,
+                AbsentNameCapability::Unavailable(NameEquivalenceUnavailable::Casefold)
+            );
+            assert_eq!(
+                d.compare_families(OsStr::new("Name"), OsStr::new("name"))
+                    .unwrap(),
+                FamilyComparison::Unavailable(NameEquivalenceUnavailable::Casefold)
+            );
+        };
+        refused(&d); // The empty casefold directory already refuses.
         assert_identity(t.path(), &caps);
         assert!(matches!(caps.linux_flags, Capability::Known(flags) if flags & CASEFOLD != 0));
         assert_eq!(
@@ -745,10 +990,7 @@ mod linux_tests {
                 ExistingNameComparison::SameObject { .. }
             ));
         }
-        assert_eq!(
-            d.capabilities().unwrap().absent_names,
-            AbsentNameCapability::default()
-        );
+        refused(&d);
         corroborate(t.root(), LinuxFilesystem::ExtFamily).unwrap();
         t.verify();
         complete(
@@ -757,6 +999,7 @@ mod linux_tests {
                 "linux.ext4_casefold_identity",
                 "linux.ext4_casefold_flags",
                 "linux.ext4_casefold_names",
+                "linux.ext4_casefold_refusal",
             ],
         );
     }
@@ -784,7 +1027,7 @@ mod linux_tests {
             flags_with(true, || Ok(CASEFOLD)).unwrap(),
             Capability::Known(CASEFOLD)
         );
-        assert_eq!(classify(0x9123_683e), LinuxFilesystem::RecognizedUnreviewed);
+        assert_eq!(classify(0x9123_683e), LinuxFilesystem::Btrfs);
         let mut calls = 0;
         assert_eq!(
             flags_with(false, || {
@@ -829,22 +1072,416 @@ mod linux_tests {
             ) else {
                 return;
             };
-            fs::write(t.path().join(a), b"test-only sentinel").unwrap();
             let d = NativeDirectory::open_parent(t.path()).unwrap();
+            let before = d.capabilities().unwrap().absent_names;
+            fs::write(t.path().join(a), b"test-only sentinel").unwrap();
             eprintln!(
                 "disposable {a:?} -> {b:?}: {:?}",
                 d.lookup_existing(OsStr::new(b)).unwrap()
             );
-            assert_eq!(
-                d.capabilities().unwrap().absent_names,
-                AbsentNameCapability::default()
-            );
+            assert_eq!(d.capabilities().unwrap().absent_names, before);
             corroborate(t.root(), LinuxFilesystem::Tmpfs).unwrap();
             t.verify();
         }
         complete(
             "checked_open::native_fs::tests::linux_tests::regression_235_part2_a1_linux_pending_after_experiment",
             &["linux.pending_experiments"],
+        );
+    }
+
+    const KINDS: [LinuxFilesystem; 5] = [
+        LinuxFilesystem::ExtFamily,
+        LinuxFilesystem::Tmpfs,
+        LinuxFilesystem::Btrfs,
+        LinuxFilesystem::RecognizedUnreviewed,
+        LinuxFilesystem::Unknown,
+    ];
+    const REVIEWED: [LinuxFilesystem; 3] = [
+        LinuxFilesystem::ExtFamily,
+        LinuxFilesystem::Tmpfs,
+        LinuxFilesystem::Btrfs,
+    ];
+    const UNSUPPORTED: [i32; 3] = [libc::ENOTTY, libc::EOPNOTSUPP, libc::ENOSYS];
+    const FAILED: [i32; 5] = [
+        libc::EACCES,
+        libc::EPERM,
+        libc::EIO,
+        libc::EINVAL,
+        libc::EBADF,
+    ];
+
+    fn unavailable_rule(cause: NameEquivalenceUnavailable) -> AbsentNameCapability {
+        AbsentNameCapability::Unavailable(cause)
+    }
+
+    fn reviewed_rule(filesystem: LinuxFilesystem, name_max: u32) -> AbsentNameCapability {
+        AbsentNameCapability::Reviewed(ReviewedNameRule::LinuxByteExact {
+            filesystem,
+            name_max,
+        })
+    }
+
+    /// Regression: every rule-table row, the per-row ABI gate, failures as typed
+    /// Unavailable (never Reviewed), frozen ext errors and simulated casefold refusals.
+    #[test]
+    fn regression_235_part2_a1_linux_rule_table() {
+        use CapabilityUnavailable as C;
+        use NameEquivalenceUnavailable as N;
+        assert_eq!(classify(0x9123_683e), LinuxFilesystem::Btrfs);
+        assert_eq!(classify(0x0102_1994), LinuxFilesystem::Tmpfs);
+        // Unreviewed control: XFS stays unreviewed.
+        assert_eq!(classify(0x5846_5342), LinuxFilesystem::RecognizedUnreviewed);
+        let unreviewed = |kind| match kind {
+            LinuxFilesystem::Unknown => C::UnknownFilesystem,
+            _ => C::UnreviewedFilesystem,
+        };
+        for kind in REVIEWED {
+            for flags in [0, 1] {
+                assert_eq!(
+                    flags_for(kind, true, || Ok(flags)).unwrap(),
+                    Capability::Known(flags)
+                );
+                assert_eq!(
+                    rule(kind, &Capability::Known(flags), Some(255)),
+                    reviewed_rule(kind, 255)
+                );
+            }
+            assert_eq!(
+                modes(kind, &Capability::Known(0)),
+                (
+                    Capability::Known(CaseMode::Sensitive),
+                    Capability::Known(true)
+                )
+            );
+            assert_eq!(
+                modes(kind, &Capability::Known(CASEFOLD)),
+                (
+                    Capability::Known(CaseMode::Insensitive),
+                    Capability::Known(true)
+                )
+            );
+            assert_eq!(
+                modes(kind, &Capability::Unavailable(C::UnsupportedAbi)),
+                (
+                    Capability::Unavailable(C::UnsupportedAbi),
+                    Capability::Known(true)
+                )
+            );
+            for name_max in [None, Some(0)] {
+                assert_eq!(
+                    rule(kind, &Capability::Known(0), name_max),
+                    unavailable_rule(N::Uninspectable(C::UnsupportedApi(None)))
+                );
+                // Flags decide first: casefold and unavailable flags win over name_max.
+                assert_eq!(
+                    rule(kind, &Capability::Known(CASEFOLD), name_max),
+                    unavailable_rule(N::Casefold)
+                );
+                assert_eq!(
+                    rule(kind, &Capability::Unavailable(C::UnsupportedAbi), name_max),
+                    unavailable_rule(N::Uninspectable(C::UnsupportedAbi))
+                );
+            }
+        }
+        for kind in [
+            LinuxFilesystem::RecognizedUnreviewed,
+            LinuxFilesystem::Unknown,
+        ] {
+            let cause = unreviewed(kind);
+            assert_eq!(
+                flags_for(kind, true, || Ok(0)).unwrap(),
+                Capability::Unavailable(C::NotApplicable)
+            );
+            assert_eq!(
+                modes(kind, &Capability::Unavailable(C::NotApplicable)),
+                (
+                    Capability::Unavailable(cause),
+                    Capability::Unavailable(cause)
+                )
+            );
+            // Kind decides first: even clear flags never review an unreviewed kind.
+            for flags in [
+                Capability::Known(0),
+                Capability::Unavailable(C::NotApplicable),
+            ] {
+                assert_eq!(
+                    rule(kind, &flags, Some(255)),
+                    unavailable_rule(N::Unreviewed(cause))
+                );
+            }
+        }
+        for abi in [false, true] {
+            for kind in KINDS {
+                let mut calls = 0;
+                let flags = flags_for(kind, abi, || {
+                    calls += 1;
+                    Ok(0)
+                })
+                .unwrap();
+                let reviewed = REVIEWED.contains(&kind);
+                assert_eq!(calls, usize::from(abi && reviewed), "{kind:?} abi={abi}");
+                if !abi && reviewed {
+                    assert_eq!(flags, Capability::Unavailable(C::UnsupportedAbi));
+                    assert_eq!(
+                        rule(kind, &flags, Some(255)),
+                        unavailable_rule(N::Uninspectable(C::UnsupportedAbi))
+                    );
+                }
+            }
+        }
+        for kind in [LinuxFilesystem::Tmpfs, LinuxFilesystem::Btrfs] {
+            for e in UNSUPPORTED {
+                assert_eq!(
+                    flags_for(kind, true, || Err(e)).unwrap(),
+                    Capability::Unavailable(C::UnsupportedApi(Some(NativeCode::Errno(e))))
+                );
+            }
+            for e in FAILED {
+                let flags = flags_for(kind, true, || Err(e)).unwrap();
+                assert_eq!(
+                    flags,
+                    Capability::Unavailable(C::QueryFailed(NativeCode::Errno(e)))
+                );
+                assert_eq!(
+                    rule(kind, &flags, Some(255)),
+                    unavailable_rule(N::Uninspectable(C::QueryFailed(NativeCode::Errno(e))))
+                );
+                assert_eq!(
+                    modes(kind, &flags).0,
+                    Capability::Unavailable(C::QueryFailed(NativeCode::Errno(e)))
+                );
+            }
+        }
+        // No non-success ioctl outcome ever reaches Reviewed, through flags_for then rule.
+        for kind in KINDS {
+            for e in UNSUPPORTED.into_iter().chain(FAILED) {
+                match flags_for(kind, true, || Err(e)) {
+                    Ok(flags) => assert!(
+                        !matches!(
+                            rule(kind, &flags, Some(255)),
+                            AbsentNameCapability::Reviewed(_)
+                        ),
+                        "{kind:?} errno {e}"
+                    ),
+                    Err(_) => assert_eq!(kind, LinuxFilesystem::ExtFamily),
+                }
+            }
+        }
+        // ext keeps L2's frozen errors; unsupported APIs stay Unavailable there too.
+        for e in UNSUPPORTED {
+            assert_eq!(
+                flags_for(LinuxFilesystem::ExtFamily, true, || Err(e)).unwrap(),
+                Capability::Unavailable(C::UnsupportedApi(Some(NativeCode::Errno(e))))
+            );
+        }
+        for e in FAILED {
+            let error = flags_for(LinuxFilesystem::ExtFamily, true, || Err(e)).unwrap_err();
+            assert_eq!(error, flags_with(true, || Err(e)).unwrap_err());
+            assert_eq!(error.code, Some(NativeCode::Errno(e)));
+        }
+        // Simulated casefold on every reviewed kind; tmpfs/btrfs are seam-only here.
+        for kind in REVIEWED {
+            let flags = flags_for(kind, true, || Ok(CASEFOLD | 1)).unwrap();
+            assert_eq!(rule(kind, &flags, Some(255)), unavailable_rule(N::Casefold));
+            assert_eq!(
+                modes(kind, &flags).0,
+                Capability::Known(CaseMode::Insensitive)
+            );
+        }
+        complete(
+            "checked_open::native_fs::tests::linux_tests::regression_235_part2_a1_linux_rule_table",
+            &[
+                "seam.linux_rule_table",
+                "seam.rule_abi_gate",
+                "seam.rule_failures_unavailable",
+                "seam.ext_frozen_errors",
+                "seam.tmpfs_casefold_refusal",
+                "seam.btrfs_casefold_refusal",
+            ],
+        );
+    }
+
+    fn scenario(t: &Fixture) -> (tempfile::TempDir, NativeDirectory) {
+        let dir = tempfile::tempdir_in(t.path()).unwrap();
+        let d = NativeDirectory::open_parent(dir.path()).unwrap();
+        (dir, d)
+    }
+
+    /// Native flags, absent, existing, family and length scenarios, each in its own
+    /// fresh child directory.
+    fn rule_groups(t: &Fixture, kind: LinuxFilesystem) {
+        let names = |a: &str, b: &str| (OsStr::new(a).to_owned(), OsStr::new(b).to_owned());
+        // flags
+        let (dir, d) = scenario(t);
+        let c = d.capabilities().unwrap();
+        assert!(
+            matches!(c.linux_flags, Capability::Known(f) if f & CASEFOLD == 0),
+            "{c:?}"
+        );
+        assert_eq!(c.case_sensitive, Capability::Known(CaseMode::Sensitive));
+        assert_eq!(c.case_preserving, Capability::Known(true));
+        let AbsentNameCapability::Reviewed(rule) = c.absent_names else {
+            panic!("reviewed rule expected: {c:?}");
+        };
+        let ReviewedNameRule::LinuxByteExact {
+            filesystem,
+            name_max,
+        } = rule;
+        assert_eq!(filesystem, kind);
+        let path = std::ffi::CString::new(dir.path().as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: NUL-terminated owned path; statvfs fills plain output data.
+        let vfs = unsafe {
+            let mut vfs: libc::statvfs = std::mem::zeroed();
+            assert_eq!(libc::statvfs(path.as_ptr(), &mut vfs), 0);
+            vfs
+        };
+        assert_eq!(u32::try_from(vfs.f_namemax).ok(), Some(name_max));
+        // absent
+        let (dir, d) = scenario(t);
+        let disjoint = FamilyComparison::Disjoint { rule };
+        let (db, upper) = names("db", "DB");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(d.compare_families(&db, &upper).unwrap(), disjoint);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        fs::write(dir.path().join("db"), b"main").unwrap();
+        assert_eq!(d.compare_families(&db, &upper).unwrap(), disjoint);
+        assert_eq!(d.lookup_existing(&upper).unwrap(), Lookup::Missing);
+        // existing
+        let (dir, d) = scenario(t);
+        for (a, b) in [("db", "DB"), ("\u{e9}", "e\u{301}")] {
+            fs::write(dir.path().join(a), b"same").unwrap();
+            fs::write(dir.path().join(b), b"same").unwrap();
+            let (a, b) = names(a, b);
+            assert!(matches!(
+                d.compare_existing(&a, &b).unwrap(),
+                ExistingNameComparison::DifferentObjects { .. }
+            ));
+            assert_eq!(d.compare_families(&a, &b).unwrap(), disjoint);
+        }
+        // family
+        let (dir, d) = scenario(t);
+        for main in ["db", "DB"] {
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                fs::write(dir.path().join(format!("{main}{suffix}")), b"member").unwrap();
+            }
+            fs::create_dir(dir.path().join(format!("{main}.ratarmount-install-state"))).unwrap();
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 10);
+        let (wal, main) = names("db-wal", "db");
+        assert_eq!(
+            d.compare_families(&wal, &main).unwrap(),
+            FamilyComparison::Overlapping {
+                rule,
+                a: FamilyRole::Main,
+                b: FamilyRole::Wal
+            }
+        );
+        // length
+        let (dir, d) = scenario(t);
+        let length = usize::try_from(name_max).unwrap().checked_sub(25).unwrap();
+        let (fits, other) = names(&"a".repeat(length), "x");
+        assert_eq!(d.compare_families(&fits, &other).unwrap(), disjoint);
+        fs::create_dir(
+            dir.path()
+                .join(format!("{}.ratarmount-install-state", "a".repeat(length))),
+        )
+        .unwrap();
+        let (long, _) = names(&"b".repeat(length + 1), "x");
+        assert_eq!(
+            d.compare_families(&long, &other).unwrap_err().kind,
+            NativeFsErrorKind::NameTooLong
+        );
+        let over = format!("{}.ratarmount-install-state", "b".repeat(length + 1));
+        let error = fs::create_dir(dir.path().join(&over)).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENAMETOOLONG));
+        let (over, _) = names(&over, "x");
+        let refused = |result: Result<(), NativeFsError>| {
+            let error = result.unwrap_err();
+            assert_eq!(
+                (error.kind, error.code),
+                (
+                    NativeFsErrorKind::Io,
+                    Some(NativeCode::Errno(libc::ENAMETOOLONG))
+                )
+            );
+        };
+        refused(d.lookup_existing(&over).map(drop));
+        refused(d.compare_existing(&over, &other).map(drop));
+        refused(d.compare_existing(&other, &over).map(drop));
+    }
+
+    fn rule_test(
+        variable: &'static str,
+        group: &'static str,
+        kind: LinuxFilesystem,
+        name: &str,
+        groups: &[&str],
+    ) {
+        let Some(t) = linux_fixture(variable, group, kind) else {
+            return;
+        };
+        if kind == LinuxFilesystem::Btrfs {
+            let d = NativeDirectory::open_parent(t.path()).unwrap();
+            assert_identity(t.path(), &d.capabilities().unwrap());
+        }
+        rule_groups(&t, kind);
+        corroborate(t.root(), kind).unwrap();
+        t.verify();
+        complete(name, groups);
+    }
+
+    /// Regression: native tmpfs absent-name rule is byte-exact on a non-casefold directory.
+    #[test]
+    fn regression_235_part2_a1_linux_tmpfs_rule() {
+        rule_test(
+            "RRS_A1_TMPFS_ROOT",
+            "linux.tmpfs_rule",
+            LinuxFilesystem::Tmpfs,
+            "checked_open::native_fs::tests::linux_tests::regression_235_part2_a1_linux_tmpfs_rule",
+            &[
+                "linux.tmpfs_rule_flags",
+                "linux.tmpfs_rule_existing",
+                "linux.tmpfs_rule_absent",
+                "linux.tmpfs_rule_family",
+                "linux.tmpfs_rule_length",
+            ],
+        );
+    }
+
+    /// Regression: native ext4 rule on a non-casefold directory of a casefold-capable image.
+    #[test]
+    fn regression_235_part2_a1_linux_ext4_rule() {
+        rule_test(
+            "RRS_A1_EXT4_ROOT",
+            "linux.ext4_rule",
+            LinuxFilesystem::ExtFamily,
+            "checked_open::native_fs::tests::linux_tests::regression_235_part2_a1_linux_ext4_rule",
+            &[
+                "linux.ext4_rule_flags",
+                "linux.ext4_rule_existing",
+                "linux.ext4_rule_absent",
+                "linux.ext4_rule_family",
+                "linux.ext4_rule_length",
+            ],
+        );
+    }
+
+    /// Regression: btrfs IDs and rule; mountinfo's device is not assumed equal to st_dev.
+    #[test]
+    fn regression_235_part2_a1_linux_btrfs() {
+        rule_test(
+            "RRS_A1_BTRFS_ROOT",
+            "linux.btrfs",
+            LinuxFilesystem::Btrfs,
+            "checked_open::native_fs::tests::linux_tests::regression_235_part2_a1_linux_btrfs",
+            &[
+                "linux.btrfs_identity",
+                "linux.btrfs_rule_flags",
+                "linux.btrfs_rule_existing",
+                "linux.btrfs_rule_absent",
+                "linux.btrfs_rule_family",
+                "linux.btrfs_rule_length",
+            ],
         );
     }
 }

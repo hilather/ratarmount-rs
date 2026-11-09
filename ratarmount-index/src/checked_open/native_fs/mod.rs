@@ -1,5 +1,8 @@
-//! Native existing-object queries only. No namespace writes, accepted comparator,
-//! acquisition provenance, family proof, lease or durability guarantee.
+//! Native existing-object queries plus one name-only family query. No namespace
+//! writes, accepted comparator, acquisition provenance, lease or durability guarantee.
+//! `compare_existing` decides existing objects by full IDs and never consumes the
+//! absent-name rule; `compare_families` applies the reviewed rule to names only,
+//! with no lookup, open or create, and nothing uses it yet.
 //! Parent rechecks bound observed drift; they cannot detect every child replacement
 //! or ID reuse and do not provide an atomic snapshot. Unavailable mode facts stay unknown.
 
@@ -88,6 +91,20 @@ impl NativeDirectory {
         self.query(|| imp::short_names(&self.file, name))
     }
 
+    /// Name-only: applies the parent's reviewed rule to both complete families.
+    pub fn compare_families(
+        &self,
+        a: &OsStr,
+        b: &OsStr,
+    ) -> Result<FamilyComparison, NativeFsError> {
+        families(
+            a,
+            b,
+            || imp::snapshot(&self.file),
+            || imp::capabilities(&self.file),
+        )
+    }
+
     fn query<T>(
         &self,
         action: impl FnMut() -> Result<T, NativeFsError>,
@@ -114,6 +131,108 @@ fn stable<T>(
         "parent revalidation",
         NativeFsErrorKind::ChangedDuringQuery,
     ))
+}
+
+/// Reservation, then a decision only when `before`, the decided capabilities and
+/// `after` are all equal.
+fn families(
+    a: &OsStr,
+    b: &OsStr,
+    mut snapshot: impl FnMut() -> Result<DirectoryCapabilities, NativeFsError>,
+    mut caps: impl FnMut() -> Result<DirectoryCapabilities, NativeFsError>,
+) -> Result<FamilyComparison, NativeFsError> {
+    validate(a)?;
+    validate(b)?;
+    reserved(a, b)?;
+    let before = std::cell::RefCell::new(None);
+    stable(
+        || {
+            let value = snapshot()?;
+            *before.borrow_mut() = Some(value.clone());
+            Ok(value)
+        },
+        || {
+            let value = caps()?;
+            if before.borrow().as_ref() != Some(&value) {
+                return Err(error(
+                    "family capabilities",
+                    NativeFsErrorKind::ChangedDuringQuery,
+                ));
+            }
+            decide(value.absent_names, a, b)
+        },
+    )
+}
+
+const INSTALL_STATE: &[u8] = b".ratarmount-install-state";
+const FAMILY: [(FamilyRole, &[u8]); 5] = [
+    (FamilyRole::Main, b""),
+    (FamilyRole::Wal, b"-wal"),
+    (FamilyRole::Shm, b"-shm"),
+    (FamilyRole::Journal, b"-journal"),
+    (FamilyRole::InstallState, INSTALL_STATE),
+];
+
+/// A requested main with a nonempty stem may not end with the install-state suffix.
+/// Only the suffix is compared ASCII case-insensitively; no other name is folded.
+fn reserved(a: &OsStr, b: &OsStr) -> Result<(), NativeFsError> {
+    for (name, operation) in [(a, "family a reserved"), (b, "family b reserved")] {
+        let name = name.as_encoded_bytes();
+        if name
+            .len()
+            .checked_sub(INSTALL_STATE.len())
+            .is_some_and(|stem| stem > 0 && name[stem..].eq_ignore_ascii_case(INSTALL_STATE))
+        {
+            return Err(error(operation, NativeFsErrorKind::ReservedName));
+        }
+    }
+    Ok(())
+}
+
+/// Literal suffix bytes appended to the untouched requested names, length checked
+/// before any byte comparison.
+fn decide(
+    absent: AbsentNameCapability,
+    a: &OsStr,
+    b: &OsStr,
+) -> Result<FamilyComparison, NativeFsError> {
+    let rule = match absent {
+        AbsentNameCapability::Reviewed(rule) => rule,
+        AbsentNameCapability::Unavailable(cause) => {
+            return Ok(FamilyComparison::Unavailable(cause))
+        }
+        AbsentNameCapability::Pending { decision } => {
+            return Ok(FamilyComparison::Pending { decision });
+        }
+    };
+    let ReviewedNameRule::LinuxByteExact { name_max, .. } = rule;
+    let family = |name: &OsStr, operation: &'static str| {
+        FAMILY
+            .iter()
+            .map(|(role, suffix)| {
+                let member = [name.as_encoded_bytes(), *suffix].concat();
+                if u32::try_from(member.len()).is_ok_and(|length| length <= name_max) {
+                    Ok((*role, member))
+                } else {
+                    Err(error(operation, NativeFsErrorKind::NameTooLong))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let a = family(a, "family a length")?;
+    let b = family(b, "family b length")?;
+    for (a_role, a_member) in &a {
+        for (b_role, b_member) in &b {
+            if a_member == b_member {
+                return Ok(FamilyComparison::Overlapping {
+                    rule,
+                    a: *a_role,
+                    b: *b_role,
+                });
+            }
+        }
+    }
+    Ok(FamilyComparison::Disjoint { rule })
 }
 
 fn full_identity(value: &Capability<NativeIdentity>) -> Result<NativeIdentity, NativeFsError> {

@@ -43,7 +43,8 @@ def transcript(profile, *, optional_skips=False, partial=False):
             skipped = next((group for group, parent in EVIDENCE.LOCAL_FIXTURES.items()
                             if partial and parent == name), None)
             if skipped:
-                text += f"A1_OPTIONAL_FIXTURE_SKIP {skipped} RRS_A1_EXT4_ROOT root=None cause=root is unset\nok\n"
+                text += (f"A1_OPTIONAL_FIXTURE_SKIP {skipped} {EVIDENCE.ROOT_VARIABLES[skipped]} "
+                         "root=None cause=root is unset\nok\n")
                 continue
             mode = "optional" if profile == "local-linux-partial" else "required"
             for group in EVIDENCE.FIXTURE_ROOTS.get(name, ()):
@@ -70,7 +71,7 @@ class TranscriptControls(unittest.TestCase):
             EVIDENCE.check(text, profile, code)
 
     def test_regression_fixed_full_names_counts_and_subgroup_matrix(self):
-        for profile, parents, groups in (("strict-linux", 14, 18), ("strict-macos", 14, 16),
+        for profile, parents, groups in (("strict-linux", 21, 44), ("strict-macos", 14, 16),
                                          ("strict-windows", 13, 17)):
             manifest = EVIDENCE.MANIFESTS[profile]
             self.assertEqual(len(manifest), parents)
@@ -96,8 +97,8 @@ class TranscriptControls(unittest.TestCase):
         text = transcript("strict-linux")
         self.assertIn("... A1_LOCK_CHILD_BEGIN", text)
         result = EVIDENCE.check(text.replace("\n", "\r\n"), "strict-linux", 0)
-        self.assertEqual(result["parent_statuses"], 14)
-        self.assertEqual(result["parent_completions"], 14)
+        self.assertEqual(result["parent_statuses"], 21)
+        self.assertEqual(result["parent_completions"], 21)
         EVIDENCE.check(text.replace("\nok\n", "\n\x1b[32mok\x1b[0m\n"), "strict-linux", 0)
         EVIDENCE.check(text.replace("engine: SQLite native fixture\n", "engine: metadata query finished ok\n"),
                        "strict-linux", 0)
@@ -111,7 +112,7 @@ class TranscriptControls(unittest.TestCase):
         text = transcript("strict-linux")
         first = next(iter(EVIDENCE.CORE))
         self.reject(text.replace("test " + first + " ... ", "test unrelated_test ... ", 1), "unknown parent test")
-        index_start = text.index("running 12 tests")
+        index_start = text.index("running 19 tests")
         self.reject(text[:index_start], "missing parent harness")
         block = (f"test {first} ... A1_GROUP_COMPLETE core.identity_domains\n"
                  f"A1_TEST_COMPLETE {first}\nok\n")
@@ -143,7 +144,8 @@ class TranscriptControls(unittest.TestCase):
 
     def test_regression_skipped_required_facility(self):
         text = transcript("local-linux-partial", partial=True)
-        self.reject(text, "required fixture skipped: linux.ext4_casefold, linux.ext4_sensitive")
+        self.reject(text, "required fixture skipped: linux.btrfs, linux.ext4_casefold, linux.ext4_rule, "
+                          "linux.ext4_sensitive")
 
     def test_regression_unknown_skip_text_and_unknown_named_skip(self):
         text = transcript("strict-linux")
@@ -205,8 +207,50 @@ class TranscriptControls(unittest.TestCase):
     def test_regression_local_partial_never_native_pass(self):
         result = EVIDENCE.check(transcript("local-linux-partial", partial=True), "local-linux-partial", 0)
         self.assertEqual(result["result"], "LOCAL_PARTIAL_EVIDENCE")
-        self.assertEqual((result["parent_completions"], result["required_groups_completed"]), (12, 13))
-        self.assertEqual(result["optional_fixture_skips"], ["linux.ext4_casefold", "linux.ext4_sensitive"])
+        self.assertEqual((result["parent_completions"], result["required_groups_completed"]), (17, 27))
+        self.assertEqual(result["optional_fixture_skips"],
+                         ["linux.btrfs", "linux.ext4_casefold", "linux.ext4_rule", "linux.ext4_sensitive"])
+
+    def test_regression_native_credit_follows_fixture_ownership_not_prefix(self):
+        for profile, partial in (("strict-linux", False), ("local-linux-partial", True)):
+            with self.subTest(profile=profile):
+                result = EVIDENCE.check(transcript(profile, partial=partial), profile, 0)
+                native, other = result["native_groups"], result["non_native_groups"]
+                self.assertEqual((native, other), (sorted(native), sorted(other)))
+                self.assertFalse(set(native) & set(other))
+                manifest = EVIDENCE.MANIFESTS[profile]
+                owner = {group: name for name, groups in manifest.items() for group in groups}
+                self.assertTrue(all(owner[group] in EVIDENCE.FIXTURE_ROOTS for group in native))
+                self.assertIn("linux.classification_errors", other)
+                self.assertTrue(all(group in other for group in owner
+                                    if group.startswith(("seam.", "shared.", "unix.", "core."))))
+                skipped = set(EVIDENCE.LOCAL_FIXTURES.values()) if partial else set()
+                self.assertEqual(set(native), {group for name, groups in manifest.items()
+                                               if name in EVIDENCE.FIXTURE_ROOTS and name not in skipped
+                                               for group in groups})
+                if partial:
+                    self.assertIn("linux.tmpfs_rule_flags", native)
+                    self.assertFalse([group for group in native
+                                      if group.startswith(("linux.ext4_rule_", "linux.btrfs_"))])
+        text = transcript("strict-linux")
+        manifest = copy.deepcopy(EVIDENCE.MANIFESTS["strict-linux"])
+        tmpfs_rule = EVIDENCE.LINUX_MODULE + EVIDENCE.PREFIX + "linux_tmpfs_rule"
+        manifest[tmpfs_rule] += ("seam.family_equivalence",)
+        with mock.patch.dict(EVIDENCE.MANIFESTS, {"strict-linux": manifest}):
+            self.reject(text, "^duplicate group owner: seam.family_equivalence$")
+
+    def test_regression_btrfs_missing_group_and_required_skip(self):
+        text = transcript("strict-linux")
+        self.reject(EVIDENCE.remove_marker(text, "A1_GROUP_COMPLETE", "linux.btrfs_rule_length"),
+                    "missing required group: linux.btrfs_rule_length")
+        name = EVIDENCE.LINUX_MODULE + EVIDENCE.PREFIX + "linux_btrfs"
+        for group in EVIDENCE.LINUX[name]:
+            text = EVIDENCE.remove_marker(text, "A1_GROUP_COMPLETE", group)
+        text = re.sub(r"A1_FIXTURE_ROOT linux\.btrfs [^\n]*\n", "", text)
+        text = text.replace("A1_TEST_COMPLETE " + name,
+                            "A1_OPTIONAL_FIXTURE_SKIP linux.btrfs RRS_A1_BTRFS_ROOT root=None cause=root is unset", 1)
+        self.reject(text, "required fixture skipped: linux.btrfs")
+        self.assertEqual(EVIDENCE.check(text, "local-linux-partial", 0)["result"], "LOCAL_PARTIAL_EVIDENCE")
 
     def test_regression_strict_profile_cannot_upgrade_optional_run(self):
         text = transcript("strict-linux").replace("mode=required", "mode=optional")
@@ -315,7 +359,11 @@ class NativeCiContract(unittest.TestCase):
         self.assertIn("a1-linux-fixtures.sh", arm)
         self.assertIn("actions/upload-artifact@v4", arm)
         self.assertIn("A1 native evidence status", arm)
-        self.assertIn("runs-on: ubuntu-latest", workflow.split("  check:\n", 1)[1].split("  checked-open-aarch64:", 1)[0])
+        check = workflow.split("  check:\n", 1)[1].split("  checked-open-aarch64:", 1)[0]
+        self.assertRegex(check, r"(?m)^\s*runs-on: ubuntu-24.04$")
+        for job in (check, arm):
+            install = re.search(r"apt-get install -y -o Acquire::Retries=5 \\\n([^\n]*)\n", job)
+            self.assertIn("btrfs-progs", install.group(1).split())
 
     def test_regression_required_ci_never_uses_partial_profile(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
@@ -526,7 +574,8 @@ class EngineProtocolControls(unittest.TestCase):
         self.enterContext(mock.patch.object(EVIDENCE, "source_identity", return_value=copy.deepcopy(self.runner.source)))
         self.enterContext(mock.patch.object(EVIDENCE.platform, "machine", return_value="x86_64"))
         self.enterContext(mock.patch.object(EVIDENCE.sys, "platform", "linux"))
-        self.enterContext(mock.patch.dict(os.environ, {"RRS_A1_TMPFS_ROOT": "/owned/tmpfs", "RRS_A1_EXT4_ROOT": "/owned/ext4"}))
+        self.enterContext(mock.patch.dict(os.environ, {"RRS_A1_TMPFS_ROOT": "/owned/tmpfs", "RRS_A1_EXT4_ROOT": "/owned/ext4",
+                                                        "RRS_A1_BTRFS_ROOT": "/owned/btrfs"}))
 
     def baseline(self):
         EVIDENCE.build_engines(self.output)
@@ -889,6 +938,22 @@ class EngineProtocolControls(unittest.TestCase):
             reseal_cell(cell)
             self.reject(mutated, diagnostic)
 
+    def test_regression_btrfs_root_is_bound_into_every_run_cell(self):
+        cells = self.baseline()
+        self.assertIn("RRS_A1_BTRFS_ROOT", EVIDENCE.RECORDED_ENV)
+        for cell in cells:
+            self.assertEqual(cell["fixture_roots"]["RRS_A1_BTRFS_ROOT"], "/owned/btrfs")
+            self.assertEqual(EVIDENCE.cell_environment(cell)["RRS_A1_BTRFS_ROOT"], "/owned/btrfs")
+            for package in EVIDENCE.PACKAGES[:2]:
+                self.assertEqual(cell["runs"][package]["env"]["RRS_A1_BTRFS_ROOT"], "/owned/btrfs")
+        for change in (lambda env: env.pop("RRS_A1_BTRFS_ROOT"), lambda env: env.update(RRS_A1_BTRFS_ROOT="/other")):
+            mutated = copy.deepcopy(cells)
+            change(mutated[1]["runs"][EVIDENCE.PACKAGES[1]]["env"])
+            self.reject(mutated, "strict fixtures environment missing")
+        mutated = copy.deepcopy(cells)
+        mutated[0]["fixture_roots"]["RRS_A1_BTRFS_ROOT"] = None
+        self.reject(mutated, "strict fixtures environment missing")
+
     def test_regression_target_cell_reuse_and_ordinary_strict_env_inheritance(self):
         cells = self.baseline()
         self.reject(cells[:1], "missing required engine/platform/deployment cell")
@@ -1044,7 +1109,7 @@ class StreamOrderingControls(unittest.TestCase):
 class NativeOwnershipControls(unittest.TestCase):
     script = ROOT / "test-harness/a1-linux-fixtures.sh"
 
-    def shell(self, body, *arguments):
+    def shell(self, body, *arguments, script=None):
         # Privileged names are always functions in these isolated subprocesses.
         # No real mount/sudo/losetup or approved native fixture is used.
         program = '''source "$1"
@@ -1053,8 +1118,9 @@ mount() { return 97; }
 umount() { return 97; }
 losetup() { return 97; }
 mkfs.ext4() { return 97; }
+mkfs.btrfs() { return 97; }
 ''' + body
-        return subprocess.run(["bash", "-c", program, "a1-contract", str(self.script), *map(str, arguments)],
+        return subprocess.run(["bash", "-c", program, "a1-contract", str(script or self.script), *map(str, arguments)],
                               cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
 
     def test_regression_root_and_nonapproved_context_are_refused_before_setup(self):
@@ -1089,7 +1155,8 @@ echo unexpectedly-accepted
         mock = r"""set -euo pipefail
 runner_uid=12345; runner_gid=23456; transfer=$2
 ext_mount=/owned/ext4; tmp_mount=/owned/tmpfs; loop_device=/dev/loop-owned; tmp_source=owned-tmpfs
-declare -A owner=([/owned/ext4]=0:0:755)
+btrfs_image=/owned/btrfs.img; btrfs_mount=/owned/btrfs; btrfs_loop=/dev/loop-btrfs
+declare -A owner=([/owned/ext4]=0:0:755 [/owned/btrfs]=0:0:755)
 verify_mount() { echo "VERIFY $1"; }
 sudo() {
     shift; printf '<%s> ' "$@"; printf '\n'
@@ -1113,16 +1180,17 @@ echo "BEFORE $(stat -c '%u:%g:%a' -- "$tmp_mount")"
 """
         result = self.shell(mock + '''assign_runner_roots
 echo "AFTER $(stat -- "$tmp_mount") $(stat -- "$tmp_mount/owned")"
-printf 'ROOTS %s %s %s\\n' "$RRS_A1_EXT4_ROOT" "$RRS_A1_TMPFS_ROOT" "$RRS_A1_REQUIRE_FIXTURES"
+printf 'ROOTS %s %s %s %s\\n' "$RRS_A1_EXT4_ROOT" "$RRS_A1_TMPFS_ROOT" "$RRS_A1_BTRFS_ROOT" "$RRS_A1_REQUIRE_FIXTURES"
 ''', "ok")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("<nodev,nosuid,uid=0,gid=0,mode=0700,size=256m>", result.stdout)
         # The old-root negative runs between mount_owned and the transfer.
         self.assertIn("BEFORE 0:0:700", result.stdout)
         self.assertIn("VERIFY /owned/tmpfs\n<install> <-d> <-m> <700> <-o> <12345> <-g> <23456> <--> "
-                      "</owned/tmpfs> </owned/ext4/owned> </owned/tmpfs/owned>", result.stdout)
+                      "</owned/tmpfs> </owned/ext4/owned> </owned/tmpfs/owned> </owned/btrfs/owned>", result.stdout)
+        self.assertIn("<mount> <-t> <btrfs> <-o> <nodev,nosuid> <--> </dev/loop-btrfs> </owned/btrfs>", result.stdout)
         self.assertIn("AFTER 12345:23456:700 12345:23456:700", result.stdout)
-        self.assertIn("ROOTS /owned/ext4/owned /owned/tmpfs/owned 1", result.stdout)
+        self.assertIn("ROOTS /owned/ext4/owned /owned/tmpfs/owned /owned/btrfs/owned 1", result.stdout)
         self.assertNotIn("remount", result.stdout)
         self.assertNotIn("remount,", self.script.read_text())
         # A failed or missing transfer, or the deprecated remount, never succeeds.
@@ -1169,31 +1237,126 @@ printf 'ROOTS %s %s %s\\n' "$RRS_A1_EXT4_ROOT" "$RRS_A1_TMPFS_ROOT" "$RRS_A1_REQ
                     with self.assertRaisesRegex(EVIDENCE.EvidenceError, "mount source/fs/device mismatch"):
                         EVIDENCE.verify_linux_fixture(root, mount, "owned-source", "tmpfs")
 
+    def test_regression_btrfs_fixture_requires_same_subvolume_not_mountinfo_device(self):
+        with tempfile.TemporaryDirectory(prefix="a1-btrfs-") as directory:
+            mount = Path(directory)
+            root = mount / "owned"
+            root.mkdir(mode=0o700)
+            device = root.stat().st_dev
+            stat_device = f"{os.major(device)}:{os.minor(device)}"
+            line = f"1 0 {{}} / {mount} rw - btrfs /dev/loop-b rw\n"
+            for mountinfo in ("0:99", stat_device):
+                with self.subTest(mountinfo=mountinfo), mock.patch.object(Path, "read_text",
+                                                                         return_value=line.format(mountinfo)):
+                    result = EVIDENCE.verify_linux_fixture(root, mount, "/dev/loop-b", "btrfs")
+                    self.assertEqual((result["mountinfo_device"], result["stat_device"]), (mountinfo, stat_device))
+                    self.assertTrue(result["kernel_release"] and result["machine"])
+            real_stat = Path.stat
+            other = os.stat_result([*real_stat(mount)[:2], device + 1, *real_stat(mount)[3:]])
+            for data, foreign_subvolume in ((line.format("0:99"), True), (line.format("0:99").replace("loop-b", "loop-x"), False),
+                                            (line.format("0:99") * 2, False),
+                                            (line.format(stat_device).replace("- btrfs", "- ext4"), False)):
+                with self.subTest(mountinfo=data, foreign_subvolume=foreign_subvolume), \
+                        mock.patch.object(Path, "read_text", return_value=data), \
+                        mock.patch.object(Path, "stat", lambda path, *a, **k: other if foreign_subvolume and path == mount
+                                          else real_stat(path, *a, **k)):
+                    with self.assertRaisesRegex(EVIDENCE.EvidenceError, "mount source/fs/device mismatch"):
+                        EVIDENCE.verify_linux_fixture(root, mount, "/dev/loop-b", "btrfs")
+
+    def test_regression_root_controls_reset_every_fixture_root_and_cover_btrfs(self):
+        calls = {}
+        groups = {"linux_tmpfs": "linux.tmpfs", "linux_ext4": "linux.ext4_sensitive", "linux_btrfs": "linux.btrfs"}
+        causes = {"missing": "root metadata: absent", "unset": "root is unset", "wrong-type": "wrong filesystem: x",
+                  "not-directory": "root is not a directory", "relative": "root must be an explicit absolute path",
+                  "unwritable": "root not writable: denied"}
+
+        def run_binary(cell, package, arguments, output, name, *, overrides):
+            calls[name] = dict(overrides)
+            test = arguments[0]
+            group = groups[test.rsplit(EVIDENCE.PREFIX, 1)[1]]
+            variable = EVIDENCE.ROOT_VARIABLES[group]
+            root = overrides.get(variable)
+            cause = next(text for key, text in causes.items() if name.endswith(key))
+            required = name.startswith("required-")
+            marker = "A1_REQUIRED_FIXTURE_FAILURE" if required else "A1_OPTIONAL_FIXTURE_SKIP"
+            text = (f"running 1 test\ntest {test} ... \n{marker} {group} {variable} "
+                    f"root={'Some(' + repr(root) + ')' if root else 'None'} cause={cause}\n")
+            text += ("FAILED\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; "
+                     "finished in 0.01s\n" if required else "ok\n" + summary(1))
+            return {"stdout": text, "status": 101 if required else 0, "argv": [test]}
+
+        def check(variables):
+            self.assertEqual(len(calls), 16)
+            for name, overrides in calls.items():
+                kind = name.split("-")[1]
+                for variable in variables:
+                    if not (variable == "RRS_A1_" + kind.upper() + "_ROOT" and "unset" not in name):
+                        self.assertIn(variable, overrides, name)
+                        self.assertIsNone(overrides[variable], name)
+            self.assertIsNone(calls["required-btrfs-unset"]["RRS_A1_BTRFS_ROOT"])
+
+        with tempfile.TemporaryDirectory(prefix="a1-roots-") as directory:
+            tmpfs, scratch = Path(directory).resolve() / "tmpfs", Path(directory).resolve() / "scratch"
+            tmpfs.mkdir(mode=0o700)
+            scratch.mkdir(mode=0o700)
+            real_is_dir = Path.is_dir
+            environment = {variable: "/inherited/" + variable for variable in EVIDENCE.FIXTURE_VARIABLES}
+            for variables in (EVIDENCE.FIXTURE_VARIABLES, EVIDENCE.FIXTURE_VARIABLES[:2]):
+                calls.clear()
+                with mock.patch.object(EVIDENCE, "FIXTURE_VARIABLES", variables), \
+                        mock.patch.object(EVIDENCE, "load_engines", return_value=[{}]), \
+                        mock.patch.object(EVIDENCE, "run_binary", side_effect=run_binary), \
+                        mock.patch.object(EVIDENCE, "verify_binary_record"), \
+                        mock.patch.object(EVIDENCE, "linux_mount_type",
+                                          side_effect=lambda path: "tmpfs" if path == tmpfs else "ext4"), \
+                        mock.patch.object(Path, "is_dir", lambda path: path == Path("/dev/shm") or real_is_dir(path)), \
+                        mock.patch.object(EVIDENCE.sys, "platform", "linux"), \
+                        mock.patch.dict(os.environ, environment):
+                    results = EVIDENCE.root_controls(tmpfs, scratch, Path(directory) / f"out-{len(variables)}",
+                                                     Path(directory))
+                self.assertEqual(len(results), 16)
+                self.assertEqual(results["required-btrfs-wrong-type"]["marker"],
+                                 "A1_REQUIRED_FIXTURE_FAILURE linux.btrfs RRS_A1_BTRFS_ROOT root=")
+                if len(variables) == 3:
+                    check(EVIDENCE.FIXTURE_VARIABLES)
+                else:  # Mutation: dropping btrfs from the reset is detected.
+                    with self.assertRaises(AssertionError):
+                        check(EVIDENCE.FIXTURE_VARIABLES)
+
     cleanup_mock = r'''set -uo pipefail
 state=$2
 base="$state/base"; image="$base/ext4.img"; ext_mount="$base/ext4"; tmp_mount="$base/tmpfs"
+btrfs_image="$base/btrfs.img"; btrfs_mount="$base/btrfs"; btrfs_loop=/dev/loop-btrfs
 attempt_output="$state/receipt"; tmp_source=owned-tmpfs; loop_device=/dev/loop-owned
 fixture_probe_complete=1; original=73; failure=$3
 rm() {
-    [[ $failure != image || ${@: -1} != "$image" ]] || return 6
+    local path
+    for path in "$@"; do  # Fails on whichever image the case names.
+        [[ !($failure == image && $path == "$image") && !($failure == btrfs-image && $path == "$btrfs_image") ]] || return 6
+    done
     command rm "$@"
 }
 mountpoint() {
-    if [[ ${@: -1} == "$tmp_mount" ]]; then test -e "$state/tmp-mounted"
-    elif [[ ${@: -1} == "$ext_mount" ]]; then test -e "$state/ext-mounted"
-    else return 1; fi
+    case ${@: -1} in
+        "$tmp_mount") test -e "$state/tmp-mounted" ;;
+        "$ext_mount") test -e "$state/ext-mounted" ;;
+        "$btrfs_mount") test -e "$state/btrfs-mounted" ;;
+        *) return 1 ;;
+    esac
 }
 findmnt() {
     if [[ $* == *'-S '* ]]; then
         [[ $failure == in-use ]] && { echo /foreign; return 0; }
-        if test -e "$state/ext-mounted"; then echo "$ext_mount"; return 0; fi
+        if [[ $* == *"$btrfs_loop"* ]]; then
+            test -e "$state/btrfs-mounted" && { echo "$btrfs_mount"; return 0; }
+        elif test -e "$state/ext-mounted"; then echo "$ext_mount"; return 0; fi
         return 1
     fi
     local target kind source column=${@: -1}
     if [[ $* == *"$tmp_mount"* ]]; then target=$tmp_mount; kind=tmpfs; source=$tmp_source
+    elif [[ $* == *"$btrfs_mount"* ]]; then target=$btrfs_mount; kind=btrfs; source=$btrfs_loop
     else target=$ext_mount; kind=ext4; source=$loop_device; fi
-    [[ $failure == foreign-tmpfs && $kind == tmpfs ]] && source=foreign
-    [[ $failure == foreign-ext4 && $kind == ext4 ]] && source=/dev/loop-foreign
+    [[ $failure == foreign-$kind ]] && source=/dev/loop-foreign
     case $column in TARGET) echo "$target";; SOURCE) echo "$source";; FSTYPE) echo "$kind";; esac
     [[ $failure == stacked && $* == *'-Rrn '* && $kind == tmpfs ]] && echo "$target/nested"
     return 0
@@ -1201,20 +1364,28 @@ findmnt() {
 sudo() {
     shift
     printf '%s\n' "$*" >> "$state/commands"
+    local attached=attached backing=$image
+    [[ ${@: -1} == "$btrfs_loop" || ${@: -1} == "$btrfs_image" ]] && { attached=btrfs-attached; backing=$btrfs_image; }
     case $1 in
         umount)
             [[ $failure == unmount ]] && return 6
-            if [[ ${@: -1} == "$tmp_mount" ]]; then rm -f "$state/tmp-mounted"
-            else rm -f "$state/ext-mounted"; fi ;;
+            case ${@: -1} in
+                "$tmp_mount") rm -f "${state:?}/tmp-mounted" ;;
+                "$btrfs_mount") rm -f "${state:?}/btrfs-mounted" ;;
+                *) rm -f "${state:?}/ext-mounted" ;;
+            esac ;;
         losetup)
             case $2 in
                 -ln)
-                    test -e "$state/attached" || return 1
-                    if [[ $failure == foreign-loop ]]; then echo "$image.foreign"; else echo "$image"; fi ;;
+                    test -e "$state/$attached" || return 1
+                    if [[ $failure == foreign-loop ]]; then echo "$backing.foreign"; else echo "$backing"; fi ;;
                 # Ubuntu 24.04 util-linux 2.39.3 getopt "d:": -d's argument is the next word, even `--`.
-                -d) [[ $# -eq 3 && $3 == "$loop_device" ]] || { echo "losetup: $3: failed to use device: No such device" >&2; return 1; }
-                    [[ $failure == detach ]] && return 6; rm -f "$state/attached" ;;
-                -j) test ! -e "$state/attached" || echo /dev/loop-owned ;;
+                -d) [[ $# -eq 3 && ($3 == "$loop_device" || $3 == "$btrfs_loop") ]] || {
+                        echo "losetup: $3: failed to use device: No such device" >&2; return 1; }
+                    [[ $failure == detach && $attached == attached ]] && return 6
+                    [[ $failure == btrfs-detach && $attached == btrfs-attached ]] && return 6
+                    rm -f "${state:?}/${attached:?}" ;;
+                -j) test ! -e "$state/$attached" || echo /dev/loop-owned ;;
                 *) return 97 ;;
             esac ;;
         *) return 97 ;;
@@ -1224,12 +1395,14 @@ sudo() {
 '''
 
     def test_regression_cleanup_source_verification_and_forced73(self):
-        for failure in ("none", "foreign-tmpfs", "foreign-ext4", "foreign-loop", "stacked", "in-use", "unmount", "detach", "image", "forced-cleanup"):
+        for failure in ("none", "foreign-tmpfs", "foreign-ext4", "foreign-btrfs", "foreign-loop", "stacked", "in-use",
+                        "unmount", "detach", "btrfs-detach", "image", "btrfs-image", "forced-cleanup"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory(prefix="a1-cleanup-") as directory:
                 root = Path(directory)
-                for path in (root / "base/ext4", root / "base/tmpfs", root / "receipt"):
+                for path in (root / "base/ext4", root / "base/tmpfs", root / "base/btrfs", root / "receipt"):
                     path.mkdir(parents=True)
-                for name in ("tmp-mounted", "ext-mounted", "attached", "base/ext4.img", "commands"):
+                for name in ("tmp-mounted", "ext-mounted", "btrfs-mounted", "attached", "btrfs-attached",
+                             "base/ext4.img", "base/btrfs.img", "commands"):
                     (root / name).touch()
                 # The real trap/cleanup code sees status 73 after the actual
                 # fixture_probe entrypoint, with every privileged command mocked.
@@ -1252,25 +1425,91 @@ fi
                     self.assertIn("original=73 cleanup_status=0 probe_complete=1", result.stdout)
                     self.assertEqual((root / "receipt/cleanup.exit-code").read_text().strip(), "0")
                     self.assertEqual((root / "receipt/fixture.exit-code").read_text().strip(), "73")
-                    self.assertIn("linux-fixture --root", (root / "probe-commands").read_text())
+                    self.assertIn("--kind btrfs", (root / "probe-commands").read_text())
                     self.assertFalse((root / "base").exists())
-                    self.assertEqual(commands.count("umount -- "), 2)
+                    self.assertEqual(commands.count("umount -- "), 3)
                     # Regression: hosted cleanup failed with "losetup: --: failed to use device".
                     self.assertIn("losetup -d /dev/loop-owned\n", commands)
+                    self.assertIn("losetup -d /dev/loop-btrfs\n", commands)
                     self.assertNotIn("failed to use device", result.stderr)
+                    continue
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual((root / "receipt/cleanup.exit-code").read_text().strip(), "1")
+                if failure == "forced-cleanup":
+                    self.assertEqual((root / "receipt/fixture.exit-code").read_text().strip(), "1")
+                    self.assertEqual((root / "receipt/original.exit-code").read_text().strip(), "73")
+                # Steps (1)-(3) failing keep both images and the base; a step (4)
+                # image failure keeps at least the failing image.
+                failing = {"image": "base/ext4.img", "btrfs-image": "base/btrfs.img"}.get(failure)
+                for image in ([failing] if failing else ["base/ext4.img", "base/btrfs.img"]):
+                    self.assertTrue((root / image).exists(), image)
+                self.assertTrue((root / "base").exists())
+                if failure not in ("detach", "btrfs-detach", "image", "btrfs-image"):
+                    self.assertNotIn("losetup -d", commands)
+                for kind, attached in (("detach", "attached"), ("btrfs-detach", "btrfs-attached")):
+                    if failure == kind:
+                        self.assertTrue((root / attached).exists())
+                for kind, mounted in (("tmpfs", "tmp-mounted"), ("ext4", "ext-mounted"), ("btrfs", "btrfs-mounted")):
+                    if failure == "foreign-" + kind or (failure == "stacked" and kind == "tmpfs"):
+                        self.assertNotIn("umount -- " + str(root / "base" / kind), commands)
+                        self.assertTrue((root / mounted).exists())
+
+    def test_regression_fixture_attempt_creates_every_mountpoint_and_records_kernel_first(self):
+        body = r'''set -euo pipefail
+RUNNER_TEMP=$2; failing=$3; log=$RUNNER_TEMP/log
+truncate() { echo "truncate $*" >> "$log"; [[ $failing != truncate ]] || return 41; }
+mkfs.ext4() { echo "mkfs.ext4" >> "$log"; }
+mkfs.btrfs() { echo "mkfs.btrfs" >> "$log"; [[ $failing != mkfs.btrfs ]] || return 42; }
+sudo() {
+    shift
+    case $1 in
+        losetup) if [[ $2 == --find ]]; then echo "/dev/fake-$(basename -- "${@: -1}")"
+                 else local device=${@: -1}; echo "$base/${device#/dev/fake-}"; fi ;;
+        mount) [[ -d ${@: -1} ]] || return 32; echo "mount ${@: -1}" >> "$log" ;;
+        *) return 97 ;;
+    esac
+}
+verify_mount() { :; }
+python3() { :; }
+cleanup() { echo "cleanup" >> "$log"; }
+assign_runner_roots() { echo "assign" >> "$log"; }
+fixture_probe() { echo "probe" >> "$log"; }
+finish_attempt() { echo "finish $1" >> "$log"; }
+set +e
+fixture_attempt "$RUNNER_TEMP/attempt" normal "$RUNNER_TEMP/engines"
+echo "status $?"
+'''
+        text = self.script.read_text()
+        old = 'mkdir -m 700 -- "$ext_mount" "$tmp_mount" "$btrfs_mount"'
+        self.assertEqual(text.count(old), 1)
+        for failing, mutated, status in (("none", False, 0), ("none", True, 32), ("mkfs.btrfs", False, 42),
+                                         ("truncate", False, 41)):
+            with self.subTest(failing=failing, mutated=mutated), \
+                    tempfile.TemporaryDirectory(prefix="a1-attempt-") as directory:
+                root = Path(directory)
+                script = root / "mutated.sh"
+                script.write_text(text.replace(old, old.replace(' "$btrfs_mount"', "")) if mutated else text)
+                result = self.shell(body, root, failing, script=script)
+                self.assertIn(f"status {status}", result.stdout, result.stderr)
+                kernel = (root / "attempt/kernel.txt").read_text()
+                self.assertRegex(kernel, r"(?m)\A\S.*\ntmpfs_casefold_feature=\S")
+                log = (root / "log").read_text().splitlines()
+                mounts = [line for line in log if line.startswith("mount ")]
+                if failing == "truncate":  # Recorded before the first provisioning step.
+                    self.assertEqual([line.split()[0] for line in log], ["truncate", "cleanup"])
+                elif status == 0:
+                    self.assertEqual([line.rsplit("/", 1)[1] for line in mounts], ["ext4", "tmpfs", "btrfs"])
+                    self.assertEqual(log[log.index(mounts[-1]) + 1:], ["assign", "probe", "finish normal", "cleanup"])
                 else:
-                    self.assertEqual(result.returncode, 1, result.stderr)
-                    self.assertEqual((root / "receipt/cleanup.exit-code").read_text().strip(), "1")
-                    self.assertTrue((root / "base/ext4.img").exists())
-                    if failure == "forced-cleanup":
-                        self.assertEqual((root / "receipt/fixture.exit-code").read_text().strip(), "1")
-                        self.assertEqual((root / "receipt/original.exit-code").read_text().strip(), "73")
-                    if failure not in ("detach", "image"):
-                        self.assertNotIn("losetup -d", commands)
-                    if failure in ("foreign-tmpfs", "stacked"):
-                        self.assertNotIn("umount -- " + str(root / "base/tmpfs"), commands)
-                    if failure == "foreign-ext4":
-                        self.assertNotIn("umount -- " + str(root / "base/ext4"), commands)
+                    self.assertNotIn("assign", log)
+        with tempfile.TemporaryDirectory(prefix="a1-kernel-") as directory:
+            root = Path(directory)
+            (root / "feature").write_text("supported\n")
+            result = self.shell('set -euo pipefail\nrecord_kernel "$2/present" "$2/feature"\n'
+                                'record_kernel "$2/absent" "$2/missing"\necho recorded\n', root)
+            self.assertIn("recorded", result.stdout, result.stderr)
+            self.assertIn("tmpfs_casefold_feature=supported\n", (root / "present").read_text())
+            self.assertRegex((root / "absent").read_text(), r"\A\S.*\ntmpfs_casefold_feature=absent\n\Z")
 
     def test_regression_no_forced73_before_probe_and_required_helper_failures_propagate(self):
         result = self.shell('fixture_probe_complete=0\nfinish_attempt forced\n')
@@ -1300,8 +1539,17 @@ echo unexpectedly-accepted
                 destination = root / path
                 destination.parent.mkdir(exist_ok=True)
                 destination.write_text(value + "\n")
+            for mode in ("normal", "forced"):  # Free-form, so outside the 99 loop.
+                (root / mode / "kernel.txt").write_text("Linux 7.0.0 #1 SMP x86_64\n")
             program = 'output=$2\nassert_attempt_status "$3" "$4"\n'
             self.assertEqual(self.shell(program, root, 0, 73).returncode, 0)
+            for mode in ("normal", "forced"):
+                kernel = root / mode / "kernel.txt"
+                for broken in ("empty", "deleted"):
+                    with self.subTest(kernel=mode, broken=broken):
+                        kernel.write_text("") if broken == "empty" else kernel.unlink()
+                        self.assertEqual(self.shell(program, root, 0, 73).returncode, 1)
+                        kernel.write_text("Linux 7.0.0 #1 SMP x86_64\n")
             for path, original in expected.items():
                 with self.subTest(path=path):
                     (root / path).write_text("99\n")

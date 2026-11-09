@@ -29,17 +29,42 @@ verify_mount() {
     local target=$1 source=$2 kind=$3
     mountpoint -q -- "$target" &&
         [[ $(findmnt -rn -M "$target" -o TARGET) == "$target" &&
-           $(findmnt -rn -M "$target" -o SOURCE) == "$source" &&
+           $(findmnt -rn --nofsroot -M "$target" -o SOURCE) == "$source" &&
            $(findmnt -rn -M "$target" -o FSTYPE) == "$kind" &&
            $(findmnt -Rrn -M "$target" -o TARGET) == "$target" ]]
 }
 
-# Only these mounts/loop/image are ours. Any mismatch leaves resources intact.
+# Only these mounts, loops and images are ours. Per resource: a mount is unmounted
+# only after its own verification (an earlier verified mount may already be gone
+# when a later mismatch is found); loops are detached only if every unmount
+# succeeded and the loop still backs our image; images and directories are removed
+# only if every earlier step succeeded. A mismatched mount or refused loop is kept.
+detach_owned_loop() {
+    local device=$1 backing=$2 mounted attached
+    mounted=$(findmnt -rn -S "$device" -o TARGET) || {
+        # findmnt's no-match status is 1. Other failures are not absence.
+        [[ $? -eq 1 ]] || return 1
+    }
+    if [[ -z $mounted ]] && [[ $(sudo -n losetup -ln -O BACK-FILE "$device") == "$backing" ]]; then
+        sudo -n losetup -d "$device" || return 1
+        attached=$(sudo -n losetup -ln -O BACK-FILE "$device") || {
+            [[ $? -eq 1 ]] || return 1
+        }
+        [[ -z $attached ]]
+    else
+        echo 'A1_CLEANUP_FAILURE: refusing foreign/in-use loop detach' >&2
+        return 1
+    fi
+}
+
 cleanup_owned() {
-    local cleanup_status=0 mounted kind target source attached
-    for kind in tmpfs ext4; do
-        if [[ $kind == tmpfs ]]; then target=$tmp_mount; source=$tmp_source
-        else target=$ext_mount; source=$loop_device; fi
+    local cleanup_status=0 unmounted kind target source attached backing
+    for kind in tmpfs ext4 btrfs; do
+        case $kind in
+            tmpfs) target=$tmp_mount; source=$tmp_source ;;
+            ext4) target=$ext_mount; source=$loop_device ;;
+            btrfs) target=$btrfs_mount; source=$btrfs_loop ;;
+        esac
         if mountpoint -q -- "$target"; then
             if [[ -n $source ]] && verify_mount "$target" "$source" "$kind"; then
                 sudo -n umount -- "$target" || cleanup_status=1
@@ -50,31 +75,29 @@ cleanup_owned() {
             fi
         fi
     done
-    if [[ -n $loop_device ]]; then
-        mounted=$(findmnt -rn -S "$loop_device" -o TARGET) || {
-            # findmnt's no-match status is 1. Other failures are not absence.
-            [[ $? -eq 1 ]] || cleanup_status=1
-        }
-        if [[ $cleanup_status -eq 0 && -z $mounted ]] &&
-           [[ $(sudo -n losetup -ln -O BACK-FILE "$loop_device") == "$image" ]]; then
-            sudo -n losetup -d "$loop_device" || cleanup_status=1
-            attached=$(sudo -n losetup -ln -O BACK-FILE "$loop_device") || {
-                [[ $? -eq 1 ]] || cleanup_status=1
-            }
-            [[ -z $attached ]] || cleanup_status=1
+    unmounted=$cleanup_status
+    for kind in ext4 btrfs; do
+        if [[ $kind == ext4 ]]; then source=$loop_device; backing=$image
+        else source=$btrfs_loop; backing=$btrfs_image; fi
+        [[ -n $source ]] || continue
+        if [[ $unmounted -eq 0 ]]; then
+            detach_owned_loop "$source" "$backing" || cleanup_status=1
         else
-            echo 'A1_CLEANUP_FAILURE: refusing foreign/in-use loop detach' >&2
+            echo "A1_CLEANUP_FAILURE: refusing $kind loop detach after a failed unmount" >&2
             cleanup_status=1
         fi
+    done
+    if [[ $cleanup_status -eq 0 ]]; then
+        for backing in "$image" "$btrfs_image"; do
+            [[ -e $backing ]] || continue
+            attached=$(sudo -n losetup -j "$backing") || cleanup_status=1
+            [[ -z $attached ]] || cleanup_status=1
+        done
     fi
     if [[ $cleanup_status -eq 0 ]]; then
-        attached=$(sudo -n losetup -j "$image") || cleanup_status=1
-        [[ -z $attached ]] || cleanup_status=1
-    fi
-    if [[ $cleanup_status -eq 0 ]]; then
-        rm -f -- "$image" || cleanup_status=1
-        rmdir -- "$ext_mount" "$tmp_mount" "$base" || cleanup_status=1
-        [[ ! -e $image && ! -e $base ]] || cleanup_status=1
+        rm -f -- "$image" "$btrfs_image" || cleanup_status=1
+        rmdir -- "$ext_mount" "$tmp_mount" "$btrfs_mount" "$base" || cleanup_status=1
+        [[ ! -e $image && ! -e $btrfs_image && ! -e $base ]] || cleanup_status=1
     fi
     printf '%s\n' "$cleanup_status" > "$attempt_output/cleanup.exit-code" || cleanup_status=1
     printf 'A1_CLEANUP original=%s cleanup_status=%s probe_complete=%s\n' \
@@ -97,10 +120,13 @@ cleanup() {
 fixture_probe() {
     verify_mount "$ext_mount" "$loop_device" ext4
     verify_mount "$tmp_mount" "$tmp_source" tmpfs
+    verify_mount "$btrfs_mount" "$btrfs_loop" btrfs
     python3 -I test-harness/a1-evidence.py linux-fixture --root "$ext_mount/owned" \
         --mount "$ext_mount" --source "$loop_device" --kind ext4 > "$attempt_output/ext4-owner.json"
     python3 -I test-harness/a1-evidence.py linux-fixture --root "$tmp_mount/owned" \
         --mount "$tmp_mount" --source "$tmp_source" --kind tmpfs > "$attempt_output/tmpfs-owner.json"
+    python3 -I test-harness/a1-evidence.py linux-fixture --root "$btrfs_mount/owned" \
+        --mount "$btrfs_mount" --source "$btrfs_loop" --kind btrfs > "$attempt_output/btrfs-owner.json"
     fixture_probe_complete=1
     printf '%s\n' 1 > "$attempt_output/probe.complete"
 }
@@ -125,15 +151,17 @@ finish_attempt() {
 mount_owned() {
     sudo -n mount -t ext4 -o nodev,nosuid -- "$loop_device" "$ext_mount"
     sudo -n mount -t tmpfs -o nodev,nosuid,uid=0,gid=0,mode=0700,size=256m "$tmp_source" "$tmp_mount"
+    sudo -n mount -t btrfs -o nodev,nosuid -- "$btrfs_loop" "$btrfs_mount"
     verify_mount "$ext_mount" "$loop_device" ext4
     verify_mount "$tmp_mount" "$tmp_source" tmpfs
+    verify_mount "$btrfs_mount" "$btrfs_loop" btrfs
 }
 
 assign_runner_roots() {
     # tmpfs ignores uid/gid/mode on remount; install -d sets the existing root.
     verify_mount "$tmp_mount" "$tmp_source" tmpfs
-    sudo -n install -d -m 700 -o "$runner_uid" -g "$runner_gid" -- "$tmp_mount" "$ext_mount/owned" "$tmp_mount/owned"
-    export RRS_A1_EXT4_ROOT="$ext_mount/owned" RRS_A1_TMPFS_ROOT="$tmp_mount/owned"
+    sudo -n install -d -m 700 -o "$runner_uid" -g "$runner_gid" -- "$tmp_mount" "$ext_mount/owned" "$tmp_mount/owned" "$btrfs_mount/owned"
+    export RRS_A1_EXT4_ROOT="$ext_mount/owned" RRS_A1_TMPFS_ROOT="$tmp_mount/owned" RRS_A1_BTRFS_ROOT="$btrfs_mount/owned"
     export RRS_A1_REQUIRE_FIXTURES=1 TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 CARGO_TERM_COLOR=never
     unset RRS_A1_LOCK_CHILD RRS_A1_LOCK_ROLE
     verify_mount "$tmp_mount" "$tmp_source" tmpfs
@@ -141,25 +169,41 @@ assign_runner_roots() {
     [[ $(stat -c '%u:%g:%a' -- "$tmp_mount/owned") == "$runner_uid:$runner_gid:700" ]]
 }
 
+# Recorded, not credited. Covers every attempt that starts; a tool missing at the
+# preflight in main stops before any attempt, so no record exists then (stated gap).
+record_kernel() {
+    local feature=absent
+    if [[ -r $2 ]]; then feature=$(cat -- "$2"); fi
+    { uname -srvm; printf 'tmpfs_casefold_feature=%s\n' "$feature"; } > "$1"
+}
+
 fixture_attempt() (
     set -euo pipefail
     local attempt_output=$1 mode=$2 engines=$3
     mkdir -m 700 -- "$attempt_output"
-    local base image ext_mount tmp_mount tmp_source loop_device= fixture_probe_complete=0 original=0
+    record_kernel "$attempt_output/kernel.txt" /sys/fs/tmpfs/features/casefold
+    local base image ext_mount tmp_mount tmp_source btrfs_image btrfs_mount
+    local loop_device= btrfs_loop= fixture_probe_complete=0 original=0
     base=$(mktemp -d "$RUNNER_TEMP/rrs-a1-linux.XXXXXXXX")
     base=$(cd -- "$base" && pwd -P)
     image="$base/ext4.img"
     ext_mount="$base/ext4"
     tmp_mount="$base/tmpfs"
+    btrfs_image="$base/btrfs.img"
+    btrfs_mount="$base/btrfs"
     tmp_source="rrs-a1-$(basename -- "$base")"
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    mkdir -m 700 -- "$ext_mount" "$tmp_mount"
+    mkdir -m 700 -- "$ext_mount" "$tmp_mount" "$btrfs_mount"
     truncate -s 512M -- "$image"
     mkfs.ext4 -F -O casefold -E encoding=utf8 "$image"
+    truncate -s 512M -- "$btrfs_image"
+    mkfs.btrfs -f -- "$btrfs_image"
     loop_device=$(sudo -n losetup --find --show -- "$image")
     [[ -n $loop_device && $(sudo -n losetup -ln -O BACK-FILE "$loop_device") == "$image" ]]
+    btrfs_loop=$(sudo -n losetup --find --show -- "$btrfs_image")
+    [[ -n $btrfs_loop && $(sudo -n losetup -ln -O BACK-FILE "$btrfs_loop") == "$btrfs_image" ]]
     mount_owned
     # Original broken root-owned fixture is an expected negative with stock's
     # already verified index executable. A build failure cannot satisfy it.
@@ -181,7 +225,8 @@ assert_attempt_status() {
        $(cat -- "$output/normal/cleanup.exit-code") == 0 &&
        $(cat -- "$output/forced/cleanup.exit-code") == 0 &&
        $(cat -- "$output/normal/probe.complete") == 1 &&
-       $(cat -- "$output/forced/probe.complete") == 1 ]]
+       $(cat -- "$output/forced/probe.complete") == 1 &&
+       -s $output/normal/kernel.txt && -s $output/forced/kernel.txt ]]
 }
 
 main() {
@@ -195,7 +240,7 @@ main() {
     [[ $output == "$(realpath -e -- "$RUNNER_TEMP")/"* && $output != "$repository/"* ]] || return 1
     mkdir -p -- "$output"
     [[ $(stat -c %u -- "$output") == "$runner_uid" && ! -L $output ]] || return 1
-    for tool in sudo mkfs.ext4 losetup mount umount mountpoint findmnt python3 flock cargo rustc; do
+    for tool in sudo mkfs.ext4 mkfs.btrfs losetup mount umount mountpoint findmnt python3 flock cargo rustc; do
         command -v "$tool" >/dev/null || { echo "A1_SETUP_FAILURE: missing $tool" >&2; return 1; }
     done
     # All builds are unprivileged, unique per engine, and finish before setup.

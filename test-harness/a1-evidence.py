@@ -59,9 +59,24 @@ LINUX = {
     ),
     LINUX_MODULE + PREFIX + "linux_ext4_casefold": (
         "linux.ext4_casefold_identity", "linux.ext4_casefold_flags", "linux.ext4_casefold_names",
+        "linux.ext4_casefold_refusal",
     ),
     LINUX_MODULE + PREFIX + "linux_classification_errors": ("linux.classification_errors",),
     LINUX_MODULE + PREFIX + "linux_pending_after_experiment": ("linux.pending_experiments",),
+    LINUX_MODULE + PREFIX + "linux_rule_table": (
+        "seam.linux_rule_table", "seam.rule_abi_gate", "seam.rule_failures_unavailable",
+        "seam.ext_frozen_errors", "seam.tmpfs_casefold_refusal", "seam.btrfs_casefold_refusal",
+    ),
+    INDEX_MODULE + PREFIX + "family_equivalence": ("seam.family_equivalence",),
+    INDEX_MODULE + PREFIX + "family_reserved_suffix": ("seam.family_reserved_suffix",),
+    INDEX_MODULE + PREFIX + "family_name_length": ("seam.family_name_length",),
+    **{LINUX_MODULE + PREFIX + test: tuple(f"linux.{prefix}_{part}" for part in parts)
+       for test, prefix, parts in (
+           ("linux_tmpfs_rule", "tmpfs_rule", ("flags", "existing", "absent", "family", "length")),
+           ("linux_ext4_rule", "ext4_rule", ("flags", "existing", "absent", "family", "length")),
+           ("linux_btrfs", "btrfs", ("identity", "rule_flags", "rule_existing", "rule_absent",
+                                     "rule_family", "rule_length")),
+       )},
 }
 MACOS = {
     MACOS_MODULE + PREFIX + "macos_apfs_identity": ("macos.apfs_identity",),
@@ -105,10 +120,13 @@ OPTIONAL_SKIP_CAUSES = {
 LOCAL_FIXTURES = {
     "linux.ext4_sensitive": LINUX_MODULE + PREFIX + "linux_ext4",
     "linux.ext4_casefold": LINUX_MODULE + PREFIX + "linux_ext4_casefold",
+    "linux.ext4_rule": LINUX_MODULE + PREFIX + "linux_ext4_rule",
+    "linux.btrfs": LINUX_MODULE + PREFIX + "linux_btrfs",
 }
 FIXTURES = {
     **LOCAL_FIXTURES,
     "linux.tmpfs": LINUX_MODULE + PREFIX + "linux_tmpfs",
+    "linux.tmpfs_rule": LINUX_MODULE + PREFIX + "linux_tmpfs_rule",
     "linux.pending_experiments": LINUX_MODULE + PREFIX + "linux_pending_after_experiment",
     "macos.apfs_identity": MACOS_MODULE + PREFIX + "macos_apfs_identity",
     "macos.apfs_insensitive": MACOS_MODULE + PREFIX + "macos_apfs_modes",
@@ -130,6 +148,9 @@ FIXTURE_ROOTS = {
     LINUX_MODULE + PREFIX + "linux_ext4": ("linux.ext4_sensitive",),
     LINUX_MODULE + PREFIX + "linux_ext4_casefold": ("linux.ext4_casefold",),
     LINUX_MODULE + PREFIX + "linux_pending_after_experiment": ("linux.pending_experiments",),
+    LINUX_MODULE + PREFIX + "linux_tmpfs_rule": ("linux.tmpfs_rule",),
+    LINUX_MODULE + PREFIX + "linux_ext4_rule": ("linux.ext4_rule",),
+    LINUX_MODULE + PREFIX + "linux_btrfs": ("linux.btrfs",),
     MACOS_MODULE + PREFIX + "macos_apfs_identity": ("macos.apfs_identity",),
     MACOS_MODULE + PREFIX + "macos_apfs_modes": ("macos.apfs_insensitive", "macos.apfs_sensitive"),
     MACOS_MODULE + PREFIX + "macos_forced_objid_fallback": ("macos.objid_fallback",),
@@ -141,9 +162,15 @@ FIXTURE_ROOTS = {
     WINDOWS_MODULE + PREFIX + "windows_native_errors": ("windows.native_errors",),
     WINDOWS_MODULE + PREFIX + "windows_pending_after_experiment": ("windows.pending_experiments",),
 }
+FIXTURE_VARIABLES = ("RRS_A1_TMPFS_ROOT", "RRS_A1_EXT4_ROOT", "RRS_A1_BTRFS_ROOT")
+# Explicit: an unmapped Linux fixture group fails at import instead of falling back.
+LINUX_ROOT_VARIABLES = {
+    **dict.fromkeys(("linux.tmpfs", "linux.pending_experiments", "linux.tmpfs_rule"), FIXTURE_VARIABLES[0]),
+    **dict.fromkeys(("linux.ext4_sensitive", "linux.ext4_casefold", "linux.ext4_rule"), FIXTURE_VARIABLES[1]),
+    "linux.btrfs": FIXTURE_VARIABLES[2],
+}
 ROOT_VARIABLES = {
-    group: ("RRS_A1_TMPFS_ROOT" if group in ("linux.tmpfs", "linux.pending_experiments")
-            else "RRS_A1_EXT4_ROOT" if group.startswith("linux.")
+    group: (LINUX_ROOT_VARIABLES[group] if group.startswith("linux.")
             else "RRS_A1_APFS_SENSITIVE_ROOT" if group == "macos.apfs_sensitive"
             else "RRS_A1_APFS_ROOT" if group.startswith("macos.") else "RRS_A1_NTFS_ROOT")
     for roots in FIXTURE_ROOTS.values() for group in roots
@@ -196,7 +223,12 @@ def check(transcript, profile, exit_code):
                     f"unrecognized skip text: {line}")
 
     manifest = MANIFESTS[profile]
+    owners = Counter(group for groups in manifest.values() for group in groups)
+    duplicates = sorted(group for group, count in owners.items() if count > 1)
+    require(not duplicates, f"duplicate group owner: {', '.join(duplicates)}")
     group_owner = {group: name for name, groups in manifest.items() for group in groups}
+    fixture_owned = {group for group, name in group_owner.items() if name in FIXTURE_ROOTS}
+    require(fixture_owned.isdisjoint(set(group_owner) - fixture_owned), "fixture/non-fixture group overlap")
     optional = OPTIONAL_SUBGROUPS.get(profile, {})
     stack = []
     families = []
@@ -353,12 +385,17 @@ def check(transcript, profile, exit_code):
     require(expected_roots <= roots_seen, "missing fixture root/mode observation")
     require(set(optional_seen) == set(optional), "missing optional subgroup outcome")
     require(tuple(children) == (LOCK_ROLES if LOCK_PARENT in manifest else ()), "missing six child outcomes")
+    # Credit follows fixture ownership and an observed root line, never a group prefix.
+    native = sorted(group for group in groups if group in fixture_owned
+                    and all((group_owner[group], root) in roots_seen for root in FIXTURE_ROOTS[group_owner[group]]))
+    require(set(native) == fixture_owned & set(groups), "native group without root observation")
     return {
         "result": "LOCAL_PARTIAL_EVIDENCE" if profile == "local-linux-partial" else "NATIVE_EVIDENCE_COMPLETE",
         "profile": profile, "parent_statuses": len(parents), "parent_completions": len(completions),
         "required_groups_completed": len(groups), "required_groups_total": len(group_owner),
         "lock_children": len(children), "optional_fixture_skips": sorted(fixture_skips),
         "optional_subgroups": sorted(optional_seen),
+        "native_groups": native, "non_native_groups": sorted(set(groups) - fixture_owned),
     }
 
 
@@ -495,7 +532,7 @@ RECORDED_ENV = (
     "TMPDIR", "CARGO_BUILD_JOBS", "CARGO_TARGET_DIR", "CARGO_TERM_COLOR",
     "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "MACOSX_DEPLOYMENT_TARGET",
     "RATARMOUNT_TEST_SQLITE_BACKEND", "RRS_A1_STRICT_ENGINE", "RRS_A1_ENGINE_EXE",
-    "RRS_A1_REQUIRE_FIXTURES", "RRS_A1_TMPFS_ROOT", "RRS_A1_EXT4_ROOT",
+    "RRS_A1_REQUIRE_FIXTURES", *FIXTURE_VARIABLES,
     "RRS_A1_LOCK_CHILD", "RRS_A1_LOCK_ROLE",
 )
 
@@ -600,7 +637,7 @@ def cell_environment(cell, *, executable=None, qualified=True):
         if key.startswith("RRS_A1_") or key == "RATARMOUNT_TEST_SQLITE_BACKEND":
             env.pop(key, None)
     # Fixture paths are passed explicitly by the approved fixture owner.
-    for key in ("RRS_A1_TMPFS_ROOT", "RRS_A1_EXT4_ROOT"):
+    for key in FIXTURE_VARIABLES:
         if key in os.environ:
             env[key] = os.environ[key]
     env.update(TMPDIR="/var/tmp", CARGO_BUILD_JOBS="2", CARGO_TERM_COLOR="never",
@@ -995,7 +1032,7 @@ def verify_run_cell(cell):
         verify_binary_record(record, cell, package, A1_RUN_ARGS, status=None)
         require(record["env"].get("RRS_A1_REQUIRE_FIXTURES") == "1"
                 and all(record["env"].get(variable) and record["env"][variable] == cell["fixture_roots"][variable]
-                        for variable in ("RRS_A1_TMPFS_ROOT", "RRS_A1_EXT4_ROOT")),
+                        for variable in FIXTURE_VARIABLES),
                 "strict fixtures environment missing")
         raw.append(record["stdout"])
     combined = "".join(raw)  # Whole raw required transcripts, never SQLAR's zero-test inventory.
@@ -1009,7 +1046,7 @@ def verify_run_cell(cell):
 
 def run_cell(cell, output):
     verify_artifacts(cell)
-    cell["fixture_roots"] = {key: os.environ.get(key) for key in ("RRS_A1_TMPFS_ROOT", "RRS_A1_EXT4_ROOT")}
+    cell["fixture_roots"] = {key: os.environ.get(key) for key in FIXTURE_VARIABLES}
     cell["lists"], cell["runs"], cell["sqlar_groups"] = {}, {}, {}
     for package in PACKAGES:
         record = run_binary(cell, package, [PREFIX, "--list"], output, package + "-list")
@@ -1127,7 +1164,7 @@ def engine_mutations(cells, output):
 
 def verify_linux_fixture(root, mount, source, kind):
     require(os.geteuid() != 0 and os.getegid() != 0, "fixture requires unprivileged UID/GID")
-    require(kind in ("tmpfs", "ext4") and root.is_absolute() and mount.is_absolute()
+    require(kind in ("tmpfs", "ext4", "btrfs") and root.is_absolute() and mount.is_absolute()
             and root.resolve(strict=True) == root and mount.resolve(strict=True) == mount
             and root.is_relative_to(mount), "fixture root/mount must be exact canonical paths")
     info = root.lstat()
@@ -1141,8 +1178,14 @@ def verify_linux_fixture(root, mount, source, kind):
         fields, device = before.split(), after.split()
         if decode(fields[4]) == str(mount):
             matches.append((device[0], decode(device[1]), fields[2]))
-    require(matches == [(kind, source, f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}")]
-            and linux_mount_type(root) == kind, "fixture mount source/fs/device mismatch or stacked mount")
+    stat_device = f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}"
+    if kind == "btrfs":
+        # mountinfo prints sb->s_dev; btrfs stat reports the subvolume's anonymous
+        # device. Require the root's subvolume to be the mount target's, not equality.
+        same = len(matches) == 1 and matches[0][:2] == (kind, source) and mount.stat().st_dev == info.st_dev
+    else:
+        same = matches == [(kind, source, stat_device)]
+    require(same and linux_mount_type(root) == kind, "fixture mount source/fs/device mismatch or stacked mount")
     # Traversal and actual create/read/reopen/unlink happen as this runner.
     with tempfile.TemporaryDirectory(prefix="a1-owner-", dir=root) as directory:
         child = Path(directory)
@@ -1153,7 +1196,9 @@ def verify_linux_fixture(root, mount, source, kind):
         require(probe.read_bytes() == b"owned native fixture\n", "fixture create/use probe failed")
         probe.unlink()
     return {"root": str(root), "mount": str(mount), "source": source, "kind": kind,
-            "uid": info.st_uid, "gid": info.st_gid, "mode": "0700", "create_use": True}
+            "uid": info.st_uid, "gid": info.st_gid, "mode": "0700", "create_use": True,
+            "kernel_release": platform.release(), "machine": platform.machine(),
+            "mountinfo_device": matches[0][2], "stat_device": stat_device}
 
 
 def root_controls(tmpfs_root, scratch_root, output, engines):
@@ -1189,10 +1234,13 @@ def root_controls(tmpfs_root, scratch_root, output, engines):
             ("required-tmpfs-relative", "RRS_A1_TMPFS_ROOT", "linux.tmpfs", "linux_tmpfs", Path("relative-a1-root"), True, "cause=root must be an explicit absolute"),
             ("required-tmpfs-unwritable", "RRS_A1_TMPFS_ROOT", "linux.tmpfs", "linux_tmpfs", unwritable, True, "cause=root not writable:"),
             ("optional-tmpfs-unwritable", "RRS_A1_TMPFS_ROOT", "linux.tmpfs", "linux_tmpfs", unwritable, False, "cause=root not writable:"),
+            ("required-btrfs-missing", "RRS_A1_BTRFS_ROOT", "linux.btrfs", "linux_btrfs", owned / "missing-btrfs", True, "cause=root metadata:"),
+            ("optional-btrfs-missing", "RRS_A1_BTRFS_ROOT", "linux.btrfs", "linux_btrfs", owned / "missing-btrfs", False, "cause=root metadata:"),
+            ("required-btrfs-unset", "RRS_A1_BTRFS_ROOT", "linux.btrfs", "linux_btrfs", None, True, "cause=root is unset"),
+            ("required-btrfs-wrong-type", "RRS_A1_BTRFS_ROOT", "linux.btrfs", "linux_btrfs", tmpfs_root, True, "cause=wrong filesystem:"),
         )
         for name, variable, group, suffix, root, required, cause in probes:
-            overrides = {"RRS_A1_TMPFS_ROOT": None, "RRS_A1_EXT4_ROOT": None,
-                         "RRS_A1_REQUIRE_FIXTURES": "1" if required else "0"}
+            overrides = {**dict.fromkeys(FIXTURE_VARIABLES), "RRS_A1_REQUIRE_FIXTURES": "1" if required else "0"}
             if root is not None:
                 overrides[variable] = str(root)
             test = LINUX_MODULE + PREFIX + suffix
@@ -1242,7 +1290,7 @@ def main(argv=None):
     fixture_command.add_argument("--root", type=Path, required=True)
     fixture_command.add_argument("--mount", type=Path, required=True)
     fixture_command.add_argument("--source", required=True)
-    fixture_command.add_argument("--kind", choices=("tmpfs", "ext4"), required=True)
+    fixture_command.add_argument("--kind", choices=("tmpfs", "ext4", "btrfs"), required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "check":
