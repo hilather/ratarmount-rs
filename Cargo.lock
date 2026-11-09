@@ -4856,7 +4856,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "clap",
@@ -4914,7 +4914,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-9p"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "libc",
  "log",
@@ -4927,7 +4927,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-checked-open-fixture"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "libc",
  "ratarmount-index",
@@ -4937,7 +4937,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-compositing"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -4966,7 +4966,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-compress"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "bzip2",
  "crc32fast",
@@ -4990,7 +4990,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-core"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "libc",
  "log",
@@ -5000,7 +5000,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-csi"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "clap",
  "env_logger",
@@ -5024,7 +5024,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-export-core"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "libc",
  "log",
@@ -5036,7 +5036,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-ar"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "libc",
  "log",
@@ -5049,7 +5049,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-asar"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "libc",
  "log",
@@ -5063,7 +5063,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-block"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "crc32fast",
  "fatfs",
@@ -5077,7 +5077,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-cab"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "libc",
@@ -5091,7 +5091,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-cpio"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "libc",
  "log",
@@ -5104,7 +5104,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-dmg"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "bzip2",
  "fatfs",
@@ -5123,7 +5123,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-exfat"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "ratarmount-core",
  "tempfile",
@@ -5132,7 +5132,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-ext4"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "ext4-view",
  "libc",
@@ -5145,7 +5145,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-fat"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "fatfs",
  "libc",
@@ -5157,7 +5157,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-git"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "errno",
  "flate2",
@@ -5172,7 +5172,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-html"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -5188,7 +5188,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-iso9660"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "bzip2",
  "libc",
@@ -5202,7 +5202,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-libarchive"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "libc",
  "log",
@@ -5215,7 +5215,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-ntfs"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "log",
  "ntfs",
@@ -5226,7 +5226,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-ogg"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "libc",
  "log",
@@ -5240,7 +5240,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-pdf"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "libc",
@@ -5255,7 +5255,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-qcow2"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "fatfs",
  "flate2",
@@ -5270,7 +5270,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-restic"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "aes 0.8.4",
  "base64 0.22.1",
@@ -5290,7 +5290,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-sevenzip"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "aes 0.8.4",
  "bzip2",
@@ -5311,7 +5311,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-sqlar"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "libc",
@@ -5327,7 +5327,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-squashfs"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "backhand",
  "libc",
@@ -5341,7 +5341,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-tar"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "bzip2",
  "encoding_rs",
@@ -5356,7 +5356,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-tensors"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "ratarmount-compress",
  "ratarmount-core",
@@ -5372,7 +5372,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-udf"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "ratarmount-core",
  "tempfile",
@@ -5381,7 +5381,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-vhd"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "fatfs",
  "log",
@@ -5395,7 +5395,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-vmdk"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "fatfs",
  "ratarmount-core",
@@ -5408,7 +5408,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-warc"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "libc",
  "log",
@@ -5422,7 +5422,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-wim"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "ratarmount-core",
  "sha1 0.10.7",
@@ -5432,7 +5432,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-xar"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "bzip2",
  "flate2",
@@ -5449,7 +5449,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-zip"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "libc",
@@ -5464,7 +5464,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-fuse"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5481,7 +5481,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-http"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "libc",
  "log",
@@ -5495,7 +5495,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-index"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "bzip2",
  "crc32fast",
@@ -5518,7 +5518,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-nfs"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5537,7 +5537,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-python"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "pyo3",
@@ -5551,7 +5551,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-remote"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5583,7 +5583,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-session"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "bzip2",
  "flate2",
@@ -5637,7 +5637,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-sftp"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "libc",
  "log",
@@ -5654,7 +5654,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-smb"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -5674,7 +5674,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-volume-plugin"
-version = "0.1.37"
+version = "0.2.0"
 dependencies = [
  "clap",
  "libc",
