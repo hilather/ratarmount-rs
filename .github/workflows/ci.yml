@@ -10,11 +10,11 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
-  # Linux host CI jobs pinned to ubuntu-24.04 while ISSUE-TBD
+  # Linux host CI jobs pinned to ubuntu-24.04 while hilather/ratarmount-rs#280
   # (ubuntu-26.04 GNU tar lseek EOVERFLOW; hilather/ratarmount-rs#73/#79).
   check:
     name: fmt + clippy + test
-    runs-on: ubuntu-24.04  # ISSUE-TBD
+    runs-on: ubuntu-24.04  # hilather/ratarmount-rs#280
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -156,7 +156,7 @@ jobs:
   # cannot go stale. Soft-skip is not allowed for the unit tests.
   nfsv4:
     name: nfsv4 feature tests
-    runs-on: ubuntu-24.04  # ISSUE-TBD
+    runs-on: ubuntu-24.04  # hilather/ratarmount-rs#280
     steps:
       - uses: actions/checkout@v4
 
@@ -199,7 +199,7 @@ jobs:
   # (`RATARMOUNT_TEST_LSD` / `RATARMOUNT_TEST_MAGNET` stay unset).
   bittorrent:
     name: bittorrent feature tests
-    runs-on: ubuntu-24.04  # ISSUE-TBD
+    runs-on: ubuntu-24.04  # hilather/ratarmount-rs#280
     timeout-minutes: 30
     env:
       # Same as packages.yml: -Dwarnings on this job would also cover
@@ -233,7 +233,7 @@ jobs:
   # No /dev/fuse and no Python required at runtime (--no-mount only).
   benchmark-gates:
     name: benchmark gates (cold index)
-    runs-on: ubuntu-24.04  # ISSUE-TBD
+    runs-on: ubuntu-24.04  # hilather/ratarmount-rs#280
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -272,7 +272,7 @@ jobs:
   # Also runnable via workflow_dispatch for ad-hoc full checks.
   benchmark-gates-full:
     name: benchmark gates (full ratios, soft-skip)
-    runs-on: ubuntu-24.04  # ISSUE-TBD
+    runs-on: ubuntu-24.04  # hilather/ratarmount-rs#280
     timeout-minutes: 45
     # Always on PR/push like the cold job, but soft on ratio availability.
     steps:
@@ -307,7 +307,7 @@ jobs:
 
   fuse-harness:
     name: FUSE phase allowlists
-    runs-on: ubuntu-24.04  # ISSUE-TBD
+    runs-on: ubuntu-24.04  # hilather/ratarmount-rs#280
     needs: check
     timeout-minutes: 45
     steps:
@@ -579,7 +579,7 @@ jobs:
   # the declared toolchain.
   msrv:
     name: msrv
-    runs-on: ubuntu-24.04  # ISSUE-TBD
+    runs-on: ubuntu-24.04  # hilather/ratarmount-rs#280
     steps:
       - uses: actions/checkout@v4
 
