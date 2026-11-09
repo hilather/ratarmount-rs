@@ -437,6 +437,64 @@ mod protocol {
         assert_eq!(records[2]["layer"], "base");
     }
 
+    /// Regression: fuse_req LOOKUP/GETATTR/READDIRPLUS counters and lookup_enoent.
+    #[test]
+    fn regression_fuse_req_lookup_getattr_readdirplus_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = RatarmountFs::new(Arc::new(Source), None)
+            .with_activity(
+                &dir.path().join("mnt"),
+                oplog::MountActivity {
+                    journal: Some(oplog::JournalOptions {
+                        path: dir.path().join("trace"),
+                        exclude: vec![],
+                        reads: oplog::Reads::All,
+                        sync: true,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut h = Harness::with_capabilities(
+            activity_mount_config(false, "", true),
+            4096,
+            fs,
+            InitFlags::all() & !InitFlags::FUSE_SETXATTR_EXT,
+        );
+        let uid = unsafe { libc::geteuid() };
+        let release = |fh: u64| [fh.to_ne_bytes().to_vec(), words(&[0, 0, 0, 0])].concat();
+        // LOOKUP success
+        let ino = u64_at(&h.call(1, 1, b"f\0"), 0);
+        // LOOKUP ENOENT
+        let miss = h.call_as(1, 1, uid, b"missing\0");
+        assert_eq!(u32_at(&miss, 4) as i32, -libc::ENOENT);
+        // GETATTR (getattr_in is 16 bytes)
+        h.call(3, ino, &[0; 16]);
+        // OPENDIR + READDIRPLUS once
+        let dir_fh = u64_at(&h.call(27, 1, &words(&[0, 0])), 0);
+        h.call(44, 1, &read_args(dir_fh, 0, 4096));
+        h.call(29, 1, &release(dir_fh));
+        let mut get = words(&[4096, 0]);
+        get.extend(b"user.ratarmount.stats\0");
+        let stats: serde_json::Value = serde_json::from_slice(&h.call(22, 1, &get)).unwrap();
+        for key in [
+            "bytes_read",
+            "bytes_written",
+            "files_touched",
+            "overlay_bytes",
+            "ops",
+            "erofs_denied",
+            "journal_error",
+        ] {
+            assert!(stats.get(key).is_some(), "missing legacy stats key {key}");
+        }
+        assert_eq!(stats["fuse_req"]["lookup"], 2);
+        assert_eq!(stats["fuse_req"]["lookup_enoent"], 1);
+        assert_eq!(stats["fuse_req"]["getattr"], 1);
+        assert_eq!(stats["fuse_req"]["readdirplus"], 1);
+        h.finish();
+    }
+
     fn read_args(fh: u64, offset: u64, size: u32) -> Vec<u8> {
         let mut body = fh.to_ne_bytes().to_vec();
         body.extend(offset.to_ne_bytes());

@@ -175,6 +175,7 @@ These are **illustrative** of what the harness is designed to surface; re-run lo
 - Mount options parity: [`docs/mount-options-parity.md`](mount-options-parity.md) (`--readahead`, `-o`)  
 - Gzip G3 polish / spacing: [`docs/gzip-binding-decision.md`](gzip-binding-decision.md), [`docs/tasks/g3-polish-batch.md`](tasks/g3-polish-batch.md)  
 - General benches: [`benchmarks/README.md`](../benchmarks/README.md)
+- Mount root `user.ratarmount.stats` / `fuse_req` counters: [`docs/sandbox.md`](sandbox.md) (xattrs / stats)
 
 ## Linux FUSE passthrough
 

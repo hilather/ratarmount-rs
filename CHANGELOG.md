@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changes
+
+- **FUSE request counters in `user.ratarmount.stats`:** nested `fuse_req` object with `lookup`, `lookup_enoent`, `getattr`, and `readdirplus` counts incremented at the FUSE trait handlers (once per request; `lookup_enoent` on ENOENT replies). Does not duplicate `ops.*` journal counters. See [sandbox xattrs](docs/sandbox.md).
+
 ## 0.2.0 (2026-11-09)
 
 ### Compatibility notes
