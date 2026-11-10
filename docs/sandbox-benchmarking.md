@@ -1,4 +1,4 @@
-# Sandbox benchmark validation and schedules
+# Sandbox benchmark validation, schedules and native lifecycle
 
 Linux builds expose the hidden validator:
 
@@ -78,7 +78,7 @@ Empty or whitespace-only argv elements and environment values are also refused.
 Resource limits must be positive. Dependency locations are absolute container paths,
 independent of the manifest location: base strictly below `/repo`, excluding `/repo/blib`,
 and build under `/repo/blib`, with the same lexical path rules. Command and resource
-fields are validated now for later execution; this command executes nothing.
+fields are validated without execution by `--validate-only` and `--dry-run`.
 Draft results remain **not yet run — pins unresolved**; target hosts **need hardware**.
 
 Linux builds also schedule without executing:
@@ -88,8 +88,8 @@ ratarmount sandbox bench --manifest tasks.json --dry-run --jobs 1
 ratarmount sandbox bench --manifest tasks.json --dry-run --task mojolicious --backend native,fuse --base-form git,tar.zst-single-frame --jobs 1,2,8 --cache cold,warm --repeats 5 --seed 1 --attempts 1 --allow-oversubscription
 ```
 
-Exactly one of `--validate-only` or `--dry-run` is required. Selection options
-require `--dry-run`; `--require-pins` works with either mode. Validation runs
+Exactly one of `--validate-only`, `--dry-run` or `--out DIR` is required. Selection options
+work with scheduling or execution; `--require-pins` works with every mode. Validation runs
 before admission and preserves the exit statuses above. Inherited `--socket`
 is rejected before manifest I/O. Any admission refusal, including oversubscription or a backend, row or job that a selected task does not support, refuses the whole selection with exit **2** and empty stdout;
 schedule reporting failures exit **1**.
@@ -103,16 +103,15 @@ For draft rows, candidate jobs remain selectable with their qualification reason
 Jobs above the task's `resources.cpus` are refused unless
 `--allow-oversubscription` is supplied; both the override and whether the cell
 actually exceeds that CPU limit are recorded. The override does not admit
-unsupported jobs. No host capacity, runtime or source availability is probed.
+unsupported jobs. Dry-run probes no host capacity, runtime or source availability.
 
 Stdout contains one `rrs-perl-bench-schedule/1` JSON object per line. No output
 files, work roots or prepared sources are created. Each entry records the cell,
 catalog revision, backend, kind, repeat, pairing, seed, repeats, attempts, CPU
 limit, admission override and availability. `qualified` describes the validated
-manifest claim; `execution_available` and `runnable` are **false** in this slice,
-including for qualified rows. `reasons` retains draft qualification reasons and
-explains that execution is unavailable. These are planned entries, not results.
-Runtime, output, work-root and high-load options are deferred.
+manifest claim. `execution_available` and `runnable` are true only for qualified
+native/warm/`tar.zst-single-frame` entries. Other entries retain an unavailable
+reason; executable entries explicitly remain ungraded. These are planned entries, not results.
 
 A cell is the canonical JSON tuple `[task, platform, base_form, jobs, cache]`.
 Cells sort by the lowercase SHA-256 digest of the JSON tuple
@@ -131,3 +130,60 @@ cells have no FUSE probe. References, warm-ups and probes have no measured repea
 number; warm-ups explicitly set `discarded:true`. The probe is a lifecycle
 placeholder without suite phases. Scheduling performs no cache treatment,
 mounting, source preparation or runtime execution, and produces no benchmark numbers.
+
+Native execution is available with an explicit local Docker-compatible executable:
+
+```sh
+ratarmount sandbox bench --manifest tasks.json --backend native --cache warm --base-form tar.zst-single-frame --repeats 5 --out /results/batch-1 --work-root /scratch/bench --runtime /usr/bin/docker
+```
+
+`--out` creates a fresh private directory; its parent and `--work-root` must exist.
+The work-root default is `/var/tmp`. Execution requires every manifest pin and
+qualification to be resolved and selected jobs to be supported. FUSE, Git and
+cold selections are refused as a whole before setup. Canonical source, output
+and scratch paths (including declared placement roots) must not overlap.
+Any selected FUSE entry takes refusal precedence with
+`FUSE execution unavailable: lifecycle deferred to B5a1a`.
+Artifact final symlinks are refused. Artifact SHA-256 and the exact local image's
+RepoDigests, OS and architecture are checked before private roots are created;
+there is no fetching, pulling or source substitution.
+
+A checked Linux `getloadavg` reading measures one-minute host load against the
+strictest selected `max_load`. Failure, invalid readings and excessive load
+refuse execution unless `--allow-high-load` is supplied. Outcomes record the
+reading or failure and the override. CPU oversubscription remains a separate
+`--allow-oversubscription` admission decision.
+
+Every reference, discarded warm-up and measurement extracts a fresh tree from
+the pinned single-frame zstd artifact and verifies the complete tar-stream digest.
+Extraction permits regular files, directories and confined relative symlinks;
+it refuses duplicate or unsafe paths, extended/special headers and mode bits above 0777.
+No descent follows archive symlinks. Bounds are 100000 entries, 128 path components,
+4096 path bytes, a 128 MiB decoder window and the smaller of `disk_bytes` or 16 GiB
+for each compressed/decoded stream. Directories start at 0700; recorded modes
+and mtimes are applied after descendants. Bench private roots stay 0700.
+An extraction failure records an ungraded outcome and removes the partial tree
+and private scratch root before returning exit **1**, without starting a runtime.
+
+The detached runtime uses `run -d --init --pull=never --name NAME`, binds the fresh
+tree at `/repo`, sets `/repo` as cwd, disables networking, drops all capabilities,
+sets no-new-privileges, limits PIDs and runs as the invoking UID:GID. Every run
+uses the same task CPU/memory limits and `IMAGE sleep infinity`. Configure,
+build and test are separate `exec` clients with `{jobs}` substitutions and
+owned 0600 stdout/stderr logs. Completed log reads are bounded to 64 KiB each.
+Execution timeouts must be **1..=86400 seconds** (one day), checked before any
+phase or deadline construction; validation-only mode retains the schema's positive-timeout rule.
+
+Timeout/interruption stops and removes the container, reaps outstanding clients,
+and repeats stop/removal after a possibly late startup. Stop failure preserves
+the tree and recovery record and blocks deletion. Recovery records name the
+executable, container and tree; investigate failed stops before manual cleanup.
+`outcomes.jsonl` contains explicit ungraded lifecycle outcomes, phases, load and
+cleanup errors. Execution returns **1** even if every phase exits zero: benchmark
+verification is unavailable until B4a2. There is no verified canonical batch,
+throughput or benchmark-success claim.
+
+Scheduling is capped at **100000 total entries**, with exit **2** through
+`selection:` before allocating the full entry list or starting execution. A cell
+has at most one reference, two warm-ups, `2*repeats` measurements and one FUSE
+probe (204 at repeats=100). This cap also applies to dry-run.

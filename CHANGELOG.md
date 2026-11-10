@@ -4,6 +4,8 @@
 
 ### Changes
 
+- Hidden Linux `sandbox bench --out DIR --runtime PATH` executes qualified native/warm/single-frame archive lifecycles with bounded extraction and runtime cleanup. Outcomes remain ungraded and return nonzero; verification is deferred. See [the benchmark guide](docs/sandbox-benchmarking.md).
+
 - Hidden Linux `sandbox bench --dry-run` emits deterministic seeded schedules with paired backend ordering, draft qualification reasons and CPU admission checks, without executing work. See [the benchmark guide](docs/sandbox-benchmarking.md).
 - Hidden Linux `sandbox bench --manifest PATH --validate-only` validates Perl task manifests and optional strict pins without execution. See [the validator guide](docs/sandbox-benchmarking.md).
 - **FUSE request counters in `user.ratarmount.stats`:** nested `fuse_req` object with `lookup`, `lookup_enoent`, `getattr`, and `readdirplus` counts incremented at the FUSE trait handlers (once per request; `lookup_enoent` on ENOENT replies). Does not duplicate `ops.*` journal counters. See [sandbox xattrs](docs/sandbox.md).
