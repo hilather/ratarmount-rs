@@ -7,6 +7,10 @@ the base unchanged. The [SWE-bench recipe](recipes/swe-bench-sandboxes.md)
 shows a larger harness; the [supervisor API](#sandbox-supervisor-api) manages
 fleets of attempts.
 
+The hidden Linux [`sandbox bench` validator](sandbox-benchmarking.md) checks
+Perl benchmark manifests, including unpinned drafts. It performs validation only;
+it does not execute workloads or establish external qualification.
+
 ## Worked example: snapshot to graded bundle
 
 This small episode runs entirely offline: patch import supplies the edits that

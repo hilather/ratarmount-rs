@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changes
+
+- Hidden Linux `sandbox bench --manifest PATH --validate-only` validates Perl task manifests and optional strict pins without execution. See [the validator guide](docs/sandbox-benchmarking.md).
+
 ## 0.2.1 (2026-11-09)
 
 ### Compatibility notes
