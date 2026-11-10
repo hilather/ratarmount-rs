@@ -1607,7 +1607,9 @@ mod sidecar_s7 {
     /// Regression: a client that requests the sidecar and stops reading held
     /// its reader (and permit) forever, so eight such clients made every
     /// later request 503. The body has a write timeout; the permits come
-    /// back while the stalled sockets are still open.
+    /// back while the stalled sockets are still open. Hold the stalled readers
+    /// in `Acquired` during the saturation probe, then release them into the
+    /// body write (#293).
     #[test]
     fn regression_http_index_sidecar_stalled_reader_releases_reader() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -1619,12 +1621,14 @@ mod sidecar_s7 {
         let h = holder(&idx);
         assert!(other_process_sees_lock(&idx));
         let gate = Arc::new(Gate {
-            open: Mutex::new(true),
+            open: Mutex::new(false),
             cv: Condvar::new(),
             acquired: AtomicUsize::new(0),
             fail_chunks: AtomicBool::new(false),
         });
+        let passed = Arc::new(AtomicUsize::new(0));
         let g2 = Arc::clone(&gate);
+        let p2 = Arc::clone(&passed);
         let srv = serve(
             &idx,
             SidecarAdmission {
@@ -1636,11 +1640,21 @@ mod sidecar_s7 {
                         while !*open {
                             open = g2.cv.wait(open).unwrap();
                         }
+                        p2.fetch_add(1, Ordering::SeqCst);
                     }
                     Ok(())
                 })
             },
         );
+        // Wake parked readers even if the test panics.
+        struct OpenGate(Arc<Gate>);
+        impl Drop for OpenGate {
+            fn drop(&mut self) {
+                *self.0.open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                self.0.cv.notify_all();
+            }
+        }
+        let _open_gate = OpenGate(Arc::clone(&gate));
         let stalled: Vec<TcpStream> = (0..INDEX_SIDECAR_READERS)
             .map(|_| {
                 let mut s = TcpStream::connect(srv.addr).unwrap();
@@ -1651,6 +1665,16 @@ mod sidecar_s7 {
         gate.wait_acquired(INDEX_SIDECAR_READERS);
         let saturated = status(&exchange(srv.addr, HEAD));
         assert_eq!(saturated, 503, "eight stalled readers hold every permit");
+        gate.set(true);
+        // All stalled readers must pass the wait before the gate closes again.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while passed.load(Ordering::SeqCst) < INDEX_SIDECAR_READERS {
+            assert!(
+                Instant::now() < deadline,
+                "stalled readers never passed the gate"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         // Every permit comes back while the stalled sockets are still open:
         // eight readers are admitted at once, and a ninth is refused.
         let deadline = Instant::now() + Duration::from_secs(20);

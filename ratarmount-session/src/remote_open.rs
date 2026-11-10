@@ -3565,6 +3565,8 @@ mod tests {
         addr: std::net::SocketAddr,
         gets: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         range_gets: Arc<std::sync::Mutex<Vec<String>>>,
+        headers_read: Arc<std::sync::atomic::AtomicUsize>,
+        drained: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
         stopped: Arc<std::sync::atomic::AtomicBool>,
         join: Option<std::thread::JoinHandle<()>>,
     }
@@ -3613,7 +3615,7 @@ mod tests {
         ignore_range: bool,
         require_bearer: Option<String>,
     ) -> IndexHttp {
-        use std::io::{BufRead, BufReader, Write as IoWrite};
+        use std::io::{self, BufRead, BufReader, Write as IoWrite};
         use std::net::TcpListener;
         use std::sync::{Arc, Mutex};
         use std::thread;
@@ -3624,6 +3626,10 @@ mod tests {
         let gets_c = Arc::clone(&gets);
         let range_gets = Arc::new(Mutex::new(Vec::new()));
         let ranges = range_gets.clone();
+        let headers_read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let headers_read_c = Arc::clone(&headers_read);
+        let drained = Arc::new(Mutex::new(Vec::new()));
+        let drained_c = Arc::clone(&drained);
         let archive_path = archive_path.to_string();
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = stopped.clone();
@@ -3642,13 +3648,20 @@ mod tests {
                 let mut range_hdr: Option<String> = None;
                 let mut cookie_hdr: Option<String> = None;
                 let mut bearer_hdr: Option<String> = None;
+                let mut content_len = 0u64;
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).is_err() {
                         break;
                     }
                     if line == "\r\n" || line == "\n" || line.is_empty() {
+                        headers_read_c.fetch_add(1, std::sync::atomic::Ordering::Release);
                         break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_len = value.trim().parse().unwrap_or(0);
+                        }
                     }
                     if let Some(v) = line.strip_prefix("Range:") {
                         range_hdr = Some(v.trim().to_string());
@@ -3660,6 +3673,21 @@ mod tests {
                         cookie_hdr = Some(v.trim().to_string());
                     }
                 }
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .split('?')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                // #297: read the body before closing, including on 401 and 404.
+                let drained_bytes =
+                    io::copy(&mut (&mut reader).take(content_len), &mut io::sink()).unwrap_or(0);
+                drained_c
+                    .lock()
+                    .unwrap()
+                    .push((path.clone(), drained_bytes));
                 if let Some(ref want) = require_bearer {
                     assert_eq!(
                         bearer_hdr.as_deref(),
@@ -3679,14 +3707,6 @@ mod tests {
                         continue;
                     }
                 }
-                let path = request_line
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("")
-                    .split('?')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
                 {
                     gets_c.lock().unwrap().push(path.clone());
                 }
@@ -3767,8 +3787,72 @@ mod tests {
             addr,
             gets,
             range_gets,
+            headers_read,
+            drained,
             stopped,
             join: Some(join),
+        }
+    }
+
+    /// Regression: #297 must read PROPFIND bodies before answering and closing.
+    #[test]
+    fn regression_297_index_http_reads_request_body_before_answering() {
+        use std::io::Write;
+        use std::net::TcpStream;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        for (path, require_cookie, status) in [
+            ("/archive.tar", None, "200 OK"),
+            ("/missing", None, "404 Not Found"),
+            ("/archive.tar", Some("session=ok"), "401 Unauthorized"),
+        ] {
+            let http = spawn_index_http(
+                "/archive.tar",
+                b"archive".to_vec(),
+                Default::default(),
+                None,
+                require_cookie.map(str::to_string),
+            );
+            let mut stream = TcpStream::connect(http.addr).unwrap();
+            let timeout = Duration::from_secs(20);
+            stream.set_read_timeout(Some(timeout)).unwrap();
+            stream.set_write_timeout(Some(timeout)).unwrap();
+            let body = [b'x'; 64];
+            let headers_read = http.headers_read.load(Ordering::Acquire);
+            write!(
+                stream,
+                "PROPFIND {path} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                http.addr,
+                body.len()
+            )
+            .unwrap();
+            // No body byte can be buffered before the headers are read.
+            let start = Instant::now();
+            while http.headers_read.load(Ordering::Acquire) == headers_read {
+                assert!(start.elapsed() < timeout, "headers not read for {status}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let write_result = stream.write_all(&body);
+            let mut response = String::new();
+            let read_result = stream.read_to_string(&mut response);
+            let socket_error = stream.take_error();
+            drop(stream);
+
+            let start = Instant::now();
+            let drained = loop {
+                if let Some(record) = http.drained.lock().unwrap().first().cloned() {
+                    break record;
+                }
+                assert!(start.elapsed() < timeout, "no drain record for {status}");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            // Check the drain first so the old helper fails here, even on reset.
+            assert_eq!(drained, (path.to_string(), body.len() as u64), "{status}");
+            write_result.unwrap();
+            read_result.unwrap();
+            assert!(response.starts_with(&format!("HTTP/1.1 {status}\r\n")));
+            assert!(socket_error.unwrap().is_none(), "{status}");
         }
     }
 
