@@ -9373,6 +9373,34 @@
       "rule_reason": "inventory-op:fs::write"
     },
     {
+      "configured_path": "rustix::fs::openat",
+      "item": "ratarmount::sandbox::bench::manifest::open_manifest",
+      "leaf_digest": "cd3d6f32fdadb415777a52092249dc462d57d622a5a4bcc858f8e792fc20e9d0",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "benchmark-manifest",
+        "creation": {
+          "basis": "Read-only existing manifest; no creation, truncation or artifact acquisition.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-GAP0-B2-M01",
+        "item": "ratarmount::sandbox::bench::manifest::open_manifest",
+        "reason": "Read the explicitly selected benchmark manifest with O_NOFOLLOW and O_NONBLOCK, require a regular descriptor, and bound input to 1 MiB plus one overflow byte."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B2-M01\",\"item\":\"ratarmount::sandbox::bench::manifest::open_manifest\",\"disposition\":\"out-of-family\",\"category\":\"benchmark-manifest\",\"reason\":\"Read the explicitly selected benchmark manifest with O_NOFOLLOW and O_NONBLOCK, require a regular descriptor, and bound input to 1 MiB plus one overflow byte.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Read-only existing manifest; no creation, truncation or artifact acquisition.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
       "configured_path": "tempfile::NamedTempFile::new_in",
       "item": "ratarmount::sandbox::daemon::atomic_json",
       "leaf_digest": "ecd765e905e2b5ffee59a27637ffa3e15186b38a15eb130320aaac06d8d2129b",
@@ -21667,7 +21695,7 @@
     }
   ],
   "policy": {
-    "configuration": "2ec098f615ea1dfff57afd4bfda70e68088af7c1fe60cfe4a44d900d0a3c0dc4",
+    "configuration": "75250bfada3554bdc34500f846d5ec68d0911590772352a1854a0b41e35672a2",
     "profiles": "f04aa50122d4ae1f0504b6411c5b47cacf3a97a9e3080e175166f3b744aa4bd8",
     "toolchain": {
       "compiler_revision": "88d9e12ae178fab0fb5cc050a94da85685d449ea",

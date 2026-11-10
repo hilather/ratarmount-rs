@@ -24,6 +24,7 @@ for most people; the last group is for maintainers.
 | [Dataset shards](shards.md) | `ratarmount shard` and `export-index` |
 | [Tensor formats](formats-tensors.md) | Safetensors and GGUF files as directories of tensors |
 | [Sandboxes](sandbox.md) | Read-only paths, quotas, RAM overlays, ownership mapping, the sandbox supervisor and its Python client |
+| [Sandbox benchmark validation](sandbox-benchmarking.md) | Linux-only structural validation of pinned or draft Perl task manifests |
 | [Git mounts](git-mounts.md) | Mount any commit, history-free synthetic heads, pinned code corpora |
 | [Provenance](provenance.md) · [Rolling archives](rolling-archives.md) | Extended attributes that survive commits; archive series that roll by size or time |
 | Recipes | [SWE-bench sandboxes](recipes/swe-bench-sandboxes.md) · [image rootfs + repository](recipes/sandbox-rootfs.md) · [vLLM and llama.cpp models](recipes/local-models.md) · [WebDataset shards](recipes/webdataset-shards.md) · [teacher logits](recipes/teacher-logits.md) · [Common Crawl WARC](recipes/common-crawl-warc.md) · [checkpoint archives](recipes/checkpoint-archives.md) · [publish an index to the Hub](recipes/publish-hf-index.md) · [deduplicated snapshots](recipes/dedup-snapshots.md) |

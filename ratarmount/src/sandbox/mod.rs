@@ -1,5 +1,7 @@
 //! A local supervisor; each attempt owns a foreground ratarmount child.
 
+#[cfg(target_os = "linux")]
+mod bench;
 mod client;
 mod daemon;
 mod finalize;
@@ -49,6 +51,10 @@ pub struct SandboxArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Validate a Perl benchmark manifest (Linux only).
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    Bench(bench::BenchArgs),
     /// Run one container command against a write-overlay stack.
     ///
     /// Mount the stack, run a container, unmount, repair and hash the result, and optionally seal or pack it. Stdout is a JSON report.
@@ -145,12 +151,22 @@ enum Command {
     Shutdown,
 }
 
+pub fn run_cli(args: &SandboxArgs) -> Result<i32, String> {
+    #[cfg(target_os = "linux")]
+    if let Command::Bench(bench) = &args.command {
+        return self::bench::run(bench, args.socket.as_deref());
+    }
+    run(args).map(|()| 0)
+}
+
 pub fn run(args: &SandboxArgs) -> Result<(), String> {
     if let Command::Run(run) = &args.command {
         return self::run::run(run).map_err(|e| e.to_string());
     }
     let socket = args.socket.as_deref().ok_or("--socket PATH is required")?;
     let operation: Op = match &args.command {
+        #[cfg(target_os = "linux")]
+        Command::Bench(_) => return Err("bench requires run_cli".into()),
         Command::Run(_) => unreachable!("handled before daemon socket lookup"),
         Command::Daemon {
             state_dir,

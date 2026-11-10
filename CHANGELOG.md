@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changes
+
+- Hidden Linux `sandbox bench --manifest PATH --validate-only` validates Perl task manifests and optional strict pins without execution. See [the validator guide](docs/sandbox-benchmarking.md).
+
 ### Fixes
 
 - The Rocky 8 `.rpm` vendors OpenSSL statically like the portable tarball, fixing startup failures on Fedora and EL9+ caused by v0.2.0/v0.2.1 linking the build host's `libssl.so.1.1`. A packaging guard checks every payload ELF's direct dependencies against the rpm's `Requires` and rejects dynamic OpenSSL links. (#291)
