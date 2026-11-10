@@ -158,11 +158,12 @@ jobs:
             || dnf config-manager --set-enabled crb 2>/dev/null \
             || true
           if command -v crb >/dev/null 2>&1; then crb enable || true; fi
+          # Vendored OpenSSL's Configure needs IPC::Cmd and Time::Piece on Rocky 8 (#291).
           dnf -y install --allowerasing \
             gcc gcc-c++ make pkgconf-pkg-config git ca-certificates \
-            which findutils tar gzip \
+            which findutils tar gzip cpio \
             fuse3-devel fuse3 libarchive-devel zlib-devel \
-            openssl-devel perl-IPC-Cmd
+            openssl-devel perl-IPC-Cmd perl-Time-Piece
           if ! command -v curl >/dev/null 2>&1; then
             dnf -y install --allowerasing curl
           fi
@@ -193,7 +194,6 @@ jobs:
           PACKAGE_FAMILY: rpm
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
-          OPENSSL_NO_VENDOR: "1"
         run: |
           # shellcheck disable=SC1091
           [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
@@ -203,6 +203,9 @@ jobs:
           cargo --version
           chmod +x packaging/build-native-packages.sh
           bash packaging/build-native-packages.sh
+
+      - name: Check rpm ELF dependencies against Requires
+        run: bash packaging/test-rpm-deps.sh dist/*.rpm
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
