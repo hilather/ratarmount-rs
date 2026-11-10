@@ -1,5 +1,8 @@
 //! A local supervisor; each attempt owns a foreground ratarmount child.
 
+#[cfg(target_os = "linux")]
+mod bench;
+mod client;
 mod daemon;
 mod finalize;
 #[cfg(test)]
@@ -23,12 +26,14 @@ mod state_log;
 mod tests;
 
 use clap::{Parser, Subcommand};
+#[cfg(test)]
+use protocol::VERSION;
 use protocol::{
     BaseOptions, JournalReads, JournalSpec, Op, Operation, OperationV2, Overlay, Request, Response,
-    VERSION, VERSION_2,
 };
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::Write;
+#[cfg(test)]
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -46,6 +51,10 @@ pub struct SandboxArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Validate a Perl benchmark manifest (Linux only).
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    Bench(bench::BenchArgs),
     /// Run one container command against a write-overlay stack.
     ///
     /// Mount the stack, run a container, unmount, repair and hash the result, and optionally seal or pack it. Stdout is a JSON report.
@@ -142,12 +151,22 @@ enum Command {
     Shutdown,
 }
 
+pub fn run_cli(args: &SandboxArgs) -> Result<i32, String> {
+    #[cfg(target_os = "linux")]
+    if let Command::Bench(bench) = &args.command {
+        return self::bench::run(bench, args.socket.as_deref());
+    }
+    run(args).map(|()| 0)
+}
+
 pub fn run(args: &SandboxArgs) -> Result<(), String> {
     if let Command::Run(run) = &args.command {
         return self::run::run(run).map_err(|e| e.to_string());
     }
     let socket = args.socket.as_deref().ok_or("--socket PATH is required")?;
     let operation: Op = match &args.command {
+        #[cfg(target_os = "linux")]
+        Command::Bench(_) => return Err("bench requires run_cli".into()),
         Command::Run(_) => unreachable!("handled before daemon socket lookup"),
         Command::Daemon {
             state_dir,
@@ -272,31 +291,5 @@ pub fn error_exit_code(args: &SandboxArgs) -> i32 {
 }
 
 fn call(socket: &std::path::Path, request: Request) -> Result<Response, String> {
-    let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
-    // Includes queued requests and cleanup of a full batch; callers can retry reads,
-    // but must not blindly retry mutations after a transport failure, except a
-    // `new` or `finalize` retried with the same --request-id and arguments.
-    let timeout = Some(Duration::from_secs(3600));
-    stream
-        .set_read_timeout(timeout)
-        .and_then(|_| stream.set_write_timeout(timeout))
-        .map_err(|e| e.to_string())?;
-    let mut bytes = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
-    bytes.push(b'\n');
-    stream.write_all(&bytes).map_err(|e| e.to_string())?;
-    let mut line = Vec::new();
-    BufReader::new(stream)
-        .take((protocol::MAX_RESPONSE + 1) as u64)
-        .read_until(b'\n', &mut line)
-        .map_err(|e| e.to_string())?;
-    if line.len() > protocol::MAX_RESPONSE || !line.ends_with(b"\n") {
-        return Err("oversized or incomplete sandbox response".into());
-    }
-    let response: Response = serde_json::from_slice(&line).map_err(|e| e.to_string())?;
-    // An older daemon answers a v2 request with a v1 error (unsupported_version).
-    let older_daemon = request.version == VERSION_2 && response.version == VERSION && !response.ok;
-    if response.version != request.version && !older_daemon {
-        return Err("unsupported response version".into());
-    }
-    Ok(response)
+    client::call(socket, request)
 }

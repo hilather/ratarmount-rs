@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changes
+
+- Hidden Linux `sandbox bench --manifest PATH --validate-only` validates Perl task manifests and optional strict pins without execution. See [the validator guide](docs/sandbox-benchmarking.md).
+
 ### Fixes
 
 - Overlay commits that delete, rename or replace members of an ordinary single-stream TAR (uncompressed, gzip, bzip2 or xz) avoid `lseek: Value too large for defined data type` on GNU tar 1.35 builds lacking the upstream `--delete` fix, including Ubuntu 26.04 and Debian 13. Concatenated TARs and unrecognized layouts (including base-256 or PAX sizes and sparse members) still require `--ignore-zeros` and a fixed GNU tar; a GNU tar delete failure leaves the original archive unchanged. (#280)
