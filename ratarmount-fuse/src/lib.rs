@@ -699,6 +699,14 @@ pub struct RatarmountFs {
     read_requested_bytes: AtomicU64,
     read_max_request: AtomicU64,
     read_service_ns: AtomicU64,
+    /// FUSE LOOKUP request entries (incl. failures). Nested under stats as fuse_req.lookup.
+    fuse_req_lookup: AtomicU64,
+    /// LOOKUP replies of ENOENT (missing/invalid-UTF-8/unknown parent).
+    fuse_req_lookup_enoent: AtomicU64,
+    /// FUSE GETATTR request entries.
+    fuse_req_getattr: AtomicU64,
+    /// FUSE READDIRPLUS request entries (once per request).
+    fuse_req_readdirplus: AtomicU64,
     /// Per-handle sequential readahead size in bytes (`0` = disabled).
     readahead_bytes: usize,
     inodes: Mutex<HashMap<u64, InodeEntry>>,
@@ -798,6 +806,10 @@ impl RatarmountFs {
             read_requested_bytes: AtomicU64::new(0),
             read_max_request: AtomicU64::new(0),
             read_service_ns: AtomicU64::new(0),
+            fuse_req_lookup: AtomicU64::new(0),
+            fuse_req_lookup_enoent: AtomicU64::new(0),
+            fuse_req_getattr: AtomicU64::new(0),
+            fuse_req_readdirplus: AtomicU64::new(0),
             inodes: Mutex::new(inodes),
             path_to_ino: Mutex::new(path_to_ino),
             next_ino: AtomicU64::new(FUSE_ROOT_ID + 1),
@@ -950,7 +962,21 @@ impl RatarmountFs {
                 .path()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            "user.ratarmount.stats" => self.oplog.stats(self.activity.quota.as_deref()).to_string(),
+            "user.ratarmount.stats" => {
+                let mut stats = self.oplog.stats(self.activity.quota.as_deref());
+                if let Some(obj) = stats.as_object_mut() {
+                    obj.insert(
+                        "fuse_req".into(),
+                        serde_json::json!({
+                            "lookup": self.fuse_req_lookup.load(Ordering::Relaxed),
+                            "lookup_enoent": self.fuse_req_lookup_enoent.load(Ordering::Relaxed),
+                            "getattr": self.fuse_req_getattr.load(Ordering::Relaxed),
+                            "readdirplus": self.fuse_req_readdirplus.load(Ordering::Relaxed),
+                        }),
+                    );
+                }
+                stats.to_string()
+            }
             _ => unreachable!(),
         };
         Ok(Some(value.into_bytes()))
@@ -3127,13 +3153,18 @@ impl Filesystem for RatarmountFs {
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        self.fuse_req_lookup.fetch_add(1, Ordering::Relaxed);
         match self.lookup_entry(parent.0, name) {
             Some((_, attr, ttl)) => reply.entry(&ttl, &attr, Generation(0)),
-            None => reply.error(Errno::ENOENT),
+            None => {
+                self.fuse_req_lookup_enoent.fetch_add(1, Ordering::Relaxed);
+                reply.error(Errno::ENOENT);
+            }
         }
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        self.fuse_req_getattr.fetch_add(1, Ordering::Relaxed);
         match self.getattr_reply(ino.0) {
             Ok((ttl, attr)) => reply.attr(&ttl, &attr),
             Err(errno) => reply.error(Errno::from_i32(errno)),
@@ -3224,6 +3255,7 @@ impl Filesystem for RatarmountFs {
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
+        self.fuse_req_readdirplus.fetch_add(1, Ordering::Relaxed);
         // Cheap list_mode only — do not call MountSource::list (fat FileInfo map).
         // Full attrs (size/mtime/uid) are filled at getattr/lookup/open.
         // nlookup is not bumped; see [`RatarmountFs::readdirplus_fill`].

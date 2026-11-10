@@ -1106,9 +1106,34 @@ without a write overlay:
 
 `stats` contains `bytes_read`, `bytes_written`, `files_touched` (distinct paths
 observed), `overlay_bytes` (quota usage, or null without a quota policy), `ops`
-(counts by journal operation), `erofs_denied`, and `journal_error` (null or an
-error string). Byte counters update during I/O; aggregated read/write operation
-counts update on RELEASE. All counters are for this mount's lifetime.
+(counts by journal operation), `erofs_denied`, `journal_error` (null or an
+error string), and nested `fuse_req` FUSE request counters. Byte counters
+update during I/O; aggregated `ops` read/write counts update on RELEASE.
+`fuse_req` counters update live, once per matching FUSE request, from daemon
+construction (unlike RELEASE-time `ops`). All counters are for this mount's
+lifetime.
+
+| Key | Meaning |
+| --- | --- |
+| `fuse_req.lookup` | FUSE LOOKUP entries (including failures) |
+| `fuse_req.lookup_enoent` | LOOKUP replies of ENOENT, including missing names, invalid-UTF-8 names, and unknown parents |
+| `fuse_req.getattr` | FUSE GETATTR entries |
+| `fuse_req.readdirplus` | FUSE READDIRPLUS entries (once per request, even if helpers run more than once) |
+
+Comparison with related counters:
+
+| Family | What it counts | When it updates |
+| --- | --- | --- |
+| `ops.open` / `ops.readdir` / `ops.read` | Successful OPENs; directory handles listed (READDIR or READDIRPLUS, first call per handle); handles that read, counted at RELEASE | Journal/`OpLog` emit path (every mount) |
+| `fuse_req.*` | Raw FUSE LOOKUP / GETATTR / READDIRPLUS request entries (and LOOKUP ENOENT) | Trait handler entry / ENOENT reply |
+| Unmount log `fuse-read-summary` | Per-request READ totals (`requests`, `requested_bytes`, …) | Unmount only |
+
+Per-request READDIR counts are not exposed in this slice. Per-request attr/name
+cache-hit authority is not exposed in this slice. Readers
+that probe xattr size then value (for example `getfattr`) may see ERANGE more
+often under load as `fuse_req` grows the JSON; retry with a larger buffer, or
+use `os.getxattr`, which does not size-probe first. See also
+[FUSE kernel tuning](fuse-kernel-tuning.md).
 
 Set `user.ratarmount.mark` on the root to append a UTF-8 label of at most 4096
 bytes. `ratarmount journal mark MOUNT LABEL` performs this same xattr call.

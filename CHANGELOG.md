@@ -6,6 +6,10 @@
 
 - Linux mounting requires libfuse3; the former build-time fallback to libfuse2 is removed. Other targets retain fuser's libfuse backend.
 
+### Changes
+
+- **FUSE request counters in `user.ratarmount.stats`:** nested `fuse_req` object with `lookup`, `lookup_enoent`, `getattr`, and `readdirplus` counts incremented at the FUSE trait handlers (once per request; `lookup_enoent` on ENOENT replies). Does not duplicate `ops.*` journal counters. See [sandbox xattrs](docs/sandbox.md).
+
 ### Fixes
 
 - Linux binaries, including portable tarballs, load libfuse3 when mounting, trying `libfuse3.so.4` then `libfuse3.so.3`. ratarmount starts without libfuse installed; mounting without it fails immediately with a message naming both candidates. This fixes portable startup on hosts with the new SONAME, including Arch. Both v0.1.37 and v0.2.0 portable binaries were affected; this was not a v0.2.0 regression.
