@@ -179,8 +179,9 @@ ratarmount --publish-index 'hf://datasets/org/name@main/shards/00001.tar.zst'
 
 A token with repository **write scope** is required, using the same token lookup
 and `HF_ENDPOINT` as reads. Without a mountpoint the command exits after
-publication. Local publication retains its existing copy, pointer, and keep-last-2
-snapshot behavior. Remote `--publish-index-to URL` names the destination archive;
+publication. Local publication makes a WAL-complete, read-only `VACUUM INTO` pin,
+an optional separate copy, and a pointer (keep-last-2). It refuses an existing
+destination and requires its directory to exist; see [indexes](formats.md#indexes). Remote `--publish-index-to URL` names the destination archive;
 its bytes must match the source archive. `s3://`, `gs://`, and `az://` destinations
 use the existing backend credentials and refuse anonymous writes.
 

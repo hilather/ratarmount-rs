@@ -138,6 +138,61 @@ ratarmount --index-id <sha256> archive.tar mnt/        # bind a mount to one pub
 ratarmount export-index shards/shards.json --format parquet -o members.parquet
 ```
 
+Local publication uses `VACUUM INTO` to make a complete snapshot, including
+committed rows still in the live index's WAL. The pin is read-only, has its own
+inode, is never linked to the live index, and its id hashes the snapshot as
+written. A destination copy is made from that pin on another inode. Build FTS
+and hashes before publishing; pins are never modified in place. Use
+`--index-id` to bind a read-only index. With an index elsewhere, `--publish-index`
+leaves an existing `archive.index.sqlite` alone with a warning, and creates it
+only when absent; it still publishes the pin and pointer.
+
+`--publish-index-to PATH` does not create directories. The directory of `PATH`
+must exist; `mkdir -p` it first. ratarmount syncs the files it publishes and
+their directory. It does not sync that directory's own entry in its parent or
+any ancestor. For a directory that was just created, `sync` (GNU coreutils:
+`sync -f DIR`) makes it durable. Pin, pointer and copy are placed in that one
+directory byte for byte, including non-UTF-8 names and `.index.sqlite` paths.
+Pruning keeps the current and previous id in the pin's own directory.
+
+Publication never replaces an existing database. An existing destination of
+any type or size, or a leftover `-wal`, `-shm` or `-journal` beside a new
+destination or pin name, is refused. An existing pin must already have exactly
+the snapshot's bytes and no write permission bit; it is fsynced before reuse.
+Choose a fresh destination, or remove the old copy and companions only after
+all processes using it have stopped. No process may retain a connection to a
+file removed from a destination or pin name: an idle rollback-mode connection
+on an unlinked inode leaves no trace this tool can inspect. A destination must
+end with a file name, not a separator, `.` or `..`.
+
+Local publication requires Unix permissions, directory fsync and installation
+without replacement; unsupported platforms or filesystems fail closed. Pin
+read bits are taken from the source, with owner read always enabled. If the
+new file's owner or group differs from the source, only owner read is granted
+unless the source was readable by both group and others. The source's owner,
+group and ACL are not copied; the publishing user owns the new pin, and its
+group and ACL follow directory creation rules. Use `chmod go+r` to share an
+owner-only pin. Its bytes and id stay the same.
+
+`VACUUM INTO` writes one extra full copy of the index per publication, rebuilding
+all tables and indexes. Time depends on row count and index structure; no
+fixed ratio to a file copy is promised. It needs up to one index size of
+private temporary space, and pins now occupy their own blocks (at most two
+are kept). An unchanged republish still makes a snapshot and syncs and hashes
+the existing pin. WAL writers can continue, but the snapshot delays WAL reset;
+a rollback-mode source blocks writers for the snapshot's duration and waits
+up to 10 seconds for an active writer.
+
+Run one publication of an archive at a time. Concurrent publications are not
+coordinated, and one can remove the other's pin after it was checked. A pointer
+can then name a missing pin; `--index-id` refuses it and the next publication
+writes a new pointer. An interrupted publication can leave
+`.ratarmount-index-snap-*.tmp` and `.ratarmount-index-snap-*.tmp-journal` files;
+they are excluded from directory-base digests, are not reaped automatically,
+and can be removed once no publication uses them. A filesystem's link/unlink
+installation fallback can leave an extra read-only temporary name for a valid
+pin; link count does not identify old or invalid pins.
+
 On HTTP, S3, GCS, Azure, the Hub and inside torrents, a mount looks for
 `{url}.index.ptr`, then the immutable `{url}.index.<sha256>.sqlite` blob it
 names, then a `Link: rel="describedby"` header on the archive, then the
@@ -261,6 +316,16 @@ The complete status against the Python original is in the
    check: a bind created later, mount propagation from another namespace or an ancestor
    rename after mounting are not caught, mount propagation flags are not read (a private
    bind is refused too), and `--corpus` members are not checked.
+
+8. **Index files and publication.**
+   A read-only mount can leave an empty `-wal` and a 32 KiB `-shm` beside the index; they hold no data and are harmless.
+   Side tables written after a publication can stay in the live index's `-wal` until the next writer checkpoints; they are not in the published pin (remaining limitation).
+   Copying the live `X.index.sqlite` without its `-wal` loses rows; copy the pin or use `--publish-index-to` instead.
+   `--publish-index-to PATH` refuses an existing `PATH`, except when `PATH` is the index being published itself (the same path under another spelling, or a symlink that resolves to it); a hard link or a bind mount of that index and a `PATH` with a pin name are refused.
+   ratarmount creates no directory for a publication: the directory of `--publish-index-to PATH` must exist.
+   ratarmount never opens an index file without a write permission bit for writing, also as root.
+   Local index publication is Unix-only.
+   An interrupted publication can leave files named `.ratarmount-index-snap-*.tmp`; they are not part of any published index.
 
 Remote, export and platform limits are listed with their own guides:
 [Remote inputs](phase10-remote.md#not-yet) · [NFS](nfs-export.md) · [other exports](export.md) · [macOS](macos.md).

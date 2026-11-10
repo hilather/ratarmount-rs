@@ -13,6 +13,7 @@
 //! [`resolve_index_location`] is unchanged (`oci:{digest}` cache stays first
 //! among folder candidates).
 
+use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -101,6 +102,10 @@ impl IndexPointer {
     /// Fingerprint `blob` (streaming SHA-256) and optional archive tarstats.
     pub fn for_blob(blob: &Path, archive: Option<&Path>) -> Result<Self> {
         let index_id = sha256_file_hex(blob)?;
+        Ok(Self::for_id(index_id, archive))
+    }
+
+    pub(crate) fn for_id(index_id: String, archive: Option<&Path>) -> Self {
         let archive_tarstats = match archive {
             Some(p) if p.is_file() => match tar_stats_from_path(p) {
                 Ok(stats) => serde_json::from_str(&serialize_tarstats(&stats)).ok(),
@@ -114,13 +119,13 @@ impl IndexPointer {
             },
             _ => None,
         };
-        Ok(Self {
+        Self {
             schema: INDEX_POINTER_SCHEMA.to_string(),
             etag_sha256: index_id.clone(),
             index_id,
             generated_at: rfc3339_utc_now(),
             archive_tarstats,
-        })
+        }
     }
 
     /// Schema + 64-hex `index_id` (path-escape / uuid rejected).
@@ -157,9 +162,11 @@ pub fn index_pointer_path(archive: &Path) -> PathBuf {
 
 /// Treat `index_file` as `{base}.index.sqlite` when it uses that suffix.
 pub fn archive_base_from_index_path(index_file: &Path) -> PathBuf {
-    let s = index_file.as_os_str().to_string_lossy();
-    match s.strip_suffix(".index.sqlite") {
-        Some(base) => PathBuf::from(base),
+    let bytes = index_file.as_os_str().as_encoded_bytes();
+    match bytes.strip_suffix(b".index.sqlite") {
+        // SAFETY: bytes is this OsStr's own encoding and the cut is immediately
+        // before a nonempty UTF-8 substring, a documented valid boundary.
+        Some(base) => PathBuf::from(unsafe { OsStr::from_encoded_bytes_unchecked(base) }),
         None => index_file.to_path_buf(),
     }
 }
@@ -226,17 +233,9 @@ pub fn index_pointer_to_json(ptr: &IndexPointer) -> Result<String> {
 }
 
 /// Atomically replace `path` with pretty-printed pointer JSON (tmp + rename).
+/// The parent directory must already exist.
 pub fn store_index_pointer_atomic(path: &Path, ptr: &IndexPointer) -> Result<()> {
     let json = index_pointer_to_json(ptr)?;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0060-M01","item":"ratarmount_index::location::store_index_pointer_atomic","disposition":"output-owner","category":"index-pointer-directory","reason":"Create the index pointer parent before allocating a sibling temporary JSON output.","creation":{"policy":"recursive-directory","basis":"The pointer writer owns this parent tree; tempfile publication and pointer validation remain separate."}}"###
-            )]
-            std::fs::create_dir_all(parent)?;
-        }
-    }
     let mut builder = tempfile::Builder::new();
     builder.prefix(".ratarmount-index-ptr-").suffix(".tmp");
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
@@ -305,59 +304,433 @@ pub fn bind_local_index_id(archive: &Path, index_id: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Hardlink (else atomic copy) `well_known` to `{archive}.index.{id}.sqlite`.
-///
-/// `id` is the already-known pin name (pointer `index_id` / sha256 of the blob
-/// being published) — this does **not** invent an id by hashing a sidecar on `-c`.
-/// An existing dest whose streaming SHA-256 is not `id` is replaced (leftover
-/// nonempty truncated file is not success). Copy uses tmp+rename.
-pub fn snapshot_index_id(archive: &Path, well_known: &Path, id: &str) -> Result<Option<PathBuf>> {
-    let id = match parse_index_id(id) {
-        Ok(id) => id,
-        Err(_) => return Ok(None),
-    };
-    if !path_is_usable_existing_index(well_known) {
-        return Ok(None);
+/// A complete, durable snapshot, bound to the absolute name and inode verified here.
+#[derive(Debug)]
+pub struct PublishedPin {
+    path: PathBuf,
+    dir: PathBuf,
+    id: String,
+    file_id: Option<(u64, u64)>,
+}
+
+impl PublishedPin {
+    pub fn path(&self) -> &Path {
+        &self.path
     }
-    let dest = index_id_path(archive, &id)?;
-    if dest == well_known {
-        return Ok(None);
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
-    if path_is_usable_existing_index(&dest) {
-        let got = sha256_file_hex(&dest)?;
-        if got == id {
-            return Ok(Some(dest));
-        }
-    }
-    if let Some(parent) = dest.parent() {
-        if !parent.as_os_str().is_empty() {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0061-M01","item":"ratarmount_index::location::snapshot_index_id","disposition":"output-owner","category":"index-cache-directory","reason":"Create the content-addressed snapshot parent before hard-linking or atomically copying the known index.","creation":{"policy":"recursive-directory","basis":"Only output directories are created; the well-known source is read through separately reviewed paths."}}"###
-            )]
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    match std::fs::hard_link(well_known, &dest) {
-        Ok(()) => Ok(Some(dest)),
-        Err(_) => {
-            atomic_copy_file(well_known, &dest)?;
-            let got = sha256_file_hex(&dest)?;
-            if got != id {
-                let _ = std::fs::remove_file(&dest);
-                return Err(IndexError::Invalid(format!(
-                    "index snapshot {} sha256 {got} != {id} after copy",
-                    dest.display()
-                )));
-            }
-            Ok(Some(dest))
-        }
+    pub fn id(&self) -> &str {
+        &self.id
     }
 }
 
-/// Unlink `{archive}.index.{hex}.sqlite` pins not in `keep_ids` (capped at
-/// [`INDEX_POINTER_KEEP_LAST`], first ids win).
+struct PinPlace {
+    dir: PathBuf,
+    name_prefix: Vec<u8>,
+    pointer: PathBuf,
+}
+
+fn pin_place(archive: &Path) -> Result<PinPlace> {
+    let template = index_id_path(archive, &"0".repeat(INDEX_ID_HEX_LEN))?;
+    let dir = std::path::absolute(nonempty_parent(&template))?;
+    let name = template
+        .file_name()
+        .expect("pin has a file name")
+        .as_encoded_bytes();
+    let name_prefix = name[..name.len() - 71].to_vec();
+    let pointer = dir.join(
+        index_pointer_path(archive)
+            .file_name()
+            .expect("pointer has a file name"),
+    );
+    Ok(PinPlace {
+        dir,
+        name_prefix,
+        pointer,
+    })
+}
+
+fn nonempty_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+impl PinPlace {
+    fn pin(&self, archive: &Path, id: &str) -> Result<PathBuf> {
+        Ok(self.dir.join(
+            index_id_path(archive, id)?
+                .file_name()
+                .expect("pin has a file name"),
+        ))
+    }
+    fn id_of(&self, name: &OsStr) -> Option<String> {
+        let rest = name
+            .as_encoded_bytes()
+            .strip_prefix(self.name_prefix.as_slice())?;
+        let id = rest.strip_suffix(b".sqlite")?;
+        if id.len() != INDEX_ID_HEX_LEN || !id.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        Some(String::from_utf8(id.to_ascii_lowercase()).expect("ASCII hex"))
+    }
+}
+
+/// The absolute directory that a publication writes into. It must already exist.
+/// Publication creates no directory and syncs only this directory's entries.
+pub fn require_publication_dir(archive: &Path) -> Result<PathBuf> {
+    let dir = pin_place(archive)?.dir;
+    check_publication_dir(&dir)?;
+    Ok(dir)
+}
+
+fn check_publication_dir(dir: &Path) -> Result<()> {
+    match std::fs::metadata(dir) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(IndexError::Invalid(format!("{} is not a directory", dir.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(IndexError::Invalid(format!(
+            "the directory {} does not exist; index publication creates no directory, create it first", dir.display()))),
+        Err(e) => Err(IndexError::Invalid(format!("cannot inspect directory {}: {e}", dir.display()))),
+    }
+}
+
+/// Fsync a directory, returning every error. Empty paths mean the working directory.
+pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    if !cfg!(unix) {
+        return Ok(());
+    }
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r#"internal-read:v1 {"id":"IR-WALPUB-M03","item":"ratarmount_index::location::fsync_dir","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"Open only the publication directory to make installed entries durable; propagate every sync failure.","creation":{"policy":"none","basis":"Existing directory only; no database descriptor and no pathname creation."}}"#
+    )]
+    let directory = std::fs::File::open(dir)?;
+    directory.sync_all()
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PinStep {
+    Placeholder(PathBuf),
+    Snapshot(PathBuf),
+    Mode(PathBuf),
+    Install(PathBuf),
+    Installed(PathBuf),
+    DirSync(PathBuf),
+    Bind,
+    Prune(PathBuf),
+    PointerStore,
+    PointerStored,
+}
+#[cfg(test)]
+type PinHook = Box<dyn FnMut(PinStep) -> std::io::Result<()>>;
+#[cfg(test)]
+thread_local! { static PIN_HOOK: std::cell::RefCell<Option<PinHook>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+pub(crate) fn pin_step(step: PinStep) -> std::io::Result<()> {
+    let hook = PIN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        let result = hook(step);
+        PIN_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+        result
+    } else {
+        Ok(())
+    }
+}
+#[cfg(test)]
+pub(crate) fn with_pin_hook<T>(
+    hook: impl FnMut(PinStep) -> std::io::Result<()> + 'static,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PIN_HOOK.with(|s| *s.borrow_mut() = None);
+        }
+    }
+    PIN_HOOK.with(|s| *s.borrow_mut() = Some(Box::new(hook)));
+    let _reset = Reset;
+    f()
+}
+
+/// Snapshot all committed rows (including WAL rows), then hash and install only
+/// the private, read-only snapshot. Never replace an existing database name.
+pub fn snapshot_index_id(archive: &Path, source: &Path) -> Result<PublishedPin> {
+    snapshot_index_id_on(archive, source, cfg!(unix))
+}
+
+pub(crate) fn snapshot_index_id_on(
+    archive: &Path,
+    source: &Path,
+    unix: bool,
+) -> Result<PublishedPin> {
+    if !unix {
+        return Err(IndexError::Invalid("local index publication is only supported on Unix: durable directories and read-only pin permissions are required".into()));
+    }
+    let place = pin_place(archive)?;
+    check_publication_dir(&place.dir)?;
+    let source = std::path::absolute(source)?;
+    let source_meta = std::fs::metadata(&source)?;
+    if !source_meta.is_file() {
+        return Err(IndexError::Invalid(format!(
+            "{} is not a regular index file",
+            source.display()
+        )));
+    }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r#"internal-read:v1 {"id":"IR-WALPUB-M01","item":"ratarmount_index::location::snapshot_index_id_on","disposition":"output-owner","category":"index-pin-snapshot","reason":"Allocate a private 0600 empty VACUUM INTO output in the existing publication directory; close its raw descriptor before SQLite writes it.","creation":{"policy":"exclusive-new-file","basis":"Random O_EXCL placeholder owned by TempPath; removed on errors, made read-only and installed without replacement after sync and hash."}}"#
+    )]
+    let tmp = tempfile::Builder::new()
+        .prefix(".ratarmount-index-snap-")
+        .suffix(".tmp")
+        .tempfile_in(&place.dir)?
+        .into_temp_path();
+    // VACUUM can leave a journal on failure; only this private name is cleaned up.
+    struct Journal(PathBuf);
+    impl Drop for Journal {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _journal = Journal(crate::sqlite_path_companion(&tmp, "-journal"));
+    #[cfg(test)]
+    pin_step(PinStep::Placeholder(tmp.to_path_buf()))?;
+    vacuum_snapshot(&source, &tmp)?;
+    let meta = std::fs::symlink_metadata(&tmp)?;
+    if !meta.is_file() || meta.len() == 0 {
+        return Err(IndexError::Invalid(
+            "VACUUM INTO did not produce a nonempty regular snapshot".into(),
+        ));
+    }
+    #[cfg(test)]
+    pin_step(PinStep::Snapshot(tmp.to_path_buf()))?;
+    let same_owner_and_group = ratarmount_core::metadata_uid(&source_meta)
+        == ratarmount_core::metadata_uid(&meta)
+        && ratarmount_core::metadata_gid(&source_meta) == ratarmount_core::metadata_gid(&meta);
+    let mode = pin_mode(
+        ratarmount_core::metadata_mode(&source_meta),
+        same_owner_and_group,
+    );
+    let mode_error = || {
+        IndexError::Invalid("cannot make the pin read-only on this filesystem; local index publication needs Unix permissions".into())
+    };
+    if !ratarmount_core::set_file_mode(&tmp, mode).map_err(|_| mode_error())?
+        || !std::fs::symlink_metadata(&tmp)?.permissions().readonly()
+    {
+        return Err(mode_error());
+    }
+    #[cfg(test)]
+    pin_step(PinStep::Mode(tmp.to_path_buf()))?;
+    let (id, rollback) = sync_then_sha256(&tmp)?;
+    if !rollback {
+        return Err(IndexError::Invalid(
+            "snapshot is not a rollback-journal SQLite database".into(),
+        ));
+    }
+    let meta = std::fs::symlink_metadata(&tmp)?;
+    if !meta.is_file() || !meta.permissions().readonly() {
+        return Err(mode_error());
+    }
+    let pin = place.pin(archive, &id)?;
+    let file_id = install_pin(tmp, &pin, &id, ratarmount_core::metadata_file_id(&meta))?;
+    #[cfg(test)]
+    pin_step(PinStep::Installed(pin.clone()))?;
+    #[cfg(test)]
+    pin_step(PinStep::DirSync(place.dir.clone()))?;
+    fsync_dir(&place.dir).map_err(|e| {
+        IndexError::Invalid(format!(
+            "cannot sync publication directory {}: {e}",
+            place.dir.display()
+        ))
+    })?;
+    Ok(PublishedPin {
+        path: pin,
+        dir: place.dir,
+        id,
+        file_id,
+    })
+}
+
+fn vacuum_snapshot(source: &Path, tmp: &Path) -> Result<()> {
+    let conn = rusqlite::Connection::open_with_flags(
+        source,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    conn.execute_batch("PRAGMA synchronous = FULL")?;
+    crate::vacuum_into(&conn, tmp).map_err(IndexError::from)
+}
+
+fn pin_mode(source_mode: u32, same_owner_and_group: bool) -> u32 {
+    let read = source_mode & 0o444;
+    if same_owner_and_group {
+        0o400 | read
+    } else if read & 0o044 == 0o044 {
+        0o444
+    } else {
+        0o400
+    }
+}
+
+fn rollback_header(bytes: &[u8]) -> bool {
+    bytes.starts_with(SQLITE_MAGIC) && bytes.get(18..20) == Some(&[1, 1])
+}
+
+/// Sync, header-check and hash through one managed cursor (#156).
+fn sync_then_sha256(path: &Path) -> std::io::Result<(String, bool)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r#"internal-read:v1 {"id":"IR-WALPUB-M02","item":"ratarmount_index::location::sync_then_sha256","disposition":"managed-read","regression":"regression_index_pin_snapshot_keeps_index_lock","category":"index-pin-snapshot","reason":"Sync and hash a new snapshot or an existing pin through one managed cursor without releasing SQLite locks.","creation":{"policy":"none","basis":"Existing snapshot input only; SQLite VFS owns the descriptor."}}"#
+    )]
+    let mut cursor = crate::managed_read::ManagedReadCursor::open(path)?;
+    cursor.sync_all()?;
+    let mut header = [0; 20];
+    let n = cursor.read_at(&mut header, 0)?;
+    let rollback = rollback_header(&header[..n]);
+    Ok((
+        crate::managed_read::sha256_hex_cursor(&mut cursor)?,
+        rollback,
+    ))
+}
+
+/// Any companion entry (or inspection error) is a refusal, including empty files
+/// and dangling symlinks: SQLite could apply it to a newly installed database.
+pub fn existing_sqlite_companion(db: &Path) -> Option<PathBuf> {
+    ["-wal", "-shm", "-journal"].into_iter().map(|suffix| crate::sqlite_path_companion(db, suffix))
+        .find(|p| !matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound))
+}
+
+fn install_pin(
+    mut tmp: tempfile::TempPath,
+    pin: &Path,
+    id: &str,
+    tmp_file_id: Option<(u64, u64)>,
+) -> Result<Option<(u64, u64)>> {
+    for _ in 0..3 {
+        if let Some(companion) = existing_sqlite_companion(pin) {
+            return Err(IndexError::Invalid(format!(
+                "{} exists beside the pin name; SQLite would apply it to the pin; remove it",
+                companion.display()
+            )));
+        }
+        match std::fs::symlink_metadata(pin) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                #[cfg(test)]
+                if let Err(e) = pin_step(PinStep::Install(pin.to_path_buf())) {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        continue;
+                    }
+                    return Err(install_error(pin, e));
+                }
+                match tmp.persist_noclobber(pin) {
+                    Ok(()) => return Ok(tmp_file_id),
+                    Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => tmp = e.path,
+                    Err(e) => return Err(install_error(pin, e.error)),
+                }
+            }
+            Err(e) => return Err(e.into()),
+            Ok(meta) => {
+                if !meta.is_file() {
+                    return Err(IndexError::Invalid(format!(
+                        "{} exists and is not a regular pin file",
+                        pin.display()
+                    )));
+                }
+                if !meta.permissions().readonly() {
+                    return Err(IndexError::Invalid(format!("{} exists and is writable; pins are read-only; remove it and publish again", pin.display())));
+                }
+                let (got, _) = match sync_then_sha256(pin) {
+                    Ok(result) => result,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        return Err(IndexError::Invalid(format!(
+                            "cannot make the existing pin {} durable: {e}",
+                            pin.display()
+                        )))
+                    }
+                };
+                if got != id {
+                    return Err(IndexError::Invalid(format!("{} already exists and is not this snapshot; it is never replaced; remove it and publish again", pin.display())));
+                }
+                let identity = ratarmount_core::metadata_file_id(&meta);
+                if let Ok(after) = std::fs::symlink_metadata(pin) {
+                    if after.is_file() && ratarmount_core::metadata_file_id(&after) == identity {
+                        return Ok(identity);
+                    }
+                }
+            }
+        }
+    }
+    Err(IndexError::Invalid(format!(
+        "{} changed during three pin installation attempts",
+        pin.display()
+    )))
+}
+
+fn install_error(pin: &Path, error: std::io::Error) -> IndexError {
+    IndexError::Invalid(format!("cannot create {} without replacing a file: {error}; local index publication needs a filesystem with an exclusive rename", pin.display()))
+}
+
+/// Match pin names on encoded bytes, including empty prefixes and case variants.
+pub fn is_pin_file_name(name: &OsStr) -> bool {
+    let bytes = name.as_encoded_bytes();
+    let tail_len = 7 + INDEX_ID_HEX_LEN + 7;
+    if bytes.len() < tail_len {
+        return false;
+    }
+    let tail = &bytes[bytes.len() - tail_len..];
+    tail[..7].eq_ignore_ascii_case(b".index.")
+        && tail[7..71].iter().all(u8::is_ascii_hexdigit)
+        && tail[71..].eq_ignore_ascii_case(b".sqlite")
+}
+
+pub(crate) fn index_pin_refusal(path: &Path) -> Option<String> {
+    if path.as_os_str().as_encoded_bytes().starts_with(b"file:") {
+        return Some(format!(
+            "{} uses a file: URI spelling; index writers require a literal path",
+            path.display()
+        ));
+    }
+    if path.file_name().is_some_and(is_pin_file_name)
+        || std::fs::canonicalize(path)
+            .ok()
+            .and_then(|p| p.file_name().map(is_pin_file_name))
+            .unwrap_or(false)
+    {
+        return Some(format!(
+            "{} is a published index pin; pins are never modified; use --index-id to bind it",
+            path.display()
+        ));
+    }
+    None
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IndexWriteAccess {
+    ReadWrite,
+    ReadOnly,
+    Refused(String),
+}
+pub(crate) fn index_write_access(path: &Path) -> IndexWriteAccess {
+    if let Some(reason) = index_pin_refusal(path) {
+        return IndexWriteAccess::Refused(reason);
+    }
+    if std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().readonly()) {
+        IndexWriteAccess::ReadOnly
+    } else {
+        IndexWriteAccess::ReadWrite
+    }
+}
+
+/// Unlink pins outside the current and previous ids, only in this pin directory.
 pub fn prune_index_snapshots(archive: &Path, keep_ids: &[&str]) -> Result<()> {
+    let place = pin_place(archive)?;
     let mut keep = Vec::new();
     for s in keep_ids {
         if let Ok(id) = parse_index_id(s) {
@@ -369,7 +742,7 @@ pub fn prune_index_snapshots(archive: &Path, keep_ids: &[&str]) -> Result<()> {
             break;
         }
     }
-    for (id, path) in list_index_id_snapshots(archive) {
+    for (id, path) in list_index_id_snapshots(&place) {
         if !keep.contains(&id) {
             let _ = std::fs::remove_file(&path);
         }
@@ -377,79 +750,76 @@ pub fn prune_index_snapshots(archive: &Path, keep_ids: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Write a new pointer for `blob` and pin `{archive}.index.{new_id}.sqlite`
-/// (hardlink of `blob` after it holds the published bytes). Keep-last-K uses
-/// [`INDEX_POINTER_KEEP_LAST`] (current pin + previous pointer id).
-pub fn publish_index_pointer(
+/// Store a pointer only for the absolute path and inode this publication synced.
+/// Concurrent publications are not coordinated: removal after the identity check
+/// can still leave a pointer naming a missing pin.
+pub fn publish_index_pointer_for_pin(
     archive: &Path,
-    blob: &Path,
+    pin: &PublishedPin,
     tarstats_archive: Option<&Path>,
 ) -> Result<IndexPointer> {
-    let ptr_path = index_pointer_path(archive);
-    let new_id = sha256_file_hex(blob)?;
-    let old_id = match load_index_pointer(&ptr_path) {
+    #[cfg(test)]
+    pin_step(PinStep::Bind)?;
+    let place = pin_place(archive)?;
+    let expected = place.pin(archive, pin.id())?;
+    if expected.as_os_str() != pin.path().as_os_str() {
+        return Err(IndexError::Invalid(format!(
+            "this pin was made for {}, not for {}",
+            pin.path().display(),
+            expected.display()
+        )));
+    }
+    let old_id = match load_index_pointer(&place.pointer) {
         Ok(Some(old)) => parse_index_id(&old.index_id).ok(),
         Ok(None) => None,
         Err(e) => {
-            warn!("ignoring invalid index pointer {}: {e}", ptr_path.display());
+            warn!(
+                "ignoring invalid index pointer {}: {e}",
+                place.pointer.display()
+            );
             None
         }
     };
-    snapshot_index_id(archive, blob, &new_id)?;
-    let mut keep: Vec<&str> = vec![new_id.as_str()];
+    let mut keep = vec![pin.id()];
     if let Some(ref old) = old_id {
-        if old.as_str() != new_id.as_str() {
+        if old != pin.id() {
             keep.push(old.as_str());
         }
     }
     prune_index_snapshots(archive, &keep)?;
-    let ptr = IndexPointer::for_blob(blob, tarstats_archive)?;
-    store_index_pointer_atomic(&ptr_path, &ptr)?;
+    #[cfg(test)]
+    pin_step(PinStep::Prune(place.dir.clone()))?;
+    let ptr = IndexPointer::for_id(pin.id().to_string(), tarstats_archive);
+    let meta = std::fs::symlink_metadata(pin.path()).ok();
+    if !meta.is_some_and(|m| m.is_file() && ratarmount_core::metadata_file_id(&m) == pin.file_id) {
+        return Err(IndexError::Invalid(
+            "the pin was pruned or replaced by another publication".into(),
+        ));
+    }
+    #[cfg(test)]
+    pin_step(PinStep::PointerStore)?;
+    store_index_pointer_atomic(&place.pointer, &ptr)?;
+    #[cfg(test)]
+    pin_step(PinStep::PointerStored)?;
+    #[cfg(test)]
+    pin_step(PinStep::DirSync(place.dir.clone()))?;
+    fsync_dir(&place.dir).map_err(|e| {
+        IndexError::Invalid(format!(
+            "the pointer was written but its directory {} could not be synced: {e}",
+            place.dir.display()
+        ))
+    })?;
     Ok(ptr)
 }
 
-pub(crate) fn atomic_copy_file(src: &Path, dest: &Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        if !parent.as_os_str().is_empty() {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0062-M01","item":"ratarmount_index::location::atomic_copy_file","disposition":"output-owner","category":"index-output-directory","reason":"Create the destination parent before the atomic managed-source index copy.","creation":{"policy":"recursive-directory","basis":"The destination tree keeps current defaults; the source copy uses managed_read and sibling tempfile publication."}}"###
-            )]
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(".ratarmount-index-snap-").suffix(".tmp");
-    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
-    let mut tmp = match parent {
-        Some(p) => {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0433-M01","item":"ratarmount_index::location::atomic_copy_file","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )]
-            let __inventory_value_0 = builder.tempfile_in(p);
-            __inventory_value_0
-        }?,
-        None => {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0434-M01","item":"ratarmount_index::location::atomic_copy_file","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )]
-            let __inventory_value_0 = builder.tempfile_in(".");
-            __inventory_value_0
-        }?,
-    };
-    {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0435-M01","item":"ratarmount_index::location::atomic_copy_file","disposition":"managed-read","regression":"regression_index_id_copy_fallback_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )]
-        crate::managed_read::copy_into(src, &mut tmp)?;
-        tmp.flush()?;
-        tmp.as_file().sync_all()?;
-    }
-    tmp.persist(dest).map_err(|e| IndexError::Io(e.error))?;
-    Ok(())
+/// Snapshot the source, then publish the current and previous snapshot ids.
+pub fn publish_index_pointer(
+    archive: &Path,
+    source: &Path,
+    tarstats_archive: Option<&Path>,
+) -> Result<IndexPointer> {
+    let pin = snapshot_index_id(archive, source)?;
+    publish_index_pointer_for_pin(archive, &pin, tarstats_archive)
 }
 
 fn sha256_file_hex(path: &Path) -> Result<String> {
@@ -460,33 +830,14 @@ __inventory_value_0
 }.map_err(IndexError::from)
 }
 
-fn list_index_id_snapshots(archive: &Path) -> Vec<(String, PathBuf)> {
-    let parent = match archive.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let Some(name) = archive.file_name() else {
+fn list_index_id_snapshots(place: &PinPlace) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(&place.dir) else {
         return Vec::new();
     };
-    let prefix = format!("{}.index.", name.to_string_lossy());
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&parent) else {
-        return out;
-    };
-    for ent in entries.flatten() {
-        let fname = ent.file_name();
-        let fname = fname.to_string_lossy();
-        let Some(rest) = fname.strip_prefix(&prefix) else {
-            continue;
-        };
-        let Some(hex) = rest.strip_suffix(".sqlite") else {
-            continue;
-        };
-        if parse_index_id(hex).is_ok() {
-            out.push((hex.to_ascii_lowercase(), parent.join(ent.file_name())));
-        }
-    }
-    out
+    entries
+        .flatten()
+        .filter_map(|ent| place.id_of(&ent.file_name()).map(|id| (id, ent.path())))
+        .collect()
 }
 
 fn rfc3339_utc_now() -> String {
@@ -2608,31 +2959,34 @@ mod tests {
         std::fs::write(&archive, b"a").unwrap();
         let well_known = default_index_path(&archive);
 
-        let blob_n = b"SQLite format 3\0snapshot-N";
-        std::fs::write(&well_known, blob_n).unwrap();
-        let id_n = hex_id(blob_n);
-        publish_index_pointer(&archive, &well_known, Some(&archive)).unwrap();
-
-        let blob_np1 = b"SQLite format 3\0snapshot-N+1-bytes";
-        let np1 = dir.path().join("np1.sqlite");
-        std::fs::write(&np1, blob_np1).unwrap();
-        // Pin of N is a hardlink of well-known. Rename (not in-place write)
-        // so the pin inode stays N when dest becomes N+1 (`-c` tmp+rename).
-        std::fs::rename(&np1, &well_known).unwrap();
-        publish_index_pointer(&archive, &well_known, Some(&archive)).unwrap();
-        let id_np1 = hex_id(blob_np1);
-
+        if !cfg!(unix) {
+            eprintln!("skip: local index publication is Unix-only");
+            return;
+        }
+        let make = |path: &Path, n: i64| {
+            let c = rusqlite::Connection::open(path).unwrap();
+            c.execute_batch("CREATE TABLE generation(n)").unwrap();
+            c.execute("INSERT INTO generation VALUES (?)", [n]).unwrap();
+        };
+        make(&well_known, 1);
+        let id_n = publish_index_pointer(&archive, &well_known, Some(&archive))
+            .unwrap()
+            .index_id;
         let snap_n = index_id_path(&archive, &id_n).unwrap();
-        assert!(snap_n.is_file(), "K=2 must keep index.{{old_id}}.sqlite");
-        assert_eq!(std::fs::read(&snap_n).unwrap(), blob_n);
-        assert_eq!(std::fs::read(&well_known).unwrap(), blob_np1);
-
-        let resolved_n = resolve_index_id_path(&archive, &id_n).unwrap();
-        assert_eq!(resolved_n, snap_n);
-        let resolved_np1 = resolve_index_id_path(&archive, &id_np1).unwrap();
-        let np1_bytes = std::fs::read(&resolved_np1).unwrap();
-        assert_eq!(np1_bytes, blob_np1);
-        assert_eq!(hex_id(&np1_bytes), id_np1);
+        let old_bytes = std::fs::read(&snap_n).unwrap();
+        let np1 = dir.path().join("np1.sqlite");
+        make(&np1, 2);
+        std::fs::rename(&np1, &well_known).unwrap();
+        let id_np1 = publish_index_pointer(&archive, &well_known, Some(&archive))
+            .unwrap()
+            .index_id;
+        assert_ne!(id_n, id_np1);
+        assert_eq!(std::fs::read(&snap_n).unwrap(), old_bytes);
+        assert_eq!(resolve_index_id_path(&archive, &id_n).unwrap(), snap_n);
+        assert_eq!(
+            sha256_file_hex(&resolve_index_id_path(&archive, &id_np1).unwrap()).unwrap(),
+            id_np1
+        );
 
         let err = resolve_index_id_path(&archive, &"b".repeat(64)).unwrap_err();
         let msg = err.to_string();
@@ -2668,27 +3022,6 @@ mod tests {
         assert_ne!(hex_id(&std::fs::read(&well_known).unwrap()), id_n);
     }
 
-    /// Regression: leftover nonempty snapshot with the wrong SHA is replaced, not kept.
-    #[test]
-    fn snapshot_index_id_replaces_wrong_sha_leftover() {
-        let dir = tempfile::tempdir().unwrap();
-        let archive = dir.path().join("a.tar");
-        let well_known = default_index_path(&archive);
-        let blob_n = b"SQLite format 3\0good-pin-bytes";
-        std::fs::write(&well_known, blob_n).unwrap();
-        let id_n = hex_id(blob_n);
-        let dest = index_id_path(&archive, &id_n).unwrap();
-        std::fs::write(&dest, b"SQLite format 3\0truncated").unwrap();
-        assert_ne!(hex_id(&std::fs::read(&dest).unwrap()), id_n);
-
-        let got = snapshot_index_id(&archive, &well_known, &id_n)
-            .unwrap()
-            .expect("pin");
-        assert_eq!(got, dest);
-        assert_eq!(std::fs::read(&dest).unwrap(), blob_n);
-        assert_eq!(hex_id(&std::fs::read(&dest).unwrap()), id_n);
-    }
-
     /// Regression: `--index-id` must not bind a leftover snapshot whose SHA is not the id.
     #[test]
     fn resolve_index_id_refuses_wrong_sha_snapshot() {
@@ -2715,11 +3048,13 @@ mod tests {
             idx.store_tarstats_for_path(&archive).unwrap();
             idx.publish_tmp().unwrap();
         }
-        let id = {
-            let bytes = std::fs::read(&idx_path).unwrap();
-            hex_id(&bytes)
-        };
-        publish_index_pointer(&archive, &idx_path, Some(&archive)).unwrap();
+        if !cfg!(unix) {
+            eprintln!("skip: local index publication is Unix-only");
+            return;
+        }
+        let id = publish_index_pointer(&archive, &idx_path, Some(&archive))
+            .unwrap()
+            .index_id;
         bind_local_index_id(&archive, &id).expect("matching archive");
 
         std::fs::write(&archive, b"new-content-longer").unwrap();
@@ -2746,5 +3081,173 @@ mod tests {
         assert!(load_index_pointer(&dir.path().join("missing.ptr"))
             .unwrap()
             .is_none());
+    }
+    /// Regression: pin names include empty/non-Unicode prefixes and case variants.
+    #[test]
+    fn regression_pin_file_name_table() {
+        let id = "A".repeat(64);
+        for name in [
+            format!("x.index.{id}.sqlite"),
+            format!(".index.{id}.sqlite"),
+            format!("X.INDEX.{id}.SQLITE"),
+        ] {
+            assert!(is_pin_file_name(OsStr::new(&name)), "{name}");
+        }
+        for name in [
+            "X.index.sqlite".to_string(),
+            format!("{id}.sqlite"),
+            format!("x.index.{}.sqlite", "a".repeat(63)),
+            format!("x.index.{}.sqlite", "a".repeat(65)),
+            format!("x.index.{id}.sqlite-wal"),
+            format!("x.index.{}.sqlite", "z".repeat(64)),
+        ] {
+            assert!(!is_pin_file_name(OsStr::new(&name)), "{name}");
+        }
+    }
+
+    /// Regression: a new pin grants no extra readership to another uid or gid.
+    #[test]
+    fn regression_pin_mode_table() {
+        for (source, same, expected) in [
+            (0o644, true, 0o444),
+            (0o600, true, 0o400),
+            (0o640, true, 0o440),
+            (0o640, false, 0o400),
+            (0o644, false, 0o444),
+            (0o604, true, 0o404),
+            (0o604, false, 0o400),
+            (0, true, 0o400),
+            (0, false, 0o400),
+            (0o777, true, 0o444),
+        ] {
+            assert_eq!(pin_mode(source, same), expected);
+        }
+    }
+
+    /// Regression: unsupported publication refuses before creating even a placeholder.
+    #[test]
+    fn regression_publish_is_refused_off_unix() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = with_pin_hook(
+            |step| panic!("unexpected step {step:?}"),
+            || snapshot_index_id_on(&dir.path().join("a"), &dir.path().join("source"), false),
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("only supported on Unix"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// Regression: only rollback-journal snapshots may become pins.
+    #[test]
+    fn regression_snapshot_header_table() {
+        let mut header = [0; 20];
+        header[..16].copy_from_slice(SQLITE_MAGIC);
+        header[18..].copy_from_slice(&[1, 1]);
+        assert!(rollback_header(&header));
+        assert!(!rollback_header(&header[..19]));
+        header[18..].copy_from_slice(&[2, 2]);
+        assert!(!rollback_header(&header));
+        header[18..].copy_from_slice(&[1, 1]);
+        header[0] = 0;
+        assert!(!rollback_header(&header));
+    }
+
+    /// Regression: base stripping preserves the destination's exact spelling.
+    #[test]
+    fn regression_index_base_strip_preserves_path_bytes() {
+        for (input, expected) in [
+            ("a.tar.index.sqlite", "a.tar"),
+            ("d/.index.sqlite", "d/"),
+            (".index.sqlite", ""),
+            ("a.sqlite", "a.sqlite"),
+            ("a.index.sqlite/", "a.index.sqlite/"),
+            ("A.INDEX.SQLITE", "A.INDEX.SQLITE"),
+        ] {
+            assert_eq!(
+                archive_base_from_index_path(Path::new(input)).as_os_str(),
+                OsStr::new(expected)
+            );
+        }
+    }
+
+    /// Regression: install, prune and pointer all derive their directory from the pin.
+    #[test]
+    fn regression_pin_place_table() {
+        for (base, directory, prefix) in [
+            ("d/a.tar", "d", "a.tar.index."),
+            ("a.tar", ".", "a.tar.index."),
+            ("out/", "out", ".index."),
+            ("", ".", ".index."),
+        ] {
+            let place = pin_place(Path::new(base)).unwrap();
+            assert_eq!(place.dir, std::path::absolute(directory).unwrap());
+            assert_eq!(place.name_prefix, prefix.as_bytes());
+            let id = "a".repeat(64);
+            assert_eq!(
+                place.id_of(OsStr::new(&format!("{prefix}{id}.sqlite"))),
+                Some(id.clone())
+            );
+            assert_eq!(
+                place.pin(Path::new(base), &id).unwrap().parent(),
+                Some(place.dir.as_path())
+            );
+            assert_eq!(place.pointer.parent(), Some(place.dir.as_path()));
+            assert!(place
+                .id_of(OsStr::new(&format!("{prefix} {id}.sqlite")))
+                .is_none());
+            assert!(place
+                .id_of(OsStr::new(&format!("{prefix}{id}.sqlite-wal")))
+                .is_none());
+        }
+    }
+
+    /// Regression: pointer storage may replace JSON but must never create directories.
+    #[test]
+    fn regression_pointer_store_creates_no_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let ptr = IndexPointer::for_id("a".repeat(64), None);
+        assert!(store_index_pointer_atomic(&dir.path().join("missing/a.index.ptr"), &ptr).is_err());
+        assert!(!dir.path().join("missing").exists());
+        let dest = dir.path().join("a.index.ptr");
+        store_index_pointer_atomic(&dest, &ptr).unwrap();
+        let next = IndexPointer::for_id("b".repeat(64), None);
+        store_index_pointer_atomic(&dest, &next).unwrap();
+        assert_eq!(load_index_pointer(&dest).unwrap().unwrap(), next);
+    }
+
+    /// Regression: readonly files stay readonly even for a privileged writer.
+    #[test]
+    fn regression_index_write_access_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.sqlite");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(index_write_access(&file), IndexWriteAccess::ReadWrite);
+        assert_eq!(
+            index_write_access(&dir.path().join("missing")),
+            IndexWriteAccess::ReadWrite
+        );
+        let mut mode = std::fs::metadata(&file).unwrap().permissions();
+        mode.set_readonly(true);
+        std::fs::set_permissions(&file, mode).unwrap();
+        assert_eq!(index_write_access(&file), IndexWriteAccess::ReadOnly);
+        let rodir = dir.path().join("rodir");
+        std::fs::create_dir(&rodir).unwrap();
+        let mut mode = std::fs::metadata(&rodir).unwrap().permissions();
+        mode.set_readonly(true);
+        std::fs::set_permissions(&rodir, mode).unwrap();
+        assert_eq!(index_write_access(&rodir), IndexWriteAccess::ReadWrite);
+        assert!(matches!(
+            index_write_access(&dir.path().join(format!(".index.{}.sqlite", "a".repeat(64)))),
+            IndexWriteAccess::Refused(_)
+        ));
+        assert!(matches!(
+            index_write_access(Path::new("file:x.sqlite")),
+            IndexWriteAccess::Refused(_)
+        ));
+        // Restore directory permissions portably so TempDir can remove it.
+        std::fs::set_permissions(&rodir, std::fs::metadata(dir.path()).unwrap().permissions())
+            .unwrap();
     }
 }

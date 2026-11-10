@@ -8970,34 +8970,6 @@
       "rule_reason": "inventory-op:managed_read::copy_into"
     },
     {
-      "configured_path": "std::fs::create_dir_all",
-      "item": "ratarmount::publish_index::atomic_copy",
-      "leaf_digest": "3c637d8549402d31ae2c63c1b964761dd1a15a959e3243055cb0ac1a690a2ef1",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "published-index-directory",
-        "creation": {
-          "basis": "Only output parents are created; the separately reviewed managed copy and tempfile publication preserve source/input obligations.",
-          "policy": "recursive-directory"
-        },
-        "disposition": "output-owner",
-        "id": "IR-E0132-M01",
-        "item": "ratarmount::publish_index::atomic_copy",
-        "reason": "Create the publication destination parent before atomic managed-source index copying."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "cli-nfsv4",
-        "cli-no-default",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0132-M01\",\"item\":\"ratarmount::publish_index::atomic_copy\",\"disposition\":\"output-owner\",\"category\":\"published-index-directory\",\"reason\":\"Create the publication destination parent before atomic managed-source index copying.\",\"creation\":{\"policy\":\"recursive-directory\",\"basis\":\"Only output parents are created; the separately reviewed managed copy and tempfile publication preserve source/input obligations.\"}}",
-      "resolved": "std::fs::create_dir_all",
-      "rule_reason": "inventory-op:fs::create_dir_all"
-    },
-    {
       "configured_path": "tempfile::NamedTempFile::new",
       "item": "ratarmount::publish_index::publish_remote",
       "leaf_digest": "1f06ee3c170994b9229110f8011de34c40f6c64f994c04ce0f7b9ec485ed7745",
@@ -18207,113 +18179,6 @@
       "rule_reason": "inventory-op:ManagedReadCursor::open"
     },
     {
-      "configured_path": "tempfile::Builder::tempfile_in",
-      "item": "ratarmount_index::location::atomic_copy_file",
-      "leaf_digest": "095c3e0df321c3841a7e66226f9364b588a130133e159917ac1b923c19c4186b",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "output-owner",
-        "creation": {
-          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
-          "policy": "unchanged-from-e6ca64e"
-        },
-        "disposition": "output-owner",
-        "id": "IR-B0433-M01",
-        "item": "ratarmount_index::location::atomic_copy_file",
-        "mode_policy": "unchanged-from-e6ca64e",
-        "reason": "Preserve this reviewed output acquisition and its existing permissions."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0433-M01\",\"item\":\"ratarmount_index::location::atomic_copy_file\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
-      "resolved": "<tempfile::Builder<'L0,'L1>>::tempfile_in",
-      "rule_reason": "inventory-op:tempfile"
-    },
-    {
-      "configured_path": "tempfile::Builder::tempfile_in",
-      "item": "ratarmount_index::location::atomic_copy_file",
-      "leaf_digest": "b571bcb15a707b1ff860904be0eb0a86900213f29b7b5a756e29c9c2b518bd4c",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "output-owner",
-        "creation": {
-          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
-          "policy": "unchanged-from-e6ca64e"
-        },
-        "disposition": "output-owner",
-        "id": "IR-B0434-M01",
-        "item": "ratarmount_index::location::atomic_copy_file",
-        "mode_policy": "unchanged-from-e6ca64e",
-        "reason": "Preserve this reviewed output acquisition and its existing permissions."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0434-M01\",\"item\":\"ratarmount_index::location::atomic_copy_file\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
-      "resolved": "<tempfile::Builder<'L0,'L1>>::tempfile_in",
-      "rule_reason": "inventory-op:tempfile"
-    },
-    {
-      "configured_path": "ratarmount_index::managed_read::copy_into",
-      "item": "ratarmount_index::location::atomic_copy_file",
-      "leaf_digest": "63a5e489448895a1a2f55fc1c9805f96e3aac73894fc14b7889abe926f8e0590",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "managed-read",
-        "creation": {
-          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
-          "policy": "none"
-        },
-        "disposition": "managed-read",
-        "id": "IR-B0435-M01",
-        "item": "ratarmount_index::location::atomic_copy_file",
-        "reason": "Use the reviewed managed reader under the existing lock guarantee.",
-        "regression": "regression_index_id_copy_fallback_keeps_index_lock"
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0435-M01\",\"item\":\"ratarmount_index::location::atomic_copy_file\",\"disposition\":\"managed-read\",\"regression\":\"regression_index_id_copy_fallback_keeps_index_lock\",\"category\":\"managed-read\",\"reason\":\"Use the reviewed managed reader under the existing lock guarantee.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
-      "resolved": "ratarmount_index::managed_read::copy_into",
-      "rule_reason": "inventory-op:managed_read::copy_into"
-    },
-    {
-      "configured_path": "std::fs::create_dir_all",
-      "item": "ratarmount_index::location::atomic_copy_file",
-      "leaf_digest": "9fe296c84af5944e83d27bce4adac676b4be0a56900b6e830cc458dbe4651397",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "index-output-directory",
-        "creation": {
-          "basis": "The destination tree keeps current defaults; the source copy uses managed_read and sibling tempfile publication.",
-          "policy": "recursive-directory"
-        },
-        "disposition": "output-owner",
-        "id": "IR-E0062-M01",
-        "item": "ratarmount_index::location::atomic_copy_file",
-        "reason": "Create the destination parent before the atomic managed-source index copy."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0062-M01\",\"item\":\"ratarmount_index::location::atomic_copy_file\",\"disposition\":\"output-owner\",\"category\":\"index-output-directory\",\"reason\":\"Create the destination parent before the atomic managed-source index copy.\",\"creation\":{\"policy\":\"recursive-directory\",\"basis\":\"The destination tree keeps current defaults; the source copy uses managed_read and sibling tempfile publication.\"}}",
-      "resolved": "std::fs::create_dir_all",
-      "rule_reason": "inventory-op:fs::create_dir_all"
-    },
-    {
       "configured_path": "ratarmount_index::managed_read::ManagedReadCursor::open",
       "item": "ratarmount_index::location::decompress_index_to_temp",
       "leaf_digest": "7a8a9f4d9404d041f79631e38daa7f826a4b79d09598393a3ea29fc16f6027b4",
@@ -18501,6 +18366,32 @@
       "rule_reason": "inventory-op:fs::create_dir_all"
     },
     {
+      "configured_path": "std::fs::File::open",
+      "item": "ratarmount_index::location::fsync_dir",
+      "leaf_digest": "875aa7a6d1fc3e8e9c3a2ab013df845c9b52485a9e71928040cb40d80242c963",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "directory-handle-or-durability",
+        "creation": {
+          "basis": "Existing directory only; no database descriptor and no pathname creation.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-WALPUB-M03",
+        "item": "ratarmount_index::location::fsync_dir",
+        "reason": "Open only the publication directory to make installed entries durable; propagate every sync failure."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-WALPUB-M03\",\"item\":\"ratarmount_index::location::fsync_dir\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"Open only the publication directory to make installed entries durable; propagate every sync failure.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing directory only; no database descriptor and no pathname creation.\"}}",
+      "resolved": "<std::fs::File>::open",
+      "rule_reason": "inventory-op:File::open"
+    },
+    {
       "configured_path": "ratarmount_index::managed_read::read_to_string",
       "item": "ratarmount_index::location::load_index_pointer",
       "leaf_digest": "df822d634de3b4a542e50c7a1ef13e001c676f1f79f2f595303d1a1ac2c2c92f",
@@ -18608,20 +18499,20 @@
       "rule_reason": "inventory-op:managed_read::sha256_hex"
     },
     {
-      "configured_path": "std::fs::create_dir_all",
-      "item": "ratarmount_index::location::snapshot_index_id",
-      "leaf_digest": "9fe296c84af5944e83d27bce4adac676b4be0a56900b6e830cc458dbe4651397",
+      "configured_path": "tempfile::Builder::tempfile_in",
+      "item": "ratarmount_index::location::snapshot_index_id_on",
+      "leaf_digest": "1fb3c910c88b8d72e9a8d9769526c9365459ee93aaaeee291692715efc1378ce",
       "lint": "clippy::disallowed_methods",
       "metadata": {
-        "category": "index-cache-directory",
+        "category": "index-pin-snapshot",
         "creation": {
-          "basis": "Only output directories are created; the well-known source is read through separately reviewed paths.",
-          "policy": "recursive-directory"
+          "basis": "Random O_EXCL placeholder owned by TempPath; removed on errors, made read-only and installed without replacement after sync and hash.",
+          "policy": "exclusive-new-file"
         },
         "disposition": "output-owner",
-        "id": "IR-E0061-M01",
-        "item": "ratarmount_index::location::snapshot_index_id",
-        "reason": "Create the content-addressed snapshot parent before hard-linking or atomically copying the known index."
+        "id": "IR-WALPUB-M01",
+        "item": "ratarmount_index::location::snapshot_index_id_on",
+        "reason": "Allocate a private 0600 empty VACUUM INTO output in the existing publication directory; close its raw descriptor before SQLite writes it."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -18629,9 +18520,9 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0061-M01\",\"item\":\"ratarmount_index::location::snapshot_index_id\",\"disposition\":\"output-owner\",\"category\":\"index-cache-directory\",\"reason\":\"Create the content-addressed snapshot parent before hard-linking or atomically copying the known index.\",\"creation\":{\"policy\":\"recursive-directory\",\"basis\":\"Only output directories are created; the well-known source is read through separately reviewed paths.\"}}",
-      "resolved": "std::fs::create_dir_all",
-      "rule_reason": "inventory-op:fs::create_dir_all"
+      "reason": "internal-read:v1 {\"id\":\"IR-WALPUB-M01\",\"item\":\"ratarmount_index::location::snapshot_index_id_on\",\"disposition\":\"output-owner\",\"category\":\"index-pin-snapshot\",\"reason\":\"Allocate a private 0600 empty VACUUM INTO output in the existing publication directory; close its raw descriptor before SQLite writes it.\",\"creation\":{\"policy\":\"exclusive-new-file\",\"basis\":\"Random O_EXCL placeholder owned by TempPath; removed on errors, made read-only and installed without replacement after sync and hash.\"}}",
+      "resolved": "<tempfile::Builder<'L0,'L1>>::tempfile_in",
+      "rule_reason": "inventory-op:tempfile"
     },
     {
       "configured_path": "tempfile::Builder::tempfile_in",
@@ -18688,20 +18579,21 @@
       "rule_reason": "inventory-op:tempfile"
     },
     {
-      "configured_path": "std::fs::create_dir_all",
-      "item": "ratarmount_index::location::store_index_pointer_atomic",
-      "leaf_digest": "9fe296c84af5944e83d27bce4adac676b4be0a56900b6e830cc458dbe4651397",
+      "configured_path": "ratarmount_index::managed_read::ManagedReadCursor::open",
+      "item": "ratarmount_index::location::sync_then_sha256",
+      "leaf_digest": "f3da9876325312e3d6741a208c3026686084c2b44429741a334bb5c3495e3133",
       "lint": "clippy::disallowed_methods",
       "metadata": {
-        "category": "index-pointer-directory",
+        "category": "index-pin-snapshot",
         "creation": {
-          "basis": "The pointer writer owns this parent tree; tempfile publication and pointer validation remain separate.",
-          "policy": "recursive-directory"
+          "basis": "Existing snapshot input only; SQLite VFS owns the descriptor.",
+          "policy": "none"
         },
-        "disposition": "output-owner",
-        "id": "IR-E0060-M01",
-        "item": "ratarmount_index::location::store_index_pointer_atomic",
-        "reason": "Create the index pointer parent before allocating a sibling temporary JSON output."
+        "disposition": "managed-read",
+        "id": "IR-WALPUB-M02",
+        "item": "ratarmount_index::location::sync_then_sha256",
+        "reason": "Sync and hash a new snapshot or an existing pin through one managed cursor without releasing SQLite locks.",
+        "regression": "regression_index_pin_snapshot_keeps_index_lock"
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -18709,9 +18601,9 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0060-M01\",\"item\":\"ratarmount_index::location::store_index_pointer_atomic\",\"disposition\":\"output-owner\",\"category\":\"index-pointer-directory\",\"reason\":\"Create the index pointer parent before allocating a sibling temporary JSON output.\",\"creation\":{\"policy\":\"recursive-directory\",\"basis\":\"The pointer writer owns this parent tree; tempfile publication and pointer validation remain separate.\"}}",
-      "resolved": "std::fs::create_dir_all",
-      "rule_reason": "inventory-op:fs::create_dir_all"
+      "reason": "internal-read:v1 {\"id\":\"IR-WALPUB-M02\",\"item\":\"ratarmount_index::location::sync_then_sha256\",\"disposition\":\"managed-read\",\"regression\":\"regression_index_pin_snapshot_keeps_index_lock\",\"category\":\"index-pin-snapshot\",\"reason\":\"Sync and hash a new snapshot or an existing pin through one managed cursor without releasing SQLite locks.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing snapshot input only; SQLite VFS owns the descriptor.\"}}",
+      "resolved": "<ratarmount_index::managed_read::ManagedReadCursor>::open",
+      "rule_reason": "inventory-op:ManagedReadCursor::open"
     },
     {
       "configured_path": "std::fs::OpenOptions::new",

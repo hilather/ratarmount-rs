@@ -1,6 +1,7 @@
-//! Copy a portable 0.7.x SQLite sidecar (`--publish-index` / `--publish-index-to`).
+//! Publish a portable 0.7.x SQLite snapshot (`--publish-index` / `--publish-index-to`).
 //!
-//! Local copies keep the existing snapshot protocol. Remote publication writes an
+//! Local publication installs a WAL-complete read-only pin and a separate copy.
+//! Remote publication writes an
 //! immutable blob before its pointer, or both names in one atomic Hub commit.
 
 use std::fs;
@@ -8,8 +9,9 @@ use std::io::{self, Read, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use ratarmount_index::{
-    archive_base_from_index_path, default_index_path, index_pointer_path, publish_index_pointer,
-    INDEX_MEDIA_TYPE,
+    archive_base_from_index_path, default_index_path, existing_sqlite_companion,
+    index_pointer_path, is_pin_file_name, publish_index_pointer_for_pin, require_publication_dir,
+    snapshot_index_id, INDEX_MEDIA_TYPE,
 };
 
 pub struct PublishIndexOpts<'a> {
@@ -19,7 +21,7 @@ pub struct PublishIndexOpts<'a> {
     pub no_recreate_index: bool,
 }
 
-/// Copy `sidecar` to `dest` (or `{archive}.index.sqlite`).
+/// Publish a WAL-complete pin and, when needed, a separate destination copy.
 pub fn publish_index(opts: PublishIndexOpts<'_>) -> Result<PathBuf, String> {
     if !opts.sidecar.is_file() {
         return Err(format!(
@@ -27,41 +29,173 @@ pub fn publish_index(opts: PublishIndexOpts<'_>) -> Result<PathBuf, String> {
             opts.sidecar.display()
         ));
     }
-    let dest = match opts.dest {
-        Some(p) => p.to_path_buf(),
-        None => default_index_path(opts.archive),
-    };
+    let dest = opts
+        .dest
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_index_path(opts.archive));
+    let explicit = opts.dest.is_some();
+    destination_shape(&dest)?;
     let base = archive_base_from_index_path(&dest);
-    if dest != opts.sidecar {
-        if opts.no_recreate_index && dest.exists() {
+    let dir = require_publication_dir(&base).map_err(|e| {
+        format!(
+            "--publish-index-to {}: {e}; nothing was published",
+            dest.display()
+        )
+    })?;
+    let mut copy = !same_directory_entry(&dest, opts.sidecar);
+    if copy {
+        if opts.no_recreate_index && fs::symlink_metadata(&dest).is_ok() {
             return Err(format!(
                 "--no-recreate-index: refusing to overwrite {}",
                 dest.display()
             ));
         }
-        atomic_copy(opts.sidecar, &dest)
-            .map_err(|e| format!("publish-index {}: {e}", dest.display()))?;
+        if let Some(reason) = destination_refusal(&dest) {
+            if explicit {
+                return Err(format!(
+                    "--publish-index-to {}: {reason}; nothing was published",
+                    dest.display()
+                ));
+            }
+            log::warn!(
+                "publish-index {}: {reason}; existing index left unchanged",
+                dest.display()
+            );
+            copy = false;
+        }
+        let parent = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if std::path::absolute(parent).map_err(|e| e.to_string())? != dir {
+            return Err(
+                "internal error: destination and pin publication directories differ".into(),
+            );
+        }
     }
-    // Pin dest as `{base}.index.{new_id}.sqlite` (hardlink after dest holds the
-    // published bytes) so dest==sidecar + later `-c` still keeps generation N.
-    publish_index_pointer(&base, &dest, Some(opts.archive)).map_err(|e| {
+    let pin = snapshot_index_id(&base, opts.sidecar)
+        .map_err(|e| format!("publish-index {}: {e}", dest.display()))?;
+    #[cfg(test)]
+    copy_step(CopyStep::Pinned).map_err(|e| e.to_string())?;
+    let mut copied = false;
+    if copy {
+        match atomic_copy(pin.path(), &dest, Some(pin.id())) {
+            Ok(()) => copied = true,
+            Err(e) if !explicit && e.kind() == io::ErrorKind::AlreadyExists => log::warn!(
+                "publish-index {}: {e}; existing index left unchanged",
+                dest.display()
+            ),
+            Err(e) => return Err(format!("publish-index {}: {e}", dest.display())),
+        }
+    }
+    publish_index_pointer_for_pin(&base, &pin, Some(opts.archive)).map_err(|e| {
         format!(
             "publish-index pointer {}: {e}",
             index_pointer_path(&base).display()
         )
     })?;
-    let bytes = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+    let bytes = fs::metadata(pin.path()).map(|m| m.len()).unwrap_or(0);
     log::info!(
-        "published index {} ({bytes} bytes, {INDEX_MEDIA_TYPE})",
-        dest.display()
+        "published index pin {} ({bytes} bytes, {INDEX_MEDIA_TYPE})",
+        pin.path().display()
     );
-    if dest != opts.sidecar {
+    if copied {
         eprintln!(
             "published index {} ({bytes} bytes, {INDEX_MEDIA_TYPE})",
             dest.display()
         );
     }
     Ok(dest)
+}
+
+fn destination_shape(dest: &Path) -> Result<(), String> {
+    let name = dest
+        .file_name()
+        .filter(|name| {
+            dest.as_os_str()
+                .as_encoded_bytes()
+                .ends_with(name.as_encoded_bytes())
+        })
+        .ok_or_else(|| "--publish-index-to needs a file path; nothing was published".to_string())?;
+    if is_pin_file_name(name) {
+        return Err(format!(
+            "--publish-index-to {} has a pin name; pins are never modified; nothing was published",
+            dest.display()
+        ));
+    }
+    Ok(())
+}
+
+fn same_directory_entry(dest: &Path, sidecar: &Path) -> bool {
+    dest == sidecar
+        || matches!((fs::canonicalize(dest), fs::canonicalize(sidecar)), (Ok(a), Ok(b)) if a == b)
+}
+
+fn destination_refusal(dest: &Path) -> Option<String> {
+    match fs::symlink_metadata(dest) {
+        Ok(_) => return Some("already exists; ratarmount does not replace an index file, because it may be open; remove it and any -wal, -shm, -journal beside it once no process uses it, or choose another destination".into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+        Err(e) => return Some(format!("cannot inspect destination: {e}")),
+    }
+    existing_sqlite_companion(dest).map(|p| format!("{} exists beside the destination; SQLite would apply it to the new index; remove it once no process uses it", p.display()))
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CopyStep {
+    Pinned,
+    Copied,
+    Sync,
+    Closed,
+    Install(PathBuf),
+    Installed,
+    DirSync(PathBuf),
+}
+#[cfg(test)]
+type CopyHook = Box<dyn FnMut(CopyStep) -> io::Result<()>>;
+#[cfg(test)]
+thread_local! { static COPY_HOOK: std::cell::RefCell<Option<CopyHook>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+fn copy_step(step: CopyStep) -> io::Result<()> {
+    let hook = COPY_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        let result = hook(step);
+        COPY_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+        result
+    } else {
+        Ok(())
+    }
+}
+#[cfg(test)]
+fn with_copy_hook<T>(
+    hook: impl FnMut(CopyStep) -> io::Result<()> + 'static,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            COPY_HOOK.with(|s| *s.borrow_mut() = None);
+        }
+    }
+    COPY_HOOK.with(|s| *s.borrow_mut() = Some(Box::new(hook)));
+    let _reset = Reset;
+    f()
+}
+
+struct HashingCopy<'a> {
+    file: &'a mut tempfile::NamedTempFile,
+    hash: sha2::Sha256,
+}
+impl Write for HashingCopy<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        use sha2::Digest;
+        let n = self.file.write(bytes)?;
+        self.hash.update(&bytes[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
 }
 
 /// Validate before building an index or sending any write requests.
@@ -90,6 +224,15 @@ pub fn validate_publish_options(
     }
     if (revision.is_some() || create_pr) && !target.starts_with("hf://") {
         return Err("--publish-revision / --create-pr require an hf:// destination".into());
+    }
+    if let Some(dest) = dest.filter(|_| !remote_publish_url(&target)) {
+        destination_shape(dest)?;
+        require_publication_dir(&archive_base_from_index_path(dest)).map_err(|e| {
+            format!(
+                "--publish-index-to {}: {e}; nothing was published",
+                dest.display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -341,18 +484,9 @@ fn snapshot_sidecar(source: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn atomic_copy(src: &Path, dest: &Path) -> io::Result<()> {
-    if let Some(parent) = dest.parent() {
-        if !parent.as_os_str().is_empty() {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0132-M01","item":"ratarmount::publish_index::atomic_copy","disposition":"output-owner","category":"published-index-directory","reason":"Create the publication destination parent before atomic managed-source index copying.","creation":{"policy":"recursive-directory","basis":"Only output parents are created; the separately reviewed managed copy and tempfile publication preserve source/input obligations."}}"###
-            )]
-            fs::create_dir_all(parent)?;
-        }
-    }
+fn atomic_copy(src: &Path, dest: &Path, expect_sha256: Option<&str>) -> io::Result<()> {
     let mut builder = tempfile::Builder::new();
-    builder.prefix(".ratarmount-publish-").suffix(".tmp");
+    builder.prefix(".ratarmount-index-snap-").suffix(".tmp");
     let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = match parent {
         Some(p) => {
@@ -373,6 +507,11 @@ fn atomic_copy(src: &Path, dest: &Path) -> io::Result<()> {
         }?,
     };
     {
+        use sha2::Digest;
+        let mut tmp = HashingCopy {
+            file: &mut tmp,
+            hash: sha2::Sha256::new(),
+        };
         // Managed (#151): the source is an index that may be open here.
         #[expect(
             clippy::disallowed_methods,
@@ -380,9 +519,38 @@ fn atomic_copy(src: &Path, dest: &Path) -> io::Result<()> {
         )]
         ratarmount_index::managed_read::copy_into(src, &mut tmp)?;
         tmp.flush()?;
+        let got = format!("{:x}", tmp.hash.finalize());
+        if expect_sha256.is_some_and(|expected| expected != got) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the pin changed while it was copied",
+            ));
+        }
     }
-    tmp.persist(dest).map_err(|e| e.error)?;
-    Ok(())
+    #[cfg(test)]
+    copy_step(CopyStep::Copied)?;
+    #[cfg(test)]
+    copy_step(CopyStep::Sync)?;
+    tmp.as_file().sync_all()?;
+    // Closing the new raw handle before install preserves other SQLite locks (#156).
+    let tmp = tmp.into_temp_path();
+    #[cfg(test)]
+    copy_step(CopyStep::Closed)?;
+    if let Some(p) = existing_sqlite_companion(dest) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} exists beside the destination", p.display()),
+        ));
+    }
+    #[cfg(test)]
+    copy_step(CopyStep::Install(dest.to_path_buf()))?;
+    tmp.persist_noclobber(dest).map_err(|e| e.error)?;
+    #[cfg(test)]
+    copy_step(CopyStep::Installed)?;
+    let parent = dest.parent().unwrap_or(Path::new("."));
+    #[cfg(test)]
+    copy_step(CopyStep::DirSync(parent.to_path_buf()))?;
+    ratarmount_index::fsync_dir(parent)
 }
 
 #[cfg(test)]
@@ -390,150 +558,835 @@ pub(crate) mod tests {
     use super::*;
     use std::fs;
 
-    /// Regression: `--publish-index` copies the sidecar (atomic replace).
+    use std::cell::RefCell;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    use std::rc::Rc;
+    fn walpub_catalog(path: &Path, generation: i64) {
+        let mut idx = ratarmount_index::SqliteIndex::create_writable(Some(path)).unwrap();
+        idx.store_versions("0.2.1").unwrap();
+        idx.publish_tmp().unwrap();
+        drop(idx);
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.execute_batch("CREATE TABLE publication_rows(n)").unwrap();
+        c.execute("INSERT INTO publication_rows VALUES (?)", [generation])
+            .unwrap();
+    }
+    fn walpub_source(path: &Path) -> rusqlite::Connection {
+        walpub_catalog(path, 1);
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; INSERT INTO publication_rows VALUES (2)").unwrap();
+        c
+    }
+    fn walpub_rows(path: &Path) -> i64 {
+        let c =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        c.query_row("SELECT count(*) FROM publication_rows", [], |r| r.get(0))
+            .unwrap()
+    }
+    fn walpub_id(path: &Path) -> String {
+        ratarmount_index::load_index_pointer(&ratarmount_index::index_pointer_path_for_index_file(
+            path,
+        ))
+        .unwrap()
+        .unwrap()
+        .index_id
+    }
+    fn walpub_pin(dest: &Path) -> PathBuf {
+        ratarmount_index::index_id_path(&archive_base_from_index_path(dest), &walpub_id(dest))
+            .unwrap()
+    }
+    fn walpub_identity(path: &Path) -> (u64, u64) {
+        let m = fs::metadata(path).unwrap();
+        (m.dev(), m.ino())
+    }
+    fn walpub_bytes(path: &Path) -> Vec<u8> {
+        ratarmount_index::managed_read::read(path).unwrap()
+    }
+    fn walpub_sha(path: &Path) -> String {
+        ratarmount_index::managed_read::sha256_hex(path).unwrap()
+    }
+    fn walpub_companion(path: &Path, suffix: &str) -> PathBuf {
+        let mut p = path.as_os_str().to_os_string();
+        p.push(suffix);
+        p.into()
+    }
+    fn walpub_no_tmp(dir: &Path) {
+        for e in fs::read_dir(dir).unwrap().flatten() {
+            assert!(
+                !e.file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b".ratarmount-index-"),
+                "{:?}",
+                e.path()
+            );
+        }
+    }
+    fn walpub_publish(
+        archive: &Path,
+        source: &Path,
+        dest: Option<&Path>,
+    ) -> Result<PathBuf, String> {
+        publish_index(PublishIndexOpts {
+            archive,
+            sidecar: source,
+            dest,
+            no_recreate_index: false,
+        })
+    }
+
+    /// Regression: copied WAL-only rows are hashed as the pin on three distinct inodes.
     #[test]
     fn publish_index_copies_sidecar() {
-        let dir = tempfile::tempdir().unwrap();
-        let archive = dir.path().join("a.tar");
-        fs::write(&archive, b"archive-bytes").unwrap();
-        let sidecar = dir.path().join("src.index.sqlite");
-        let blob = b"SQLite format 3\0publish-me";
-        fs::write(&sidecar, blob).unwrap();
-        let dest = dir.path().join("out.index.sqlite");
-        let got = publish_index(PublishIndexOpts {
-            archive: &archive,
-            sidecar: &sidecar,
-            dest: Some(&dest),
-            no_recreate_index: false,
-        })
-        .expect("publish");
-        assert_eq!(got, dest);
-        assert_eq!(fs::read(&dest).unwrap(), blob);
-        let ptr_path = ratarmount_index::index_pointer_path_for_index_file(&dest);
-        let ptr = ratarmount_index::load_index_pointer(&ptr_path)
-            .unwrap()
-            .expect("pointer next to dest");
-        assert_eq!(ptr.schema, ratarmount_index::INDEX_POINTER_SCHEMA);
-        assert_eq!(ptr.index_id, ratarmount_index::sha256_hex(blob));
-        assert_eq!(ptr.etag_sha256, ptr.index_id);
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("source.sqlite");
+        let _holder = walpub_source(&source);
+        let dest = d.path().join("out.index.sqlite");
+        assert_eq!(
+            walpub_publish(&d.path().join("a.tar"), &source, Some(&dest)).unwrap(),
+            dest
+        );
+        let pin = walpub_pin(&dest);
+        assert_eq!(walpub_rows(&dest), 2);
+        assert_eq!(walpub_bytes(&dest), walpub_bytes(&pin));
+        assert_eq!(walpub_sha(&dest), walpub_id(&dest));
+        assert_ne!(walpub_identity(&pin), walpub_identity(&source));
+        assert_ne!(walpub_identity(&dest), walpub_identity(&source));
+        assert_ne!(walpub_identity(&pin), walpub_identity(&dest));
+        assert_eq!(fs::metadata(&dest).unwrap().mode() & 0o777, 0o600);
     }
 
-    /// Regression: dest == sidecar still writes `{archive}.index.ptr`.
+    /// Regression: publishing the live sidecar itself stores a pointer to a WAL-complete pin.
     #[test]
     fn publish_index_dest_eq_sidecar_writes_ptr() {
-        let dir = tempfile::tempdir().unwrap();
-        let archive = dir.path().join("a.tar");
-        fs::write(&archive, b"archive-bytes").unwrap();
-        let sidecar = ratarmount_index::default_index_path(&archive);
-        let blob = b"SQLite format 3\0same-path";
-        fs::write(&sidecar, blob).unwrap();
-        let got = publish_index(PublishIndexOpts {
-            archive: &archive,
-            sidecar: &sidecar,
-            dest: None,
-            no_recreate_index: false,
-        })
-        .expect("publish");
-        assert_eq!(got, sidecar);
-        assert_eq!(fs::read(&sidecar).unwrap(), blob);
-        let ptr_path = ratarmount_index::index_pointer_path(&archive);
-        assert!(ptr_path.is_file(), "dest==sidecar must still write .ptr");
-        let ptr = ratarmount_index::load_index_pointer(&ptr_path)
-            .unwrap()
-            .expect("ptr");
-        assert_eq!(ptr.index_id, ratarmount_index::sha256_hex(blob));
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.tar");
+        let source = default_index_path(&a);
+        let _holder = walpub_source(&source);
+        let before = walpub_bytes(&source);
+        walpub_publish(&a, &source, None).unwrap();
+        assert_eq!(walpub_bytes(&source), before);
+        assert_eq!(walpub_rows(&walpub_pin(&source)), 2);
     }
 
-    /// Regression: remount `--index-id` of N while N+1 is well-known (keep-last-K=2).
+    /// Regression: a fresh explicit destination retains the previous snapshot across generations.
     #[test]
     fn publish_index_keep_last_k_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let archive = dir.path().join("a.tar");
-        fs::write(&archive, b"archive-bytes").unwrap();
-        let dest = dir.path().join("out.index.sqlite");
-        let blob_n = b"SQLite format 3\0blob-N";
-        let sidecar_n = dir.path().join("n.index.sqlite");
-        fs::write(&sidecar_n, blob_n).unwrap();
-        publish_index(PublishIndexOpts {
-            archive: &archive,
-            sidecar: &sidecar_n,
-            dest: Some(&dest),
-            no_recreate_index: false,
-        })
-        .unwrap();
-        let id_n = ratarmount_index::sha256_hex(blob_n);
-
-        let blob_np1 = b"SQLite format 3\0blob-N+1-more";
-        let sidecar_np1 = dir.path().join("np1.index.sqlite");
-        fs::write(&sidecar_np1, blob_np1).unwrap();
-        publish_index(PublishIndexOpts {
-            archive: &archive,
-            sidecar: &sidecar_np1,
-            dest: Some(&dest),
-            no_recreate_index: false,
-        })
-        .unwrap();
-        let id_np1 = ratarmount_index::sha256_hex(blob_np1);
-        assert_eq!(fs::read(&dest).unwrap(), blob_np1);
-
-        let base = ratarmount_index::archive_base_from_index_path(&dest);
-        let snap = ratarmount_index::index_id_path(&base, &id_n).unwrap();
-        assert!(
-            snap.is_file(),
-            "previous blob kept as index.{{old_id}}.sqlite"
-        );
-        assert_eq!(fs::read(&snap).unwrap(), blob_n);
-        assert_eq!(
-            ratarmount_index::resolve_index_id_path(&base, &id_n).unwrap(),
-            snap
-        );
-        let resolved_np1 = ratarmount_index::resolve_index_id_path(&base, &id_np1).unwrap();
-        assert_eq!(fs::read(&resolved_np1).unwrap(), blob_np1);
+        let d = tempfile::tempdir().unwrap();
+        let dest = d.path().join("out.index.sqlite");
+        let a = d.path().join("a.tar");
+        let mut ids = Vec::new();
+        for n in 1..=3 {
+            let source = d.path().join(format!("s{n}.sqlite"));
+            walpub_catalog(&source, n);
+            if dest.exists() {
+                fs::remove_file(&dest).unwrap();
+            }
+            walpub_publish(&a, &source, Some(&dest)).unwrap();
+            ids.push(walpub_id(&dest));
+        }
+        let base = archive_base_from_index_path(&dest);
+        assert!(ratarmount_index::resolve_index_id_path(&base, &ids[0]).is_err());
+        for id in &ids[1..] {
+            let p = ratarmount_index::resolve_index_id_path(&base, id).unwrap();
+            assert_eq!(walpub_sha(&p), *id);
+        }
     }
 
-    /// Regression: dest==sidecar `--publish-index` pins N so remount `--index-id` of N
-    /// still works after well-known is rebuilt to N+1 (`-c` tmp+rename).
+    /// Regression: replacing the live sidecar retains the previous immutable generation.
     #[test]
     fn publish_index_dest_eq_sidecar_keep_last_k_across_rebuild() {
-        let dir = tempfile::tempdir().unwrap();
-        let archive = dir.path().join("a.tar");
-        fs::write(&archive, b"archive-bytes").unwrap();
-        let sidecar = ratarmount_index::default_index_path(&archive);
-        let blob_n = b"SQLite format 3\0sidecar-N";
-        fs::write(&sidecar, blob_n).unwrap();
-        publish_index(PublishIndexOpts {
-            archive: &archive,
-            sidecar: &sidecar,
-            dest: None,
-            no_recreate_index: false,
-        })
-        .unwrap();
-        let id_n = ratarmount_index::sha256_hex(blob_n);
-
-        let blob_np1 = b"SQLite format 3\0sidecar-N+1";
-        let np1 = dir.path().join("np1.tmp");
-        fs::write(&np1, blob_np1).unwrap();
-        fs::rename(&np1, &sidecar).unwrap();
-        publish_index(PublishIndexOpts {
-            archive: &archive,
-            sidecar: &sidecar,
-            dest: None,
-            no_recreate_index: false,
-        })
-        .unwrap();
-
-        let snap = ratarmount_index::index_id_path(&archive, &id_n).unwrap();
-        assert!(snap.is_file(), "dest==sidecar must pin index.{{id}}.sqlite");
-        assert_eq!(fs::read(&snap).unwrap(), blob_n);
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.tar");
+        let source = default_index_path(&a);
+        walpub_catalog(&source, 1);
+        walpub_publish(&a, &source, None).unwrap();
+        let old = walpub_id(&source);
+        let pin = walpub_pin(&source);
+        let before = walpub_bytes(&pin);
+        let new = d.path().join("new.sqlite");
+        walpub_catalog(&new, 2);
+        fs::rename(new, &source).unwrap();
+        walpub_publish(&a, &source, None).unwrap();
+        assert_ne!(walpub_id(&source), old);
+        assert_eq!(walpub_bytes(&pin), before);
         assert_eq!(
-            ratarmount_index::resolve_index_id_path(&archive, &id_n).unwrap(),
-            snap
+            ratarmount_index::resolve_index_id_path(&a, &old).unwrap(),
+            pin
         );
-        let id_np1 = ratarmount_index::sha256_hex(blob_np1);
-        let resolved_np1 = ratarmount_index::resolve_index_id_path(&archive, &id_np1).unwrap();
-        assert_eq!(fs::read(&resolved_np1).unwrap(), blob_np1);
     }
 
+    /// Regression: every existing destination or orphan companion is refused before publication.
+    #[test]
+    fn regression_publish_index_to_refuses_existing_dest() {
+        for case in 0..8 {
+            let d = tempfile::tempdir().unwrap();
+            let source = d.path().join("source.sqlite");
+            walpub_catalog(&source, 1);
+            let dest = d.path().join("out.index.sqlite");
+            let mut holder = None;
+            match case {
+                0 => holder = Some(walpub_source(&dest)),
+                1 => walpub_catalog(&dest, 2),
+                2 => fs::write(&dest, b"").unwrap(),
+                3 => symlink(d.path().join("missing"), &dest).unwrap(),
+                4 => fs::create_dir(&dest).unwrap(),
+                _ => fs::write(
+                    walpub_companion(&dest, ["-wal", "-shm", "-journal"][case - 5]),
+                    b"orphan",
+                )
+                .unwrap(),
+            }
+            let before: Vec<_> = fs::read_dir(d.path())
+                .unwrap()
+                .flatten()
+                .map(|e| {
+                    let p = e.path();
+                    let m = fs::symlink_metadata(&p).unwrap();
+                    let bytes = if m.is_file() {
+                        Some(walpub_bytes(&p))
+                    } else {
+                        None
+                    };
+                    (p, (m.dev(), m.ino()), bytes)
+                })
+                .collect();
+            let err = walpub_publish(&d.path().join("a.tar"), &source, Some(&dest)).unwrap_err();
+            assert!(
+                err.contains("nothing was published") && err.contains(&dest.display().to_string()),
+                "{err}"
+            );
+            assert_eq!(fs::read_dir(d.path()).unwrap().count(), before.len());
+            for (p, id, data) in before {
+                let m = fs::symlink_metadata(&p).unwrap();
+                assert_eq!((m.dev(), m.ino()), id);
+                if let Some(data) = data {
+                    assert_eq!(walpub_bytes(&p), data);
+                }
+            }
+            drop(holder);
+            walpub_no_tmp(d.path());
+        }
+    }
+
+    /// Regression: refusal never opens, converts or replaces a destination held by SQLite.
+    #[test]
+    fn regression_publish_index_to_never_touches_a_held_dest() {
+        for case in 0..3 {
+            let d = tempfile::tempdir().unwrap();
+            let source = d.path().join("source.sqlite");
+            walpub_catalog(&source, 1);
+            let dest = d.path().join("out.index.sqlite");
+            let c = rusqlite::Connection::open(&dest).unwrap();
+            if case != 1 {
+                c.execute_batch("CREATE TABLE held(n); INSERT INTO held VALUES (1)")
+                    .unwrap();
+            }
+            if case == 0 {
+                c.execute_batch("BEGIN EXCLUSIVE; INSERT INTO held VALUES (2)")
+                    .unwrap();
+            }
+            let inode = walpub_identity(&dest);
+            let err = walpub_publish(&d.path().join("a.tar"), &source, Some(&dest)).unwrap_err();
+            assert!(err.contains("already exists"), "{err}");
+            assert_eq!(walpub_identity(&dest), inode);
+            match case {0=>c.execute_batch("COMMIT").unwrap(),1=>c.execute_batch("CREATE TABLE held(n); PRAGMA journal_mode=WAL; INSERT INTO held VALUES (1)").unwrap(),_=>{let other=rusqlite::Connection::open(&dest).unwrap();other.execute_batch("PRAGMA journal_mode=WAL; INSERT INTO held VALUES (2)").unwrap();assert_eq!(c.query_row("SELECT count(*) FROM held",[],|r|r.get::<_,i64>(0)).unwrap(),2);c.execute_batch("INSERT INTO held VALUES (3)").unwrap();}}
+            assert!(!ratarmount_index::index_pointer_path_for_index_file(&dest).exists());
+            assert_eq!(
+                fs::read_dir(d.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|e| is_pin_file_name(&e.file_name()))
+                    .count(),
+                0
+            );
+        }
+    }
+
+    /// Regression: a destination created after preflight wins without being clobbered.
+    #[test]
+    fn regression_publish_index_to_new_dest_is_never_clobbered() {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("source.sqlite");
+        walpub_catalog(&source, 1);
+        let dest = d.path().join("out.index.sqlite");
+        let holder = Rc::new(RefCell::new(None));
+        let state = holder.clone();
+        let saved = Rc::new(RefCell::new(None));
+        let observed = saved.clone();
+        let race_dest = dest.clone();
+        let result = with_copy_hook(
+            move |s| {
+                if s == CopyStep::Pinned {
+                    *state.borrow_mut() = Some(walpub_source(&race_dest));
+                    *observed.borrow_mut() = Some((
+                        walpub_identity(&race_dest),
+                        walpub_bytes(&race_dest),
+                        walpub_bytes(&walpub_companion(&race_dest, "-wal")),
+                    ));
+                }
+                Ok(())
+            },
+            || walpub_publish(&d.path().join("a.tar"), &source, Some(&dest)),
+        );
+        assert!(result.is_err());
+        let saved = saved.borrow();
+        let (inode, main, wal) = saved.as_ref().unwrap();
+        assert_eq!(&walpub_identity(&dest), inode);
+        assert_eq!(&walpub_bytes(&dest), main);
+        assert_eq!(&walpub_bytes(&walpub_companion(&dest, "-wal")), wal);
+        assert_eq!(walpub_rows(&dest), 2);
+        assert!(fs::metadata(walpub_companion(&dest, "-wal")).unwrap().len() > 0);
+        assert!(!ratarmount_index::index_pointer_path_for_index_file(&dest).exists());
+        walpub_no_tmp(d.path());
+    }
+
+    /// Regression: pin-named destinations are refused even when they equal the source.
+    #[test]
+    fn regression_publish_index_to_refuses_pin_named_dest() {
+        for case in 0..5 {
+            let d = tempfile::tempdir().unwrap();
+            let ordinary = d.path().join("source.sqlite");
+            walpub_catalog(&ordinary, 1);
+            let dest = d.path().join(format!(
+                "{}.index.{}.sqlite",
+                if case == 4 { "" } else { "a" },
+                "a".repeat(64)
+            ));
+            if case > 0 {
+                fs::copy(&ordinary, &dest).unwrap();
+            }
+            let source = if case == 2 || case == 3 {
+                dest.clone()
+            } else {
+                ordinary
+            };
+            let spelling = if case == 3 {
+                dest.parent()
+                    .unwrap()
+                    .join(".")
+                    .join(dest.file_name().unwrap())
+            } else {
+                dest.clone()
+            };
+            let before = if dest.exists() {
+                Some(walpub_bytes(&dest))
+            } else {
+                None
+            };
+            let err =
+                walpub_publish(&d.path().join("a.tar"), &source, Some(&spelling)).unwrap_err();
+            assert!(err.contains("pin name"), "{err}");
+            if let Some(b) = before {
+                assert_eq!(walpub_bytes(&dest), b);
+            }
+            assert!(!ratarmount_index::index_pointer_path_for_index_file(&dest).exists());
+            walpub_no_tmp(d.path());
+        }
+    }
+
+    /// Regression: implicit publication warns and leaves an existing well-known database alone.
+    #[test]
+    fn regression_publish_index_leaves_existing_well_known() {
+        for hardlink in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let a = d.path().join("a.tar");
+            let source = d.path().join("source.sqlite");
+            let _holder = walpub_source(&source);
+            let dest = default_index_path(&a);
+            let _dest_holder = if hardlink {
+                fs::hard_link(&source, &dest).unwrap();
+                None
+            } else {
+                Some(walpub_source(&dest))
+            };
+            let before = walpub_bytes(&dest);
+            let inode = walpub_identity(&dest);
+            let wal = fs::read(walpub_companion(&dest, "-wal")).ok();
+            walpub_publish(&a, &source, None).unwrap();
+            assert_eq!(walpub_bytes(&dest), before);
+            assert_eq!(walpub_identity(&dest), inode);
+            assert_eq!(fs::read(walpub_companion(&dest, "-wal")).ok(), wal);
+            assert_eq!(walpub_rows(&walpub_pin(&dest)), 2);
+            assert!(publish_index(PublishIndexOpts {
+                archive: &a,
+                sidecar: &source,
+                dest: None,
+                no_recreate_index: true
+            })
+            .unwrap_err()
+            .contains("--no-recreate-index"));
+        }
+    }
+
+    /// Regression: canonical spelling identifies one entry; hard links are different WAL names.
+    #[test]
+    fn regression_publish_index_same_entry_table() {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("source.sqlite");
+        walpub_catalog(&source, 1);
+        fs::create_dir(d.path().join("sub")).unwrap();
+        let link = d.path().join("link");
+        symlink(&source, &link).unwrap();
+        let chain = d.path().join("chain");
+        symlink(&link, &chain).unwrap();
+        for p in [
+            source.clone(),
+            d.path().join("./source.sqlite"),
+            d.path().join("sub/../source.sqlite"),
+            link,
+            chain,
+        ] {
+            assert!(same_directory_entry(&p, &source), "{}", p.display());
+        }
+        let hard = d.path().join("hard");
+        fs::hard_link(&source, &hard).unwrap();
+        let copy = d.path().join("copy");
+        fs::copy(&source, &copy).unwrap();
+        let dangling = d.path().join("dangling");
+        symlink(d.path().join("missing"), &dangling).unwrap();
+        for p in [hard, copy, d.path().join("missing"), dangling] {
+            assert!(!same_directory_entry(&p, &source), "{}", p.display());
+        }
+    }
+
+    /// Regression: alternate spellings and symlinks preserve the source and WAL; hard links refuse.
+    #[test]
+    fn regression_publish_index_same_entry_is_not_copied_and_hard_link_is_refused() {
+        for case in 0..4 {
+            let d = tempfile::tempdir().unwrap();
+            let source = d.path().join("x.index.sqlite");
+            let _holder = walpub_source(&source);
+            fs::create_dir(d.path().join("sub")).unwrap();
+            let dest = match case {
+                0 => d.path().join("./x.index.sqlite"),
+                1 => d.path().join("sub/../x.index.sqlite"),
+                2 => {
+                    let p = d.path().join("link.index.sqlite");
+                    symlink(&source, &p).unwrap();
+                    p
+                }
+                _ => {
+                    let p = d.path().join("hard.index.sqlite");
+                    fs::hard_link(&source, &p).unwrap();
+                    p
+                }
+            };
+            let before = walpub_bytes(&source);
+            let wal = walpub_bytes(&walpub_companion(&source, "-wal"));
+            let inode = walpub_identity(&source);
+            let result = walpub_publish(&d.path().join("a.tar"), &source, Some(&dest));
+            if case == 3 {
+                let e = result.unwrap_err();
+                assert!(
+                    e.contains("already exists") && e.contains("nothing was published"),
+                    "{e}"
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(walpub_rows(&walpub_pin(&dest)), 2);
+            }
+            assert_eq!(walpub_bytes(&source), before);
+            assert_eq!(walpub_bytes(&walpub_companion(&source, "-wal")), wal);
+            assert_eq!(walpub_identity(&source), inode);
+            if case == 2 {
+                assert!(fs::symlink_metadata(&dest).unwrap().is_symlink());
+            }
+        }
+    }
+
+    /// Regression: copy hashing, fsync and raw close precede the no-replace install.
+    #[test]
+    fn regression_publish_index_to_copy_is_verified_synced_and_closed_before_install() {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("source.sqlite");
+        walpub_catalog(&source, 1);
+        let dest = d.path().join("out.index.sqlite");
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let e = events.clone();
+        with_copy_hook(
+            move |s| {
+                e.borrow_mut().push(s);
+                Ok(())
+            },
+            || walpub_publish(&d.path().join("a.tar"), &source, Some(&dest)),
+        )
+        .unwrap();
+        assert_eq!(
+            *events.borrow(),
+            [
+                CopyStep::Pinned,
+                CopyStep::Copied,
+                CopyStep::Sync,
+                CopyStep::Closed,
+                CopyStep::Install(dest.clone()),
+                CopyStep::Installed,
+                CopyStep::DirSync(d.path().to_path_buf())
+            ]
+        );
+        for corrupt in [false, true] {
+            if dest.exists() {
+                fs::remove_file(&dest).unwrap();
+            }
+            let pin = walpub_pin(&dest);
+            let result = with_copy_hook(
+                move |s| {
+                    if corrupt && s == CopyStep::Pinned {
+                        fs::set_permissions(&pin, fs::Permissions::from_mode(0o600)).unwrap();
+                        fs::write(&pin, b"changed pin").unwrap();
+                    }
+                    if !corrupt && s == CopyStep::Sync {
+                        return Err(io::Error::other("sync failure"));
+                    }
+                    Ok(())
+                },
+                || walpub_publish(&d.path().join("a.tar"), &source, Some(&dest)),
+            );
+            assert!(result.is_err());
+            assert!(!dest.exists());
+            walpub_no_tmp(d.path());
+        }
+    }
+
+    /// Regression: an install or post-install sync failure keeps the old pointer.
+    #[test]
+    fn regression_publish_index_to_late_failure_keeps_pointer() {
+        for sync in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let source = d.path().join("source.sqlite");
+            walpub_catalog(&source, 1);
+            let dest = d.path().join("out.index.sqlite");
+            let base = archive_base_from_index_path(&dest);
+            let old = ratarmount_index::IndexPointer::for_blob(&source, None).unwrap();
+            ratarmount_index::store_index_pointer_atomic(&index_pointer_path(&base), &old).unwrap();
+            let before = walpub_bytes(&index_pointer_path(&base));
+            assert!(with_copy_hook(
+                move |s| {
+                    if (sync && matches!(s, CopyStep::DirSync(_)))
+                        || (!sync && matches!(s, CopyStep::Install(_)))
+                    {
+                        Err(io::Error::other("late failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || walpub_publish(&d.path().join("a.tar"), &source, Some(&dest))
+            )
+            .is_err());
+            assert_eq!(walpub_bytes(&index_pointer_path(&base)), before);
+            assert_eq!(dest.exists(), sync);
+            walpub_no_tmp(d.path());
+        }
+    }
+
+    /// Regression: invalid UTF-8 parents put copy, pin, pointer and sync in the same directory.
+    #[test]
+    fn regression_publish_index_to_non_utf8_parent_places_artifacts_together() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skip: byte-path case is Linux-only");
+            return;
+        }
+        use std::os::unix::ffi::OsStringExt;
+        for exists in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let t = d.path().join("T");
+            fs::create_dir(&t).unwrap();
+            let out = t.join(std::ffi::OsString::from_vec(b"out-\xff/sub".to_vec()));
+            if exists {
+                fs::create_dir_all(&out).unwrap();
+            }
+            let dest = out.join("a.index.sqlite");
+            let source = d.path().join("source.sqlite");
+            walpub_catalog(&source, 1);
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let e = events.clone();
+            let result = with_copy_hook(
+                move |s| {
+                    e.borrow_mut().push(s);
+                    Ok(())
+                },
+                || walpub_publish(&d.path().join("a.tar"), &source, Some(&dest)),
+            );
+            if exists {
+                result.unwrap();
+                assert!(walpub_pin(&dest).exists());
+                assert!(ratarmount_index::index_pointer_path_for_index_file(&dest).exists());
+                assert_eq!(fs::read_dir(&t).unwrap().count(), 1);
+                assert!(events.borrow().contains(&CopyStep::DirSync(out)));
+            } else {
+                assert!(result.unwrap_err().contains("does not exist"));
+                assert_eq!(fs::read_dir(&t).unwrap().count(), 0);
+                assert!(events.borrow().is_empty());
+            }
+        }
+    }
+
+    /// Regression: separator, dot and dot-dot destination suffixes cannot create artifacts.
+    #[test]
+    fn regression_publish_index_to_refuses_destination_without_file_name() {
+        for exists in [false, true] {
+            for suffix in ["out/", "out/.", "out/.."] {
+                let d = tempfile::tempdir().unwrap();
+                let source = d.path().join("source.sqlite");
+                walpub_catalog(&source, 1);
+                if exists {
+                    fs::create_dir(d.path().join("out")).unwrap();
+                }
+                let before = fs::read_dir(d.path()).unwrap().count();
+                assert!(walpub_publish(
+                    &d.path().join("a.tar"),
+                    &source,
+                    Some(&d.path().join(suffix))
+                )
+                .unwrap_err()
+                .contains("needs a file path"));
+                assert_eq!(fs::read_dir(d.path()).unwrap().count(), before);
+            }
+        }
+    }
+
+    /// Regression: .index.sqlite destinations rotate their own pins, preserving out.index pins.
+    #[test]
+    fn regression_publish_index_to_directory_base_rotates_its_own_pins() {
+        let d = tempfile::tempdir().unwrap();
+        let out = d.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let independent = d.path().join("out.index.sqlite");
+        let a = d.path().join("a.tar");
+        let mut independent_ids = Vec::new();
+        let mut inner_ids = Vec::new();
+        for n in 1..=5 {
+            let source = d.path().join(format!("s{n}.sqlite"));
+            walpub_catalog(&source, n);
+            let dest = if n <= 2 {
+                independent.clone()
+            } else {
+                out.join(".index.sqlite")
+            };
+            if dest.exists() {
+                fs::remove_file(&dest).unwrap();
+            }
+            walpub_publish(&a, &source, Some(&dest)).unwrap();
+            if n <= 2 {
+                independent_ids.push(walpub_id(&dest));
+            } else {
+                inner_ids.push(walpub_id(&dest));
+                for id in &independent_ids {
+                    assert!(
+                        ratarmount_index::resolve_index_id_path(&d.path().join("out"), id).is_ok()
+                    );
+                }
+            }
+        }
+        assert!(
+            !ratarmount_index::index_id_path(&d.path().join("out/"), &inner_ids[0])
+                .unwrap()
+                .exists()
+        );
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 4);
+        assert_eq!(walpub_id(&out.join(".index.sqlite")), inner_ids[2]);
+    }
+
+    /// Regression: missing publication directories refuse before any output or source preparation.
+    #[test]
+    fn regression_publish_index_to_missing_directory_is_refused() {
+        for suffix in [
+            "out/a.index.sqlite",
+            "out/sub/a.index.sqlite",
+            "new/../link/sub/a.index.sqlite",
+            "a/b/../../out/x.index.sqlite",
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            let t = d.path().join("T");
+            fs::create_dir(&t).unwrap();
+            let source = d.path().join("source.sqlite");
+            walpub_catalog(&source, 1);
+            let dest = t.join(suffix);
+            let before = fs::read_dir(&t).unwrap().count();
+            let err = walpub_publish(&d.path().join("a.tar"), &source, Some(&dest)).unwrap_err();
+            assert!(
+                err.contains("nothing was published") && err.contains("does not exist"),
+                "{err}"
+            );
+            assert_eq!(fs::read_dir(&t).unwrap().count(), before);
+            assert!(validate_publish_options(
+                true,
+                &[d.path().join("a.tar")],
+                Some(&dest),
+                None,
+                false
+            )
+            .is_err());
+            assert!(atomic_copy(&source, &dest, None).is_err());
+            assert_eq!(fs::read_dir(&t).unwrap().count(), before);
+        }
+        let d = tempfile::tempdir().unwrap();
+        assert!(validate_publish_options(
+            true,
+            &[d.path().join("a.tar")],
+            Some(&d.path().join("out.index.sqlite")),
+            None,
+            false
+        )
+        .is_ok());
+        assert!(validate_publish_options(
+            true,
+            &[d.path().join("a.tar")],
+            Some(Path::new("s3://bucket/a.tar")),
+            None,
+            false
+        )
+        .is_ok());
+        assert!(validate_publish_options(
+            true,
+            &[d.path().join("a.tar")],
+            Some(&d.path().join("out/")),
+            None,
+            false
+        )
+        .is_err());
+    }
+
+    /// Regression: a file bind mount shares the inode but has another SQLite WAL name.
+    #[test]
+    fn regression_publish_index_to_refuses_file_bind_mount_of_the_index() {
+        use std::process::Command;
+        const TEST: &str="publish_index::tests::regression_publish_index_to_refuses_file_bind_mount_of_the_index";
+        if let Some(alias) = std::env::var_os("WALPUB_ALIAS_READER") {
+            // Fresh exec is essential: SQLite's per-inode shm cache in the source
+            // holder's process would otherwise make this alias see source WAL rows.
+            let c = rusqlite::Connection::open_with_flags(
+                PathBuf::from(alias),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            assert_eq!(
+                c.query_row("SELECT count(*) FROM publication_rows WHERE n=2", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            eprintln!("fresh alias reader row passed");
+            return;
+        }
+        if !cfg!(target_os = "linux") {
+            eprintln!("skip: file bind mount requires Linux");
+            return;
+        }
+        let _spawn = ratarmount_index::test_process::spawning();
+        if std::env::var_os("WALPUB_BIND_CHILD").is_none() {
+            match Command::new("unshare").args(["-Urm", "true"]).output() {
+                Ok(out) if out.status.success() => {}
+                other => {
+                    eprintln!("skip: unshare -Urm unavailable: {other:?}");
+                    return;
+                }
+            }
+            let out = Command::new("unshare")
+                .arg("-Urm")
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("WALPUB_BIND_CHILD", "1")
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            eprintln!("{text}");
+            assert!(out.status.success(), "{text}");
+            for row in [
+                "explicit bind refusal row passed",
+                "implicit bind preservation row passed",
+                "fresh alias reader row passed",
+            ] {
+                assert!(text.contains(row), "{text}");
+            }
+            return;
+        }
+        struct Mounted(Vec<PathBuf>);
+        impl Drop for Mounted {
+            fn drop(&mut self) {
+                for path in self.0.iter().rev() {
+                    let _ = Command::new("umount").arg(path).status();
+                }
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        let mut mounts = Mounted(Vec::new());
+        let source = d.path().join("source.sqlite");
+        let holder = walpub_source(&source);
+        let before = walpub_bytes(&walpub_companion(&source, "-wal"));
+        let e = d.path().join("E");
+        fs::create_dir(&e).unwrap();
+        let alias = e.join("alias.index.sqlite");
+        fs::write(&alias, b"").unwrap();
+        let bind = |path: &Path| {
+            let out = Command::new("mount")
+                .arg("--bind")
+                .arg(&source)
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        bind(&alias);
+        mounts.0.push(alias.clone());
+        assert_eq!(walpub_identity(&alias), walpub_identity(&source));
+        assert_eq!(fs::metadata(&alias).unwrap().nlink(), 1);
+        assert_ne!(
+            fs::canonicalize(&alias).unwrap(),
+            fs::canonicalize(&source).unwrap()
+        );
+        assert!(existing_sqlite_companion(&alias).is_none());
+        let err = walpub_publish(&d.path().join("a.tar"), &source, Some(&alias)).unwrap_err();
+        assert!(
+            err.contains("already exists") && err.contains("nothing was published"),
+            "{err}"
+        );
+        assert_eq!(fs::read_dir(&e).unwrap().count(), 1);
+        assert_eq!(walpub_bytes(&walpub_companion(&source, "-wal")), before);
+        assert_eq!(
+            holder
+                .query_row("SELECT count(*) FROM publication_rows", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        eprintln!("explicit bind refusal row passed");
+        let e2 = d.path().join("E2");
+        fs::create_dir(&e2).unwrap();
+        let archive = e2.join("a.tar");
+        let well = default_index_path(&archive);
+        fs::write(&well, b"").unwrap();
+        bind(&well);
+        mounts.0.push(well.clone());
+        walpub_publish(&archive, &source, None).unwrap();
+        assert_eq!(walpub_identity(&well), walpub_identity(&source));
+        let pin = walpub_pin(&well);
+        assert_eq!(walpub_rows(&pin), 2);
+        assert_eq!(walpub_sha(&pin), walpub_id(&well));
+        eprintln!("implicit bind preservation row passed");
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env("WALPUB_ALIAS_READER", &alias)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains("fresh alias reader row passed"));
+        eprintln!("{text}");
+        drop(mounts);
+    }
     #[test]
     fn publish_index_refuses_overwrite_when_no_recreate() {
         let dir = tempfile::tempdir().unwrap();
@@ -1348,7 +2201,7 @@ pub(crate) mod tests {
         c.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (1);")
             .unwrap();
         let holder = s7_wal_holder(&src);
-        atomic_copy(&src, &dir.path().join("copy.sqlite")).unwrap();
+        atomic_copy(&src, &dir.path().join("copy.sqlite"), None).unwrap();
         assert!(other_process_sees_lock(&src), "local copy kept the lock");
         drop(holder);
         drop(c);
