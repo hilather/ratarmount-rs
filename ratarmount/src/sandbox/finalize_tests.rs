@@ -18,7 +18,7 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Finalize and retain are Linux only (ruling 7).
 pub(super) fn linux() -> bool {
@@ -49,6 +49,153 @@ pub(super) struct Env {
     pub(super) base: PathBuf,
     pub(super) state: tempfile::TempDir,
     pub(super) scratch: Scratch,
+}
+
+/// Window in which `open_after_drop*` retries an `in_use` result, checked before
+/// each retry. The last attempt may finish after this window.
+const OPEN_AFTER_DROP_RETRY_WINDOW: Duration = Duration::from_secs(10);
+
+/// Reopen only after this test dropped the supervisor on this state. A sibling
+/// test's child can inherit its lock until exec/exit (daemon.rs:85-88 and
+/// test_process.rs), as in CI run 42730791388 attempt 2. Retry only `in_use`
+/// within `OPEN_AFTER_DROP_RETRY_WINDOW` (10 s; checked before each retry) so a
+/// real lock leak still fails with the last error. The last attempt may finish
+/// after that window.
+pub(super) fn open_after_drop(
+    state: &Path,
+    max_attempts: usize,
+    timeout: Duration,
+    fake: Fake,
+) -> Supervisor<Fake> {
+    open_after_drop_result(state, max_attempts, timeout, fake).unwrap()
+}
+
+fn open_after_drop_result(
+    state: &Path,
+    max_attempts: usize,
+    timeout: Duration,
+    fake: Fake,
+) -> Result<Supervisor<Fake>, ApiError> {
+    open_after_drop_with(state, max_attempts, timeout, fake, &mut || {})
+}
+
+fn open_after_drop_timed(
+    state: &Path,
+    max_attempts: usize,
+    timeout: Duration,
+    fake: Fake,
+) -> (Supervisor<Fake>, Duration) {
+    let (result, took) = open_after_drop_timed_with(state, max_attempts, timeout, fake, &mut || {});
+    (result.unwrap(), took)
+}
+
+fn open_after_drop_with(
+    state: &Path,
+    max_attempts: usize,
+    timeout: Duration,
+    fake: Fake,
+    on_in_use: &mut dyn FnMut(),
+) -> Result<Supervisor<Fake>, ApiError> {
+    open_after_drop_timed_with(state, max_attempts, timeout, fake, on_in_use).0
+}
+
+fn open_after_drop_timed_with(
+    state: &Path,
+    max_attempts: usize,
+    timeout: Duration,
+    fake: Fake,
+    on_in_use: &mut dyn FnMut(),
+) -> (Result<Supervisor<Fake>, ApiError>, Duration) {
+    let started = Instant::now();
+    loop {
+        let attempt = Instant::now();
+        let result = Supervisor::open(state, max_attempts, timeout, fake.clone());
+        let took = attempt.elapsed();
+        match result {
+            Err(error)
+                if error.code == "in_use" && started.elapsed() < OPEN_AFTER_DROP_RETRY_WINDOW =>
+            {
+                on_in_use();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return (result, took),
+        }
+    }
+}
+
+/// Regression: a post-drop open failed while an inherited lock description
+/// remained live. Release a separate holder only after observing `in_use`;
+/// other errors must return immediately without invoking the retry hook.
+#[test]
+fn regression_open_after_drop_retries_in_use() {
+    {
+        let state = private_tempdir();
+        let fake = Fake::default();
+        let timeout = Duration::from_secs(2);
+        let _processes = ratarmount_index::test_process::exclusive();
+        drop(Supervisor::open(state.path(), 8, timeout, fake.clone()).unwrap());
+        let mut held = Some(super::daemon::lock(&state.path().join("daemon.lock")).unwrap());
+        let mut calls = 0;
+        let sup = open_after_drop_with(state.path(), 8, timeout, fake, &mut || {
+            calls += 1;
+            drop(held.take());
+        })
+        .unwrap();
+        assert!(
+            calls >= 1,
+            "the held lock must produce in_use before retrying"
+        );
+        assert!(held.is_none());
+        assert_eq!(sup.root, fs::canonicalize(state.path()).unwrap());
+    }
+
+    let dir = private_tempdir();
+    let state = dir.path().join("file");
+    fs::write(&state, b"not a directory").unwrap();
+    let mut calls = 0;
+    let error = open_after_drop_with(
+        &state,
+        8,
+        Duration::from_secs(2),
+        Fake::default(),
+        &mut || calls += 1,
+    )
+    .err()
+    .expect("a state file must be refused");
+    assert_eq!(error.code, "unsafe_path");
+    assert_eq!(calls, 0, "errors other than in_use must not retry");
+}
+
+/// Regression: retained-start timing included failed opens and retry sleeps.
+/// A hook delay must be excluded from the final open's measured duration.
+#[test]
+fn regression_open_after_drop_timing_excludes_retries() {
+    const HOOK: Duration = Duration::from_millis(200);
+    let state = private_tempdir();
+    let fake = Fake::default();
+    let timeout = Duration::from_secs(2);
+    let _processes = ratarmount_index::test_process::exclusive();
+    drop(Supervisor::open(state.path(), 8, timeout, fake.clone()).unwrap());
+    let mut held = Some(super::daemon::lock(&state.path().join("daemon.lock")).unwrap());
+    let mut calls = 0;
+    let wall = Instant::now();
+    let (result, took) = open_after_drop_timed_with(state.path(), 8, timeout, fake, &mut || {
+        calls += 1;
+        std::thread::sleep(HOOK);
+        drop(held.take());
+    });
+    let wall_elapsed = wall.elapsed();
+    let sup = result.unwrap();
+    assert!(
+        calls >= 1,
+        "the held lock must produce in_use before retrying"
+    );
+    assert!(held.is_none());
+    assert_eq!(sup.root, fs::canonicalize(state.path()).unwrap());
+    assert!(
+        took + HOOK <= wall_elapsed,
+        "final open {took:?} plus hook {HOOK:?} must fit within wall time {wall_elapsed:?}"
+    );
 }
 
 impl Env {
@@ -97,8 +244,9 @@ impl Env {
             scratch,
         } = self;
         let timeout = sup.timeout;
+        let _processes = ratarmount_index::test_process::exclusive();
         drop(sup);
-        let mut sup = Supervisor::open(state.path(), max_attempts, timeout, fake.clone()).unwrap();
+        let mut sup = open_after_drop(state.path(), max_attempts, timeout, fake.clone());
         sup.test_ids = Some(TestIds::default());
         Self {
             sup,
@@ -1976,6 +2124,7 @@ fn regression_supervisor_finalize_bases() {
     // ref is refused.
     let repo = env.dir().join("repo");
     let git = |args: &[&str]| {
+        let _processes = ratarmount_index::test_process::spawning();
         std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
@@ -3384,6 +3533,7 @@ fn regression_supervisor_finalize_rechecks_lower_identity_at_sync() {
         env.sup.seams.after_lower_lock = Some(Box::new(move |_| {
             let aside = a.with_file_name("A.aside");
             let copy = a.with_file_name("A.copy");
+            let _processes = ratarmount_index::test_process::spawning();
             let status = std::process::Command::new("cp")
                 .arg("-a")
                 .arg(&a)
@@ -3565,10 +3715,14 @@ fn regression_supervisor_finalize_without_retain_syncs() {
     assert_eq!(env.sup.seams.syncs[synced.len()..], synced[..]);
     // The fast path syncs a refilled entry (a new inode at the same path).
     let old = fs::metadata(&entry).unwrap().ino();
+    // Regression: CI run 42730791388 / main run 41770894534: the freed inode
+    // was reused; pin it so the refill gets a new one.
+    let pinned = fs::File::open(&entry).unwrap();
     writable(&entry);
     fs::remove_dir_all(&entry).unwrap();
     let _refill = env.layered(&[&directory, &bundle], false);
     assert_ne!(fs::metadata(&entry).unwrap().ino(), old);
+    drop(pinned);
     let before = env.sup.seams.syncs.len();
     env.finalize(&attempt.id, false, None).unwrap();
     assert!(env.sup.seams.syncs[before..].contains(&entry.join("b.txt")));
@@ -6032,8 +6186,9 @@ fn regression_supervisor_retained_dir_refuses_strays() {
     let fake = env.fake.clone();
     // A directory with an attempt-ID name stays a bare name.
     fs::create_dir(retained.join("bare1")).unwrap();
+    let _processes = ratarmount_index::test_process::exclusive();
     drop(env.sup);
-    let open = || Supervisor::open(&state, 64, Duration::from_secs(2), fake.clone());
+    let open = || open_after_drop_result(&state, 64, Duration::from_secs(2), fake.clone());
     // A file is not an attempt; neither is a symlink to a directory, nor a
     // directory whose name is no attempt ID.
     let file = retained.join("README");
@@ -6049,7 +6204,7 @@ fn regression_supervisor_retained_dir_refuses_strays() {
     assert_eq!(open().map(|_| ()).unwrap_err().code, "invalid_request");
     fs::remove_dir(retained.join("-invalid")).unwrap();
     // With only the bare directory left, the daemon opens and still holds it.
-    let sup = open().unwrap();
+    let sup = open_after_drop(&state, 64, Duration::from_secs(2), fake);
     assert!(sup.bare_retained.contains("bare1"));
     assert!(sup.held().contains("bare1"));
 }
@@ -6253,10 +6408,14 @@ fn regression_supervisor_retain_syncs_retained_tree() {
     );
     // The fast path syncs a refilled entry (a new inode at the same path).
     let old = fs::metadata(&entry).unwrap().ino();
+    // Regression: CI run 42730791388 / main run 41770894534: the freed inode
+    // was reused; pin it so the refill gets a new one.
+    let pinned = fs::File::open(&entry).unwrap();
     writable(&entry);
     fs::remove_dir_all(&entry).unwrap();
     let _refill = env.layered(&[&directory, &bundle], false);
     assert_ne!(fs::metadata(&entry).unwrap().ino(), old);
+    drop(pinned);
     let before = env.sup.seams.syncs.len();
     env.finalize(&attempt.id, false, None).unwrap();
     assert!(env.sup.seams.syncs[before..].contains(&entry.join("b.txt")));
@@ -6374,6 +6533,7 @@ fn regression_supervisor_retain_rechecks_lower_identity_at_sync() {
         let a = a.clone();
         env.sup.seams.after_lower_lock = Some(Box::new(move |_| {
             let copy = a.with_file_name("A.copy");
+            let _processes = ratarmount_index::test_process::spawning();
             let status = std::process::Command::new("cp")
                 .arg("-a")
                 .arg(&a)
@@ -6489,6 +6649,7 @@ fn retained_record(id: &str, pad: usize) -> super::retained::Retained {
 fn regression_state_log_retained_unsafe_file_refused_before_reconcile() {
     for case in ["symlink", "link", "mode"] {
         let state = private_tempdir();
+        let _processes = ratarmount_index::test_process::exclusive();
         drop(Supervisor::open(state.path(), 8, Duration::from_secs(2), Fake::default()).unwrap());
         let log = state.path().join(super::retained::NAME);
         let stale = state.path().join("attempts/attempt-stale");
@@ -6506,9 +6667,10 @@ fn regression_state_log_retained_unsafe_file_refused_before_reconcile() {
             "link" => fs::hard_link(&log, state.path().join("second-link")).unwrap(),
             _ => fs::set_permissions(&log, fs::Permissions::from_mode(0o640)).unwrap(),
         }
-        let error = Supervisor::open(state.path(), 8, Duration::from_secs(2), Fake::default())
-            .err()
-            .expect("refused");
+        let error =
+            open_after_drop_result(state.path(), 8, Duration::from_secs(2), Fake::default())
+                .err()
+                .expect("refused");
         assert!(
             error.message.contains(super::retained::NAME),
             "{case}: {}",
@@ -7073,6 +7235,9 @@ fn sync_with(
 /// namespace (`unshare -Urm`), each printing `row (x) passed` or why it
 /// was skipped.
 fn real_mount_rows() {
+    // The child runs one --exact test; the parent guard is process-local.
+    // No sibling test in this child can hold a daemon lock for its descendants
+    // to inherit, so run_mount and cp below need no process guard here.
     use std::ffi::OsStr;
     let os = |path: &Path| path.as_os_str().to_owned();
     let mut env = Env::new();
@@ -7404,6 +7569,7 @@ fn regression_supervisor_finalize_sync_poison_real_mounts() {
         eprintln!("skip: set RATARMOUNT_TEST_OVERLAYFS=1 for T17's real-mount rows (unprivileged user namespaces)");
         return;
     }
+    let _processes = ratarmount_index::test_process::spawning();
     let namespaces = std::process::Command::new("unshare")
         .args(["-Urm", "true"])
         .status()
@@ -7412,7 +7578,6 @@ fn regression_supervisor_finalize_sync_poison_real_mounts() {
         eprintln!("skip: unprivileged user and mount namespaces are unavailable (unshare -Urm)");
         return;
     }
-    let _processes = ratarmount_index::test_process::spawning();
     let output = std::process::Command::new("unshare")
         .args(["-Urm", "--"])
         .arg(std::env::current_exe().unwrap())
@@ -7523,6 +7688,7 @@ fn finalize_timing_sync_10k_files() {
 fn retained_start_timing_4096() {
     let disk = disk_dir();
     let state = disk.path().join("state");
+    let _processes = ratarmount_index::test_process::exclusive();
     drop(Supervisor::open(&state, 8, Duration::from_secs(2), Fake::default()).unwrap());
     {
         let mut log = super::retained::RetainedLog::open(&state).unwrap();
@@ -7532,9 +7698,7 @@ fn retained_start_timing_4096() {
             fs::create_dir_all(state.join("retained").join(&id).join("overlay")).unwrap();
         }
     }
-    let started = std::time::Instant::now();
-    let sup = Supervisor::open(&state, 8, Duration::from_secs(2), Fake::default()).unwrap();
-    let elapsed = started.elapsed();
+    let (sup, elapsed) = open_after_drop_timed(&state, 8, Duration::from_secs(2), Fake::default());
     assert_eq!(sup.retained_log.live_ids().count(), 4096);
     println!(
         "timing: a start with 4,096 retained entries on {}: {elapsed:?}",

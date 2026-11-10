@@ -1989,6 +1989,13 @@ fn main() {
         }
     };
 
+    if guard.is_some() {
+        if let Err(e) = ratarmount_fuse::preflight_mount_backend() {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
+
     // Classify every local member's commit journal against the records that
     // vote on it BEFORE any recovery write; members a record does not own wait
     // for the identity gates (recovered below, after the overlay opened).

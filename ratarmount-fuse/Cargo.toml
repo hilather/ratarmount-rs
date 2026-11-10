@@ -14,9 +14,6 @@ autotests = false
 [dependencies]
 ratarmount-core.workspace = true
 ratarmount-compositing.workspace = true
-# ABI support is negotiated at runtime, including 7.40 for optional passthrough.
-# Keep the libfuse mounting backend used by 0.15 (no longer a default feature).
-fuser = { version = "0.18.0", features = ["libfuse"] }
 libc.workspace = true
 log.workspace = true
 thiserror.workspace = true
@@ -24,6 +21,17 @@ tempfile.workspace = true
 serde_json = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# ABI support is negotiated at runtime, including 7.40 for optional passthrough.
+# Linux mounts through runtime-loaded libfuse3 in src/libfuse3.rs. Never enable
+# fuser's libfuse feature here (test-portable-deps.sh and
+# regression_portable_no_libfuse_needed guard the absence of a load-time link).
+fuser = "0.18.0"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+# Other targets retain fuser's libfuse mounting backend.
+fuser = { version = "0.18.0", features = ["libfuse"] }
 
 [dev-dependencies]
 rusqlite.workspace = true
