@@ -51,10 +51,16 @@ pub(super) struct Env {
     pub(super) scratch: Scratch,
 }
 
+/// Window in which `open_after_drop*` retries an `in_use` result, checked before
+/// each retry. The last attempt may finish after this window.
+const OPEN_AFTER_DROP_RETRY_WINDOW: Duration = Duration::from_secs(10);
+
 /// Reopen only after this test dropped the supervisor on this state. A sibling
 /// test's child can inherit its lock until exec/exit (daemon.rs:85-88 and
 /// test_process.rs), as in CI run 42730791388 attempt 2. Retry only `in_use`
-/// for at most 10 s so a real lock leak still fails with the last error.
+/// within `OPEN_AFTER_DROP_RETRY_WINDOW` (10 s; checked before each retry) so a
+/// real lock leak still fails with the last error. The last attempt may finish
+/// after that window.
 pub(super) fn open_after_drop(
     state: &Path,
     max_attempts: usize,
@@ -73,6 +79,16 @@ fn open_after_drop_result(
     open_after_drop_with(state, max_attempts, timeout, fake, &mut || {})
 }
 
+fn open_after_drop_timed(
+    state: &Path,
+    max_attempts: usize,
+    timeout: Duration,
+    fake: Fake,
+) -> (Supervisor<Fake>, Duration) {
+    let (result, took) = open_after_drop_timed_with(state, max_attempts, timeout, fake, &mut || {});
+    (result.unwrap(), took)
+}
+
 fn open_after_drop_with(
     state: &Path,
     max_attempts: usize,
@@ -80,14 +96,29 @@ fn open_after_drop_with(
     fake: Fake,
     on_in_use: &mut dyn FnMut(),
 ) -> Result<Supervisor<Fake>, ApiError> {
+    open_after_drop_timed_with(state, max_attempts, timeout, fake, on_in_use).0
+}
+
+fn open_after_drop_timed_with(
+    state: &Path,
+    max_attempts: usize,
+    timeout: Duration,
+    fake: Fake,
+    on_in_use: &mut dyn FnMut(),
+) -> (Result<Supervisor<Fake>, ApiError>, Duration) {
     let started = Instant::now();
     loop {
-        match Supervisor::open(state, max_attempts, timeout, fake.clone()) {
-            Err(error) if error.code == "in_use" && started.elapsed() < Duration::from_secs(10) => {
+        let attempt = Instant::now();
+        let result = Supervisor::open(state, max_attempts, timeout, fake.clone());
+        let took = attempt.elapsed();
+        match result {
+            Err(error)
+                if error.code == "in_use" && started.elapsed() < OPEN_AFTER_DROP_RETRY_WINDOW =>
+            {
                 on_in_use();
                 std::thread::sleep(Duration::from_millis(20));
             }
-            result => return result,
+            result => return (result, took),
         }
     }
 }
@@ -133,6 +164,38 @@ fn regression_open_after_drop_retries_in_use() {
     .expect("a state file must be refused");
     assert_eq!(error.code, "unsafe_path");
     assert_eq!(calls, 0, "errors other than in_use must not retry");
+}
+
+/// Regression: retained-start timing included failed opens and retry sleeps.
+/// A hook delay must be excluded from the final open's measured duration.
+#[test]
+fn regression_open_after_drop_timing_excludes_retries() {
+    const HOOK: Duration = Duration::from_millis(200);
+    let state = private_tempdir();
+    let fake = Fake::default();
+    let timeout = Duration::from_secs(2);
+    let _processes = ratarmount_index::test_process::exclusive();
+    drop(Supervisor::open(state.path(), 8, timeout, fake.clone()).unwrap());
+    let mut held = Some(super::daemon::lock(&state.path().join("daemon.lock")).unwrap());
+    let mut calls = 0;
+    let wall = Instant::now();
+    let (result, took) = open_after_drop_timed_with(state.path(), 8, timeout, fake, &mut || {
+        calls += 1;
+        std::thread::sleep(HOOK);
+        drop(held.take());
+    });
+    let wall_elapsed = wall.elapsed();
+    let sup = result.unwrap();
+    assert!(
+        calls >= 1,
+        "the held lock must produce in_use before retrying"
+    );
+    assert!(held.is_none());
+    assert_eq!(sup.root, fs::canonicalize(state.path()).unwrap());
+    assert!(
+        took + HOOK <= wall_elapsed,
+        "final open {took:?} plus hook {HOOK:?} must fit within wall time {wall_elapsed:?}"
+    );
 }
 
 impl Env {
@@ -7635,9 +7698,7 @@ fn retained_start_timing_4096() {
             fs::create_dir_all(state.join("retained").join(&id).join("overlay")).unwrap();
         }
     }
-    let started = std::time::Instant::now();
-    let sup = open_after_drop(&state, 8, Duration::from_secs(2), Fake::default());
-    let elapsed = started.elapsed();
+    let (sup, elapsed) = open_after_drop_timed(&state, 8, Duration::from_secs(2), Fake::default());
     assert_eq!(sup.retained_log.live_ids().count(), 4096);
     println!(
         "timing: a start with 4,096 retained entries on {}: {elapsed:?}",
