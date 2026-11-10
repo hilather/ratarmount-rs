@@ -1,5 +1,6 @@
 //! A local supervisor; each attempt owns a foreground ratarmount child.
 
+mod client;
 mod daemon;
 mod finalize;
 #[cfg(test)]
@@ -23,12 +24,14 @@ mod state_log;
 mod tests;
 
 use clap::{Parser, Subcommand};
+#[cfg(test)]
+use protocol::VERSION;
 use protocol::{
     BaseOptions, JournalReads, JournalSpec, Op, Operation, OperationV2, Overlay, Request, Response,
-    VERSION, VERSION_2,
 };
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::Write;
+#[cfg(test)]
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -272,31 +275,5 @@ pub fn error_exit_code(args: &SandboxArgs) -> i32 {
 }
 
 fn call(socket: &std::path::Path, request: Request) -> Result<Response, String> {
-    let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
-    // Includes queued requests and cleanup of a full batch; callers can retry reads,
-    // but must not blindly retry mutations after a transport failure, except a
-    // `new` or `finalize` retried with the same --request-id and arguments.
-    let timeout = Some(Duration::from_secs(3600));
-    stream
-        .set_read_timeout(timeout)
-        .and_then(|_| stream.set_write_timeout(timeout))
-        .map_err(|e| e.to_string())?;
-    let mut bytes = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
-    bytes.push(b'\n');
-    stream.write_all(&bytes).map_err(|e| e.to_string())?;
-    let mut line = Vec::new();
-    BufReader::new(stream)
-        .take((protocol::MAX_RESPONSE + 1) as u64)
-        .read_until(b'\n', &mut line)
-        .map_err(|e| e.to_string())?;
-    if line.len() > protocol::MAX_RESPONSE || !line.ends_with(b"\n") {
-        return Err("oversized or incomplete sandbox response".into());
-    }
-    let response: Response = serde_json::from_slice(&line).map_err(|e| e.to_string())?;
-    // An older daemon answers a v2 request with a v1 error (unsupported_version).
-    let older_daemon = request.version == VERSION_2 && response.version == VERSION && !response.ok;
-    if response.version != request.version && !older_daemon {
-        return Err("unsupported response version".into());
-    }
-    Ok(response)
+    client::call(socket, request)
 }
