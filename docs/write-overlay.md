@@ -105,7 +105,8 @@ gzip, bzip2 or xz) avoid GNU tar 1.35's `--delete --ignore-zeros` failure
 (`lseek: Value too large for defined data type` on Ubuntu 26.04 and Debian 13).
 Concatenated TARs and layouts the check does not recognize, including base-256
 or PAX sizes and sparse members, retain `--ignore-zeros` and still need a fixed
-GNU tar on those systems. A failed commit leaves the archive unchanged. (#280)
+GNU tar on those systems. A GNU tar delete failure leaves the original archive
+unchanged. (#280)
 
 Successful local commits refresh the overlay's base size, mtime and digest,
 update its stack digest, and record `meta.base_committed_at`. Strong digests
