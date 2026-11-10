@@ -809,22 +809,32 @@ mod tests {
         assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
     }
 
+    fn write_helper(path: &Path, script: &str, during: &mut dyn FnMut()) {
+        // #296: another thread's fork must not inherit a writable helper fd.
+        let mut writer = Command::new("sh")
+            .arg("-c")
+            .arg(r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#)
+            .arg("sh")
+            .arg(script)
+            .arg(path)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        during();
+        assert!(writer.wait().unwrap().success());
+    }
+
     /// A `ProcessMounter` whose unmount helper is the script `body` (run as
     /// `HELPER -u -- PATH`, its argv appended to `argv.log`) and whose mount
     /// table is the file `mounts`, listing `path`.
     fn stopper(dir: &Path, body: &str, path: &Path) -> ProcessMounter {
-        use std::os::unix::fs::PermissionsExt;
         let helper = dir.join("helper.sh");
-        fs::write(
-            &helper,
-            format!(
-                "#!/bin/sh\nprintf '%s ' \"$@\" >> '{}'\necho >> '{}'\n{body}\n",
-                dir.join("argv.log").display(),
-                dir.join("argv.log").display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let script = format!(
+            "#!/bin/sh\nprintf '%s ' \"$@\" >> '{}'\necho >> '{}'\n{body}\n",
+            dir.join("argv.log").display(),
+            dir.join("argv.log").display()
+        );
+        write_helper(&helper, &script, &mut || {});
         let table = dir.join("mounts");
         fs::write(&table, format!("{}\n", path.display())).unwrap();
         let mut mounter = ProcessMounter::new(PathBuf::from("/nonexistent/ratarmount"));
@@ -857,6 +867,111 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap()
+    }
+
+    /// Regression: #296 helper exec must survive a child holding forked fds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_296_helper_exec_survives_a_paused_forked_child() {
+        let _processes = ratarmount_index::test_process::spawning();
+        // Isolate the parked fork from other tests' writable descriptors.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sandbox::process::tests::sandbox_paused_forked_child",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("#296 helper executed"), "{stdout}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "subprocess helper for #296 paused-fork regression"]
+    fn sandbox_paused_forked_child() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+
+        struct PausedChild {
+            release: io::PipeWriter,
+            worker: Option<thread::JoinHandle<io::Result<ExitStatus>>>,
+        }
+
+        impl Drop for PausedChild {
+            fn drop(&mut self) {
+                if let Some(worker) = self.worker.take() {
+                    let _ = self.release.write_all(b"x");
+                    let _ = worker.join();
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mnt");
+        let helper = dir.path().join("helper.sh");
+        let table = dir.path().join("mounts");
+        let argv = dir.path().join("argv.log");
+        fs::write(&table, format!("{}\n", path.display())).unwrap();
+        let script = format!(
+            "#!/bin/sh\nprintf '%s ' \"$@\" >> '{0}'\necho >> '{0}'\n: > '{1}'\nexit 0\n",
+            argv.display(),
+            table.display()
+        );
+        let (mut ready, ready_writer) = io::pipe().unwrap();
+        let (release_reader, release) = io::pipe().unwrap();
+        let mut paused = PausedChild {
+            release,
+            worker: None,
+        };
+        let mut pipes = Some((ready_writer, release_reader));
+        write_helper(&helper, &script, &mut || {
+            let (ready_writer, release_reader) = pipes.take().unwrap();
+            // spawn waits for exec, so it must run on another thread.
+            paused.worker = Some(thread::spawn(move || {
+                let mut command = Command::new("true");
+                // Only async-signal-safe pipe operations before exec.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::write(ready_writer.as_raw_fd(), b"x".as_ptr().cast(), 1) != 1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        let mut byte = 0u8;
+                        if libc::read(release_reader.as_raw_fd(), (&mut byte as *mut u8).cast(), 1)
+                            != 1
+                        {
+                            return Err(io::Error::from_raw_os_error(libc::EIO));
+                        }
+                        Ok(())
+                    });
+                }
+                command.spawn()?.wait()
+            }));
+            ready.read_exact(&mut [0]).unwrap();
+        });
+        let mut mounter = ProcessMounter::new(PathBuf::from("/nonexistent/ratarmount"));
+        mounter.helper = Some(helper);
+        mounter.mount_table = Some(table);
+        assert_eq!(
+            mounter
+                .stop(&attempt_at(&path, "ready"), Duration::ZERO)
+                .unwrap(),
+            StopOutcome::Stopped { exit: None }
+        );
+        assert_eq!(
+            fs::read_to_string(argv).unwrap(),
+            format!("-u -- {} \n", path.display())
+        );
+        paused.release.write_all(b"x").unwrap();
+        let exit = paused.worker.take().unwrap().join().unwrap().unwrap();
+        assert!(exit.success(), "{exit}");
+        println!("#296 helper executed");
     }
 
     /// Regression (R1c-1 T5, ruling 7): finalize's stop decides from the
