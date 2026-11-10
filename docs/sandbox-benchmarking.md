@@ -55,8 +55,11 @@ Pinned digests are `sha256:` plus 64 lowercase hex digits; Git commit/tree IDs
 are full 40- or 64-digit lowercase hex, with the same length for both. Images use `name@sha256:DIGEST`.
 CPAN paths use `authors/id/A/AB/AUTHOR/Distribution-VERSION.tar.gz` (also tgz,
 tar.bz2, tar.xz or zip); Git URLs use HTTPS without userinfo, query or fragment.
+All-zero digests are refused; Git hosts must contain a dot.
+A pinned CPAN path requires a pinned version, even in non-strict drafts.
 Artifact and dependency-lock paths may be absolute or resolve against the manifest directory, without acquisition.
 Paths are lexically normal: no empty, `.` or `..` components or trailing slash.
+Paths also refuse whitespace, braces, backslash and the exact values `TODO`, `TBD`, `fake`, `unknown` (paths-only).
 Placement roots are relative to the manifest directory and cannot overlap.
 
 Known `.t` inventories use `state: "known"`, a positive `count` and pinned digest;
@@ -65,11 +68,13 @@ Candidate jobs are unique positive integers. Supported jobs must be candidates
 with passing evidence for each selected backend (`native` or `fuse`). Each
 evidence object has `jobs`, `backend`, `passed`, `source_sha256`, `image`,
 `dependency_lock_sha256`, and `test_inventory_sha256`, matching the row's pins.
+`evidence.source_sha256` must equal `artifact.tar_stream_sha256`.
 Qualified rows have supported jobs and no refusal reasons; unqualified rows
 have reasons. Strict validation requires resolved inputs and qualification.
 
 Commands use nonempty argv and positive timeouts; only `{jobs}` substitution is
 accepted in argv/environment. NULs and invalid environment names are refused.
+Empty or whitespace-only argv elements and environment values are also refused.
 Resource limits must be positive. Dependency locations are absolute container paths,
 independent of the manifest location: base strictly below `/repo`, excluding `/repo/blib`,
 and build under `/repo/blib`, with the same lexical path rules. Command and resource
