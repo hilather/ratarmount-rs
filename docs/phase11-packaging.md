@@ -53,7 +53,7 @@ Scaffold: `packaging/build-appimage.sh` (stages AppDir; runs `linuxdeploy` when 
 Short term without AppImage:
 
 1. `cargo build --release` on target glibc
-2. Ship binary + dynamic deps (`libfuse3`, `libarchive`, compression libs as linked)
+2. Ship binary + linked deps (`libarchive`, compression libs); require host `fuse3` for runtime loading
 3. Optional helpers: `e2fsprogs` (EXT4), `squashfs-tools` (SquashFS)
 4. Or static-friendlier builds later with musl (FUSE still needs libfuse at runtime typically)
 

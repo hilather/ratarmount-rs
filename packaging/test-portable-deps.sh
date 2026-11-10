@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Audit direct ELF dependencies in the portable binary (or release tarball).
-# Indirect dependencies of system libarchive/libfuse are resolved by those
-# distro packages and are outside this binary's direct NEEDED entries.
+# libfuse3 must be loaded at runtime (.so.4, then .so.3), never via NEEDED.
+# Indirect dependencies of system libarchive are resolved by its distro package
+# and are outside this binary's direct NEEDED entries.
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
@@ -56,22 +57,37 @@ echo "Direct NEEDED libraries for $INPUT:"
 printf '  %s\n' $NEEDED
 
 failed=0
+openssl_failed=0
 while IFS= read -r library; do
   case "$library" in
     # glibc 2.31-compatible runtime family, plus the compiler runtime.
     libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|libutil.so.1|libresolv.so.2|libanl.so.1|libgcc_s.so.1|ld-linux*.so.*) ;;
-    # Declared host runtime packages: FUSE and libarchive. Compression libraries
+    # Declared host link-time package: libarchive. Compression libraries
     # may remain dynamic; these SONAMEs are stable across supported Linux distros.
-    libfuse3.so.3|libarchive.so.13|libz.so.1|libbz2.so.1.0|liblzma.so.5|libzstd.so.1) ;;
+    libarchive.so.13|libz.so.1|libbz2.so.1.0|liblzma.so.5|libzstd.so.1) ;;
+    libfuse*)
+      echo "FAIL: portable binary must not link libfuse at load time: $library (libfuse3 is loaded at runtime: libfuse3.so.4, then libfuse3.so.3)" >&2
+      failed=1
+      ;;
     *)
       echo "FAIL: unapproved direct dependency: $library" >&2
       failed=1
+      case "$library" in libssl*|libcrypto*) openssl_failed=1 ;; esac
       ;;
   esac
 done <<< "$NEEDED"
 
+for candidate in libfuse3.so.4 libfuse3.so.3; do
+  if ! LC_ALL=C grep -aqF "$candidate" "$BINARY"; then
+    echo "FAIL: missing runtime libfuse3 candidate $candidate" >&2
+    failed=1
+  fi
+done
+
 if (( failed )); then
-  echo 'Portable binary must not directly depend on libssl or libcrypto; vendor OpenSSL in the portable build.' >&2
+  if (( openssl_failed )); then
+    echo 'Portable binary must not directly depend on libssl or libcrypto; vendor OpenSSL in the portable build.' >&2
+  fi
   exit 1
 fi
 
