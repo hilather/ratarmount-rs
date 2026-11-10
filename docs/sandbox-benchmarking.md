@@ -91,13 +91,13 @@ ratarmount sandbox bench --manifest tasks.json --dry-run --task mojolicious --ba
 Exactly one of `--validate-only` or `--dry-run` is required. Selection options
 require `--dry-run`; `--require-pins` works with either mode. Validation runs
 before admission and preserves the exit statuses above. Inherited `--socket`
-is rejected before manifest I/O. Admission refusals exit **2** without stdout;
+is rejected before manifest I/O. Any admission refusal, including oversubscription or a backend, row or job that a selected task does not support, refuses the whole selection with exit **2** and empty stdout;
 schedule reporting failures exit **1**.
 
-Selections accept comma-separated or repeated values. Defaults are all tasks,
+Only `--task`, `--backend`, `--base-form`, `--jobs` and `--cache` accept comma-separated or repeated values; scalar options take one value. Defaults are all tasks,
 each task's declared backends, both base forms, jobs **1**, both cache treatments,
 **5** measured repeats per backend, seed **1**, and **1** concurrent attempt.
-Repeats must be positive; attempts accepts only **1**. Unknown tasks/backends,
+Repeats must be **1..=100**; attempts accepts only **1**. Unknown tasks/backends,
 non-candidate jobs and jobs outside a qualified row's supported set are refused.
 For draft rows, candidate jobs remain selectable with their qualification reasons.
 Jobs above the task's `resources.cpus` are refused unless

@@ -4,7 +4,7 @@
 
 ### Changes
 
-- Linux `sandbox bench --dry-run` emits deterministic seeded schedules with paired backend ordering, draft qualification reasons and CPU admission checks, without executing work. See [the benchmark guide](docs/sandbox-benchmarking.md).
+- Hidden Linux `sandbox bench --dry-run` emits deterministic seeded schedules with paired backend ordering, draft qualification reasons and CPU admission checks, without executing work. See [the benchmark guide](docs/sandbox-benchmarking.md).
 - Hidden Linux `sandbox bench --manifest PATH --validate-only` validates Perl task manifests and optional strict pins without execution. See [the validator guide](docs/sandbox-benchmarking.md).
 
 ### Fixes

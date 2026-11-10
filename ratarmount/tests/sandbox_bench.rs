@@ -210,8 +210,15 @@ fn regression_bench_cli_invalid_arguments_exit_two() {
         );
         drop(listener);
     }
+    for (mode, expected) in [("--validate-only", "validation"), ("--dry-run", "schedule")] {
+        bench_report_to_full(file, mode, expected);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bench_report_to_full(file: &str, mode: &str, expected: &str) {
     let report = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
-        .args(["sandbox", "bench", "--manifest", file, "--validate-only"])
+        .args(["sandbox", "bench", "--manifest", file, mode])
         .stdout(
             std::fs::File::options()
                 .write(true)
@@ -221,7 +228,7 @@ fn regression_bench_cli_invalid_arguments_exit_two() {
         .output()
         .unwrap();
     assert_eq!(report.status.code(), Some(1));
-    assert!(stderr(&report).contains("bench validation report"));
+    assert!(stderr(&report).contains(&format!("bench {expected} report")));
 }
 
 // Regression: inherited sockets in either position reached manifest I/O first.
@@ -309,6 +316,7 @@ fn regression_bench_cli_dry_run_emits_schedule_without_files() {
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     for option in [
         "--repeats 0",
+        "--repeats 101",
         "--attempts 2",
         "--jobs 0",
         "--backend overlay2",
@@ -324,6 +332,7 @@ fn regression_bench_cli_dry_run_emits_schedule_without_files() {
             stderr(&result)
         );
         assert!(result.stdout.is_empty());
+        assert!(option != "--repeats 101" || stderr(&result).contains("1..=100"));
     }
     for option in [
         "--task mojolicious",
@@ -343,7 +352,7 @@ fn regression_bench_cli_dry_run_emits_schedule_without_files() {
             "{option}: {}",
             stderr(&result)
         );
-        assert!(stderr(&result).contains("--dry-run"));
+        assert!(stderr(&result).contains("cannot be used with"));
     }
 }
 

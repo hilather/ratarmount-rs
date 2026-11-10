@@ -47,8 +47,8 @@ struct Selection {
     /// Cache treatments (default: cold,warm); no cache operations are performed.
     #[arg(long, requires = "dry_run", value_delimiter = ',', value_enum)]
     cache: Vec<schedule::Cache>,
-    /// Measured repeats per backend (default: 5).
-    #[arg(long, requires = "dry_run", value_parser = clap::value_parser!(u32).range(1..))]
+    /// Measured repeats per backend, 1..=100 (default: 5).
+    #[arg(long, requires = "dry_run", value_parser = clap::value_parser!(u32).range(1..=100))]
     repeats: Option<u32>,
     /// Recorded deterministic ordering seed (default: 1).
     #[arg(long, requires = "dry_run")]
