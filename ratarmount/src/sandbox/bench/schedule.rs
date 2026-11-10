@@ -34,12 +34,12 @@ enum Kind {
     EmptyTopFuseProbe,
 }
 #[derive(Debug, Clone, Serialize)]
-struct Cell {
-    task: String,
-    platform: String,
-    base_form: BaseForm,
-    jobs: u32,
-    cache: Cache,
+pub(super) struct Cell {
+    pub task: String,
+    pub platform: String,
+    pub base_form: BaseForm,
+    pub jobs: u32,
+    pub cache: Cache,
 }
 impl Cell {
     fn identity(&self) -> String {
@@ -57,9 +57,9 @@ impl Cell {
 pub(super) struct Entry {
     schema: &'static str,
     catalog_revision: String,
-    cell: Cell,
+    pub cell: Cell,
     kind: Kind,
-    backend: Backend,
+    pub backend: Backend,
     repeat: Option<u32>,
     discarded: bool,
     paired: bool,
@@ -71,7 +71,7 @@ pub(super) struct Entry {
     oversubscribed: bool,
     qualified: bool,
     execution_available: bool,
-    runnable: bool,
+    pub runnable: bool,
     reasons: Vec<String>,
 }
 // A scheduling projection, decoded only after B2 validates every manifest field.
@@ -133,6 +133,7 @@ pub(super) fn build(bytes: &[u8], options: &Selection) -> Result<Vec<Entry>, Str
         }
     }
     let mut cells = Vec::new();
+    let mut total_entries = 0;
     for task in &manifest.tasks {
         if !options.task.is_empty() && !options.task.contains(&task.id) {
             continue;
@@ -163,6 +164,14 @@ pub(super) fn build(bytes: &[u8], options: &Selection) -> Result<Vec<Entry>, Str
                     &[BaseForm::Git, BaseForm::TarZstSingleFrame],
                 ) {
                     for cache in selected(&options.cache, &[Cache::Cold, Cache::Warm]) {
+                        // Cap all entries before allocating their list: at most 2*100+4 per cell.
+                        total_entries += 1
+                            + backends.len()
+                                * (repeats as usize + usize::from(cache == Cache::Warm))
+                            + usize::from(backends.contains(&Backend::Fuse));
+                        if total_entries > 100_000 {
+                            return Err("schedule exceeds the 100000 total-entry cap".into());
+                        }
                         let cell = Cell {
                             task: task.id.clone(),
                             platform: row.platform_id.clone(),
@@ -172,7 +181,7 @@ pub(super) fn build(bytes: &[u8], options: &Selection) -> Result<Vec<Entry>, Str
                         };
                         let identity = cell.identity();
                         let mut reasons = row.qualification.reasons.clone();
-                        reasons.push("execution unavailable: B3 schedules only".into());
+                        reasons.push("execution unavailable: selection or qualification unsupported by native lifecycle".into());
                         let entry = Entry {
                             schema: "rrs-perl-bench-schedule/1",
                             catalog_revision: manifest.catalog_revision.clone(),
@@ -243,6 +252,19 @@ pub(super) fn build(bytes: &[u8], options: &Selection) -> Result<Vec<Entry>, Str
             entries.push(entry);
         }
     }
+    for entry in &mut entries {
+        entry.execution_available = entry.qualified
+            && entry.backend == Backend::Native
+            && entry.cell.base_form == BaseForm::TarZstSingleFrame
+            && entry.cell.cache == Cache::Warm;
+        entry.runnable = entry.execution_available;
+        if entry.execution_available {
+            entry.reasons.pop();
+            entry
+                .reasons
+                .push("execution ungraded: verification unavailable until B4a2".into());
+        }
+    }
     Ok(entries)
 }
 
@@ -267,9 +289,12 @@ mod tests {
     fn regression_bench_schedule_seed_reproducible() {
         let mut options = Selection::default();
         let first = schedule(&options);
-        assert!(first
-            .iter()
-            .all(|e| e.qualified && !e.execution_available && !e.runnable));
+        assert!(first.iter().all(|e| e.qualified
+            && e.execution_available == e.runnable
+            && e.runnable
+                == (e.backend == Backend::Native
+                    && e.cell.base_form == BaseForm::TarZstSingleFrame
+                    && e.cell.cache == Cache::Warm)));
         let bytes = serde_json::to_vec(&first).unwrap();
         assert_eq!(bytes, serde_json::to_vec(&schedule(&options)).unwrap());
         let identities: Vec<_> = first
@@ -284,7 +309,14 @@ mod tests {
         );
         options.seed = Some(2);
         let second = schedule(&options);
-        assert!(hash("rrs-perl-bench/backend-orientation/1", 2, &identities[1]).starts_with('c'));
+        let identity = second
+            .iter()
+            .filter(|e| e.kind == Kind::Measured)
+            .nth(10)
+            .unwrap()
+            .cell
+            .identity();
+        assert!(hash("rrs-perl-bench/backend-orientation/1", 2, &identity).starts_with('c'));
         assert_eq!(measured(&second)[10], Backend::Native);
         assert_ne!(
             identities,
@@ -410,6 +442,21 @@ mod tests {
         assert!(build(&bytes, &options)
             .unwrap_err()
             .contains("unsupported jobs 3"));
+    }
+    // Regression: manifest growth allocated an unbounded schedule before refusing execution.
+    #[test]
+    fn regression_bench_schedule_entry_cap_refused() {
+        let mut value = fixture();
+        let template = value["tasks"][0].clone();
+        value["tasks"] = serde_json::Value::Array((0..124).map(|_| template.clone()).collect());
+        let options = Selection {
+            repeats: Some(100),
+            ..Selection::default()
+        };
+        let Err(error) = build(&serde_json::to_vec(&value).unwrap(), &options) else {
+            panic!("schedule entry cap was not enforced");
+        };
+        assert!(error.contains("100000 total-entry cap"));
     }
     // Regression: concurrent attempts were accepted despite a serial-only schedule contract.
     #[test]

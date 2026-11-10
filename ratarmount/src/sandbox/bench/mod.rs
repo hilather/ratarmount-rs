@@ -1,7 +1,11 @@
-//! Linux-only validation and scheduling. Execution belongs to later slices.
+//! Linux-only validation, scheduling and ungraded native lifecycle.
 
+mod io;
 mod manifest;
+mod run;
+mod runtime;
 mod schedule;
+mod source;
 
 use clap::{ArgGroup, Args};
 use std::io::Write;
@@ -9,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Args)]
 #[command(
-    group(ArgGroup::new("mode").required(true).multiple(false).args(["validate_only", "dry_run"])),
-    after_help = "Example: ratarmount sandbox bench --manifest tasks.json --validate-only\nExample: ratarmount sandbox bench --manifest tasks.json --dry-run --jobs 1\n\nRequires Linux. Structural validation does not establish external qualification.\nDry-run emits a JSONL schedule without execution or file creation.\nInherited `--socket` is rejected; bench owns its supervisor.\n\nExit status:\n  0  Structurally valid (draft pins allowed unless --require-pins); schedule admitted if dry-run.\n  1  Operational or reporting failure.\n  2  Invalid arguments/manifest, unresolved strict pins or refused selection."
+    group(ArgGroup::new("mode").required(true).multiple(false).args(["validate_only", "dry_run", "out"])),
+    after_help = "Example: ratarmount sandbox bench --manifest tasks.json --validate-only\nExample: ratarmount sandbox bench --manifest tasks.json --dry-run --jobs 1\n\nRequires Linux. Structural validation does not establish external qualification.\nDry-run emits a JSONL schedule without execution or file creation.\nInherited `--socket` is rejected; bench owns its supervisor.\n\nExit status:\n  0  Structurally valid (draft pins allowed unless --require-pins); schedule admitted if dry-run.\n  1  Operational/reporting failure, or ungraded native execution (verification unavailable).\n  2  Invalid arguments/manifest, unresolved strict pins or refused selection."
 )]
 pub(super) struct BenchArgs {
     /// JSON manifest using schema rrs-perl-tasks/1.
@@ -25,6 +29,18 @@ pub(super) struct BenchArgs {
     /// Refuse unresolved identities, counts and qualification.
     #[arg(long)]
     require_pins: bool,
+    /// Execute native/warm/archive entries into a fresh private output directory (ungraded).
+    #[arg(long, value_name = "DIR", requires = "runtime")]
+    out: Option<PathBuf>,
+    /// Existing parent for private scratch trees.
+    #[arg(long, default_value = "/var/tmp", value_name = "DIR")]
+    work_root: PathBuf,
+    /// Explicit local Docker-compatible executable; never pulls an image.
+    #[arg(long, value_name = "PATH", requires = "out")]
+    runtime: Option<PathBuf>,
+    /// Record and override an excessive or unavailable host-load reading.
+    #[arg(long, requires = "out")]
+    allow_high_load: bool,
     #[command(flatten)]
     selection: Selection,
 }
@@ -33,31 +49,31 @@ pub(super) struct BenchArgs {
 #[group(conflicts_with = "validate_only")]
 struct Selection {
     /// Task IDs (default: all); comma-separated or repeated.
-    #[arg(long, requires = "dry_run", value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',')]
     task: Vec<String>,
     /// Backends (default: those declared by each task).
-    #[arg(long, requires = "dry_run", value_delimiter = ',', value_enum)]
+    #[arg(long, value_delimiter = ',', value_enum)]
     backend: Vec<schedule::Backend>,
     /// Base forms (default: git,tar.zst-single-frame).
-    #[arg(long, requires = "dry_run", value_delimiter = ',', value_enum)]
+    #[arg(long, value_delimiter = ',', value_enum)]
     base_form: Vec<schedule::BaseForm>,
     /// Jobs per attempt (default: 1).
-    #[arg(long, requires = "dry_run", value_delimiter = ',', value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, value_delimiter = ',', value_parser = clap::value_parser!(u32).range(1..))]
     jobs: Vec<u32>,
     /// Cache treatments (default: cold,warm); no cache operations are performed.
-    #[arg(long, requires = "dry_run", value_delimiter = ',', value_enum)]
+    #[arg(long, value_delimiter = ',', value_enum)]
     cache: Vec<schedule::Cache>,
     /// Measured repeats per backend, 1..=100 (default: 5).
-    #[arg(long, requires = "dry_run", value_parser = clap::value_parser!(u32).range(1..=100))]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100))]
     repeats: Option<u32>,
     /// Recorded deterministic ordering seed (default: 1).
-    #[arg(long, requires = "dry_run")]
+    #[arg(long)]
     seed: Option<u64>,
     /// Concurrent attempts; only 1 is supported (default: 1).
-    #[arg(long, requires = "dry_run", value_parser = clap::value_parser!(u32).range(1..=1))]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1))]
     attempts: Option<u32>,
     /// Admit jobs above the task's CPU limit and record the override.
-    #[arg(long, requires = "dry_run")]
+    #[arg(long)]
     allow_oversubscription: bool,
 }
 
@@ -66,8 +82,10 @@ pub(super) fn run(args: &BenchArgs, socket: Option<&Path>) -> Result<i32, String
         eprintln!("sandbox bench: inherited --socket is rejected; bench owns its supervisor");
         return Ok(2);
     }
-    if args.validate_only == args.dry_run {
-        eprintln!("sandbox bench: exactly one of --validate-only or --dry-run is required");
+    if usize::from(args.validate_only) + usize::from(args.dry_run) + usize::from(args.out.is_some())
+        != 1
+    {
+        eprintln!("sandbox bench: exactly one of --validate-only, --dry-run or --out is required");
         return Ok(2);
     }
     let bytes = match manifest::open_manifest(&args.manifest) {
@@ -78,7 +96,7 @@ pub(super) fn run(args: &BenchArgs, socket: Option<&Path>) -> Result<i32, String
         }
     };
     for (strict, prefix) in [(false, "invalid manifest"), (true, "unresolved pins")] {
-        if strict && !args.require_pins {
+        if strict && !args.require_pins && args.out.is_none() {
             break;
         }
         if let Err(error) = manifest::validate(&bytes, &args.manifest, strict) {
@@ -86,7 +104,7 @@ pub(super) fn run(args: &BenchArgs, socket: Option<&Path>) -> Result<i32, String
             return Ok(2);
         }
     }
-    if args.dry_run {
+    if args.dry_run || args.out.is_some() {
         let entries = match schedule::build(&bytes, &args.selection) {
             Ok(entries) => entries,
             Err(error) => {
@@ -94,6 +112,9 @@ pub(super) fn run(args: &BenchArgs, socket: Option<&Path>) -> Result<i32, String
                 return Ok(2);
             }
         };
+        if args.out.is_some() {
+            return run::execute(args, &bytes, &entries);
+        }
         let mut stdout = std::io::stdout().lock();
         for entry in entries {
             serde_json::to_writer(&mut stdout, &entry)
@@ -205,6 +226,10 @@ mod tests {
             validate_only: false,
             require_pins: false,
             dry_run: false,
+            out: None,
+            work_root: "/var/tmp".into(),
+            runtime: None,
+            allow_high_load: false,
             selection: Selection::default(),
         };
         assert_eq!(run(&args, None).unwrap(), 2);

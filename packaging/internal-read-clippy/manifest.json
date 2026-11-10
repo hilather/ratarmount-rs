@@ -9373,6 +9373,202 @@
       "rule_reason": "inventory-op:fs::write"
     },
     {
+      "configured_path": "rustix::fs::mkdirat",
+      "item": "ratarmount::sandbox::bench::io::create_directory",
+      "leaf_digest": "3b7b05be0c3b824c2cb304b4663cc77b4553bd154b9088815f8a62716a0dd51a",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "benchmark-owned-directory",
+        "creation": {
+          "basis": "Validated single-component child of a held parent; mkdirat requests 0700 and refuses collisions, then no-follow reopen and fchmod establish 0700 before any descendants.",
+          "policy": "exclusive-directory-relative"
+        },
+        "disposition": "output-owner",
+        "id": "IR-GAP0-B4A1-M04",
+        "item": "ratarmount::sandbox::bench::io::create_directory",
+        "reason": "Create both exclusive bench-owned private roots and confined archive extraction directories at one mkdirat site, initially 0700. Private roots stay 0700; recorded archive directory metadata is applied only to extracted directories after descendants."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4A1-M04\",\"item\":\"ratarmount::sandbox::bench::io::create_directory\",\"disposition\":\"output-owner\",\"category\":\"benchmark-owned-directory\",\"reason\":\"Create both exclusive bench-owned private roots and confined archive extraction directories at one mkdirat site, initially 0700. Private roots stay 0700; recorded archive directory metadata is applied only to extracted directories after descendants.\",\"creation\":{\"policy\":\"exclusive-directory-relative\",\"basis\":\"Validated single-component child of a held parent; mkdirat requests 0700 and refuses collisions, then no-follow reopen and fchmod establish 0700 before any descendants.\"}}",
+      "resolved": "rustix::fs::at::mkdirat",
+      "rule_reason": "inventory-op:rustix::mkdirat"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
+      "item": "ratarmount::sandbox::bench::io::create_output",
+      "leaf_digest": "899981352c0306416921e366f876ab826a5f8d86552bde53719347bcdbe2b752",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "benchmark-output",
+        "creation": {
+          "basis": "O_EXCL and O_NOFOLLOW prevent replacement; initial mode 0600, never widened.",
+          "policy": "exclusive-file-relative"
+        },
+        "disposition": "output-owner",
+        "id": "IR-GAP0-B4A1-M05",
+        "item": "ratarmount::sandbox::bench::io::create_output",
+        "reason": "Create exclusive owned logs and ungraded status/control outputs relative to the private output root; move log descriptors into child stdio."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4A1-M05\",\"item\":\"ratarmount::sandbox::bench::io::create_output\",\"disposition\":\"output-owner\",\"category\":\"benchmark-output\",\"reason\":\"Create exclusive owned logs and ungraded status/control outputs relative to the private output root; move log descriptors into child stdio.\",\"creation\":{\"policy\":\"exclusive-file-relative\",\"basis\":\"O_EXCL and O_NOFOLLOW prevent replacement; initial mode 0600, never widened.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
+      "item": "ratarmount::sandbox::bench::io::create_tree_file",
+      "leaf_digest": "899981352c0306416921e366f876ab826a5f8d86552bde53719347bcdbe2b752",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "benchmark-extraction-file",
+        "creation": {
+          "basis": "Held no-follow parent and single-component name; O_EXCL and O_NOFOLLOW refuse aliases or replacement.",
+          "policy": "exclusive-file-relative"
+        },
+        "disposition": "output-owner",
+        "id": "IR-GAP0-B4A1-M06",
+        "item": "ratarmount::sandbox::bench::io::create_tree_file",
+        "reason": "Create an exclusive confined regular archive member at 0600; apply accepted archive file metadata after writing its bounded contents."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4A1-M06\",\"item\":\"ratarmount::sandbox::bench::io::create_tree_file\",\"disposition\":\"output-owner\",\"category\":\"benchmark-extraction-file\",\"reason\":\"Create an exclusive confined regular archive member at 0600; apply accepted archive file metadata after writing its bounded contents.\",\"creation\":{\"policy\":\"exclusive-file-relative\",\"basis\":\"Held no-follow parent and single-component name; O_EXCL and O_NOFOLLOW refuse aliases or replacement.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
+      "item": "ratarmount::sandbox::bench::io::open_artifact",
+      "leaf_digest": "13653cc6d08b37be3ec2872c866e26f9bf789bcc7087f1da2583110bff15d2ac",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "benchmark-artifact",
+        "creation": {
+          "basis": "Existing local archive only; no creation or substitution.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-GAP0-B4A1-M01",
+        "item": "ratarmount::sandbox::bench::io::open_artifact",
+        "reason": "Open only the admitted pinned local archive without following its final symlink; nonblocking open followed by regular-file and bounded size checks precedes hashing and decoding."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4A1-M01\",\"item\":\"ratarmount::sandbox::bench::io::open_artifact\",\"disposition\":\"out-of-family\",\"category\":\"benchmark-artifact\",\"reason\":\"Open only the admitted pinned local archive without following its final symlink; nonblocking open followed by regular-file and bounded size checks precedes hashing and decoding.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing local archive only; no creation or substitution.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
+      "item": "ratarmount::sandbox::bench::io::open_child_directory",
+      "leaf_digest": "78ea351b851f94d4df93852699ef40cb7d99412a52e3949ed06a94f3c0ad8c54",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "benchmark-descent",
+        "creation": {
+          "basis": "Existing confined directory; no descriptor duplication or creation.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-GAP0-B4A1-M03",
+        "item": "ratarmount::sandbox::bench::io::open_child_directory",
+        "reason": "Descend one validated child of a held directory using O_DIRECTORY and O_NOFOLLOW; archive-created symlinks are never traversed."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4A1-M03\",\"item\":\"ratarmount::sandbox::bench::io::open_child_directory\",\"disposition\":\"out-of-family\",\"category\":\"benchmark-descent\",\"reason\":\"Descend one validated child of a held directory using O_DIRECTORY and O_NOFOLLOW; archive-created symlinks are never traversed.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing confined directory; no descriptor duplication or creation.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
+      "item": "ratarmount::sandbox::bench::io::open_directory",
+      "leaf_digest": "26225be76f4b29bdc33565d966c68c61c1ef1e09254f232ff4150f8c868a9e20",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "benchmark-directory",
+        "creation": {
+          "basis": "Existing admitted directory only.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-GAP0-B4A1-M02",
+        "item": "ratarmount::sandbox::bench::io::open_directory",
+        "reason": "Open an admitted canonical source/output/scratch parent or root as a no-follow directory descriptor for confined operations."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4A1-M02\",\"item\":\"ratarmount::sandbox::bench::io::open_directory\",\"disposition\":\"out-of-family\",\"category\":\"benchmark-directory\",\"reason\":\"Open an admitted canonical source/output/scratch parent or root as a no-follow directory descriptor for confined operations.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing admitted directory only.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
+      "item": "ratarmount::sandbox::bench::io::open_run_log",
+      "leaf_digest": "44a385f6cf735d8da8166d5f28c000e0ecf530ebb128dfe9ec3f086982cba3b8",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "benchmark-completed-log",
+        "creation": {
+          "basis": "Read-only completed owned log; no creation or truncation.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-GAP0-B4A1-M07",
+        "item": "ratarmount::sandbox::bench::io::open_run_log",
+        "reason": "Read at most 64 KiB of a completed owned regular runtime log through its private root, without following symlinks or cloning the child stdio descriptor."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4A1-M07\",\"item\":\"ratarmount::sandbox::bench::io::open_run_log\",\"disposition\":\"out-of-family\",\"category\":\"benchmark-completed-log\",\"reason\":\"Read at most 64 KiB of a completed owned regular runtime log through its private root, without following symlinks or cloning the child stdio descriptor.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Read-only completed owned log; no creation or truncation.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
       "configured_path": "rustix::fs::openat",
       "item": "ratarmount::sandbox::bench::manifest::open_manifest",
       "leaf_digest": "cd3d6f32fdadb415777a52092249dc462d57d622a5a4bcc858f8e792fc20e9d0",
