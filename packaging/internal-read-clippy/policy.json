@@ -533,6 +533,12 @@
       "reason": "Reviewed Linux abstract socket liveness and tmpfs validation; non-Linux fallback liveness uses UnixStream and tmpfs is Unsupported. R1c-1: the finalize filesystem-type probe is a Linux fstatfs on an already open descriptor; elsewhere it answers an unknown type, which the allowlist refuses and no caller reaches because finalize is refused off Linux first."
     },
     {
+      "file": "ratarmount/src/sandbox/mod.rs",
+      "reviewer": "Gap 0 B2 implementation review",
+      "provenance": "PLAN-r5a.1 section 7 and section 13; B2 authorization 2026-11-10 00:30 ET",
+      "reason": "Reviewed Linux-only bench module, hidden command variant and dispatch/match arms. Descendants inherit the gate; non-Linux builds retain only legacy commands and run_cli delegates to run without shared bench helpers."
+    },
+    {
       "file": "ratarmount/src/sandbox/process.rs",
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",

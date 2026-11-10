@@ -1584,11 +1584,14 @@ fn main() {
     }
 
     if let Some(command) = &args.sandbox_api {
-        if let Err(error) = sandbox::run(command) {
-            eprintln!("sandbox: {error}");
-            std::process::exit(sandbox::error_exit_code(command));
+        match sandbox::run_cli(command) {
+            Ok(0) => return,
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("sandbox: {error}");
+                std::process::exit(sandbox::error_exit_code(command));
+            }
         }
-        return;
     }
 
     if let Some(snapshot) = &args.snapshot {
