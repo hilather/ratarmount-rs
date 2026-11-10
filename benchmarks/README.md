@@ -1,5 +1,10 @@
 # Benchmarks
 
+Linux `ratarmount sandbox bench --manifest tasks.json --dry-run` emits a
+deterministic JSONL schedule with admission checks. See the
+[sandbox benchmark guide](../docs/sandbox-benchmarking.md) for selections,
+qualification and ordering. This schedules work without executing benchmarks.
+
 ## Format sweep
 
 [`compare-formats.sh`](compare-formats.sh) measures the Rust binary across 21

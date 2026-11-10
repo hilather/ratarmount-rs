@@ -91,6 +91,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 
 | Symptom / fix | Commands |
 |---------------|----------|
+| Benchmark schedule: seeded order, balanced pairs, reference/warm-up/probe order, admission and dry-run JSONL without files | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --bin ratarmount sandbox::bench` · `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --test sandbox_bench` |
 | Linux benchmark manifest validation: strict schema, duplicate keys, every field, pins, jobs and deferred commands; hidden CLI, socket precedence and preserved legacy exit statuses | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --bin ratarmount regression_bench_` · `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --test sandbox_bench regression_bench_` |
 | Sandbox legacy client extraction preserves connect/Serde error display and oversized/incomplete response refusal | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --bin ratarmount regression_sandbox_client_` |
 | #269: sandbox create-base refuses FIFO/socket/device sources, including `file://` URLs, before prepare or index-directory creation | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --bin ratarmount regression_supervisor_create_base_refuses_fifo_socket_device` |
