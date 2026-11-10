@@ -97,6 +97,17 @@ fn regression_bench_cli_no_positional_steal() {
     let positional = cli(&["bench", "--manifest", path, "--validate-only", "mountpoint"]);
     assert_eq!(positional.status.code(), Some(2));
     assert!(stderr(&positional).contains("unexpected argument 'mountpoint'"));
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let mut pinned = draft();
+    pinned["tasks"].as_array_mut().unwrap().truncate(1);
+    pinned["platforms"][0] = serde_json::json!({"id":"linux-amd64","os":"linux","architecture":"amd64","image":format!("perl@{hash}"),"toolchain_sha256":hash,"dependency_lock":{"path":"deps.lock","sha256":hash}});
+    for (key, value) in serde_json::json!({"version":"9.42","cpan":{"path":"authors/id/S/SR/SRI/Mojolicious-9.42.tar.gz","sha256":hash},"git":{"repository":"https://github.com/mojolicious/mojo.git","commit":"a".repeat(40),"tree":"a".repeat(40)},"artifact":{"path":"mojo.tar.zst","sha256":hash,"tar_stream_sha256":hash},"test_inventory":{"state":"known","count":10,"sha256":hash},"backends":["native"],"platforms":[{"platform_id":"linux-amd64","candidate_jobs":[1],"supported_jobs":[1],"qualification":{"qualified":true,"reasons":[],"evidence":[{"jobs":1,"backend":"native","passed":true,"source_sha256":hash,"image":format!("perl@{hash}"),"dependency_lock_sha256":hash,"test_inventory_sha256":hash}]}}]}).as_object().unwrap() {
+        pinned["tasks"][0][key] = value.clone();
+    }
+    std::fs::write(path, serde_json::to_vec(&pinned).unwrap()).unwrap();
+    let pins = "--require-pins";
+    let strict = cli(&["bench", "--manifest", path, "--validate-only", pins]);
+    assert_eq!(strict.status.code(), Some(0), "{}", stderr(&strict));
 }
 
 // Regression: invalid arguments, unsafe manifest types and operational errors shared the wrong status.
@@ -179,9 +190,14 @@ fn regression_bench_cli_invalid_arguments_exit_two() {
             path.display(),
             stderr(&result)
         );
+        // Oversized files and /dev/null hit descriptor/size checks before JSON parsing.
+        assert!(stderr(&result).contains(if path == link || path == socket {
+            "manifest-open"
+        } else {
+            "manifest must be a regular file of at most 1 MiB"
+        }));
         drop(listener);
     }
-    std::fs::write(&path, serde_json::to_vec(&draft()).unwrap()).unwrap();
     let report = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
         .args(["sandbox", "bench", "--manifest", file, "--validate-only"])
         .stdout(
