@@ -124,8 +124,8 @@ pub(super) fn build(bytes: &[u8], options: &Selection) -> Result<Vec<Entry>, Str
     if attempts != 1 {
         return Err("--attempts accepts only 1; concurrent attempts are unsupported".into());
     }
-    if repeats == 0 {
-        return Err("--repeats must be positive".into());
+    if !(1..=100).contains(&repeats) {
+        return Err("--repeats must be in 1..=100".into());
     }
     for id in &options.task {
         if !manifest.tasks.iter().any(|task| &task.id == id) {
@@ -154,8 +154,8 @@ pub(super) fn build(bytes: &[u8], options: &Selection) -> Result<Vec<Entry>, Str
                 let oversubscribed = jobs > task.resources.cpus;
                 if oversubscribed && !options.allow_oversubscription {
                     return Err(format!(
-                        "jobs {jobs} exceeds cpus {}; use --allow-oversubscription",
-                        task.resources.cpus
+                        "task {:?}: jobs {jobs} exceeds cpus {}; use --allow-oversubscription",
+                        task.id, task.resources.cpus
                     ));
                 }
                 for base_form in selected(
@@ -284,6 +284,8 @@ mod tests {
         );
         options.seed = Some(2);
         let second = schedule(&options);
+        assert!(hash("rrs-perl-bench/backend-orientation/1", 2, &identities[1]).starts_with('c'));
+        assert_eq!(measured(&second)[10], Backend::Native);
         assert_ne!(
             identities,
             second
@@ -395,7 +397,7 @@ mod tests {
         let bytes = serde_json::to_vec(&v).unwrap();
         assert!(build(&bytes, &options)
             .unwrap_err()
-            .contains("--allow-oversubscription"));
+            .contains("task \"mojo\": jobs 8 exceeds cpus 2; use --allow-oversubscription"));
         options.allow_oversubscription = true;
         let entries = build(&bytes, &options).unwrap();
         assert!(entries

@@ -8,8 +8,8 @@ shows a larger harness; the [supervisor API](#sandbox-supervisor-api) manages
 fleets of attempts.
 
 The hidden Linux [`sandbox bench` validator](sandbox-benchmarking.md) checks
-Perl benchmark manifests, including unpinned drafts. It performs validation only;
-it does not execute workloads or establish external qualification.
+Perl benchmark manifests, including unpinned drafts, and can emit a deterministic
+dry-run schedule. It executes no workloads and establishes no external qualification.
 
 ## Worked example: snapshot to graded bundle
 
