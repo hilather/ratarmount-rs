@@ -41,7 +41,7 @@ fn read_manifest(
     file: impl Read,
     metadata: std::io::Result<(bool, u64)>,
 ) -> Result<Vec<u8>, (i32, String)> {
-    let (regular, size) = metadata.map_err(|e| (1, e.to_string()))?;
+    let (regular, size) = metadata.map_err(|e| (1, format!("manifest-stat: {e}")))?;
     if !regular || size > MAX_MANIFEST {
         return Err((2, "manifest must be a regular file of at most 1 MiB".into()));
     }
@@ -400,7 +400,7 @@ pub(super) fn validate(bytes: &[u8], path: &Path, strict: bool) -> Result<(), St
         digest(&p.toolchain_sha256, "platform.toolchain_sha256", strict)?;
         let lock = &p.dependency_lock;
         resolve(&lock.path, "dependency_lock.path", path, strict)?;
-        digest(&p.dependency_lock.sha256, "dependency_lock.sha256", strict)?;
+        digest(&lock.sha256, "dependency_lock.sha256", strict)?;
     }
     check(!manifest.tasks.is_empty(), "tasks", "empty task catalog")?;
     let mut ids = BTreeSet::new();
@@ -439,6 +439,7 @@ impl Task {
             )?;
         }
         if pin(&self.cpan.path, "cpan.path", strict)? {
+            pin(&self.version, "version", true)?;
             let parts: Vec<_> = self.cpan.path.split('/').collect();
             check(
                 parts.len() == 6
@@ -895,7 +896,7 @@ mod tests {
         // validate: schema/revision/empty catalogs + platform OS/arch/image/toolchain/lock => named rows;
         // ID grammar/duplicates => /id rows + schema_and_unknown_fields duplicates (task and platform).
         // Task::validate: role/distribution/version/CPAN/Git/artifact/inventory => named pointer rows;
-        // CPAN grammar/dist/version/9.42.1 => /cpan/path; Git parse/HTTPS/host/user/password/query/fragment/
+        // CPAN author lengths/prefixes/case/dist/version => /cpan/path; Git parse/HTTPS/host/user/password/query/fragment/
         // root/space/both braces => /git/repository; Git hex/length => /git/{commit,tree} + relations table.
         // Artifact == manifest => tasks.json and absolute rows; inventory state/known zero|null|unpinned
         // => /test_inventory rows; unknown count/hash/strict => relations table.
@@ -974,7 +975,7 @@ mod tests {
           ["/tasks/0/version","9x","version"],
           ["/tasks/0/cpan/path","authors/id/S/SR/SRI/Mojolicious-9.42.1.tar.gz","cpan.path"],
           ["/tasks/0/cpan/path","other/id/S/SR/SRI/Mojolicious-9.42.tar.gz","cpan.path"],
-          ["/tasks/0/cpan/path","authors/id/SS/SSR/SSRI/Mojolicious-9.42.tar.gz","cpan.path"],
+          ["/tasks/0/cpan/path","authors/id/SR/SR/SRI/Mojolicious-9.42.tar.gz","cpan.path"],
           ["/tasks/0/cpan/path","authors/id/S/SRR/SRRI/Mojolicious-9.42.tar.gz","cpan.path"],
           ["/tasks/0/cpan/path","authors/id/S/SR/SZI/Mojolicious-9.42.tar.gz","cpan.path"],
           ["/tasks/0/cpan/path","authors/id/Z/SR/SRI/Mojolicious-9.42.tar.gz","cpan.path"],
@@ -1006,6 +1007,7 @@ mod tests {
           [{"/tasks/0/platforms/0/qualification/evidence/0/image":"perl@sha256:1111111111111111111111111111111111111111111111111111111111111111"},false,"evidence.image"],
           [{"/tasks/0/platforms/0/qualification/evidence/0/image":"unpinned"},false,"evidence.image"],
           [{"/tasks/0/version":"unpinned","/tasks/0/cpan/path":"unpinned"},false,"version"],
+          [{"/tasks/0/version":"unpinned","/tasks/0/cpan/path":"authors/id/S/SR/SRI/Mojolicious-unpinned.tar.gz","/tasks/0/platforms/0/supported_jobs":[],"/tasks/0/platforms/0/qualification":{"qualified":false,"reasons":["r"],"evidence":[]}},false,"version"],
           [{"/tasks/0/cpan/path":"unpinned"},false,"cpan.path"],
           [{"/tasks/0/cpan/sha256":"unpinned"},false,"cpan.sha256"],
           [{"/tasks/0/git/repository":"unpinned"},false,"git.repository"],
@@ -1072,7 +1074,11 @@ mod tests {
                 Err(std::io::Error::other("injected"))
             }
         }
-        io_refusal(read_manifest(&b""[..], Err(injected())), 1, "injected");
+        io_refusal(
+            read_manifest(&b""[..], Err(injected())),
+            1,
+            "manifest-stat:",
+        );
         io_refusal(
             read_manifest(FailingRead, Ok((true, 0))),
             1,

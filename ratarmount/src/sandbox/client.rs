@@ -73,7 +73,10 @@ mod tests {
     // Regression: extraction must reject EOF without a response's newline framing.
     #[test]
     fn regression_sandbox_client_missing_newline_rejected() {
-        let dir = super::super::tests::private_tempdir();
+        let dir = tempfile::Builder::new()
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .unwrap();
         let socket = dir.path().join("client.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
