@@ -41,6 +41,15 @@ OpenSSL security advisory, rebuild and re-release the portable tarball.
 Users get those fixes by upgrading to the new tarball. Updating distro
 OpenSSL packages does not change an already-shipped portable tarball.
 
+The Rocky 8 `.rpm` also vendors OpenSSL statically. The v0.2.0/v0.2.1 rpm
+linked the build host's `libssl.so.1.1` without declaring it, so it installed
+successfully on Fedora and EL9+ but failed at startup. The rpm receives
+OpenSSL fixes only when maintainers rebuild and re-release it, and users
+upgrade to the new package; updating distro OpenSSL does not update the
+vendored copy. `packaging/test-rpm-deps.sh PACKAGE.rpm` checks every payload
+ELF's direct `NEEDED` libraries against the package's `Requires`, rejects
+dynamic OpenSSL links, and runs in the Packages workflow before upload.
+
 The binary links the host's `libarchive.so.13`. Linux mounts load libfuse3
 at runtime, trying `libfuse3.so.4` then `libfuse3.so.3`, so startup needs no
 libfuse and a mount without it fails immediately with an install hint.
