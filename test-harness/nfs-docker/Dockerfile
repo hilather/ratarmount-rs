@@ -5,8 +5,8 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# nfs-common → mount.nfs / mount.nfs4. libarchive13 + libfuse3-3 match
-# the dynamically linked cargo binary on Ubuntu 24.04.
+# nfs-common → mount.nfs / mount.nfs4. libarchive13 supplies the linked library;
+# libfuse3-3 supplies the runtime-loaded mount helper on Ubuntu 24.04.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         nfs-common \

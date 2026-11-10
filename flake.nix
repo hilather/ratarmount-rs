@@ -22,6 +22,9 @@
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = with pkgs; [ fuse3 libarchive openssl sqlite zlib zstd ];
           doCheck = false;
+          postFixup = ''
+            patchelf --add-rpath ${pkgs.lib.makeLibraryPath [ pkgs.fuse3 ]} $out/bin/ratarmount
+          '';
           meta = with pkgs.lib; {
             description = "Mount archives as a filesystem with random access";
             homepage = "https://github.com/hilather/ratarmount-rs";
