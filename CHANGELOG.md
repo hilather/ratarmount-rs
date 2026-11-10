@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixes
+
+- Overlay commits that delete, rename or replace members of an ordinary single-stream TAR (uncompressed, gzip, bzip2 or xz) avoid `lseek: Value too large for defined data type` on GNU tar 1.35 builds lacking the upstream `--delete` fix, including Ubuntu 26.04 and Debian 13. Concatenated TARs and unrecognized layouts (including base-256 or PAX sizes and sparse members) still require `--ignore-zeros` and a fixed GNU tar; failures leave the archive unchanged. (#280)
+
 ## 0.2.1 (2026-11-09)
 
 ### Compatibility notes

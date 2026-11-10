@@ -46,6 +46,99 @@ pub fn find_last_tar_eof<R: Read + Seek>(
     last_interior_two_zero(suffix, align, len)
 }
 
+/// Whether GNU tar can reach the whole archive without `--ignore-zeros`.
+///
+/// Walk physical headers separately, including PAX/GNU helpers, and require a
+/// complete terminal EOF followed only by zero padding. Unsupported layouts
+/// return `false`: in particular, sparse members and size overrides could make
+/// GNU tar's walk differ from the plain octal sizes examined here.
+/// The reader's position changes; only I/O failures return an error.
+pub fn is_single_tar_stream<R: Read + Seek>(reader: &mut R) -> io::Result<bool> {
+    let len = reader.seek(SeekFrom::End(0))?;
+    if len % BLOCK_SIZE != 0 {
+        return Ok(false);
+    }
+    let mut pos = 0u64;
+    while pos < len {
+        reader.seek(SeekFrom::Start(pos))?;
+        let mut header = [0u8; 512];
+        reader.read_exact(&mut header)?;
+        if header.iter().all(|&b| b == 0) {
+            let remaining = len.checked_sub(pos).expect("header is within length");
+            return Ok(remaining >= 1024 && region_all_zero(reader, pos, remaining)?);
+        }
+
+        let Some(stored) = parse_plain_octal(&header[148..156]) else {
+            return Ok(false);
+        };
+        // Both sums are bounded by 512 bytes. Do not use checksum_signed:
+        // converting negative bytes to u32 there can overflow in debug builds.
+        let mut unsigned = 0u64;
+        let mut signed = 0i64;
+        for (i, &byte) in header.iter().enumerate() {
+            let byte = if (148..156).contains(&i) { b' ' } else { byte };
+            unsigned += u64::from(byte);
+            signed += i64::from(byte as i8);
+        }
+        if stored != unsigned && u64::try_from(signed).ok() != Some(stored) {
+            return Ok(false);
+        }
+        let Some(size) = parse_plain_octal(&header[124..136]) else {
+            return Ok(false);
+        };
+        let typeflag = header[156];
+        match typeflag {
+            b'0' | 0 | b'7' => {}
+            // GNU tar forces these types' sizes to zero. A nonzero declared
+            // size could hide an interior EOF from a size-based walker.
+            b'1'..=b'6' if size == 0 => {}
+            b'x' | b'g' | b'L' | b'K' if size <= MAX_HEADER_PAYLOAD_BYTES => {}
+            _ => return Ok(false),
+        }
+        let Some(body_start) = pos.checked_add(BLOCK_SIZE) else {
+            return Ok(false);
+        };
+        let Some(padded_size) = size
+            .checked_add(BLOCK_SIZE - 1)
+            .map(|n| n & !(BLOCK_SIZE - 1))
+        else {
+            return Ok(false);
+        };
+        let Some(next) = body_start.checked_add(padded_size).filter(|&n| n <= len) else {
+            return Ok(false);
+        };
+        if matches!(typeflag, b'x' | b'g') {
+            let mut body = vec![0u8; size as usize];
+            reader.read_exact(&mut body)?;
+            // GNU tar also accepts tab-separated PAX records. Match anywhere;
+            // false positives merely retain --ignore-zeros.
+            if body.windows(5).any(|w| w == b"size=")
+                || body.windows(10).any(|w| w == b"GNU.sparse")
+            {
+                return Ok(false);
+            }
+        }
+        pos = next;
+    }
+    Ok(false)
+}
+
+/// Plain octal only: reject base-256, signs and embedded terminators/junk.
+fn parse_plain_octal(bytes: &[u8]) -> Option<u64> {
+    let start = bytes.iter().position(|&b| b != b' ').unwrap_or(bytes.len());
+    let digits = &bytes[start..];
+    let end = digits
+        .iter()
+        .position(|b| !(b'0'..=b'7').contains(b))
+        .unwrap_or(digits.len());
+    if digits[end..].iter().any(|&b| b != 0 && b != b' ') {
+        return None;
+    }
+    digits[..end].iter().try_fold(0u64, |n, &byte| {
+        n.checked_mul(8)?.checked_add(u64::from(byte - b'0'))
+    })
+}
+
 /// Start of a trailing aligned zero-block run of at least 1024 bytes, if the
 /// suffix ends in zeros (including a short leftover after the last full block).
 fn trailing_zero_eof<R: Read + Seek>(
@@ -1219,6 +1312,195 @@ mod tests {
         write_ustar_members(&mut out, members).expect("write members");
         write_tar_eof(&mut out).expect("eof");
         out
+    }
+
+    fn classifier_member(typeflag: u8, size: u64, body: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_raw_ustar_header(
+            &mut bytes,
+            UstarHeaderFields {
+                name: b"member",
+                size,
+                typeflag,
+                linkname: b"target",
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            },
+        )
+        .unwrap();
+        bytes.extend_from_slice(body);
+        write_padding(&mut bytes, body.len() as u64).unwrap();
+        bytes
+    }
+
+    fn classifier_checksum(bytes: &mut [u8], signed: bool) {
+        bytes[148..156].fill(b' ');
+        let sum: i64 = bytes[..512]
+            .iter()
+            .map(|&b| {
+                if signed {
+                    i64::from(b as i8)
+                } else {
+                    i64::from(b)
+                }
+            })
+            .sum();
+        assert!(sum >= 0);
+        bytes[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    }
+
+    /// Regression: #280 ordinary single streams can omit GNU tar's broken -i.
+    #[test]
+    fn is_single_tar_stream_accepts_terminal_padding_and_regular_types() {
+        for typeflag in [0, b'0', b'7'] {
+            let mut bytes = classifier_member(typeflag, 1024, &[0; 1024]);
+            write_tar_eof(&mut bytes).unwrap();
+            assert!(is_single_tar_stream(&mut Cursor::new(&bytes)).unwrap());
+            bytes.resize(20 * 512, 0);
+            assert!(is_single_tar_stream(&mut Cursor::new(&bytes)).unwrap());
+        }
+        for len in [1024, 10240] {
+            assert!(is_single_tar_stream(&mut Cursor::new(vec![0; len])).unwrap());
+        }
+        let bytes = pack(&[member_file("first", b"one"), member_file("last", b"two")]);
+        assert!(is_single_tar_stream(&mut Cursor::new(bytes)).unwrap());
+    }
+
+    /// Regression: #71/#280 interior EOFs, even between helpers and members, need -i.
+    #[test]
+    fn is_single_tar_stream_rejects_concatenation_and_helper_eofs() {
+        let first = pack(&[member_file("first", b"one")]);
+        let last = pack(&[member_file("last", b"two")]);
+        let mut concatenated = first.clone();
+        concatenated.extend_from_slice(&last);
+        assert!(!is_single_tar_stream(&mut Cursor::new(concatenated)).unwrap());
+        let mut lone_zero = first[..first.len() - 512].to_vec();
+        lone_zero.extend_from_slice(&last);
+        assert!(!is_single_tar_stream(&mut Cursor::new(lone_zero)).unwrap());
+        for typeflag in *b"xgLK" {
+            let body = encode_pax_record("path", b"last").unwrap();
+            let mut bytes = first[..first.len() - 1024].to_vec();
+            bytes.extend(classifier_member(typeflag, body.len() as u64, &body));
+            write_tar_eof(&mut bytes).unwrap();
+            bytes.extend_from_slice(&last);
+            assert!(!is_single_tar_stream(&mut Cursor::new(bytes)).unwrap());
+        }
+    }
+
+    /// Regression: GNU tar ignores declared payload sizes on types 1 through 6.
+    #[test]
+    fn is_single_tar_stream_non_data_types_require_zero_size() {
+        for typeflag in b'1'..=b'6' {
+            let mut bytes = classifier_member(typeflag, 0, b"");
+            bytes.extend(pack(&[member_file("last", b"two")]));
+            assert!(is_single_tar_stream(&mut Cursor::new(bytes)).unwrap());
+            let mut bytes = classifier_member(typeflag, 1024, &[0; 1024]);
+            bytes.extend(pack(&[member_file("last", b"two")]));
+            assert!(!is_single_tar_stream(&mut Cursor::new(bytes)).unwrap());
+        }
+    }
+
+    /// Regression: path/link helpers are safe, but PAX size and sparse overrides need -i.
+    #[test]
+    fn is_single_tar_stream_classifies_helpers_conservatively() {
+        for typeflag in *b"xgLK" {
+            let body = if matches!(typeflag, b'x' | b'g') {
+                encode_pax_record("path", "long".repeat(40).as_bytes()).unwrap()
+            } else {
+                let mut body = "long".repeat(40).into_bytes();
+                body.push(0);
+                body
+            };
+            let mut bytes = classifier_member(typeflag, body.len() as u64, &body);
+            bytes.extend(pack(&[member_file("last", b"two")]));
+            assert!(is_single_tar_stream(&mut Cursor::new(bytes)).unwrap());
+
+            let mut oversized = classifier_member(typeflag, MAX_HEADER_PAYLOAD_BYTES + 1, b"");
+            write_tar_eof(&mut oversized).unwrap();
+            assert!(!is_single_tar_stream(&mut Cursor::new(oversized)).unwrap());
+        }
+        for typeflag in *b"xg" {
+            for body in [
+                b"9 size=0\n".as_slice(),
+                b"9\tsize=0\n",
+                b"29 size=18446744073709551615\n",
+                b"22 GNU.sparse.major=1\n",
+                b"20 path=dir/size=x\n",
+            ] {
+                let mut bytes = classifier_member(typeflag, body.len() as u64, body);
+                bytes.extend(pack(&[member_file("last", b"two")]));
+                assert!(!is_single_tar_stream(&mut Cursor::new(bytes)).unwrap());
+            }
+        }
+        for typeflag in *b"SDMNVZ" {
+            let mut bytes = classifier_member(typeflag, 0, b"");
+            write_tar_eof(&mut bytes).unwrap();
+            assert!(!is_single_tar_stream(&mut Cursor::new(bytes)).unwrap());
+        }
+    }
+
+    /// Regression: high-bit names must never overflow the classifier's checksum.
+    #[test]
+    fn is_single_tar_stream_high_bit_checksums_do_not_panic() {
+        let mut bytes = pack(&[member_file("latin", b"body")]);
+        bytes[0] = 0xe9;
+        classifier_checksum(&mut bytes, false);
+        assert!(is_single_tar_stream(&mut Cursor::new(&bytes)).unwrap());
+        classifier_checksum(&mut bytes, true);
+        assert!(is_single_tar_stream(&mut Cursor::new(&bytes)).unwrap());
+        bytes[1] ^= 1;
+        assert!(!is_single_tar_stream(&mut Cursor::new(bytes)).unwrap());
+    }
+
+    /// Regression: base-256, hostile octal fields and truncated streams keep -i.
+    #[test]
+    fn is_single_tar_stream_rejects_invalid_sizes_checksums_and_tails() {
+        let original = pack(&[member_file("member", b"body")]);
+        let mut embedded_null = [b'0'; 12];
+        embedded_null[4] = 0;
+        let mut leading_null = [b'0'; 12];
+        leading_null[0] = 0;
+        for size in [
+            [0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],
+            *b"77777777777\0",
+            *b"00000000008\0",
+            *b"+0000000004\0",
+            embedded_null,
+            leading_null,
+        ] {
+            let mut bytes = original.clone();
+            bytes[124..136].copy_from_slice(&size);
+            classifier_checksum(&mut bytes, false);
+            assert!(!is_single_tar_stream(&mut Cursor::new(bytes)).unwrap());
+        }
+        for checksum in [*b"invalid!", *b"+000001\0", [0x80; 8]] {
+            let mut bytes = original.clone();
+            bytes[148..156].copy_from_slice(&checksum);
+            assert!(!is_single_tar_stream(&mut Cursor::new(bytes)).unwrap());
+        }
+        for len in [0, 512, 513, 1023, 1025] {
+            assert!(!is_single_tar_stream(&mut Cursor::new(vec![0; len])).unwrap());
+        }
+        for len in [
+            512,
+            original.len() - 512,
+            original.len() - 1,
+            original.len() + 1,
+        ] {
+            let mut bytes = original.clone();
+            bytes.resize(len, 0);
+            assert!(!is_single_tar_stream(&mut Cursor::new(bytes)).unwrap());
+        }
+        let mut bytes = original;
+        bytes[0] ^= 1;
+        assert!(!is_single_tar_stream(&mut Cursor::new(bytes)).unwrap());
+        let mut empty_size = classifier_member(b'0', 0, b"");
+        empty_size[124..136].fill(0);
+        classifier_checksum(&mut empty_size, false);
+        write_tar_eof(&mut empty_size).unwrap();
+        assert!(is_single_tar_stream(&mut Cursor::new(empty_size)).unwrap());
     }
 
     fn open_mem(bytes: Vec<u8>) -> SqliteIndexedTar {

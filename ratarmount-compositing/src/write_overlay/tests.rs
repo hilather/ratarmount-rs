@@ -3817,6 +3817,157 @@ fn soft_skip_gnu_tar_commit(err: &impl std::fmt::Display) -> bool {
         || s.contains("Value too large for defined data type")
 }
 
+/// Regression: #280 GNU tar 1.35 --delete -i fails even on ordinary TARs.
+/// Isolate PATH in a child and emulate the failure on every host, intercepting
+/// all names find_gnu_tar tries (including Homebrew's gtar).
+#[cfg(unix)]
+#[test]
+fn regression_280_gnu_tar_delete_single_stream_wrapper() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _process_guard = ratarmount_index::test_process::spawning();
+    const CHILD: &str = "RATARMOUNT_TEST_280_TAR_CHILD";
+    const LOG: &str = "RATARMOUNT_TEST_280_TAR_LOG";
+    if std::env::var_os(CHILD).is_none() {
+        let Some(bin) = find_gnu_tar() else {
+            eprintln!("skip: GNU tar is required for the #280 wrapper regression");
+            return;
+        };
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let real_tar = std::env::split_paths(&original_path)
+            .map(|dir| dir.join(&bin))
+            .find(|path| {
+                path.is_file()
+                    && path
+                        .metadata()
+                        .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+            })
+            .expect("resolve the GNU tar selected before changing PATH")
+            .canonicalize()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let script = r#"#!/bin/sh
+printf '%s\t' "$@" >> "$RATARMOUNT_TEST_280_TAR_LOG"
+printf '\n' >> "$RATARMOUNT_TEST_280_TAR_LOG"
+delete=no
+ignore_zeros=no
+for arg in "$@"; do
+    case "$arg" in
+        --delete) delete=yes ;;
+        --ignore-zeros) ignore_zeros=yes ;;
+    esac
+done
+if [ "$delete" = yes ] && [ "$ignore_zeros" = yes ]; then
+    printf '%s\n' 'tar: lseek: work.tar: Value too large for defined data type' >&2
+    exit 2
+fi
+exec "$RATARMOUNT_TEST_280_REAL_TAR" "$@"
+"#;
+        for name in ["gtar", "gnutar", "tar"] {
+            let wrapper = dir.path().join(name);
+            fs::write(&wrapper, script).unwrap();
+            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = std::env::join_paths(
+            std::iter::once(dir.path().to_path_buf()).chain(std::env::split_paths(&original_path)),
+        )
+        .unwrap();
+        let out = StdCommand::new(std::env::current_exe().unwrap())
+            .env(CHILD, "1")
+            .env(LOG, &log)
+            .env("RATARMOUNT_TEST_280_REAL_TAR", &real_tar)
+            .env("PATH", path)
+            .args([
+                "write_overlay::tests::regression_280_gnu_tar_delete_single_stream_wrapper",
+                "--exact",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child stdout: {}\nchild stderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("running 1 test"));
+        return;
+    }
+
+    let mut failures = Vec::new();
+    for live in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("single.tar");
+        fs::write(
+            &archive,
+            pack_tar(&[
+                ustar_file("old.txt", b"old bytes"),
+                ustar_file("gone.txt", b"delete me"),
+                ustar_file("keep.txt", b"keep bytes"),
+            ]),
+        )
+        .unwrap();
+        let overlay = dir.path().join("ov");
+        let mut ov = overlay_with_base(open_uncompressed_tar_base(&archive, false), &overlay);
+        ov.set_commit_mode(CommitMode::Copy);
+        ov.unlink("/gone.txt").unwrap();
+        fs::write(overlay.join("old.txt"), b"replacement bytes").unwrap();
+        let result = if live {
+            ov.commit_live(&archive, |p| Ok(open_uncompressed_tar_base(p, false)))
+        } else {
+            drop(ov);
+            commit_overlay(&overlay, &archive, &yes_commit_opts())
+        };
+        match result {
+            Ok(true) => {
+                let base = open_uncompressed_tar_base(&archive, false);
+                assert!(base.lookup("/gone.txt", 0).is_none());
+                assert_eq!(read_member(base.as_ref(), "/old.txt"), b"replacement bytes");
+                assert_eq!(read_member(base.as_ref(), "/keep.txt"), b"keep bytes");
+            }
+            other => failures.push(format!("single stream live={live}: {other:?}")),
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("concatenated.tar");
+    let mut before = pack_tar(&[ustar_file("first.txt", b"first bytes")]);
+    before.extend(pack_tar(&[ustar_file("last.txt", b"last bytes")]));
+    fs::write(&archive, &before).unwrap();
+    let overlay = dir.path().join("ov");
+    let ov = overlay_with_base(open_uncompressed_tar_base(&archive, true), &overlay);
+    ov.unlink("/first.txt").unwrap();
+    drop(ov);
+    let error = commit_overlay(&overlay, &archive, &yes_commit_opts()).unwrap_err();
+    assert!(error.to_string().contains("lseek"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("Value too large for defined data type"),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read(&archive).unwrap(),
+        before,
+        "failed commit changed the archive"
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    let log = fs::read_to_string(std::env::var_os(LOG).unwrap()).unwrap();
+    assert!(!log.is_empty(), "GNU tar wrapper was not invoked");
+    let deletes: Vec<Vec<&str>> = log
+        .lines()
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .filter(|args| args.contains(&"--delete"))
+        .collect();
+    assert_eq!(deletes.len(), 3, "{log}");
+    for args in &deletes[..2] {
+        assert!(!args.contains(&"--ignore-zeros"), "{log}");
+    }
+    assert!(deletes[2].contains(&"--ignore-zeros"), "{log}");
+}
+
 fn sibling_index_sqlite_paths(dir: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = fs::read_dir(dir)
         .unwrap()
