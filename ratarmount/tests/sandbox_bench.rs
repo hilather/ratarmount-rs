@@ -1,4 +1,4 @@
-//! Validation-only CLI regressions; no FUSE, network or runtime prerequisites.
+//! Validation and schedule CLI regressions; no FUSE, network or runtime prerequisites.
 
 use std::process::{Command, Output};
 
@@ -30,6 +30,9 @@ fn regression_bench_cli_hidden_and_explicit_help() {
             "Linux",
             "Exit status:",
             "Inherited `--socket` is rejected; bench owns its supervisor.",
+            "Example: ratarmount sandbox bench --manifest tasks.json --dry-run",
+            "--dry-run",
+            "JSONL schedule without execution or file creation",
         ] {
             assert!(help.contains(expected), "{help}");
         }
@@ -133,6 +136,10 @@ fn regression_bench_cli_invalid_arguments_exit_two() {
             "{args:?}: {}",
             stderr(&output)
         );
+        if args.contains(&"--dry-run") {
+            assert!(stderr(&output).contains("cannot be used with"));
+            assert!(!stderr(&output).contains("unexpected argument"));
+        }
     }
     let invalid = cli(&[
         "bench",
@@ -190,12 +197,17 @@ fn regression_bench_cli_invalid_arguments_exit_two() {
             path.display(),
             stderr(&result)
         );
-        // Oversized files and /dev/null hit descriptor/size checks before JSON parsing.
-        assert!(stderr(&result).contains(if path == link || path == socket {
-            "manifest-open"
-        } else {
-            "manifest must be a regular file of at most 1 MiB"
-        }));
+        // Link and socket: manifest-open; fifo, oversized, directory and /dev/null: type/size checks.
+        assert!(
+            stderr(&result).contains(if path == link || path == socket {
+                "manifest-open"
+            } else {
+                "manifest must be a regular file of at most 1 MiB"
+            }),
+            "descriptor case {}: {}",
+            path.display(),
+            stderr(&result)
+        );
         drop(listener);
     }
     let report = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
@@ -237,15 +249,137 @@ fn regression_bench_cli_socket_rejected_before_manifest_io() {
             "--validate-only",
         ],
     ] {
-        let output = cli(&args);
-        assert_eq!(output.status.code(), Some(2));
-        let error = stderr(&output);
-        assert!(error.contains("--socket is rejected"), "{error}");
-        assert!(!error.contains("manifest-open"), "{error}");
+        for mode in ["--validate-only", "--dry-run"] {
+            let args: Vec<_> = args
+                .iter()
+                .map(|a| if *a == "--validate-only" { mode } else { *a })
+                .collect();
+            let output = cli(&args);
+            assert_eq!(output.status.code(), Some(2));
+            let error = stderr(&output);
+            assert!(error.contains("--socket is rejected"), "{error}");
+            assert!(!error.contains("manifest-open"), "{error}");
+        }
     }
     assert!(!missing.exists());
 }
 
+#[cfg(target_os = "linux")]
+fn bench(path: &std::path::Path, options: &str) -> Output {
+    let mut args = vec!["bench", "--manifest", path.to_str().unwrap()];
+    args.extend(options.split_ascii_whitespace());
+    cli(&args)
+}
+#[cfg(target_os = "linux")]
+fn schedule_rows(output: Output) -> Vec<serde_json::Value> {
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect()
+}
+// Regression: dry-run ignored selections, emitted prose, or created preparation/output files.
+#[test]
+#[cfg(target_os = "linux")]
+fn regression_bench_cli_dry_run_emits_schedule_without_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tasks.json");
+    let bytes = serde_json::to_vec(&draft()).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let args = "sandbox bench --manifest tasks.json --dry-run --task mojolicious --backend native,fuse --base-form git,tar.zst-single-frame --jobs 1,2,8 --cache cold,warm --repeats 3 --seed 42 --attempts 1 --allow-oversubscription";
+    let output = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .args(args.split_ascii_whitespace())
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let rows = schedule_rows(output);
+    assert_eq!(rows.len(), 108);
+    for row in &rows {
+        assert_eq!(row["schema"], "rrs-perl-bench-schedule/1");
+        assert_eq!(row["cell"]["task"], "mojolicious");
+        assert_eq!(row["seed"], 42);
+        assert_eq!(row["repeats"], 3);
+        assert_eq!(row["attempts"], 1);
+        assert_eq!(row["allow_oversubscription"], true);
+        assert_eq!(row["oversubscribed"], row["cell"]["jobs"] == 8);
+    }
+    assert_eq!(rows.iter().filter(|r| r["kind"] == "measured").count(), 72);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    for option in [
+        "--repeats 0",
+        "--attempts 2",
+        "--jobs 0",
+        "--backend overlay2",
+        "--base-form zip",
+        "--cache hot",
+        "--task missing",
+    ] {
+        let result = bench(&path, &format!("--dry-run {option}"));
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "{option}: {}",
+            stderr(&result)
+        );
+        assert!(result.stdout.is_empty());
+    }
+    for option in [
+        "--task mojolicious",
+        "--backend native",
+        "--base-form git",
+        "--jobs 1",
+        "--cache warm",
+        "--repeats 2",
+        "--seed 2",
+        "--attempts 1",
+        "--allow-oversubscription",
+    ] {
+        let result = bench(&path, &format!("--validate-only {option}"));
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "{option}: {}",
+            stderr(&result)
+        );
+        assert!(stderr(&result).contains("--dry-run"));
+    }
+}
+
+// Regression: draft schedules asserted runnable qualification or skipped B2 validation/statuses.
+#[test]
+#[cfg(target_os = "linux")]
+fn regression_bench_cli_draft_schedule_is_not_runnable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tasks.json");
+    let missing = bench(&path, "--dry-run");
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stderr(&missing).contains("manifest-open"));
+    std::fs::write(&path, b"{}").unwrap();
+    let bad = bench(&path, "--dry-run --task missing");
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(stderr(&bad).starts_with("sandbox bench: invalid manifest:"));
+    std::fs::write(&path, serde_json::to_vec(&draft()).unwrap()).unwrap();
+    let rows = schedule_rows(bench(&path, "--dry-run"));
+    assert_eq!(rows.len(), 156);
+    for row in rows {
+        assert_eq!(row["qualified"], false);
+        assert_eq!(row["execution_available"], false);
+        assert_eq!(row["runnable"], false);
+        let reasons = row["reasons"].as_array().unwrap();
+        assert!(reasons
+            .iter()
+            .any(|r| r == "Pins and offline qualification unresolved"));
+        assert!(reasons
+            .iter()
+            .any(|r| r == "execution unavailable: B3 schedules only"));
+    }
+    let strict = bench(&path, "--dry-run --require-pins");
+    assert_eq!(strict.status.code(), Some(2));
+    assert!(stderr(&strict).starts_with("sandbox bench: unresolved pins:"));
+    assert!(strict.stdout.is_empty());
+}
 // Regression: bench dispatch changed sandbox run's status 2 or legacy success/error paths.
 #[test]
 fn regression_bench_cli_legacy_exit_statuses_preserved() {
