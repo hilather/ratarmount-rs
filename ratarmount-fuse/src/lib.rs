@@ -8,6 +8,9 @@ mod fuser_tests;
 #[cfg(test)]
 mod test_overlay;
 
+#[cfg(target_os = "linux")]
+mod libfuse3;
+
 pub mod oplog;
 mod passthrough;
 pub use passthrough::{PassthroughMode, PassthroughOptions};
@@ -3884,6 +3887,39 @@ fn mount_options_conflict(a: &MountOption, b: &MountOption) -> bool {
     )
 }
 
+/// Check that the mount backend is available before indexing or daemonizing.
+pub fn preflight_mount_backend() -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        libfuse3::preflight()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mount_session(
+    fs: RatarmountFs,
+    mountpoint: &Path,
+    config: Config,
+) -> std::io::Result<(libfuse3::Mount, fuser::Session<RatarmountFs>)> {
+    let (fd, guard) = libfuse3::mount(mountpoint, &config)?;
+    let acl = config.acl;
+    let session = fuser::Session::from_fd(fs, fd, acl, config)?;
+    Ok((guard, session))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_session(
+    fs: RatarmountFs,
+    mountpoint: &Path,
+    config: Config,
+) -> std::io::Result<fuser::Session<RatarmountFs>> {
+    fuser::Session::new(fs, mountpoint, &config)
+}
+
 /// `Session::run` outcome after the mount has been established.
 ///
 /// fuser turns `ENODEV` into `Ok` and returns every other `read` errno.
@@ -4012,7 +4048,7 @@ pub fn mount_blocking_with_activity(
         overlay.is_none() && activity.journal.is_some(),
     );
     let _ = foreground;
-    // Idempotent with `Filesystem::init`. In place before `Session::new`.
+    // Idempotent with `Filesystem::init`. In place before the session handshake.
     raise_nofile_soft_to_hard();
     let mut fs = RatarmountFs::with_readahead(source, overlay, readahead)
         .with_passthrough(passthrough)
@@ -4025,16 +4061,21 @@ pub fn mount_blocking_with_activity(
     // must exist before `run` so a shadowed archive member can drop a 60s
     // kernel cache, and so those writes never run on the request thread.
     //
-    // `run` consumes the session and unmounts before returning. Then drop
-    // the sender and join the notifier, whose fd is independently owned.
+    // `run` consumes the session. On Linux the libfuse3 guard then unmounts;
+    // other targets unmount inside `run`. Drop the sender and join the notifier,
+    // whose fd is independently owned.
     // No notification shares a lock with libfuse.
-    // `run` also drops the mount on a malformed request. A notify parked on
+    // Errors, including malformed requests, also reach that unmount. A notify parked on
     // a directory `i_rwsem` returns once the holder drops that lock; the holder was
     // waiting on a reply the session thread sent before `run` returned.
     // After unmount a further write fails with `ENODEV` or `ECONNABORTED`
     // (thread exits), and the dropped sender ends `recv`.
     let kernel_notify = Arc::clone(&fs.kernel_notify);
-    let session = fuser::Session::new(fs, mountpoint.as_ref(), &config)?;
+    // Bind the guard before the session so early returns drop the session first.
+    #[cfg(target_os = "linux")]
+    let (guard, session) = mount_session(fs, mountpoint.as_ref(), config)?;
+    #[cfg(not(target_os = "linux"))]
+    let session = mount_session(fs, mountpoint.as_ref(), config)?;
     #[cfg(target_os = "linux")]
     if passthrough.mode == PassthroughMode::On {
         passthrough::linux::probe(&session)?;
@@ -4042,6 +4083,8 @@ pub fn mount_blocking_with_activity(
     let (tx, notifier_thread) = spawn_notifier(session.notifier());
     kernel_notify.install(tx);
     let res = fuse_session_result(session.run());
+    #[cfg(target_os = "linux")]
+    drop(guard);
     kernel_notify.clear();
     let _ = notifier_thread.join();
     let journal_result = oplog.finish();

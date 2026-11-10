@@ -17247,6 +17247,58 @@
       "reason": "internal-read:v1 {\"id\":\"IR-B0394-I01\",\"disposition\":\"residual\",\"family\":\"factory-and-format-readers\",\"issue\":\"#196\",\"reason\":\"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes\",\"item\":\"ratarmount_formats_zip::read_file_range_at_into\",\"native_observed\":false,\"creation\":{\"policy\":\"none\",\"basis\":\"try_clone duplicates the already-held archive descriptor; it opens no pathname.\"},\"category\":\"archive-input\"}"
     },
     {
+      "configured_path": "std::os::fd::BorrowedFd::try_clone_to_owned",
+      "item": "ratarmount_fuse::libfuse3::mount",
+      "leaf_digest": "d15ef7502a3123ddebcdf3d750d2c314dabc926f2eee4be57aebea842b41e8da",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "descriptor-handoff",
+        "creation": {
+          "basis": "duplicates the /dev/fuse descriptor libfuse just opened for the mount; the duplicate is handed to fuser",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-LIBFUSE3-SESSION-FD",
+        "item": "ratarmount_fuse::libfuse3::mount",
+        "reason": "Hand an independently owned FUSE descriptor to fuser"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-LIBFUSE3-SESSION-FD\",\"item\":\"ratarmount_fuse::libfuse3::mount\",\"disposition\":\"out-of-family\",\"category\":\"descriptor-handoff\",\"reason\":\"Hand an independently owned FUSE descriptor to fuser\",\"creation\":{\"policy\":\"none\",\"basis\":\"duplicates the /dev/fuse descriptor libfuse just opened for the mount; the duplicate is handed to fuser\"}}",
+      "resolved": "<std::os::fd::owned::BorrowedFd<'L0>>::try_clone_to_owned",
+      "rule_reason": "inventory-op:try_clone_to_owned"
+    },
+    {
+      "configured_path": "libc::dlsym",
+      "item": "ratarmount_fuse::libfuse3::symbol",
+      "leaf_digest": "b55c84ec252533e14e2fa0cc487cb5211999e2ea5dc9903ed9fa2d0dcfbd310a",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "dynamic-loader-symbol",
+        "creation": {
+          "basis": "resolves a libfuse3 entry point in the handle dlopen just returned; creates no pathname",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-LIBFUSE3-DLSYM",
+        "item": "ratarmount_fuse::libfuse3::symbol",
+        "reason": "Resolve the libfuse3 mount API in the loaded library"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-LIBFUSE3-DLSYM\",\"item\":\"ratarmount_fuse::libfuse3::symbol\",\"disposition\":\"out-of-family\",\"category\":\"dynamic-loader-symbol\",\"reason\":\"Resolve the libfuse3 mount API in the loaded library\",\"creation\":{\"policy\":\"none\",\"basis\":\"resolves a libfuse3 entry point in the handle dlopen just returned; creates no pathname\"}}",
+      "resolved": "libc::unix::dlsym",
+      "rule_reason": "inventory-op:libc::dlsym"
+    },
+    {
       "configured_path": "std::fs::OpenOptions",
       "item": "ratarmount_fuse::oplog",
       "leaf_digest": "997a8f109d29e33a70a58258f100c19d1db0a413e2cdcde564270c38a0e3fd39",

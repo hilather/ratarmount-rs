@@ -218,8 +218,8 @@ Workspace MSRV is 1.90. On Linux, mounts that other users or containers must
 see need `user_allow_other` in `/etc/fuse.conf`. Details, verification and
 package layout: [packaging](docs/packaging.md) · [macOS](docs/macos.md).
 
-Portable tarballs vendor OpenSSL statically, so OpenSSL fixes arrive by
-upgrading the tarball, not the distro ([why](docs/packaging.md)); AUR, Nix,
+Portable tarballs and the `.rpm` vendor OpenSSL statically, so OpenSSL fixes
+arrive by upgrading to a rebuilt release ([why](docs/packaging.md)); AUR, Nix,
 conda and Homebrew core formulas are
 [unpublished drafts](docs/packaging.md#additional-package-drafts).
 

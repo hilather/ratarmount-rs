@@ -25,14 +25,15 @@ CI workflow: [`.github/workflows/packages.yml`](https://github.com/hilather/rata
 > (apt hang / exit 127). Use the portable glibc 2.31 tarball on older hosts; Rocky 9 packages
 > can be built locally with `PACKAGE_FAMILY=rpm ./packaging/build-native-packages.sh`.
 
-Each native package is built **on** that distro (matching glibc / libfuse). The **portable** job uses Debian bullseye so one tarball runs on most modern Ubuntu/Rocky hosts with glibc ≥ 2.31.
+Each native package is built **on** that distro (matching glibc and link-time libraries). Linux loads the host's libfuse3 at runtime. The **portable** job uses Debian bullseye so one tarball runs on most modern Ubuntu/Rocky hosts with glibc ≥ 2.31.
 
 The portable binary vendors OpenSSL statically. Releases up to 0.1.34 linked
 bullseye's `libssl.so.1.1`, which Arch, Ubuntu 22.04+ (including DGX OS) and
 current Fedora do not ship, so those tarballs fail with "error while loading
 shared libraries: libssl.so.1.1". `packaging/test-portable-deps.sh BINARY`
-lists the binary's direct `NEEDED` libraries and fails on any `libssl` or
-`libcrypto`; the Packages workflow runs it before upload.
+lists the binary's direct `NEEDED` libraries and fails on any `libssl`,
+`libcrypto` or `libfuse*` entry. It also requires both runtime libfuse3
+candidate strings; the Packages workflow runs it before upload.
 
 Vendoring freezes OpenSSL inside the portable tarball. That tarball receives
 OpenSSL fixes only when maintainers rebuild and re-release it. After an
@@ -40,8 +41,20 @@ OpenSSL security advisory, rebuild and re-release the portable tarball.
 Users get those fixes by upgrading to the new tarball. Updating distro
 OpenSSL packages does not change an already-shipped portable tarball.
 
-The runtime still uses the host's `libarchive.so.13` and `libfuse3.so.3`, and
-their own dependencies come from those distro packages; on Arch the
+The Rocky 8 `.rpm` also vendors OpenSSL statically. The v0.2.0/v0.2.1 rpm
+linked the build host's `libssl.so.1.1` without declaring it, so it installed
+successfully on Fedora and EL9+ but failed at startup. The rpm receives
+OpenSSL fixes only when maintainers rebuild and re-release it, and users
+upgrade to the new package; updating distro OpenSSL does not update the
+vendored copy. `packaging/test-rpm-deps.sh PACKAGE.rpm` checks every payload
+ELF's direct `NEEDED` libraries against the package's `Requires`, rejects
+dynamic OpenSSL links, and runs in the Packages workflow before upload.
+
+The binary links the host's `libarchive.so.13`. Linux mounts load libfuse3
+at runtime, trying `libfuse3.so.4` then `libfuse3.so.3`, so startup needs no
+libfuse and a mount without it fails immediately with an install hint.
+Native deb/rpm packages retain their `fuse3` runtime dependency. These
+libraries' own dependencies come from their distro packages; on Arch the
 `libcrypto.so.3` seen in `ldd` comes from the host libarchive, not ratarmount.
 
 **Triggers**
