@@ -72,7 +72,11 @@ def write_elf(path, sonames):
     dyn += struct.pack("<QQ", 10, len(strs))
     dyn += struct.pack("<QQ", 0, 0)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(ehdr + ph_load + ph_dyn + dyn + strs)
+    data = ehdr + ph_load + ph_dyn + dyn + strs
+    # Binutils 2.30 over-reads this sectionless ELF's dynamic string table.
+    # Pad the file; PT_LOAD still covers the complete string table above.
+    data += b"\x00" * (-len(data) % 4096)
+    path.write_bytes(data)
 
 write_elf(path, sonames)
 PY
@@ -165,6 +169,27 @@ run --payload "$WORK" --wrong "$WORK/good.requires"
 expect_exit wrong-options 2
 expect_err_has wrong-options 'usage:'
 
+# Regression: a failed mktemp is an infrastructure error, not a violation.
+TMPDIR="$WORK/missing-tmpdir" run --payload "$WORK" --requires "$WORK/good.requires"
+expect_exit missing-tmpdir 2
+expect_err_has missing-tmpdir 'error: cannot create temporary directory'
+
+# Regression: unreadable inputs must report tool/read errors with exit 2.
+if (( EUID == 0 )); then
+  echo 'skip: unreadable payload/Requires regressions require non-root (root can read mode-000 files)'
+else
+  write_elf "$WORK/unreadable/usr/bin/ratarmount" libc.so.6
+  chmod 000 "$WORK/unreadable/usr/bin/ratarmount"
+  run --payload "$WORK/unreadable" --requires "$WORK/good.requires"
+  expect_exit unreadable-payload 2
+  expect_err_has unreadable-payload 'error: cannot read payload file magic:'
+  printf 'fuse3\nlibarchive\n' > "$WORK/unreadable.requires"
+  chmod 000 "$WORK/unreadable.requires"
+  run --payload "$WORK" --requires "$WORK/unreadable.requires"
+  expect_exit unreadable-requires 2
+  expect_err_has unreadable-requires 'error: cannot read Requires file:'
+fi
+
 # All approved libraries, plus a non-ELF mount helper, are accepted.
 write_elf "$WORK/good/usr/bin/ratarmount" "${ALLOWLIST[@]}"
 printf '#!/bin/sh\nexec ratarmount "$@"\n' > "$WORK/good/usr/bin/mount.fuse.ratarmount"
@@ -177,6 +202,19 @@ expect_out_lacks good 'mount.fuse.ratarmount'
 expect_out_lacks good 'FAIL:'
 expect_err_lacks good 'FAIL:'
 
+# Regression: exit 0 and resolved names must not hide inspection diagnostics.
+readelf() {
+  command readelf "$@"
+  echo 'warning: fixture inspection diagnostic' >&2
+}
+export -f readelf
+run --payload "$WORK/good" --requires "$WORK/good.requires"
+unset -f readelf
+expect_exit inspection-stderr 2
+expect_err_has inspection-stderr 'error: cannot resolve NEEDED names: usr/bin/ratarmount'
+expect_err_has inspection-stderr 'warning: fixture inspection diagnostic'
+expect_out_lacks inspection-stderr 'OK:'
+
 # Regression: the v0.2.1 shape links undeclared OpenSSL 1.1.
 write_elf "$WORK/old/usr/bin/ratarmount" "${ALLOWLIST[@]}" libssl.so.1.1 libcrypto.so.1.1
 run --payload "$WORK/old" --requires "$WORK/good.requires"
@@ -184,6 +222,44 @@ expect_exit openssl11 1
 expect_err_has openssl11 'usr/bin/ratarmount: libssl.so.1.1'
 expect_err_has openssl11 'usr/bin/ratarmount: libcrypto.so.1.1'
 expect_err_has openssl11 'the rpm must vendor OpenSSL (do not set OPENSSL_NO_VENDOR in the rpm job)'
+
+# Regression: translated inspection output must not hide OpenSSL dependencies.
+# Without the French locale installed, the locale request is a no-op; these
+# dependency assertions must still pass.
+LANGUAGE=fr LC_ALL=fr_FR.UTF-8 LANG=fr_FR.UTF-8 LC_MESSAGES=fr_FR.UTF-8 \
+  run --payload "$WORK/old" --requires "$WORK/good.requires"
+expect_exit openssl11-french 1
+expect_err_has openssl11-french 'FAIL: usr/bin/ratarmount: libssl.so.1.1: the rpm must vendor OpenSSL'
+
+# Regression: unresolved NEEDED names must never become an empty approved list.
+# Binutils 2.30 can print a raw hex value; newer versions may instead print
+# "<corrupt: 0x...>". A rendered corrupt name is a policy failure (1), while
+# an unresolved name or any inspection stderr is an inspection error (2).
+for corruption in needed-offset string-table; do
+  binary="$WORK/corrupt-$corruption/usr/bin/ratarmount"
+  write_elf "$binary" libssl.so.1.1
+  python3 - "$binary" "$corruption" << 'PY'
+import struct
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+data = bytearray(path.read_bytes())
+dyn_off = 176
+if sys.argv[2] == "needed-offset":
+    struct.pack_into("<Q", data, dyn_off + 8, 0xffff)  # NEEDED beyond DT_STRSZ.
+else:
+    struct.pack_into("<Q", data, dyn_off + 16 + 8, 0x10000)  # DT_STRTAB past EOF.
+path.write_bytes(data)
+PY
+  run --payload "$WORK/corrupt-$corruption" --requires "$WORK/good.requires"
+  case "$RC" in
+    1) expect_err_has "corrupt-$corruption" 'unapproved/undeclared direct dependency' ;;
+    2) expect_err_has "corrupt-$corruption" 'error: cannot resolve NEEDED names: usr/bin/ratarmount' ;;
+    *) miss "corrupt-$corruption" ;;
+  esac
+  expect_out_lacks "corrupt-$corruption" 'OK:'
+done
 
 # OpenSSL 3 and either libfuse3 SONAME are also forbidden.
 for soname in libssl.so.3 libcrypto.so.3 libfuse3.so.3 libfuse3.so.4 libfoo.so.1; do

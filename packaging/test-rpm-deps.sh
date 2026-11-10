@@ -4,6 +4,10 @@
 # libarchive's distro package supplies its own compression dependencies.
 set -euo pipefail
 
+# Inspection parsers below expect English output, including gettext messages.
+export LC_ALL=C
+unset LANGUAGE
+
 usage() {
   echo "usage: $0 <package.rpm>" >&2
   echo "       $0 --payload <dir> --requires <file>" >&2
@@ -53,9 +57,15 @@ if [[ "$MODE" == rpm ]]; then
   done
 fi
 
-TMPDIR_AUDIT="$(mktemp -d)"
+if ! TMPDIR_AUDIT="$(mktemp -d)"; then
+  echo 'error: cannot create temporary directory' >&2
+  exit 2
+fi
 cleanup() {
-  rm -rf "$TMPDIR_AUDIT"
+  if ! rm -rf "$TMPDIR_AUDIT"; then
+    echo "error: cannot remove temporary directory: $TMPDIR_AUDIT" >&2
+    exit 2
+  fi
 }
 trap cleanup EXIT
 
@@ -67,7 +77,10 @@ extract_cpio() {
 
 case "$MODE" in
   rpm)
-    mkdir -p "$TMPDIR_AUDIT/payload" "$TMPDIR_AUDIT/rpmdb"
+    if ! mkdir -p "$TMPDIR_AUDIT/payload" "$TMPDIR_AUDIT/rpmdb"; then
+      echo 'error: cannot create temporary payload and rpm database directories' >&2
+      exit 2
+    fi
     REQUIRES="$TMPDIR_AUDIT/requires"
     if ! rpm --dbpath "$TMPDIR_AUDIT/rpmdb" -qp --requires "$INPUT" > "$REQUIRES"; then
       echo "error: cannot read rpm Requires: $INPUT" >&2
@@ -80,14 +93,22 @@ case "$MODE" in
     PAYLOAD="$TMPDIR_AUDIT/payload"
     ;;
   --payload-cpio)
-    mkdir -p "$TMPDIR_AUDIT/payload"
+    if ! mkdir -p "$TMPDIR_AUDIT/payload"; then
+      echo 'error: cannot create temporary payload directory' >&2
+      exit 2
+    fi
     if ! extract_cpio < "$INPUT"; then
       echo "error: cannot extract cpio payload: $INPUT" >&2
       exit 2
     fi
     PAYLOAD="$TMPDIR_AUDIT/payload"
     ;;
-  --payload) PAYLOAD="$(cd "$INPUT" && pwd)" ;;
+  --payload)
+    if ! PAYLOAD="$(cd "$INPUT" && pwd)"; then
+      echo "error: cannot access payload directory: $INPUT" >&2
+      exit 2
+    fi
+    ;;
 esac
 
 echo "Requires for $INPUT:"
@@ -109,7 +130,10 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     ""|rpmlib\(*|/*) ;;
     *) CAPABILITIES+=("$capability") ;;
   esac
-done < "$REQUIRES"
+done < "$REQUIRES" || {
+  echo "error: cannot read Requires file: $REQUIRES" >&2
+  exit 2
+}
 
 has_requires() {
   local wanted="$1" capability
@@ -132,24 +156,47 @@ if ! find "$PAYLOAD" -type f -print0 > "$TMPDIR_AUDIT/files"; then
   exit 2
 fi
 while IFS= read -r -d '' binary; do
-  magic="$(od -An -tx1 -N4 "$binary" | tr -d ' \n')"
+  if ! magic="$(od -An -tx1 -N4 "$binary" | tr -d ' \n')"; then
+    echo "error: cannot read payload file magic: $binary" >&2
+    exit 2
+  fi
   if [[ "$magic" != 7f454c46 ]]; then
     continue
   fi
   elf_count=$((elf_count + 1))
   relative="${binary#"${PAYLOAD%/}"/}"
   if command -v readelf >/dev/null 2>&1; then
-    if ! NEEDED="$(readelf -d "$binary" 2>/dev/null \
-      | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p')"; then
-      echo "error: cannot inspect ELF: $relative" >&2
+    if ! DYNAMIC="$(readelf -d "$binary" 2>"$TMPDIR_AUDIT/inspect.stderr")"; then
+      echo "error: cannot resolve NEEDED names: $relative" >&2
+      cat "$TMPDIR_AUDIT/inspect.stderr" >&2
+      exit 2
+    fi
+    # readelf can exit 0 while printing raw values for unresolved names.
+    # The dynamic tag names are not translated, unlike "Shared library".
+    if ! NEEDED="$(sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' <<< "$DYNAMIC")" \
+      || ! needed_count="$(awk '$2 == "(NEEDED)" { n++ } END { print n+0 }' <<< "$DYNAMIC")" \
+      || ! name_count="$(awk 'NF { n++ } END { print n+0 }' <<< "$NEEDED")"; then
+      echo "error: cannot resolve NEEDED names: $relative" >&2
+      cat "$TMPDIR_AUDIT/inspect.stderr" >&2
+      exit 2
+    fi
+    if (( needed_count != name_count )); then
+      echo "error: cannot resolve NEEDED names: $relative ($needed_count NEEDED entries, $name_count names)" >&2
+      cat "$TMPDIR_AUDIT/inspect.stderr" >&2
       exit 2
     fi
   else
-    if ! NEEDED="$(objdump -p "$binary" 2>/dev/null \
+    if ! NEEDED="$(objdump -p "$binary" 2>"$TMPDIR_AUDIT/inspect.stderr" \
       | awk '$1 == "NEEDED" { print $2 }')"; then
-      echo "error: cannot inspect ELF: $relative" >&2
+      echo "error: cannot resolve NEEDED names: $relative" >&2
+      cat "$TMPDIR_AUDIT/inspect.stderr" >&2
       exit 2
     fi
+  fi
+  if [[ -s "$TMPDIR_AUDIT/inspect.stderr" ]]; then
+    echo "error: cannot resolve NEEDED names: $relative" >&2
+    cat "$TMPDIR_AUDIT/inspect.stderr" >&2
+    exit 2
   fi
 
   echo "Direct NEEDED libraries for $relative:"
@@ -198,7 +245,10 @@ while IFS= read -r -d '' binary; do
         ;;
     esac
   done <<< "$NEEDED"
-done < "$TMPDIR_AUDIT/files"
+done < "$TMPDIR_AUDIT/files" || {
+  echo 'error: cannot read payload file list' >&2
+  exit 2
+}
 
 if (( elf_count == 0 )); then
   echo "FAIL: .: no ELF file found in payload: $INPUT" >&2
