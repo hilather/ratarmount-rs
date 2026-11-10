@@ -36,7 +36,7 @@ class CiContract(unittest.TestCase):
         self.assertIn("rustup toolchain install 1.98.0 --profile minimal --component clippy", self.check)
         self.assertIn('DRIVER="$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver"', self.check)
         self.assertIn("CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo clippy --workspace --all-targets -- -D warnings", self.check)
-        self.assertIn("CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test --workspace", self.check)
+        self.assertIn("CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test --workspace --no-fail-fast", self.check)
         self.assertIn('RATARMOUNT_REQUIRE_XORRISO: "1"', self.check)
         self.assertIn("run: python3 -I packaging/internal-read-clippy/policy.py", self.check)
         self.assertNotIn("policy.py --collect", self.check)
