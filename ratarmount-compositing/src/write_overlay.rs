@@ -5025,6 +5025,7 @@ impl WriteOverlay {
         ratarmount_compress::fastcopy::log_commit_copy(source.len(), method);
         tmp.as_file().sync_all()?;
         let work_tar = tmp.path().to_path_buf();
+        let delete_args = gnu_tar_delete_args(tmp.as_file());
         #[expect(
             clippy::disallowed_methods,
             reason = r###"internal-read:v1 {"id":"IR-B0170-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::persist_uncompressed_tar_plan","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
@@ -5044,9 +5045,8 @@ impl WriteOverlay {
         fs::write(&append_list, &plan.appends_nul)?;
         if !plan.deletions_nul.is_empty() {
             let output = tar_env_command()
+                .args(&delete_args)
                 .args([
-                    "--delete",
-                    "--ignore-zeros",
                     "--null",
                     &format!("--files-from={}", deletion_list.display()),
                     "--file",
@@ -8790,6 +8790,13 @@ fn commit_overlay_tar(
 
     let plan = collect_overlay_commit_plan(write_overlay)?;
 
+    let delete_args = gnu_tar_delete_args(
+        work_holder
+            .as_ref()
+            .expect("every supported format has a work temp")
+            .as_file(),
+    );
+
     #[expect(
         clippy::disallowed_methods,
         reason = r###"internal-read:v1 {"id":"IR-B0194-M01","item":"ratarmount_compositing::write_overlay::commit_overlay_tar","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
@@ -8826,7 +8833,8 @@ fn commit_overlay_tar(
         }
         if !plan.deletions_nul.is_empty() {
             println!(
-                "    tar --delete --ignore-zeros --null --files-from='{}' --file '{}' 2>&1 |",
+                "    tar {} --null --files-from='{}' --file '{}' 2>&1 |",
+                delete_args.join(" "),
                 deletion_list.display(),
                 work_tar.display()
             );
@@ -8859,9 +8867,8 @@ fn commit_overlay_tar(
 
     if !plan.deletions_nul.is_empty() {
         let output = tar_env_command()
+            .args(&delete_args)
             .args([
-                "--delete",
-                "--ignore-zeros",
                 "--null",
                 &format!("--files-from={}", deletion_list.display()),
                 "--file",
@@ -9795,6 +9802,22 @@ fn ensure_gnu_tar() -> Result<()> {
          (install `gtar` via Homebrew on macOS, or use Linux GNU tar)."
             .into(),
     ))
+}
+
+/// #280: GNU tar 1.35 e89c7a45eb breaks --delete --ignore-zeros (fixed by
+/// d437ecf7). Omit the flag only for a proven single stream; #71 still needs
+/// it to preserve members after interior EOFs in concatenated TARs.
+fn gnu_tar_delete_args(work: &File) -> Vec<&'static str> {
+    // Read the existing temp handle. Moving its shared offset is harmless:
+    // GNU tar opens the work path itself, and publication uses the path too.
+    if matches!(
+        ratarmount_formats_tar::is_single_tar_stream(&mut &*work),
+        Ok(true)
+    ) {
+        vec!["--delete"]
+    } else {
+        vec!["--delete", "--ignore-zeros"]
+    }
 }
 
 fn tar_env_command() -> Command {

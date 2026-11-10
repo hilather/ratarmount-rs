@@ -4,11 +4,13 @@
 
 ### Changes
 
+- Hidden Linux `sandbox bench --dry-run` emits deterministic seeded schedules with paired backend ordering, draft qualification reasons and CPU admission checks, without executing work. See [the benchmark guide](docs/sandbox-benchmarking.md).
 - Hidden Linux `sandbox bench --manifest PATH --validate-only` validates Perl task manifests and optional strict pins without execution. See [the validator guide](docs/sandbox-benchmarking.md).
 
 ### Fixes
 
 - The Rocky 8 `.rpm` vendors OpenSSL statically like the portable tarball, fixing startup failures on Fedora and EL9+ caused by v0.2.0/v0.2.1 linking the build host's `libssl.so.1.1`. A packaging guard checks every payload ELF's direct dependencies against the rpm's `Requires` and rejects dynamic OpenSSL links. (#291)
+- Overlay commits that delete, rename or replace members of an ordinary single-stream TAR (uncompressed, gzip, bzip2 or xz) avoid `lseek: Value too large for defined data type` on GNU tar 1.35 builds lacking the upstream `--delete` fix, including Ubuntu 26.04 and Debian 13. Concatenated TARs and unrecognized layouts (including base-256 or PAX sizes and sparse members) still require `--ignore-zeros` and a fixed GNU tar; a GNU tar delete failure leaves the original archive unchanged. (#280)
 
 ## 0.2.1 (2026-11-09)
 
