@@ -11,6 +11,8 @@
 
 ### Fixes
 
+- Native sandbox benchmarks confine archive symlink targets independent of entry order, bound extraction descriptors, clean restrictive archive/runtime directories through held handles, preserve primary failures and record pre-runtime/interrupt outcomes. Admission uses the unique scratch leaf, retains default `/var/tmp`, and refuses canonical work-root containment or missing output parents with exit 2.
+- Native benchmark cleanup accepts non-UTF-8 runtime names, preserves existing scratch collisions and primary errors on outcome-write failure, and removes scratch leaves after execution errors. Work-root ancestor refusals also cover the runtime executable and placement output.
 - Local `--publish-index` and `--publish-index-to` now publish a complete, read-only `VACUUM INTO` snapshot, including committed codec maps and `--hashes` rows still in WAL. The snapshot is synced, hashed and installed without replacement on its own inode; directory syncs make the pin, optional copy and pointer durable. This fixes missing WAL rows, drifting pin hashes and silently lost rows when a later writer used the hard-linked pin. Publication preserves non-UTF-8 path bytes and prunes in the pin's directory, including directory and bare `.index.sqlite` bases. Destination directories were previously created without being made durable; they must now exist.
 
 - The Rocky 8 `.rpm` vendors OpenSSL statically like the portable tarball, fixing startup failures on Fedora and EL9+ caused by v0.2.0/v0.2.1 linking the build host's `libssl.so.1.1`. A packaging guard checks every payload ELF's direct dependencies against the rpm's `Requires` and rejects dynamic OpenSSL links. (#291)

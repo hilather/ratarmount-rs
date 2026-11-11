@@ -32,8 +32,8 @@ pub(super) struct BenchArgs {
     /// Execute native/warm/archive entries into a fresh private output directory (ungraded).
     #[arg(long, value_name = "DIR", requires = "runtime")]
     out: Option<PathBuf>,
-    /// Existing parent for private scratch trees.
-    #[arg(long, default_value = "/var/tmp", value_name = "DIR")]
+    /// Existing scratch parent; explicit use requires --out. Need not be under --out.
+    #[arg(long, default_value = "/var/tmp", value_name = "DIR", requires = "out")]
     work_root: PathBuf,
     /// Explicit local Docker-compatible executable; never pulls an image.
     #[arg(long, value_name = "PATH", requires = "out")]

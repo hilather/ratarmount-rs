@@ -21,6 +21,35 @@ pub(super) fn timeout(seconds: u64) -> io::Result<Duration> {
     Ok(Duration::from_secs(seconds))
 }
 static INTERRUPTED: AtomicI32 = AtomicI32::new(0);
+pub(super) fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::Relaxed) != 0
+}
+#[cfg(test)]
+pub(super) fn test_set_interrupted() {
+    INTERRUPTED.store(libc::SIGINT, Ordering::Relaxed);
+}
+#[cfg(test)]
+pub(super) struct InterruptScope {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: i32,
+}
+#[cfg(test)]
+impl InterruptScope {
+    pub fn new() -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = LOCK.lock().unwrap();
+        Self {
+            _lock: lock,
+            previous: INTERRUPTED.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+#[cfg(test)]
+impl Drop for InterruptScope {
+    fn drop(&mut self) {
+        INTERRUPTED.store(self.previous, Ordering::Relaxed);
+    }
+}
 extern "C" fn on_signal(signal: libc::c_int) {
     INTERRUPTED.store(signal, Ordering::Relaxed);
 }
@@ -152,6 +181,17 @@ impl<'a, E: Effects> Runtime<'a, E> {
         interruptible: bool,
     ) -> io::Result<Phase> {
         let limit = timeout(seconds)?;
+        if interruptible && self.effects.interrupted() {
+            return Ok(Phase {
+                phase: phase.into(),
+                exit_code: None,
+                error: Some("interrupted".into()),
+                stdout_log: String::new(),
+                stderr_log: String::new(),
+                stdout: None,
+                stderr: None,
+            });
+        }
         self.serial += 1;
         let stdout_log = format!("{}-{}-{phase}.stdout.log", self.name, self.serial);
         let stderr_log = format!("{}-{}-{phase}.stderr.log", self.name, self.serial);
@@ -429,6 +469,26 @@ mod tests {
                         "cleanup tree"
                     ]
                 );
+            },
+        );
+    }
+    // Regression: a pre-spawn interrupt created logs/clients or suppressed kill/rm cleanup (F4).
+    #[test]
+    fn regression_bench_pre_spawn_interrupt_still_stops() {
+        exercise(
+            Fake {
+                time: Duration::from_secs(1),
+                interrupt: true,
+                ..Fake::default()
+            },
+            |r| {
+                let phase = r.invoke("run", &["run".into()], 30, true).unwrap();
+                assert_eq!(phase.error.as_deref(), Some("interrupted"));
+                assert!(phase.stdout_log.is_empty() && phase.stderr_log.is_empty());
+                assert!(r.effects.events.is_empty());
+                assert_eq!(r.serial, 0);
+                r.stop().unwrap();
+                assert_eq!(r.effects.events, ["kill", "rm"]);
             },
         );
     }
