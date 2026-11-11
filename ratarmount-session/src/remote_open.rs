@@ -3662,15 +3662,15 @@ mod tests {
                         if name.eq_ignore_ascii_case("content-length") {
                             content_len = value.trim().parse().unwrap_or(0);
                         }
-                    }
-                    if let Some(v) = line.strip_prefix("Range:") {
-                        range_hdr = Some(v.trim().to_string());
-                    }
-                    if let Some(v) = line.strip_prefix("Authorization:") {
-                        bearer_hdr = Some(v.trim().to_string());
-                    }
-                    if let Some(v) = line.strip_prefix("Cookie:") {
-                        cookie_hdr = Some(v.trim().to_string());
+                        if name.eq_ignore_ascii_case("range") {
+                            range_hdr = Some(value.trim().to_string());
+                        }
+                        if name.eq_ignore_ascii_case("authorization") {
+                            bearer_hdr = Some(value.trim().to_string());
+                        }
+                        if name.eq_ignore_ascii_case("cookie") {
+                            cookie_hdr = Some(value.trim().to_string());
+                        }
                     }
                 }
                 let path = request_line
@@ -4222,8 +4222,10 @@ mod tests {
                     if line == "\r\n" || line == "\n" || line.is_empty() {
                         break;
                     }
-                    if let Some(v) = line.strip_prefix("Range:") {
-                        range_hdr = Some(v.trim().to_string());
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("range") {
+                            range_hdr = Some(value.trim().to_string());
+                        }
                     }
                 }
                 let path = request_line.split_whitespace().nth(1).unwrap_or("");

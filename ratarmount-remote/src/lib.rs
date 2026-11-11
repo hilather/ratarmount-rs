@@ -1869,11 +1869,13 @@ mod tests {
                             break;
                         }
                         headers.push(line.clone());
-                        if let Some(v) = line.strip_prefix("Range:") {
-                            range_hdr = Some(v.trim().to_string());
-                        }
-                        if let Some(v) = line.strip_prefix("Authorization:") {
-                            auth_hdr = Some(v.trim().to_string());
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("range") {
+                                range_hdr = Some(value.trim().to_string());
+                            }
+                            if name.eq_ignore_ascii_case("authorization") {
+                                auth_hdr = Some(value.trim().to_string());
+                            }
                         }
                         // Case-insensitive Cookie: (HTTP headers are case-insensitive).
                         let lower = line.to_ascii_lowercase();
@@ -2751,11 +2753,13 @@ mod tests {
                         if line == "\r\n" || line == "\n" || line.is_empty() {
                             break;
                         }
-                        if let Some(v) = line.strip_prefix("Content-Length:") {
-                            content_length = v.trim().parse().unwrap_or(0);
-                        }
-                        if let Some(v) = line.strip_prefix("Authorization:") {
-                            auth_hdr = Some(v.trim().to_string());
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                            if name.eq_ignore_ascii_case("authorization") {
+                                auth_hdr = Some(value.trim().to_string());
+                            }
                         }
                     }
                     // Drain request body if any (PROPFIND).
