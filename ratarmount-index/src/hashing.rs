@@ -363,14 +363,31 @@ enum HashBackend {
     Libarchive,
 }
 
-fn read_probe<R: Read + ?Sized>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+// EOF is a format miss only beyond the probed stream's metadata length.
+// SeekFrom::End uses ManagedReadCursor's handle-backed xFileSize for raw input;
+// decoder readers use decoded block/frame extents or fully decoded memory/spool
+// lengths (gzip builds its size by inflating), never the compressed file length.
+fn read_probe<R: Read + Seek + ?Sized>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let end = reader
+        .stream_position()?
+        .checked_add(buf.len() as u64)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let mut count = 0;
     while count < buf.len() {
         match reader.read(&mut buf[count..]) {
             Ok(0) => break,
             Ok(n) => count += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
+        }
+    }
+    if count < buf.len() {
+        let position = reader.stream_position()?;
+        let len = reader.seek(SeekFrom::End(0))?;
+        reader.seek(SeekFrom::Start(position))?;
+        if len >= end {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
         }
     }
     Ok(count)
@@ -385,7 +402,7 @@ fn classify(
     if head.starts_with(b"7z\xbc\xaf\x27\x1c") {
         stream.seek(SeekFrom::Start(0))?;
         let mut envelope = [0; 32];
-        if stream.read_exact(&mut envelope).is_ok()
+        if read_probe(stream, &mut envelope)? == envelope.len()
             && crc32fast::hash(&envelope[12..])
                 == u32::from_le_bytes(envelope[8..12].try_into().unwrap())
         {
@@ -404,7 +421,7 @@ fn classify(
     };
     if n >= 4 && local[..4] == *b"PK\x03\x04" {
         stream.seek(SeekFrom::Start(first.oh as u64))?;
-        if stream.read_exact(&mut local).is_ok() {
+        if read_probe(stream, &mut local)? == local.len() {
             let data = first.oh.checked_add(
                 30 + i64::from(u16::from_le_bytes([local[26], local[27]]))
                     + i64::from(u16::from_le_bytes([local[28], local[29]])),
@@ -1403,6 +1420,86 @@ mod tests {
         check_zip(&bytes, &rows, &parts, None, true, false, true);
     }
 
+    fn check_classification_read_error(bytes: &[u8], row: (i64, i64, u64)) {
+        use crate::managed_read::{seams, Seam};
+        use std::io::ErrorKind;
+        for kind in [ErrorKind::Other, ErrorKind::UnexpectedEof] {
+            capture_logs();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("A.bin");
+            std::fs::write(&path, bytes).unwrap();
+            let idx = make_index(None, &[row], None);
+            idx.insert_xattr(row.0, "user.hash.sha256", b"kept")
+                .unwrap();
+            let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+            let seen = reads.clone();
+            let error = seams::with(
+                move |seam| {
+                    if seam == Seam::BeforeRead {
+                        seen.set(seen.get() + 1);
+                        if seen.get() == 2 {
+                            return Err(std::io::Error::new(kind, "injected classification read"));
+                        }
+                    }
+                    Ok(())
+                },
+                || fill_content_hashes(&idx, &path, &algorithms()),
+            )
+            .unwrap_err();
+            assert!(matches!(error, IndexError::Io(ref e) if e.kind() == kind));
+            assert_eq!(
+                reads.get(),
+                2,
+                "initial head succeeds, next read fails once"
+            );
+            assert_eq!(
+                idx.get_xattr(row.0, "user.hash.sha256").unwrap().unwrap(),
+                b"kept"
+            );
+            assert!(idx.get_xattr(row.0, "user.hash.crc32").unwrap().is_none());
+            MESSAGES.with(|m| {
+                assert!(m
+                    .borrow()
+                    .iter()
+                    .any(|s| s.contains("filled=0, kept_existing=1")))
+            });
+            assert_remedy();
+        }
+    }
+
+    /// Regression: a failed ZIP local-header reread must not authorize raw hashing.
+    #[test]
+    fn regression_303_zip_classification_read_error() {
+        let (bytes, rows, _) = zip_bytes(false, false);
+        check_classification_read_error(&bytes, rows[0]);
+    }
+
+    /// Regression: a failed Copy-7z envelope reread must not hash its TAR member raw.
+    #[test]
+    fn regression_303_copy_7z_classification_read_error() {
+        let (tar, _) = tar_bytes(&[vec![42; 700]]);
+        check_classification_read_error(&copy_7z_bytes(&tar), (32, 0, tar.len() as u64));
+    }
+
+    /// Regression: real short streams, including incomplete signatures, keep offset filling.
+    #[test]
+    fn regression_303_genuinely_short_classification_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        for bytes in [b"abc".as_slice(), b"PK\x03\x04", b"7z\xbc\xaf\x27\x1c"] {
+            for codec in ["tar", "gz", "zst"] {
+                let path = dir.path().join(format!("A.{codec}"));
+                std::fs::write(&path, encoded(bytes, codec)).unwrap();
+                for oh in [0, 1] {
+                    let idx = make_index(None, &[(oh, 0, bytes.len() as u64)], None);
+                    report_fill(&idx, &path).1.unwrap();
+                    for algo in algorithms() {
+                        assert_hash(&idx, oh, &algo, bytes);
+                    }
+                }
+            }
+        }
+    }
+
     /// Regression: short/Interrupted probe reads accumulate through EOF.
     #[test]
     fn regression_303_probe_short_reads_and_interruptions() {
@@ -1416,10 +1513,46 @@ mod tests {
                 self.1.read(&mut buf[..1])
             }
         }
+        impl Seek for Probe {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.1.seek(pos)
+            }
+        }
         let mut reader = Probe(false, Cursor::new(b"abc"));
         let mut buf = [0; 4];
         assert_eq!(read_probe(&mut reader, &mut buf).unwrap(), 3);
         assert_eq!(&buf[..3], b"abc");
+    }
+
+    /// Regression: premature EOF and unavailable length cannot become format misses.
+    #[test]
+    fn regression_303_probe_eof_requires_metadata() {
+        struct Probe(Cursor<Vec<u8>>, bool);
+        impl Read for Probe {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl Seek for Probe {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                if self.1 && matches!(pos, SeekFrom::End(_)) {
+                    return Err(std::io::Error::other("injected length failure"));
+                }
+                self.0.seek(pos)
+            }
+        }
+        for fail_length in [false, true] {
+            let mut reader = Probe(Cursor::new(vec![0; 64]), fail_length);
+            let error = read_probe(&mut reader, &mut [0; 30]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if fail_length {
+                    std::io::ErrorKind::Other
+                } else {
+                    std::io::ErrorKind::UnexpectedEof
+                }
+            );
+        }
     }
 
     /// Regression: ZIP prefix/local-header signatures may cross zstd frames.
