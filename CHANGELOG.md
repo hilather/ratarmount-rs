@@ -4,6 +4,7 @@
 
 ### Changes
 
+- **Library API (experimental):** `ratarmount_index::fill_content_hashes` now returns `Result<FillReport>` instead of `Result<()>`, reporting members filled, kept with existing hashes, and unverifiable.
 - Hidden Linux `sandbox bench --out DIR --runtime PATH` executes qualified native/warm/single-frame archive lifecycles with bounded extraction and runtime cleanup. Runs are graded against a native reference (see below). See [the benchmark guide](docs/sandbox-benchmarking.md).
 - Native sandbox benchmarks confine archive symlink targets independent of entry order, bound extraction descriptors, clean restrictive archive/runtime directories through held handles, preserve primary failures and record pre-runtime/interrupt outcomes. Admission uses the unique scratch leaf, retains default `/var/tmp`, and refuses canonical work-root containment or missing output parents with exit 2.
 - Native benchmark cleanup accepts non-UTF-8 runtime names, preserves existing scratch collisions and primary errors on outcome-write failure, and removes scratch leaves after execution errors. Work-root ancestor refusals also cover the runtime executable and placement output.

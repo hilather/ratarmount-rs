@@ -46,7 +46,7 @@ pub use digest_cache::{
 pub use dirent_order::{cmp_offset_then_name, DirentOrder, VisibleMember};
 pub use hashing::{
     compute_hashes_limited, fill_content_hashes, hash_hex, normalize_algorithm, sha256_hex,
-    sha256_hex_stream, sha256_stream_calls_this_thread, HASH_STREAM_CHUNK,
+    sha256_hex_stream, sha256_stream_calls_this_thread, FillReport, HASH_STREAM_CHUNK,
     SUPPORTED_HASH_ALGORITHMS,
 };
 pub use local_cache::{
