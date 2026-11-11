@@ -315,10 +315,13 @@ fn prepare_fill(index: &SqliteIndex, algorithms: &[String]) -> Result<FillState>
         let sparse = stmt
             .query_map([], |r| r.get::<_, i64>(0))?
             .collect::<std::result::Result<HashSet<_>, _>>()?;
-        // Every row owns its xattr slot, even empty/generated/non-regular rows
-        // excluded from the payload candidates.
+        // Real members share xattr slots even when empty or non-regular. Generated
+        // parents have no archive content; their placeholder offsets do not count.
+        // NULL is not proof of generation. A missing column still fails closed in
+        // regular_file_payloads above, without guessing which rows are generated.
         let mut stmt = conn.prepare(
             "SELECT offsetheader FROM files WHERE offsetheader IS NOT NULL
+             AND COALESCE(isgenerated, 0) = 0
              GROUP BY offsetheader HAVING COUNT(*) > 1",
         )?;
         let shared = stmt
@@ -1083,17 +1086,82 @@ mod tests {
         }
     }
 
-    /// Regression: an empty or otherwise ineligible sibling still shares its slot.
+    /// Regression: an implicit TAR parent must not block the first member's hash.
+    #[test]
+    fn regression_303_generated_parent_does_not_share_slot() {
+        let parts = vec![b"first".to_vec(), b"second".to_vec()];
+        let (mut tar, rows) = tar_bytes(&parts);
+        for (i, &(oh, _, _)) in rows.iter().enumerate() {
+            let header = &mut tar[oh as usize..oh as usize + 512];
+            header[..100].fill(0);
+            header[..4].copy_from_slice(format!("d/f{i}").as_bytes());
+            checksum(header);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("A.tar");
+        std::fs::write(&path, tar).unwrap();
+        for backend in [Some("SQLiteIndexedTar"), None] {
+            let idx = make_index(None, &rows, backend);
+            idx.with_conn(|c| {
+                c.execute(
+                    "UPDATE files SET path='/d', name=replace(name, 'm', 'f')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+            // Match the indexer's synthesized /d row: no explicit d/ TAR member,
+            // isgenerated=1, and placeholder offsets colliding with d/f0 at 0.
+            idx.insert_file(
+                "",
+                "d",
+                0,
+                0,
+                0,
+                0.0,
+                0o040755,
+                b'5' as i64,
+                "",
+                0,
+                0,
+                true,
+                false,
+                true,
+                0,
+            )
+            .unwrap();
+            assert_eq!(rows[0].0, 0);
+            assert_eq!(idx.regular_file_payloads().unwrap().len(), 2);
+            let (report, result) = report_fill(&idx, &path);
+            result.unwrap();
+            assert_eq!(
+                report,
+                FillReport {
+                    filled: 2,
+                    ..FillReport::default()
+                }
+            );
+            for (row, part) in rows.iter().zip(&parts) {
+                for algo in algorithms() {
+                    assert_hash(&idx, row.0, &algo, part);
+                }
+            }
+        }
+    }
+
+    /// Regression: an empty or otherwise ineligible real sibling still shares its slot.
     #[test]
     fn regression_303_shared_slot_with_empty_sibling_unverifiable() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("A.asar");
         std::fs::write(&path, [9; 40]).unwrap();
         for (mode, generated, size) in [
-            (0o100644, false, 0),
-            (0o040755, false, 0),
-            (0o120777, false, 0),
-            (0o100644, true, 20),
+            (0o100644, Some(false), 0),
+            (0o040755, Some(false), 0),
+            (0o120777, Some(false), 0),
+            (0o100644, None, 0),
+            (0o040755, None, 0),
+            (0o120777, None, 0),
         ] {
             let idx = make_index(None, &[(0, 0, 20), (0, 20, size)], Some("ASARMountSource"));
             idx.with_conn(|c| {
@@ -1116,6 +1184,16 @@ mod tests {
             );
             assert!(idx.list_xattr_keys(0).unwrap().is_empty());
         }
+        // Older schemas without the column remain unsupported by the candidate
+        // query: fail before writing, including ASAR's shared offsetheader=0.
+        let idx = make_index(None, &[(0, 0, 20), (0, 20, 0)], None);
+        idx.with_conn(|c| {
+            c.execute_batch("ALTER TABLE files DROP COLUMN isgenerated")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(fill_content_hashes(&idx, &path, &algorithms()).is_err());
+        assert!(idx.list_xattr_keys(0).unwrap().is_empty());
     }
 
     /// Regression: decoder failures report kept hashes before returning the error.
