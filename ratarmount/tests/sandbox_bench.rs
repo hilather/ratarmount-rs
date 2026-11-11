@@ -372,6 +372,10 @@ fn regression_bench_cli_dry_run_emits_schedule_without_files() {
     assert!(stderr(&capped).starts_with("sandbox bench: selection:"));
     assert!(stderr(&capped).contains("100000 total-entry cap"));
     assert!(capped.stdout.is_empty());
+    large["tasks"].as_array_mut().unwrap().pop();
+    std::fs::write(&path, serde_json::to_vec(&large).unwrap()).unwrap();
+    let admitted = schedule_rows(bench(&path, "--dry-run --repeats 100"));
+    assert_eq!(admitted.len(), 99_876);
 }
 
 // Regression: draft schedules asserted runnable qualification or skipped B2 validation/statuses.
@@ -464,10 +468,13 @@ mod native {
         dir: tempfile::TempDir,
         value: Value,
         path: PathBuf,
+        runtime: PathBuf,
     }
     impl Fixture {
         fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            Self::with_directories(tempfile::tempdir().unwrap(), 0)
+        }
+        fn with_directories(dir: tempfile::TempDir, count: usize) -> Self {
             let mut tar = tar::Builder::new(Vec::new());
             let mut header = tar::Header::new_ustar();
             header.set_size(6);
@@ -475,6 +482,29 @@ mod native {
             header.set_cksum();
             tar.append_data(&mut header, "source.txt", &b"source"[..])
                 .unwrap();
+            for (name, mode) in [("archive-zero", 0o000), ("archive-write", 0o300)] {
+                let mut header = tar::Header::new_ustar();
+                header.set_mode(mode);
+                header.set_size(0);
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_cksum();
+                tar.append_data(&mut header, name, &b""[..]).unwrap();
+                let mut header = tar::Header::new_ustar();
+                header.set_mode(0o600);
+                header.set_size(1);
+                header.set_cksum();
+                tar.append_data(&mut header, format!("{name}/child"), &b"x"[..])
+                    .unwrap();
+            }
+            for index in 0..count {
+                let mut header = tar::Header::new_ustar();
+                header.set_mode(0o755);
+                header.set_size(0);
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_cksum();
+                tar.append_data(&mut header, format!("directory-{index}"), &b""[..])
+                    .unwrap();
+            }
             let tar = tar.into_inner().unwrap();
             let archive = zstd::encode_all(tar.as_slice(), 1).unwrap();
             let hash = |bytes: &[u8]| format!("sha256:{:x}", Sha256::digest(bytes));
@@ -499,7 +529,16 @@ mod native {
             std::fs::create_dir(dir.path().join("work")).unwrap();
             std::fs::create_dir(dir.path().join("state")).unwrap();
             let path = dir.path().join("tasks.json");
-            let fixture = Self { dir, value, path };
+            let runtime = PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../test-harness/sandbox-bench/runtime.sh"
+            ));
+            let fixture = Self {
+                dir,
+                value,
+                path,
+                runtime,
+            };
             fixture.save();
             fixture
         }
@@ -507,33 +546,45 @@ mod native {
             std::fs::write(&self.path, serde_json::to_vec(&self.value).unwrap()).unwrap();
         }
         fn command(&self) -> Command {
+            self.command_at(
+                &self.dir.path().join("out"),
+                Some(&self.dir.path().join("work")),
+                "native",
+                "warm",
+            )
+        }
+        fn command_at(
+            &self,
+            out: &std::path::Path,
+            work: Option<&std::path::Path>,
+            backend: &str,
+            cache: &str,
+        ) -> Command {
             let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
             command
                 .args(["sandbox", "bench", "--manifest"])
                 .arg(&self.path)
                 .arg("--out")
-                .arg(self.dir.path().join("out"))
-                .arg("--work-root")
-                .arg(self.dir.path().join("work"))
+                .arg(out)
                 .arg("--runtime")
-                .arg(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../test-harness/sandbox-bench/runtime.sh"
-                ))
+                .arg(&self.runtime)
                 .args([
                     "--allow-high-load",
                     "--backend",
-                    "native",
+                    backend,
                     "--base-form",
                     "tar.zst-single-frame",
                     "--cache",
-                    "warm",
+                    cache,
                     "--repeats",
                     "1",
                 ])
                 .env("BENCH_STUB_STATE", self.dir.path().join("state"))
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            if let Some(work) = work {
+                command.arg("--work-root").arg(work);
+            }
             command
         }
         fn fault(&self, fault: &str) {
@@ -558,6 +609,20 @@ mod native {
                     .to_str()
                     .unwrap()
                     .starts_with("container.")));
+        }
+        fn remove_preserved_tree(&self, row: &Value) {
+            use std::os::unix::fs::PermissionsExt;
+            let tree = std::path::Path::new(row["tree"].as_str().unwrap());
+            for name in ["archive-zero", "archive-write"] {
+                let child = tree.join(name);
+                if child.exists() {
+                    std::fs::set_permissions(child, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+            }
+            let scratch = tree.parent().unwrap();
+            std::fs::remove_dir_all(scratch).unwrap();
+            assert!(!scratch.exists());
         }
     }
     // Regression: execution accepted unresolved pins, invalid deadlines or unsupported selections before setup.
@@ -620,11 +685,26 @@ mod native {
                 _ => {}
             }
             f.save();
-            let mut command = f.command();
+            let mut command = if case == "fuse" {
+                f.command_at(
+                    &f.dir.path().join("out"),
+                    Some(&f.dir.path().join("work")),
+                    "fuse",
+                    "cold",
+                )
+            } else {
+                f.command()
+            };
             match case {
                 "fuse" => {
-                    // A non-runnable native reference precedes FUSE in this cold selection.
-                    command.args(["--backend", "fuse", "--cache", "cold"]);
+                    // A cold native reference precedes FUSE; the whole selection must name B5a1a.
+                    let dry = bench(
+                        &f.path,
+                        "--dry-run --backend fuse --cache cold --base-form tar.zst-single-frame",
+                    );
+                    let rows = schedule_rows(dry);
+                    assert_eq!(rows[0]["backend"], "native");
+                    assert!(rows.iter().any(|r| r["backend"] == "fuse"));
                 }
                 "cold" => {
                     command.args(["--cache", "cold"]);
@@ -706,6 +786,7 @@ mod native {
                 if fault == "stop-fail" {
                     assert!(row["stop_error"].is_string());
                     assert!(std::path::Path::new(row["tree"].as_str().unwrap()).is_dir());
+                    f.remove_preserved_tree(&row);
                 } else {
                     assert!(row["stop_error"].is_null());
                 }
@@ -804,5 +885,288 @@ mod native {
                 .count(),
             0
         );
+    }
+    // Regression: explicit work-root without out bypassed its requires-out rule.
+    #[test]
+    fn regression_bench_work_root_requires_out() {
+        let f = Fixture::new();
+        for mode in ["--dry-run", "--validate-only"] {
+            let result = bench(&f.path, &format!("{mode} --work-root /var/tmp"));
+            assert_eq!(result.status.code(), Some(2));
+            let error = stderr(&result);
+            assert!(
+                error.contains("required") && error.contains("--out"),
+                "{error}"
+            );
+        }
+        assert_eq!(bench(&f.path, "--dry-run").status.code(), Some(0));
+        assert_eq!(bench(&f.path, "--validate-only").status.code(), Some(0));
+        assert!(!f.dir.path().join("out").exists());
+    }
+    // Regression: missing output parents and canonical work-root overlaps reached runtime setup.
+    #[test]
+    fn regression_bench_out_parent_and_work_root_refusals() {
+        for case in [
+            "out-parent-missing",
+            "catalog-parent",
+            "artifact-parent",
+            "ancestor",
+            "contains-source",
+            "contains-output",
+            "under-source",
+            "scratch-in-out",
+            "host-alias",
+        ] {
+            let mut f = Fixture::new();
+            let mut out = f.dir.path().join("out");
+            let mut work = f.dir.path().join("work");
+            let reason = match case {
+                "out-parent-missing" => {
+                    out = f.dir.path().join("missing/out");
+                    "--out parent must exist"
+                }
+                "catalog-parent" => {
+                    work = f.dir.path().to_owned();
+                    "equals catalog or artifact parent"
+                }
+                "artifact-parent" => {
+                    std::fs::create_dir(f.dir.path().join("artifacts")).unwrap();
+                    std::fs::rename(
+                        f.dir.path().join("source.tar.zst"),
+                        f.dir.path().join("artifacts/source.tar.zst"),
+                    )
+                    .unwrap();
+                    f.value["tasks"][0]["artifact"]["path"] = json!("artifacts/source.tar.zst");
+                    work = f.dir.path().join("artifacts");
+                    "equals catalog or artifact parent"
+                }
+                "ancestor" => {
+                    work = "/".into();
+                    "ancestor containment"
+                }
+                "contains-source" => {
+                    f.value["tasks"][0]["placement"]["source"] = json!("work/src");
+                    "ancestor containment"
+                }
+                "contains-output" => {
+                    f.value["tasks"][0]["placement"]["output"] = json!("work/output");
+                    "ancestor containment"
+                }
+                "under-source" => {
+                    f.value["tasks"][0]["placement"]["source"] = json!("work");
+                    work = work.join("child");
+                    std::fs::create_dir(&work).unwrap();
+                    "under placement.source"
+                }
+                "host-alias" => {
+                    std::os::unix::fs::symlink(f.dir.path(), work.join("alias")).unwrap();
+                    work = work.join("alias");
+                    "equals catalog or artifact parent"
+                }
+                _ => {
+                    f.value["tasks"][0]["placement"]["scratch"] = json!("out/scratch");
+                    "overlapping source/output/scratch roots"
+                }
+            };
+            f.save();
+            let result = f
+                .command_at(&out, Some(&work), "native", "warm")
+                .output()
+                .unwrap();
+            assert_eq!(result.status.code(), Some(2), "{case}: {}", stderr(&result));
+            assert!(stderr(&result).contains("sandbox bench: selection:"));
+            assert!(
+                stderr(&result).contains(reason),
+                "{case}: {}",
+                stderr(&result)
+            );
+            assert!(!stderr(&result).contains("bench native lifecycle:"));
+            assert!(!out.exists());
+            assert!(!f.calls().contains("image inspect"));
+            assert!(!f.calls().contains("run -d"));
+        }
+    }
+    fn runtime_ancestor_refused(case: &str) {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let mut f = if case == "var-tmp" {
+            Fixture::with_directories(tempfile::tempdir_in("/var/tmp").unwrap(), 0)
+        } else {
+            Fixture::new()
+        };
+        let work = if case == "var-tmp" {
+            PathBuf::from("/var/tmp")
+        } else {
+            f.dir.path().join("work")
+        };
+        let runtime = f.dir.path().join("work/runtime");
+        std::fs::write(&runtime, std::fs::read(&f.runtime).unwrap()).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        f.runtime = if case == "host-alias" {
+            let alias = f.dir.path().join("runtime-alias");
+            symlink(&runtime, &alias).unwrap();
+            alias
+        } else {
+            runtime
+        };
+        let out = f.dir.path().join("out");
+        let result = f
+            .command_at(&out, Some(&work), "native", "warm")
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(2), "{case}: {}", stderr(&result));
+        let error = stderr(&result);
+        assert!(
+            error.contains("sandbox bench: selection:") && error.contains("ancestor containment"),
+            "{case}: {error}"
+        );
+        assert!(!error.contains("bench native lifecycle:"));
+        assert!(!out.exists());
+        assert!(f.calls().is_empty());
+    }
+    // Regression: work-root ancestors of the resolved runtime were admitted, including host symlink aliases.
+    #[test]
+    fn regression_bench_work_root_runtime_ancestor_refused() {
+        for case in ["contained", "host-alias"] {
+            runtime_ancestor_refused(case);
+        }
+    }
+    // Regression: /var/tmp incorrectly exempted contained runtime executables from refusal.
+    #[test]
+    fn regression_bench_var_tmp_runtime_ancestor_refused() {
+        runtime_ancestor_refused("var-tmp");
+    }
+    // Regression: default /var/tmp falsely overlapped outputs/catalogs beneath it (S-4).
+    #[test]
+    fn regression_bench_var_tmp_default_and_sibling_work_admitted() {
+        for kind in ["default", "explicit-default", "sibling"] {
+            // Deliberately independent of process TMPDIR, including catalog and artifact.
+            let f = Fixture::with_directories(tempfile::tempdir_in("/var/tmp").unwrap(), 0);
+            let sibling = f.dir.path().join("work");
+            let work = match kind {
+                "default" => None,
+                "explicit-default" => Some(std::path::Path::new("/var/tmp")),
+                _ => Some(sibling.as_path()),
+            };
+            let result = f
+                .command_at(&f.dir.path().join("out"), work, "native", "warm")
+                .output()
+                .unwrap();
+            assert_eq!(result.status.code(), Some(1), "{kind}: {}", stderr(&result));
+            assert!(stderr(&result).contains("ungraded: benchmark verification unavailable"));
+            let rows = f.rows();
+            assert_eq!(rows.len(), 3);
+            for row in rows {
+                assert!(row["execution_error"].is_null());
+                assert!(row["cleanup_error"].is_null());
+                let tree = std::path::Path::new(row["tree"].as_str().unwrap());
+                assert_eq!(
+                    tree.parent().unwrap().parent().unwrap(),
+                    work.unwrap_or(std::path::Path::new("/var/tmp"))
+                );
+                assert!(!tree.exists());
+                assert!(!tree.parent().unwrap().exists());
+            }
+            assert!(std::path::Path::new("/var/tmp").is_dir());
+            f.no_containers();
+        }
+    }
+    // Regression: one held descriptor per archive directory exhausted RLIMIT_NOFILE (T-8).
+    #[test]
+    fn regression_bench_many_directories_under_fd_limit() {
+        use std::os::unix::process::CommandExt;
+        let f = Fixture::with_directories(tempfile::tempdir().unwrap(), 1100);
+        f.fault("many-directories");
+        let mut command = f.command();
+        unsafe {
+            command.pre_exec(|| {
+                let mut limit = std::mem::zeroed();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limit.rlim_cur = limit.rlim_cur.min(64);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let result = command.output().unwrap();
+        assert_eq!(result.status.code(), Some(1), "{}", stderr(&result));
+        assert_eq!(f.rows().len(), 3);
+        assert!(f.rows().iter().all(|r| r["execution_error"].is_null()
+            && r["cleanup_error"].is_null()
+            && r["phases"].as_array().unwrap().len() == 4));
+        f.no_containers();
+    }
+    // Regression: runtime-created restrictive dirs, run-after-create failure, or between-entry INT leaked trees.
+    #[test]
+    fn regression_bench_runtime_fault_cleanup_and_between_entry_interrupt() {
+        for fault in [
+            "mode-000",
+            "mode-0500",
+            "archive-modes",
+            "run-fail",
+            "interrupt-after-stop",
+            "depth-257",
+        ] {
+            let f = Fixture::new();
+            f.fault(fault);
+            let result = f.command().output().unwrap();
+            assert_eq!(
+                result.status.code(),
+                Some(1),
+                "{fault}: {}",
+                stderr(&result)
+            );
+            let rows = f.rows();
+            assert!(!rows.is_empty());
+            f.no_containers();
+            assert!(f.calls().contains("kill ") && f.calls().contains("rm -f "));
+            if fault == "depth-257" {
+                assert!(rows[0]["cleanup_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("depth exceeds 256; remaining tree preserved"));
+                assert!(std::path::Path::new(rows[0]["tree"].as_str().unwrap()).exists());
+                f.remove_preserved_tree(&rows[0]);
+            } else {
+                assert!(rows.iter().all(|r| r["cleanup_error"].is_null()));
+                for row in &rows {
+                    let tree = std::path::Path::new(row["tree"].as_str().unwrap());
+                    assert!(!tree.exists() && !tree.parent().unwrap().exists());
+                }
+            }
+            if fault == "archive-modes" {
+                assert_eq!(rows.len(), 3);
+                assert!(rows.iter().all(|row| row["stop_error"].is_null()
+                    && row["phases"].as_array().unwrap().len() == 4
+                    && row["phases"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|phase| phase["exit_code"] == 0)));
+            }
+            if fault == "run-fail" {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["phases"][0]["exit_code"], 17);
+                assert_eq!(rows[0]["phases"].as_array().unwrap().len(), 1);
+            }
+            if fault == "interrupt-after-stop" {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[1]["execution_error"], "interrupted");
+                assert_eq!(rows[1]["phases"], json!([]));
+                assert!(rows[0]["execution_error"].is_null());
+                assert_eq!(
+                    f.calls()
+                        .lines()
+                        .filter(|s| s.starts_with("run -d"))
+                        .count(),
+                    1
+                );
+                assert!(!f.dir.path().join("out/1-recovery.json").exists());
+                assert!(!stderr(&result).contains("bench native lifecycle: interrupted"));
+                assert!(stderr(&result).contains("ungraded: benchmark verification unavailable"));
+            }
+        }
     }
 }

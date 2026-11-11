@@ -61,7 +61,7 @@ fn path(bytes: &[u8]) -> io::Result<String> {
     }
     Ok(text.to_owned())
 }
-fn link_target(parent: &str, bytes: &[u8]) -> io::Result<String> {
+fn link_target(parent: &str, bytes: &[u8], links: &BTreeSet<String>) -> io::Result<String> {
     let target = std::str::from_utf8(bytes).map_err(|_| invalid("non-UTF-8 symlink"))?;
     if target.is_empty()
         || target.starts_with('/')
@@ -70,60 +70,64 @@ fn link_target(parent: &str, bytes: &[u8]) -> io::Result<String> {
     {
         return Err(invalid("unsafe symlink target"));
     }
-    let mut depth = if parent.is_empty() {
-        0
-    } else {
-        parent.split('/').count()
-    };
-    for part in target.split('/') {
-        match part {
+    let mut parts: Vec<_> = parent.split('/').filter(|p| !p.is_empty()).collect();
+    let components: Vec<_> = target.split('/').collect();
+    for (index, part) in components.iter().enumerate() {
+        if links.contains(&parts.join("/")) {
+            return Err(invalid("symlink target passes through archive symlink"));
+        }
+        match *part {
             ".." => {
-                depth = depth
-                    .checked_sub(1)
-                    .ok_or_else(|| invalid("symlink escapes tree"))?
+                parts.pop().ok_or_else(|| invalid("symlink escapes tree"))?;
             }
             "" | "." => {}
-            _ => depth += 1,
+            part => parts.push(part),
+        }
+        if index + 1 < components.len() && links.contains(&parts.join("/")) {
+            return Err(invalid("symlink target passes through archive symlink"));
         }
     }
     Ok(target.into())
 }
 pub(super) struct Tree {
     root: OwnedFd,
-    directories: BTreeMap<String, (OwnedFd, u32, u64)>,
+    directories: BTreeMap<String, (u32, u64)>,
+    last_parent: Option<(String, OwnedFd)>,
 }
 impl Tree {
     fn directory(&mut self, name: &str) -> io::Result<&OwnedFd> {
-        let mut parent = String::new();
-        for part in name.split('/').filter(|p| !p.is_empty()) {
-            let child = if parent.is_empty() {
-                part.into()
-            } else {
-                format!("{parent}/{part}")
-            };
-            if !self.directories.contains_key(&child) {
-                let fd = if parent.is_empty() {
-                    &self.root
+        if name.is_empty() {
+            return Ok(&self.root);
+        }
+        if self
+            .last_parent
+            .as_ref()
+            .is_none_or(|(cached, _)| cached != name)
+        {
+            let mut parent = String::new();
+            let mut current = None;
+            for part in name.split('/') {
+                let child = if parent.is_empty() {
+                    part.into()
                 } else {
-                    &self.directories[&parent].0
+                    format!("{parent}/{part}")
                 };
-                let child_fd = owned::create_directory(fd, part)?;
-                self.directories.insert(child.clone(), (child_fd, 0o755, 0));
+                let fd = current.as_ref().unwrap_or(&self.root);
+                current = Some(if self.directories.contains_key(&child) {
+                    owned::open_child_directory(fd, &std::ffi::CString::new(part)?)?
+                } else {
+                    let fd = owned::create_directory(fd, part)?;
+                    self.directories.insert(child.clone(), (0o755, 0));
+                    fd
+                });
+                parent = child;
             }
-            parent = child;
+            self.last_parent = Some((name.into(), current.unwrap()));
         }
-        Ok(if name.is_empty() {
-            &self.root
-        } else {
-            &self.directories[name].0
-        })
+        Ok(&self.last_parent.as_ref().unwrap().1)
     }
-    pub fn make_removable(&self) -> io::Result<()> {
-        fchmod(&self.root, Mode::from_raw_mode(0o700))?;
-        for (fd, _, _) in self.directories.values() {
-            fchmod(fd, Mode::from_raw_mode(0o700))?;
-        }
-        Ok(())
+    pub fn make_removable(self) -> io::Result<()> {
+        owned::make_removable(self.root)
     }
 }
 // No automatic deletion: the caller must first establish that the runtime stopped.
@@ -140,6 +144,7 @@ pub(super) fn extract(
     let mut tree = Tree {
         root,
         directories: BTreeMap::new(),
+        last_parent: None,
     };
     let extracted = (|| {
         extract_tar(
@@ -155,11 +160,15 @@ pub(super) fn extract(
         }
         Ok(())
     })();
-    if extracted.is_err() {
-        tree.make_removable()?;
+    match extracted {
+        Ok(()) => Ok(tree),
+        Err(error) => {
+            let cleanup = tree.make_removable();
+            #[cfg(test)]
+            let cleanup = cleanup.and_then(|()| super::run::inject("make-removable-fail"));
+            Err(owned::with_cleanup(error, cleanup))
+        }
     }
-    extracted?;
-    Ok(tree)
 }
 fn extract_tar<R: Read>(
     tree: &mut Tree,
@@ -169,6 +178,8 @@ fn extract_tar<R: Read>(
 ) -> io::Result<()> {
     let mut archive = tar::Archive::new(input);
     let mut seen = BTreeSet::new();
+    let mut links = BTreeSet::new();
+    let mut pending = Vec::new();
     for entry in archive.entries()?.raw(true) {
         let mut entry = entry?;
         if seen.len() >= max_entries {
@@ -177,6 +188,20 @@ fn extract_tar<R: Read>(
         let name = path(&entry.path_bytes())?;
         if !seen.insert(name.clone()) {
             return Err(invalid("duplicate archive path"));
+        }
+        if name
+            .split('/')
+            .scan(String::new(), |prefix, part| {
+                let previous = prefix.clone();
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(part);
+                Some(previous)
+            })
+            .any(|prefix| links.contains(&prefix))
+        {
+            return Err(invalid("entry path has archive symlink prefix"));
         }
         let mode = entry.header().mode()?;
         if mode & !0o777 != 0 {
@@ -188,8 +213,7 @@ fn extract_tar<R: Read>(
         if kind.is_dir() {
             tree.directory(&name)?;
             let metadata = tree.directories.get_mut(&name).unwrap();
-            metadata.1 = mode;
-            metadata.2 = mtime;
+            *metadata = (mode, mtime);
         } else if kind.is_file() {
             let parent = tree.directory(parent)?;
             let mut output = owned::create_tree_file(parent, leaf)?;
@@ -206,10 +230,10 @@ fn extract_tar<R: Read>(
             let bytes = entry
                 .link_name_bytes()
                 .ok_or_else(|| invalid("missing symlink target"))?;
-            let target = link_target(parent, &bytes)?;
-            let parent = tree.directory(parent)?;
-            symlinkat(target.as_str(), parent, leaf)?;
-            utimensat(parent, leaf, &times(mtime)?, AtFlags::SYMLINK_NOFOLLOW)?;
+            let target = link_target(parent, &bytes, &BTreeSet::new())?;
+            tree.directory(parent)?;
+            links.insert(name.clone());
+            pending.push((name, target, mtime));
         } else {
             return Err(invalid("unsupported special archive entry"));
         }
@@ -219,10 +243,38 @@ fn extract_tar<R: Read>(
     if input.digest() != digest {
         return Err(invalid("tar-stream sha256 mismatch"));
     }
-    // Held descriptors let restrictive parent modes be applied after all descendants.
-    for (fd, mode, mtime) in tree.directories.values().rev() {
-        fchmod(fd, Mode::from_raw_mode(*mode))?;
-        futimens(fd, &times(*mtime)?)?;
+    // Validate against the complete link set before publishing any symlinks.
+    for (name, target, _) in &pending {
+        if tree.directories.contains_key(name) {
+            return Err(invalid("symlink path is already a created directory"));
+        }
+        let (parent, _) = name.rsplit_once('/').unwrap_or(("", name));
+        link_target(parent, target.as_bytes(), &links)?;
+    }
+    for name in &seen {
+        for (offset, _) in name.match_indices('/') {
+            if links.contains(&name[..offset]) {
+                return Err(invalid("entry path has archive symlink prefix"));
+            }
+        }
+    }
+    for (name, target, mtime) in pending {
+        let (parent, leaf) = name.rsplit_once('/').unwrap_or(("", &name));
+        let parent = tree.directory(parent)?;
+        symlinkat(target.as_str(), parent, leaf)?;
+        utimensat(parent, leaf, &times(mtime)?, AtFlags::SYMLINK_NOFOLLOW)?;
+    }
+    // Reverse path order visits descendants first; only the last directory fd is cached.
+    let mut metadata: Vec<_> = tree
+        .directories
+        .iter()
+        .map(|(name, data)| (name.clone(), *data))
+        .collect();
+    metadata.sort_by_key(|(name, _)| name.split('/').count());
+    for (name, (mode, mtime)) in metadata.into_iter().rev() {
+        let fd = tree.directory(&name)?;
+        fchmod(fd, Mode::from_raw_mode(mode))?;
+        futimens(fd, &times(mtime)?)?;
     }
     Ok(())
 }
@@ -271,6 +323,7 @@ mod tests {
         let mut tree = Tree {
             root: owned::open_directory(dir.path())?,
             directories: BTreeMap::new(),
+            last_parent: None,
         };
         let result = extract_tar(&mut tree, Hashed::new(bytes, max), digest, entries);
         tree.make_removable()?;
@@ -294,32 +347,102 @@ mod tests {
     // Regression: unsafe, duplicate, special entries or symlink parents escaped extraction.
     #[test]
     fn regression_bench_native_archive_paths_confined() {
-        for entries in [
-            vec![("../escape", b'0', 0o644, "x")],
-            vec![("/absolute", b'0', 0o644, "x")],
-            vec![("a//b", b'0', 0o644, "x")],
-            vec![("a/./b", b'0', 0o644, "x")],
-            vec![("a", b'0', 0o644, "x"), ("a", b'0', 0o644, "y")],
-            vec![
-                ("dir", b'5', 0o755, ""),
-                ("a", b'2', 0o777, "dir"),
-                ("a/file", b'0', 0o644, "x"),
-            ],
-            vec![("a", b'2', 0o777, "../escape")],
-            vec![("a", b'2', 0o777, "/absolute")],
-            vec![("a", b'1', 0o644, "")],
-            vec![("a", b'6', 0o644, "")],
-            vec![("a", b'0', 0o4755, "x")],
+        for (entries, reason) in [
+            (
+                vec![("../escape", b'0', 0o644, "x")],
+                "unsafe child component",
+            ),
+            (
+                vec![("/absolute", b'0', 0o644, "x")],
+                "unsafe child component",
+            ),
+            (vec![("a//b", b'0', 0o644, "x")], "unsafe child component"),
+            (vec![("a/./b", b'0', 0o644, "x")], "unsafe child component"),
+            (
+                vec![("a", b'0', 0o644, "x"), ("a", b'0', 0o644, "y")],
+                "duplicate archive path",
+            ),
+            (
+                vec![
+                    ("dir", b'5', 0o755, ""),
+                    ("a", b'2', 0o777, "dir"),
+                    ("a/file", b'0', 0o644, "x"),
+                ],
+                "archive symlink prefix",
+            ),
+            (
+                vec![("a", b'2', 0o777, "../escape")],
+                "symlink escapes tree",
+            ),
+            (
+                vec![("a", b'2', 0o777, "/absolute")],
+                "unsafe symlink target",
+            ),
+            (
+                vec![("a", b'1', 0o644, "")],
+                "unsupported special archive entry",
+            ),
+            (
+                vec![("a", b'6', 0o644, "")],
+                "unsupported special archive entry",
+            ),
+            (
+                vec![("a", b'0', 0o4755, "x")],
+                "unsupported archive mode bits",
+            ),
+            (
+                vec![
+                    ("a", b'2', 0o777, "."),
+                    ("x", b'2', 0o777, "a/a/a/a/a/a/../../../../../.."),
+                ],
+                "through archive symlink",
+            ),
+            (
+                vec![("x", b'2', 0o777, "l/l/../.."), ("l", b'2', 0o777, ".")],
+                "through archive symlink",
+            ),
+            (
+                vec![
+                    ("a/b/up", b'2', 0o777, "../.."),
+                    ("x", b'2', 0o777, "a/b/up/../.."),
+                ],
+                "through archive symlink",
+            ),
+            (
+                vec![
+                    ("x", b'2', 0o777, "a/b/up/../.."),
+                    ("a/b/up", b'2', 0o777, "../.."),
+                ],
+                "through archive symlink",
+            ),
+            (
+                vec![("a/b", b'0', 0o644, "x"), ("a", b'2', 0o777, ".")],
+                "already a created directory",
+            ),
         ] {
             let bytes = tar(&entries);
-            assert!(
-                unpack(&bytes, &digest(&bytes), 100_000, 10).is_err(),
-                "{entries:?}"
-            );
+            let error = unpack(&bytes, &digest(&bytes), 100_000, 10).unwrap_err();
+            assert!(error.to_string().contains(reason), "{entries:?}: {error}");
         }
         let bytes = tar(&[("a", b'0', 0o755, "data")]);
-        assert!(unpack(&bytes, &digest(&bytes), 10, 10).is_err());
-        assert!(unpack(&bytes, &digest(&bytes), 100_000, 0).is_err());
+        assert!(unpack(&bytes, &digest(&bytes), 10, 10)
+            .unwrap_err()
+            .to_string()
+            .contains("archive byte bound exceeded"));
+        assert!(unpack(&bytes, &digest(&bytes), 100_000, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("archive entry bound exceeded"));
+    }
+    // Regression: final-component confined symlink chains were over-refused.
+    #[test]
+    fn regression_bench_native_final_symlink_chain() {
+        let bytes = tar(&[
+            ("lib.so", b'2', 0o777, "lib.so.1"),
+            ("lib.so.1", b'2', 0o777, "lib.so.1.2"),
+            ("lib.so.1.2", b'0', 0o644, "library"),
+        ]);
+        unpack(&bytes, &digest(&bytes), 100_000, 10).unwrap();
     }
     // Regression: valid compressed bytes with a different tar identity were executed.
     #[test]
@@ -340,6 +463,7 @@ mod tests {
         let mut tree = Tree {
             root,
             directories: BTreeMap::new(),
+            last_parent: None,
         };
         let bytes = tar(&[
             ("d", b'5', 0o500, ""),
@@ -406,6 +530,34 @@ mod tests {
                 0o700
             );
         }
-        std::fs::remove_dir_all(failed).unwrap();
+        owned::remove_tree(&private, "failed").unwrap();
+        assert!(!failed.exists());
+    }
+    // Regression: mode-000/0300 archive directories survived a successful runtime stop.
+    #[test]
+    fn regression_bench_native_unsearchable_archive_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = owned::open_directory(dir.path()).unwrap();
+        let mut tree = Tree {
+            root: owned::create_directory(&parent, "tree").unwrap(),
+            directories: BTreeMap::new(),
+            last_parent: None,
+        };
+        let bytes = tar(&[
+            ("zero", b'5', 0o000, ""),
+            ("zero/child", b'0', 0o600, "x"),
+            ("write", b'5', 0o300, ""),
+            ("write/child", b'0', 0o600, "x"),
+        ]);
+        extract_tar(
+            &mut tree,
+            Hashed::new(bytes.as_slice(), 100_000),
+            &digest(&bytes),
+            10,
+        )
+        .unwrap();
+        drop(tree);
+        owned::remove_tree(&parent, "tree").unwrap();
+        assert!(!dir.path().join("tree").exists());
     }
 }

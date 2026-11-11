@@ -110,7 +110,9 @@ files, work roots or prepared sources are created. Each entry records the cell,
 catalog revision, backend, kind, repeat, pairing, seed, repeats, attempts, CPU
 limit, admission override and availability. `qualified` describes the validated
 manifest claim. `execution_available` and `runnable` are true only for qualified
-native/warm/`tar.zst-single-frame` entries. Other entries retain an unavailable
+native/warm/`tar.zst-single-frame` entries. Dry-run `runnable` does not check
+execution's `--out` strict pins or its N6 `timeout_seconds` range of **1..=86400**.
+Other entries retain an unavailable
 reason; executable entries explicitly remain ungraded. These are planned entries, not results.
 
 A cell is the canonical JSON tuple `[task, platform, base_form, jobs, cache]`.
@@ -138,10 +140,21 @@ ratarmount sandbox bench --manifest tasks.json --backend native --cache warm --b
 ```
 
 `--out` creates a fresh private directory; its parent and `--work-root` must exist.
-The work-root default is `/var/tmp`. Execution requires every manifest pin and
-qualification to be resolved and selected jobs to be supported. FUSE, Git and
-cold selections are refused as a whole before setup. Canonical source, output
-and scratch paths (including declared placement roots) must not overlap.
+An explicit `--work-root` requires `--out`; the default `/var/tmp` does not
+trigger that requirement, so default dry-run and validate-only remain valid.
+Work-root need not be under `--out`: the sibling layout above stays valid.
+Execution requires every manifest pin and qualification to be resolved and
+selected jobs to be supported. FUSE, Git and cold selections are refused as a
+whole before setup. Overlap checks compare the unique scratch leaf minted under
+work-root with canonical artifact, source, catalog, runtime, output and placement
+roots, resolving host symlinks. Source, output and scratch groups must not overlap.
+Work-root itself is refused if it equals the catalog or artifact parent, equals
+or is under `placement.source`, or is an ancestor of `--out`, the catalog directory,
+the artifact parent, any `placement.source` or `placement.output`, or the resolved
+runtime executable. Exactly `/var/tmp` permits the catalog, artifact, output and
+placement paths beneath it when the unique scratch leaf does not overlap them;
+the runtime executable has no such exception. A catalog directly in `/var/tmp` still
+conflicts with its parent. Each refusal exits **2** with a selection reason.
 Any selected FUSE entry takes refusal precedence with
 `FUSE execution unavailable: lifecycle deferred to B5a1a`.
 Artifact final symlinks are refused. Artifact SHA-256 and the exact local image's
@@ -156,9 +169,13 @@ reading or failure and the override. CPU oversubscription remains a separate
 
 Every reference, discarded warm-up and measurement extracts a fresh tree from
 the pinned single-frame zstd artifact and verifies the complete tar-stream digest.
-Extraction permits regular files, directories and confined relative symlinks;
-it refuses duplicate or unsafe paths, extended/special headers and mode bits above 0777.
-No descent follows archive symlinks. Bounds are 100000 entries, 128 path components,
+Extraction permits regular files and directories. Relative symlink targets are
+accepted only when they stay inside the tree lexically and do not pass through
+an archive-created symlink, independent of entry order. Final-component confined
+symlink chains remain legal. Links are published after stream/digest acceptance,
+before directory metadata. Extraction refuses duplicate or unsafe paths,
+extended/special headers and mode bits above 0777. No descent follows archive symlinks.
+Bounds are 100000 entries, 128 path components,
 4096 path bytes, a 128 MiB decoder window and the smaller of `disk_bytes` or 16 GiB
 for each compressed/decoded stream. Directories start at 0700; recorded modes
 and mtimes are applied after descendants. Bench private roots stay 0700.
@@ -187,3 +204,17 @@ Scheduling is capped at **100000 total entries**, with exit **2** through
 `selection:` before allocating the full entry list or starting execution. A cell
 has at most one reference, two warm-ups, `2*repeats` measurements and one FUSE
 probe (204 at repeats=100). This cap also applies to dry-run.
+
+Cleanup walks top-down through held directory handles, chmodding pinned directories
+to 0700 via `/proc/self/fd` before listing them. Symlinks are unlinked without
+chmodding their targets. The iterative walk caps depth at 256; overflow or missing
+`/proc` preserves the remaining tree and records `cleanup_error`. Rootless Podman
+without keep-id may return EPERM for subuid-owned directories; Podman qualification
+remains out of scope. Extraction caches the last parent descriptor rather than
+holding one descriptor per archive directory.
+
+An interrupt before extraction records `execution_error: "interrupted"` with
+`phases: []`; between entries it prevents the next extract and runtime start.
+An interrupt before runtime spawn records a phase error with empty `stdout_log`
+and `stderr_log` strings and creates no phase logs. Kill/rm cleanup still runs.
+These outcomes keep the existing ungraded exit **1** presentation.
