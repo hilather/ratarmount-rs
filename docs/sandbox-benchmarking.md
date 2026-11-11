@@ -225,14 +225,21 @@ the runtime container. Each schedule sequence matches exactly one terminal index
   `interrupt_observed`, lifecycle error, outcome counts, finish time and wall time.
   It is exclusively created as `.batch-end.json.tmp`, written and synced before
   a directory-relative rename publishes it; the output directory is then synced.
-  Failed publication removes the temporary file, preserving the primary error.
+  Failed publication removes the temporary file; a directory-sync failure after
+  publication removes the published marker, preserving the primary error.
   Final cleanup failure is reflected in its error/status. A failure writing this
   file returns exit 1 and never prints `passed:`. After a run append fails, no
   further terminals or end marker are written; a missing end marker means incomplete.
+  Errors returned before records finish (host identity/uname, header or output creation)
+  read the interrupt flag once and use the `interrupted:` lifecycle form below if set.
+  Failed `runs.jsonl` appends use the same form when the flag is observed; neither case
+  writes an end marker. Other lifecycle errors retain the status frozen at finish
+  and follow the `; interrupt observed` suffix rule below.
 
 Checked `libc::uname` supplies sysname, release, version and machine, without
 reading `/proc` or `/etc` for identity. Nodename is omitted. Uname failure is an
-explicit lifecycle error before output or scratch creation.
+explicit lifecycle error before output or scratch creation; the no-end-marker
+interrupt rule above applies.
 
 A native reference must have zero phase exits, positive `Files=` and `Tests=`
 counts and a terminal `Result: PASS` prove summary. All later runs in that cell
@@ -247,7 +254,8 @@ terminal for each remaining entry. Batch status precedence is `interrupted`,
 `error`, `failed`, then `passed`. An interrupt at an entry gives that entry an
 `interrupted` terminal and blocks later entries with reason `interrupted`.
 An interrupt observed after completed terminals, including a failure break, keeps
-the outcome-derived status and failure reason, and records `interrupt_observed:true`.
+the outcome-derived status and failure reason when all terminals were recorded,
+and records `interrupt_observed:true`.
 
 Exit **0** requires every scheduled run to pass; stub batches also exit 0 but
 remain fixtures. Exit **1** covers failed/blocked, interrupted/incomplete and
@@ -265,6 +273,16 @@ The interrupted count includes every entry without a passed/failed/error termina
 including the entry whose interrupt arm fired. Status and interrupt observation are
 frozen once for the end marker and stderr, including lifecycle errors.
 A late interrupt on a completed batch appends `; interrupt observed after completion`.
+A non-interrupted lifecycle error with a frozen `interrupt_observed:true` appends
+`; interrupt observed` as the final clause, after the whole error text including
+any `; cleanup: …` chain.
+
+The defensive line `sandbox bench: error: batch stopped with E errored, F failed and B blocked runs; see runs.jsonl`
+should not occur; indicates an internal inconsistency (an error status without a
+lifecycle error). Its observed-interrupt suffix is `; interrupt observed`.
+Bind-path conversion and phase-serialization errors record an error terminal,
+block remaining entries and clean scratch through the normal lifecycle error path.
+A phase-serialization failure leaves `phases: []` in the terminal row.
 Records make no throughput or verified-performance claim. `sandbox bench summarize`
 is not yet available.
 

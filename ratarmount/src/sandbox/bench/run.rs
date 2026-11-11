@@ -83,7 +83,7 @@ fn host_load() -> io::Result<f64> {
 }
 // Resolve existing ancestors as well as lexical paths, exposing symlink aliases
 // even for an output or placement root that has not been created yet.
-pub(super) fn resolve(path: &Path) -> io::Result<PathBuf> {
+fn resolve(path: &Path) -> io::Result<PathBuf> {
     if path.exists() {
         return path.canonicalize();
     }
@@ -128,7 +128,7 @@ pub(super) fn execute(
         match args.runtime_kind {
             None => {
                 return Err(invalid(
-                    "--runtime-kind docker|podman|stub is required for execution",
+                    "--runtime-kind docker|stub is required for execution",
                 ))
             }
             Some(RuntimeKind::Podman) => {
@@ -314,10 +314,24 @@ pub(super) fn execute(
     Ok(code)
 }
 fn presentation(result: io::Result<record::Finished>) -> Result<(i32, String), String> {
-    let finished = result.map_err(|e| record::lifecycle_error(false, &e))?;
+    let finished = match result {
+        Ok(finished) => finished,
+        Err(error) => {
+            let interrupted = runtime::interrupted();
+            let message = record::lifecycle_error(interrupted, &error);
+            return if interrupted {
+                Ok((1, message))
+            } else {
+                Err(message)
+            };
+        }
+    };
     if let Err(error) = finished.result {
         let interrupted = finished.status.status == "interrupted";
-        let message = record::lifecycle_error(interrupted, &error);
+        let mut message = record::lifecycle_error(interrupted, &error);
+        if !interrupted && finished.status.interrupt_observed {
+            message.push_str("; interrupt observed");
+        }
         return if interrupted {
             Ok((1, message))
         } else {
@@ -493,19 +507,26 @@ fn execute_owned(
             Ok(())
         })();
         row["lifecycle_ms"]["extract"] = serde_json::json!(started.elapsed().as_millis());
-        if let Err(error) = prepared {
-            let error = owned::with_cleanup(error, cleanup(work_parent, id));
-            row["lifecycle_ms"]["total"] = serde_json::json!(started.elapsed().as_millis());
-            let (primary, secondary) = owned::error_parts(&error);
-            row["reason"] = primary.clone().into();
-            row["execution_error"] = primary.into();
-            row["cleanup_error"] = serde_json::json!(secondary);
-            let recorded = records.terminal(&row);
-            return Ok(records.finish(entries, Err(owned::with_cleanup(error, recorded))));
-        }
-        let mount = tree_path
-            .to_str()
-            .ok_or_else(|| invalid("unsupported runtime bind path"))?;
+        let prepared = prepared.and_then(|()| {
+            #[cfg(test)]
+            inject("mount-utf8")?;
+            tree_path
+                .to_str()
+                .ok_or_else(|| invalid("unsupported runtime bind path"))
+        });
+        let mount = match prepared {
+            Ok(mount) => mount,
+            Err(error) => {
+                let error = owned::with_cleanup(error, cleanup(work_parent, id));
+                row["lifecycle_ms"]["total"] = serde_json::json!(started.elapsed().as_millis());
+                let (primary, secondary) = owned::error_parts(&error);
+                row["reason"] = primary.clone().into();
+                row["execution_error"] = primary.into();
+                row["cleanup_error"] = serde_json::json!(secondary);
+                let recorded = records.terminal(&row);
+                return Ok(records.finish(entries, Err(owned::with_cleanup(error, recorded))));
+            }
+        };
         let mut runtime =
             runtime::Runtime::new(runtime::Local::new(executable), &logs, name.clone());
         let mut phases = Vec::new();
@@ -580,15 +601,32 @@ fn execute_owned(
                 "tree preserved because runtime stop failed",
             ))
         };
-        row["phases"] = serde_json::to_value(&phases)?;
+        let serialized = serde_json::to_value(&phases).map_err(io::Error::from);
+        #[cfg(test)]
+        let serialized = serialized.and_then(|value| {
+            if inject("interrupt-phases-serialize").is_err() {
+                runtime::test_set_interrupted();
+            }
+            inject("phases-serialize").map(|()| value)
+        });
+        let execution = match (serialized, execution) {
+            (Ok(value), execution) => {
+                row["phases"] = value;
+                execution
+            }
+            // The row retains phases: [] when serialization fails.
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(primary)) => Err(owned::with_cleanup(primary, Err(error))),
+        };
         row["execution_error"] =
             serde_json::json!(execution.as_ref().err().map(ToString::to_string));
         row["stop_error"] = serde_json::json!(stop.as_ref().err().map(ToString::to_string));
         row["cleanup_error"] = serde_json::json!(cleanup.as_ref().err().map(ToString::to_string));
         row["lifecycle_ms"]["total"] = serde_json::json!(started.elapsed().as_millis());
-        if phases
-            .iter()
-            .any(|p| p.error.as_deref() == Some("interrupted"))
+        if execution.is_ok()
+            && phases
+                .iter()
+                .any(|p| p.error.as_deref() == Some("interrupted"))
         {
             row["outcome"] = "interrupted".into();
             row["reason"] = "interrupted".into();
@@ -662,17 +700,49 @@ mod tests {
         assert!(!f.dir.path().join("work/owned-test").exists());
         assert!(!f.calls().contains("run -d"));
     }
-    // Regression: header failures leaked output and end-marker/final-cleanup failures claimed passed (N2/N6).
+    // Regression: every outer lifecycle error retains the interrupt form, including uname.
+    #[test]
+    fn regression_bench_outer_lifecycle_error_keeps_interrupted_form() {
+        let _scope = runtime::InterruptScope::new();
+        for fault in ["outcomes-create", "uname-fail"] {
+            for interrupted in [false, true] {
+                let _signals = runtime::Signals::install().unwrap();
+                let mut f = Fixture::new();
+                let _fault = FaultScope::new(&[fault]);
+                if interrupted {
+                    runtime::test_set_interrupted();
+                }
+                let result = f.run_finished();
+                let error = if fault == "uname-fail" {
+                    "host identity: uname failed: uname-fail"
+                } else {
+                    "outcomes-create"
+                };
+                assert_eq!(result.as_ref().unwrap_err().to_string(), error);
+                assert_eq!(
+                    presentation(result),
+                    if interrupted {
+                        Ok((1, format!("sandbox bench: interrupted: batch incomplete; lifecycle error: {error}")))
+                    } else {
+                        Err(format!("bench native lifecycle: {error}"))
+                    }
+                );
+                assert!(!f.dir.path().join("out").exists());
+                assert!(!f.dir.path().join("out/batch-end.json").exists());
+            }
+        }
+    }
+    // Regression: header failures leaked output and end-marker/dir-fsync/final-cleanup failures claimed passed (N2/N6).
     #[test]
     fn regression_bench_record_header_and_end_failures() {
         let _signals = runtime::InterruptScope::new();
-        for name in ["batch.json", "schedule.jsonl", "batch-end.json"] {
+        for (name, fault) in [
+            ("batch.json", "record-header-fail:batch.json"),
+            ("schedule.jsonl", "record-header-fail:schedule.jsonl"),
+            ("batch-end.json", "record-header-fail:batch-end.json"),
+            ("batch-end.json", "record-end-fsync-fail:batch-end.json"),
+        ] {
             let mut f = Fixture::new();
-            let fault = match name {
-                "batch.json" => "record-header-fail:batch.json",
-                "schedule.jsonl" => "record-header-fail:schedule.jsonl",
-                _ => "record-header-fail:batch-end.json",
-            };
             let _fault = FaultScope::new(&[fault]);
             let result = f.run_finished();
             let error = match &result {
@@ -680,9 +750,11 @@ mod tests {
                 Err(error) => error,
             };
             assert_eq!(owned::error_parts(error).0, fault);
-            assert!(presentation(result)
-                .unwrap_err()
-                .starts_with("bench native lifecycle:"));
+            let shown = presentation(result).unwrap_err();
+            assert!(shown.starts_with("bench native lifecycle:"));
+            if fault == "record-end-fsync-fail:batch-end.json" {
+                assert_eq!(shown, format!("bench native lifecycle: {fault}"));
+            }
             assert!(!f.dir.path().join("out/batch-end.json").exists());
             assert!(!f.dir.path().join("out/.batch-end.json.tmp").exists());
             assert_eq!(f.dir.path().join("out").exists(), name == "batch-end.json");
@@ -772,7 +844,11 @@ mod tests {
             if lifecycle_error {
                 assert_eq!(
                     shown.unwrap_err(),
-                    "bench native lifecycle: cleanup-final-fail"
+                    if fault == "interrupt-after-last" {
+                        "bench native lifecycle: cleanup-final-fail; interrupt observed"
+                    } else {
+                        "bench native lifecycle: cleanup-final-fail"
+                    }
                 );
                 assert_eq!(end["error"], "cleanup-final-fail");
             } else {
@@ -781,6 +857,23 @@ mod tests {
                 assert_eq!(message, "sandbox bench: passed: 3 runs graded; batch complete; stub fixture, not publishable");
             }
         }
+        // Regression: the observation suffix follows the entire cleanup error chain (D1).
+        let _signals = runtime::Signals::install().unwrap();
+        let mut f = Fixture::new();
+        let _fault = FaultScope::new(&["interrupt-after-last", "cleanup-final-fail"]);
+        let mut finished = f.run_finished().unwrap();
+        assert!(finished.status.interrupt_observed);
+        assert_eq!(f.end()["status"], finished.status.status);
+        finished.result = Err(owned::with_cleanup(
+            finished.result.unwrap_err(),
+            Err(io::Error::other("x")),
+        ));
+        assert_eq!(
+            presentation(Ok(finished)),
+            Err(
+                "bench native lifecycle: cleanup-final-fail; cleanup: x; interrupt observed".into()
+            )
+        );
     }
     // Regression: an unavailable or excessive load silently passed without a recorded override.
     #[test]
@@ -1091,12 +1184,13 @@ mod tests {
                     faults.push("cleanup-fail");
                 }
                 let _fault = FaultScope::new(&faults);
-                let result = f.run();
+                let finished = f.run_finished().unwrap();
+                let result = &finished.result;
                 CLEANUPS.with(|count| assert_eq!(count.get(), 1));
                 if record_fails {
-                    let error = result.unwrap_err();
+                    let error = result.as_ref().unwrap_err();
                     assert_eq!(
-                        owned::error_parts(&error),
+                        owned::error_parts(error),
                         (
                             "record-fail".into(),
                             cleanup_fails.then(|| "cleanup-fail".into())
@@ -1104,14 +1198,20 @@ mod tests {
                     );
                     assert!(f.rows().is_empty());
                     assert!(!f.dir.path().join("out/batch-end.json").exists());
+                    let suffix = if cleanup_fails {
+                        "; cleanup: cleanup-fail"
+                    } else {
+                        ""
+                    };
+                    assert_eq!(presentation(Ok(finished)), Ok((1, format!("sandbox bench: interrupted: batch incomplete; lifecycle error: record-fail{suffix}"))));
                 } else {
                     if cleanup_fails {
                         assert_eq!(
-                            owned::error_parts(&result.unwrap_err()),
+                            owned::error_parts(result.as_ref().unwrap_err()),
                             ("cleanup-fail".into(), None)
                         );
                     } else {
-                        result.unwrap();
+                        result.as_ref().unwrap();
                     }
                     let rows = f.rows();
                     assert_eq!(rows.len(), 3);
@@ -1144,6 +1244,64 @@ mod tests {
                 drop(signals);
             }
         }
+    }
+    fn leak_exit(fault: &'static str, interrupted: bool) {
+        let _scope = runtime::InterruptScope::new();
+        let mut f = Fixture::new();
+        let mut faults = vec![fault];
+        if interrupted {
+            faults.push("interrupt-phases-serialize");
+        }
+        let _fault = FaultScope::new(&faults);
+        let finished = f.run_finished();
+        assert!(finished.is_ok(), "error exit must finish records");
+        let finished = finished.unwrap();
+        assert_eq!(
+            owned::error_parts(finished.result.as_ref().unwrap_err()),
+            (fault.into(), None)
+        );
+        let rows = f.rows();
+        assert_eq!(rows.len(), f.entries.len());
+        assert_eq!(rows[0]["outcome"], "error");
+        assert_eq!(rows[0]["reason"], fault);
+        assert_eq!(rows[0]["execution_error"], fault);
+        assert!(rows[0]["cleanup_error"].is_null());
+        assert_eq!(rows[0]["phases"], serde_json::json!([]));
+        assert!(rows[1..].iter().all(|r| r["outcome"] == "blocked"));
+        assert!(!f.dir.path().join("work/owned-test").exists());
+        assert_eq!(f.end()["status"], "error");
+        assert_eq!(f.end()["interrupt_observed"], interrupted);
+        let mut expected = format!("bench native lifecycle: {fault}");
+        if interrupted {
+            expected.push_str("; interrupt observed");
+        }
+        assert_eq!(presentation(Ok(finished)), Err(expected));
+    }
+    // Regression: bind-path conversion skipped scratch cleanup and the terminal row (L1).
+    #[test]
+    fn regression_bench_mount_utf8_error_finishes_and_removes_scratch() {
+        leak_exit("mount-utf8", false);
+    }
+    // Regression: phase serialization skipped scratch cleanup and the terminal row (L2).
+    #[test]
+    fn regression_bench_phases_serialize_error_finishes_and_removes_scratch() {
+        leak_exit("phases-serialize", false);
+        leak_exit("phases-serialize", true);
+        let _scope = runtime::InterruptScope::new();
+        let mut f = Fixture::new();
+        let _fault = FaultScope::new(&[
+            "execution-fail",
+            "phases-serialize",
+            "interrupt-phases-serialize",
+            "record-fail",
+        ]);
+        let finished = f.run_finished().unwrap();
+        assert_eq!(
+            finished.result.as_ref().unwrap_err().to_string(),
+            "execution-fail; cleanup: phases-serialize; record-fail"
+        );
+        assert_eq!(presentation(Ok(finished)), Ok((1, "sandbox bench: interrupted: batch incomplete; lifecycle error: execution-fail; cleanup: phases-serialize; record-fail".into())));
+        assert!(!f.dir.path().join("work/owned-test").exists());
     }
     // Regression: execution I/O failure after startup removed the tree but leaked its empty scratch leaf.
     #[test]

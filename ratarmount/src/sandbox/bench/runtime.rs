@@ -2,6 +2,7 @@
 use super::io::{self as owned, invalid};
 use rustix::fd::OwnedFd;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
@@ -37,7 +38,9 @@ pub(super) struct InterruptScope {
 impl InterruptScope {
     pub fn new() -> Self {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let lock = LOCK.lock().unwrap();
+        let lock = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self {
             _lock: lock,
             previous: INTERRUPTED.swap(0, Ordering::Relaxed),
@@ -141,7 +144,8 @@ impl Effects for Local<'_> {
         Ok(())
     }
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub(super) struct Phase {
     phase: String,
     pub exit_code: Option<i32>,
@@ -154,7 +158,7 @@ pub(super) struct Phase {
     stdout_truncated: bool,
     stderr_truncated: bool,
     argv: Vec<String>,
-    environment: std::collections::BTreeMap<String, String>,
+    environment: BTreeMap<String, String>,
 }
 impl Phase {
     pub(super) fn stdout(&self) -> Option<&str> {
@@ -166,6 +170,17 @@ impl Phase {
     pub fn success(&self) -> bool {
         self.exit_code == Some(0) && self.error.is_none()
     }
+}
+fn environment(args: &[String]) -> BTreeMap<String, String> {
+    args.get(1..)
+        .unwrap_or_default()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .take_while(|w| w[0] == "-e")
+        .filter_map(|w| w[1].split_once('='))
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect()
 }
 pub(super) struct Runtime<'a, E: Effects> {
     effects: E,
@@ -205,16 +220,7 @@ impl<'a, E: Effects> Runtime<'a, E> {
                 stdout_truncated: false,
                 stderr_truncated: false,
                 argv: args.to_vec(),
-                environment: args
-                    .get(1..)
-                    .unwrap_or_default()
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .take_while(|w| w[0] == "-e")
-                    .filter_map(|w| w[1].split_once('='))
-                    .map(|(k, v)| (k.into(), v.into()))
-                    .collect(),
+                environment: environment(args),
             });
         }
         self.serial += 1;
@@ -234,16 +240,7 @@ impl<'a, E: Effects> Runtime<'a, E> {
             stdout_truncated: false,
             stderr_truncated: false,
             argv: args.to_vec(),
-            environment: args
-                .get(1..)
-                .unwrap_or_default()
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .take_while(|w| w[0] == "-e")
-                .filter_map(|w| w[1].split_once('='))
-                .map(|(k, v)| (k.into(), v.into()))
-                .collect(),
+            environment: environment(args),
         };
         let mut child = self.effects.spawn(args, stdout, stderr)?;
         let started = self.effects.now();
@@ -463,6 +460,51 @@ mod tests {
         let logs = owned::open_directory(dir.path()).unwrap();
         let mut runtime = Runtime::new(fake, &logs, "unit".into());
         run(&mut runtime);
+    }
+    // Regression: one panicking scope poisoned every later interrupt test.
+    #[test]
+    fn regression_bench_interrupt_scope_tolerates_poison() {
+        assert!(std::thread::spawn(|| {
+            let _scope = InterruptScope::new();
+            test_set_interrupted();
+            panic!("poison interrupt scope");
+        })
+        .join()
+        .is_err());
+        let scope = std::panic::catch_unwind(InterruptScope::new);
+        assert!(scope.is_ok());
+        // No test sets the flag outside an InterruptScope; Drop restores zero under the lock.
+        assert_eq!(scope.unwrap().previous, 0);
+    }
+    // Regression: environment parsing drifted between pre-spawn and spawned phase records.
+    #[test]
+    fn regression_bench_phase_environment_from_argv() {
+        let args = ["run", "-e", "A=1", "-e", "B=x=y", "img", "-e", "C=3"].map(String::from);
+        let expected = BTreeMap::from([("A".into(), "1".into()), ("B".into(), "x=y".into())]);
+        assert_eq!(environment(&args), expected);
+        let boundary = ["run", "-e", "A=1", "img", "cmd", "-e", "C=3"].map(String::from);
+        let boundary_expected = BTreeMap::from([("A".into(), "1".into())]);
+        assert_eq!(environment(&boundary), boundary_expected);
+        assert_eq!(
+            environment(&["exec".into(), "-e".into(), "no-equals".into()]),
+            BTreeMap::new()
+        );
+        for (args, expected) in [(&args[..], &expected), (&boundary[..], &boundary_expected)] {
+            for interrupt in [false, true] {
+                exercise(
+                    Fake {
+                        interrupt,
+                        time: Duration::from_secs(1),
+                        ..Fake::default()
+                    },
+                    |r| {
+                        let phase = r.invoke("run", args, 30, true).unwrap();
+                        assert_eq!(&phase.environment, expected);
+                        assert_eq!(r.effects.events.is_empty(), interrupt);
+                    },
+                );
+            }
+        }
     }
     // Regression: the runtime dropped D6 truncation flags when serializing phase records.
     #[test]
