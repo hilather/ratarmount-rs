@@ -108,7 +108,10 @@ pub(super) fn host_identity(result: io::Result<libc::utsname>) -> io::Result<Hos
     })
 }
 pub(super) fn uname() -> io::Result<Host> {
+    // SAFETY: utsname is a C struct of c_char arrays; all-zero is a valid value.
     let mut value = unsafe { std::mem::zeroed() };
+    // SAFETY: value is aligned, valid and exclusively borrowed. uname writes NUL-terminated
+    // fields on success; -1 is mapped to last_os_error below.
     let result = if unsafe { libc::uname(&mut value) } == -1 {
         Err(io::Error::last_os_error())
     } else {
@@ -191,6 +194,8 @@ fn write_record_file(dir: &OwnedFd, name: &str, rows: &[Value]) -> io::Result<()
         if atomic {
             rustix::fs::renameat(dir, temporary, dir, name)?;
             published = true;
+            #[cfg(test)]
+            run::inject(&format!("record-end-fsync-fail:{name}"))?;
             rustix::fs::fsync(dir)?;
         }
         Ok(())
@@ -231,13 +236,21 @@ impl Status {
                 "interrupted: batch incomplete; {} runs not executed",
                 self.counts["blocked"] + self.counts["interrupted"]
             ),
+            "error" => format!(
+                "error: batch stopped with {} errored, {} failed and {} blocked runs; see runs.jsonl",
+                self.counts["error"], self.counts["failed"], self.counts["blocked"]
+            ),
             _ => format!(
                 "failed: batch complete with {} failed and {} blocked runs; see runs.jsonl",
                 self.counts["failed"], self.counts["blocked"]
             ),
         };
         let suffix = if self.interrupt_observed && self.status != "interrupted" {
-            "; interrupt observed after completion"
+            if self.status == "error" {
+                "; interrupt observed"
+            } else {
+                "; interrupt observed after completion"
+            }
         } else {
             ""
         };
@@ -418,7 +431,8 @@ impl<'a> Records<'a> {
         Finished { status, result }
     }
     fn status(&self, error: bool) -> Status {
-        let status = if self.counts["interrupted"] > 0 {
+        let interrupt_observed = runtime::interrupted();
+        let status = if self.counts["interrupted"] > 0 || (self.broken && interrupt_observed) {
             "interrupted"
         } else if error || self.counts["error"] > 0 {
             "error"
@@ -429,7 +443,7 @@ impl<'a> Records<'a> {
         };
         Status {
             status,
-            interrupt_observed: runtime::interrupted(),
+            interrupt_observed,
             counts: self.counts.clone(),
             fixture: self.header["fixture"] == true,
         }
@@ -557,46 +571,47 @@ mod tests {
             );
         }
     }
+    fn records(dir: &Path, kind: RuntimeKind) -> (OwnedFd, Value, Vec<schedule::Entry>) {
+        let bytes = serde_json::to_vec(&super::super::tests::fixture()).unwrap();
+        let entries = schedule::build(&bytes, &super::super::Selection::default()).unwrap();
+        let fd = owned::open_directory(dir).unwrap();
+        let manifest = dir.join("tasks.json");
+        std::fs::write(&manifest, &bytes).unwrap();
+        let args = BenchArgs {
+            manifest,
+            validate_only: false,
+            dry_run: false,
+            require_pins: false,
+            out: Some(dir.join("out")),
+            work_root: dir.into(),
+            runtime: Some("runtime".into()),
+            runtime_kind: Some(kind),
+            allow_high_load: false,
+            selection: super::super::Selection::default(),
+        };
+        let host = host_identity(Ok(unsafe { std::mem::zeroed() })).unwrap();
+        let header = batch(
+            &args,
+            &bytes,
+            &entries,
+            Path::new("runtime"),
+            &AdmittedPaths {
+                catalog: dir.join("admitted-catalog.json"),
+                artifacts: BTreeMap::from([("mojo".into(), dir.join("admitted-artifact"))]),
+            },
+            host,
+            json!({}),
+        )
+        .unwrap();
+        (fd, header, entries)
+    }
     // Regression: Docker records were fixture-labelled or stub output was publishable (7a).
     #[test]
     fn regression_bench_runtime_kind_recorded_and_fixture_derived() {
         for kind in [RuntimeKind::Docker, RuntimeKind::Stub] {
             let fixture = kind == RuntimeKind::Stub;
-            let bytes = serde_json::to_vec(&super::super::tests::fixture()).unwrap();
-            let entries = schedule::build(&bytes, &super::super::Selection::default()).unwrap();
             let dir = tempfile::tempdir().unwrap();
-            let fd = owned::open_directory(dir.path()).unwrap();
-            let manifest = dir.path().join("tasks.json");
-            std::fs::write(&manifest, &bytes).unwrap();
-            let args = BenchArgs {
-                manifest,
-                validate_only: false,
-                dry_run: false,
-                require_pins: false,
-                out: Some(dir.path().join("out")),
-                work_root: dir.path().into(),
-                runtime: Some("runtime".into()),
-                runtime_kind: Some(kind),
-                allow_high_load: false,
-                selection: super::super::Selection::default(),
-            };
-            let host = host_identity(Ok(unsafe { std::mem::zeroed() })).unwrap();
-            let header = batch(
-                &args,
-                &bytes,
-                &entries,
-                Path::new("runtime"),
-                &AdmittedPaths {
-                    catalog: dir.path().join("admitted-catalog.json"),
-                    artifacts: BTreeMap::from([(
-                        "mojo".into(),
-                        dir.path().join("admitted-artifact"),
-                    )]),
-                },
-                host,
-                json!({}),
-            )
-            .unwrap();
+            let (fd, header, entries) = records(dir.path(), kind);
             let records = Records::create(&fd, "id", header, &entries).unwrap();
             let batch: Value =
                 serde_json::from_slice(&std::fs::read(dir.path().join("batch.json")).unwrap())
@@ -616,6 +631,48 @@ mod tests {
                 assert_eq!(record["fixture"], fixture);
                 assert_eq!(record["publishable"], !fixture);
             }
+        }
+    }
+    // Regression: a defensive error status must not claim a completed failed batch.
+    #[test]
+    fn regression_bench_error_status_presentation_is_explicit() {
+        let mut status = Status {
+            status: "error",
+            interrupt_observed: false,
+            fixture: false,
+            counts: BTreeMap::from([
+                ("error".into(), 1),
+                ("failed".into(), 0),
+                ("blocked".into(), 2),
+            ]),
+        };
+        let message = "sandbox bench: error: batch stopped with 1 errored, 0 failed and 2 blocked runs; see runs.jsonl";
+        assert_eq!(status.presentation(), (1, message.into()));
+        status.interrupt_observed = true;
+        assert_eq!(
+            status.presentation(),
+            (1, format!("{message}; interrupt observed"))
+        );
+    }
+    // Regression: a broken append of any terminal must retain an observed interrupt.
+    #[test]
+    fn regression_bench_broken_records_status_follows_interrupt() {
+        let _scope = runtime::InterruptScope::new();
+        for interrupted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (fd, header, entries) = records(dir.path(), RuntimeKind::Stub);
+            let mut records = Records::create(&fd, "id", header, &entries).unwrap();
+            records.broken = true;
+            if interrupted {
+                runtime::test_set_interrupted();
+            }
+            let finished = records.finish(&entries, Err(io::Error::other("append-fail")));
+            assert_eq!(
+                finished.status.status,
+                if interrupted { "interrupted" } else { "error" }
+            );
+            assert_eq!(finished.status.interrupt_observed, interrupted);
+            assert!(!dir.path().join("batch-end.json").exists());
         }
     }
     // Regression: interrupted lifecycle errors lost their distinct stderr presentation (N3).

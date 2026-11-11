@@ -1393,7 +1393,7 @@ mod native {
         let f = Fixture::new();
         let output = f.kind(None).output().unwrap();
         assert_eq!(output.status.code(), Some(2));
-        assert!(stderr(&output).contains("--runtime-kind docker|podman|stub is required"));
+        assert!(stderr(&output).contains("--runtime-kind docker|stub is required"));
         assert!(!f.dir.path().join("out").exists());
         assert!(f.calls().is_empty());
         assert_eq!(
