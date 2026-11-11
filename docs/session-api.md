@@ -269,6 +269,15 @@ Engine v1 **does not produce `Busy`**. Two `IndexJob`s on the same dest use dist
 | `Temp` | Platform temp, unlinked on `Session` drop **and** on failed `open` (RAII guard). Unix pid dir is `0700`. Stale-pid sweep waits for G4. Confirm in UI. **Not** the fallback when sibling fails. |
 | `CliCompat` | Today’s CLI/Python folder order, including `:memory:` last resort. Not a GUI policy id. |
 
+The sibling policy can select a pointer's published pin. If the archive has
+changed, a rebuild may rename a new index over that pin's name (it never writes
+the old inode). Later side-table writes are refused by the pin name, so seek
+maps can be recomputed on each open until the stale pin and pointer are removed
+or the index is re-published. Use `--index-id` or `Recreate::Never` for an immutable
+binding. Read-only sidecars are never opened for writing by any index writer,
+also as root and through aliases with any link count. Build FTS and hashes
+before publication.
+
 `resolve_index` (G4) is the embedder helper. Existing `resolve_index_location` stays the Python/CLI helper (`CliCompat` last-resort `:memory:` unchanged). `Session::open` and `IndexJob::run` call `resolve_index` for every policy. Factory `resolved_index` keeps `IndexPolicy::CliCompat` so CLI/Python still fall back to `:memory:`. `Recreate::Never` never falls back to `:memory:` (missing sidecar → `NotFound`; tarstats mismatch → `CorruptIndex`).
 
 ```rust
@@ -340,7 +349,9 @@ separate writable connection with the index crate's writable-sidecar settings.
 files never gain this index; in-memory catalogs are not modified either.
 Published SHA-256 snapshots and sidecars with a published pointer also stay
 unindexed so paging cannot invalidate the published content identity.
-On Unix, sidecars with multiple hardlinks are also left untouched.
+On Unix, sidecars with multiple hardlinks are also left untouched. Pin names
+and symlinks to them are refused by optional writers, as are `file:` spellings;
+read-only pin aliases stay protected after their pin name is pruned.
 If creation fails (including a locked or read-only database), paging continues
 correctly using the same keyset query with a full scan per page. Creation is
 attempted at most once per catalog, and unindexed paging logs once at debug

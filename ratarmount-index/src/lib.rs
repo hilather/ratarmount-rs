@@ -30,6 +30,8 @@ mod patch;
 mod payload_cache;
 #[cfg(test)]
 mod prepared_tests;
+#[cfg(all(test, unix))]
+mod publish_tests;
 mod range_cache;
 mod search;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -54,17 +56,18 @@ pub use local_cache::{
 };
 pub use location::{
     archive_base_from_index_path, bind_local_index_id, default_index_folders, default_index_path,
-    expand_user, find_existing_sibling_index, index_id_path, index_pointer_path,
-    index_pointer_path_for_index_file, index_pointer_to_json, is_index_url, load_index_pointer,
-    local_sibling_index_candidates, looks_like_url_archive, materialize_index_file,
-    maybe_fetch_index_url, object_store_sibling_index_candidates, parse_index_folders,
-    parse_index_id, parse_index_pointer_json, parse_link_describedby, path_can_create_index,
-    path_is_usable_existing_index, pick_index_path, possible_index_paths, prune_index_snapshots,
-    publish_index_pointer, resolve_index_id_path, resolve_index_location,
+    existing_sqlite_companion, expand_user, find_existing_sibling_index, fsync_dir, index_id_path,
+    index_pointer_path, index_pointer_path_for_index_file, index_pointer_to_json, is_index_url,
+    is_pin_file_name, load_index_pointer, local_sibling_index_candidates, looks_like_url_archive,
+    materialize_index_file, maybe_fetch_index_url, object_store_sibling_index_candidates,
+    parse_index_folders, parse_index_id, parse_index_pointer_json, parse_link_describedby,
+    path_can_create_index, path_is_usable_existing_index, pick_index_path, possible_index_paths,
+    prune_index_snapshots, publish_index_pointer, publish_index_pointer_for_pin,
+    require_publication_dir, resolve_index_id_path, resolve_index_location,
     resolve_prepared_index_location, resolve_sibling_index_location, sibling_index_candidates,
     sibling_index_id_candidates, sibling_index_id_url, sibling_index_pointer_url,
     sibling_index_url, sibling_parent_dir, snapshot_index_id, store_index_pointer_atomic,
-    test_writable_dir, IndexLocation, IndexPointer, INDEX_ID_HEX_LEN, INDEX_LINK_REL,
+    test_writable_dir, IndexLocation, IndexPointer, PublishedPin, INDEX_ID_HEX_LEN, INDEX_LINK_REL,
     INDEX_MEDIA_TYPE, INDEX_POINTER_KEEP_LAST, INDEX_POINTER_SCHEMA, MEMORY_INDEX,
 };
 pub use meta_cache::{
@@ -2984,7 +2987,14 @@ impl SqliteIndex {
     /// or incomplete.
     pub fn open_writable(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let conn = Connection::open(path)?;
+        let conn = match location::index_write_access(path) {
+            location::IndexWriteAccess::Refused(reason) => return Err(IndexError::Invalid(reason)),
+            location::IndexWriteAccess::ReadOnly => Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?,
+            location::IndexWriteAccess::ReadWrite => Connection::open(path)?,
+        };
         // Brief wait if a concurrent reader is finishing (mount RO + side-table write).
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch(

@@ -456,6 +456,10 @@ fn iter_by_offset_page_recreate_never_keeps_sidecar_unindexed() {
 /// Regression: auxiliary DDL must not invalidate a published snapshot's SHA-256 pointer.
 #[test]
 fn iter_by_offset_page_published_snapshot_keeps_sha256_valid() {
+    if !cfg!(unix) {
+        eprintln!("skip: local index publication is Unix-only");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("published.tar");
     std::fs::write(&archive, tar_bytes(&[member("z", b"a"), member("a", b"b")])).unwrap();

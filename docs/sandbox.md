@@ -2014,8 +2014,7 @@ an ordinary file read. On Windows the reader reads an ordinary private file.
 
 Covered (each with a regression test; the reviewed Clippy manifest
 lists the production operation approvals): index pointers (`{archive}.index.ptr`); the index blob hash
-behind pointer ids, snapshot verification and publication; the `snapshot_index_id`
-copy fallback; the compression probe and decompression input of an index; the
+behind pointer ids, snapshot verification and publication; the pin snapshot's sync and hash; the compression probe and decompression input of an index; the
 meta-v3 metadata cache (the `$XDG_CACHE_HOME/ratarmount/meta-v3` LRU of whole
 sidecar downloads: header, blob digest, install copy); the remote index id
 comparison and the copy of a fetched or meta-v3 blob to the local cache name;
