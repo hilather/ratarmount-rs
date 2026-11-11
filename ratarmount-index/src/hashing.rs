@@ -220,14 +220,15 @@ pub fn compute_hashes_limited<R: Read>(
 /// values byte-identical. ZIP late filling requires a verified unencrypted Stored
 /// entry; 7z is build-time only. Sparse, shared-slot and libarchive rows are skipped.
 /// Other backends require true payload offsets into the decoded stream.
+/// Returns counts of members filled, kept with existing hashes, and unverifiable.
 pub fn fill_content_hashes(
     index: &SqliteIndex,
     archive_path: &Path,
     algorithms: &[String],
-) -> Result<()> {
+) -> Result<FillReport> {
     let mut fill = prepare_fill(index, algorithms)?;
     if fill.rows.iter().all(|row| row.algos.is_empty()) {
-        return Ok(());
+        return Ok(fill.report);
     }
     // Keep this acquisition's compiler owner and reviewed inventory unchanged.
     #[expect(
@@ -236,11 +237,11 @@ pub fn fill_content_hashes(
     )]
     let mut archive = crate::managed_read::ManagedReadCursor::open(archive_path)?;
     archive.seek(SeekFrom::Start(0))?;
-    fill_content_hashes_report(index, archive_path, archive, &mut fill).map(|_| ())
+    fill_content_hashes_report(index, archive_path, archive, &mut fill)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct FillReport {
+pub struct FillReport {
     pub filled: usize,
     pub kept_existing: usize,
     pub unverifiable: usize,
@@ -258,6 +259,7 @@ pub(crate) struct FillState {
     rows: Vec<HashRow>,
     algos: String,
     report: FillReport,
+    format_unverifiable: Option<String>,
     kept: HashSet<usize>,
     filled: HashSet<usize>,
 }
@@ -276,8 +278,13 @@ impl Drop for FillState {
                 self.report.kept_existing, self.algos);
         }
         if self.report.unverifiable > 0 {
-            warn!("{} members have unverifiable content locations or unsupported late hashes; rebuild with --recreate-index --hashes {}",
-                self.report.unverifiable, self.algos);
+            if let Some(name) = &self.format_unverifiable {
+                warn!("{} members skipped as unverifiable: content locations in {name} indexes cannot be verified, so no hashes were stored for them",
+                    self.report.unverifiable);
+            } else {
+                warn!("{} members have unverifiable content locations or unsupported late hashes; rebuild with --recreate-index --hashes {}",
+                    self.report.unverifiable, self.algos);
+            }
         }
     }
 }
@@ -287,6 +294,7 @@ fn prepare_fill(index: &SqliteIndex, algorithms: &[String]) -> Result<FillState>
         rows: Vec::new(),
         algos: String::new(),
         report: FillReport::default(),
+        format_unverifiable: None,
         kept: HashSet::new(),
         filled: HashSet::new(),
     };
@@ -482,6 +490,9 @@ pub(crate) fn fill_content_hashes_report(
         Some(_) => HashBackend::Unverifiable,
         None => classify(&mut *stream, &head[..n], &fill.rows[0])?,
     };
+    if matches!(backend, HashBackend::Unverifiable | HashBackend::Libarchive) {
+        fill.format_unverifiable = meta.get("backendName").cloned();
+    }
     let mut zip_windows = HashMap::new();
     if backend == HashBackend::Zip && !meta.contains_key("zipMultipartParts") {
         // Central directory is authoritative; no member decompression or path open.
@@ -1038,9 +1049,10 @@ mod tests {
         }
     }
 
-    /// Regression: CAB offsets must not hash archive headers as member content.
+    /// Regression: CAB offsets are unverifiable and rebuilding cannot help.
     #[test]
     fn regression_303_unlisted_backend_is_unverifiable() {
+        capture_logs();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("A.cab");
         std::fs::write(&path, [9; 40]).unwrap();
@@ -1050,6 +1062,19 @@ mod tests {
         assert_eq!(report.unverifiable, 1);
         assert_eq!(report.filled, 0);
         assert!(idx.list_xattr_keys(0).unwrap().is_empty());
+        MESSAGES.with(|m| {
+            let messages = m.borrow();
+            assert!(
+                messages
+                    .iter()
+                    .any(|s| s.contains("skipped as unverifiable") && s.contains("CABMountSource")),
+                "{messages:?}"
+            );
+            assert!(
+                messages.iter().all(|s| !s.contains("--recreate-index")),
+                "{messages:?}"
+            );
+        });
     }
 
     /// Regression: physical TAR size zero must not discard effective PAX size 700.
@@ -1110,6 +1135,7 @@ mod tests {
         let path = dir.path().join("A.bin");
         std::fs::write(&path, vec![9; 100]).unwrap();
         for backend in [None, Some("LibarchiveMountSource")] {
+            capture_logs();
             let rows = if backend.is_none() {
                 vec![(0, 0, 20), (0, 20, 20)]
             } else {
@@ -1122,6 +1148,21 @@ mod tests {
             assert_eq!(report.filled, 0);
             for row in rows {
                 assert!(idx.list_xattr_keys(row.0).unwrap().is_empty());
+            }
+            if let Some(name) = backend {
+                MESSAGES.with(|m| {
+                    let messages = m.borrow();
+                    assert!(
+                        messages
+                            .iter()
+                            .any(|s| s.contains("skipped as unverifiable") && s.contains(name)),
+                        "{messages:?}"
+                    );
+                    assert!(
+                        messages.iter().all(|s| !s.contains("--recreate-index")),
+                        "{messages:?}"
+                    );
+                });
             }
         }
     }
@@ -1380,7 +1421,17 @@ mod tests {
         } else {
             assert!(idx.list_xattr_keys(rows[0].0).unwrap().is_empty());
         }
-        assert_remedy();
+        MESSAGES.with(|m| {
+            assert!(
+                m.borrow().iter().any(|s| {
+                    s.contains(
+                        "members have unverifiable content locations or unsupported late hashes",
+                    ) && s.contains("--recreate-index --hashes sha256,crc32")
+                }),
+                "{:?}",
+                m.borrow()
+            );
+        });
     }
 
     /// Regression: ZIP preservation and late filling use central-directory evidence.
@@ -1821,7 +1872,12 @@ mod tests {
         if caller {
             idx.begin_write().unwrap();
         }
-        fill_content_hashes(&idx, &path, &algorithms()).unwrap();
+        let report: crate::FillReport = fill_content_hashes(&idx, &path, &algorithms()).unwrap();
+        assert_eq!(report.filled, 1);
+        assert_eq!(report.kept_existing, 0);
+        let report = fill_content_hashes(&idx, &path, &algorithms()).unwrap();
+        assert_eq!(report.filled, 0);
+        assert_eq!(report.kept_existing, 1);
         assert_eq!(idx.with_conn(|c| Ok(c.is_autocommit())).unwrap(), !caller);
         if caller {
             idx.commit_write().unwrap();
