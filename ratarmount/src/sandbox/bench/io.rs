@@ -1,4 +1,4 @@
-//! Eight acquisition leaves (M01–M07 plus the cleanup O_PATH pin); callers supply admitted roots and single-component children.
+//! Nine acquisition leaves (M01–M07, cleanup O_PATH pin M08 and fd-relative reopen M09); callers supply admitted roots and single-component children.
 use rustix::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::fs::{self, Mode, OFlags, CWD};
 use std::ffi::{CStr, CString};
@@ -159,7 +159,7 @@ pub(super) fn with_cleanup(error: io::Error, cleanup: io::Result<()>) -> io::Err
         }
     }
 }
-fn writable_child(parent: impl AsFd, name: &CStr) -> io::Result<()> {
+fn writable_child(parent: impl AsFd, name: &CStr) -> io::Result<(OwnedFd, fs::Stat)> {
     child_component(name)?;
     #[expect(
         clippy::disallowed_methods,
@@ -172,25 +172,76 @@ fn writable_child(parent: impl AsFd, name: &CStr) -> io::Result<()> {
         Mode::empty(),
     )?;
     let proc = format!("/proc/self/fd/{}", pinned.as_raw_fd());
-    fs::chmod(proc.as_str(), Mode::from_raw_mode(0o700)).map_err(|error| {
-        let hint = if error == rustix::io::Errno::NOENT {
-            " (is /proc mounted?)"
-        } else {
-            ""
-        };
+    // Future replacement: fchmodat2(AT_EMPTY_PATH) once Linux 6.6+ is required.
+    chmod_pinned(&proc).map_err(|error| {
         io::Error::other(format!(
-            "cannot set directory permissions through {proc}{hint}: {error}"
+            "cannot set directory permissions through {proc}; pinned /proc fd required, no name fallback: {error}"
         ))
-    })
+    })?;
+    let identity = fs::fstat(&pinned)?;
+    #[cfg(test)]
+    BEFORE_REOPEN.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(name);
+        }
+    });
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-GAP0-B4B-M09","item":"ratarmount::sandbox::bench::io::writable_child","disposition":"out-of-family","category":"benchmark-cleanup-reopen","reason":"Reopen the chmodded O_PATH directory pin through dot for confined cleanup listing without another parent/name lookup; retain its pinned identity for guarded removal.","creation":{"policy":"none","basis":"Existing pinned directory only; read-only fd-relative reopen without creation or proc lookup."}}"###
+    )]
+    let readable = fs::openat(
+        &pinned,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    // Only the listing fd survives for the depth of the walk; identity came from the O_PATH pin.
+    drop(pinned);
+    Ok((readable, identity))
 }
+fn chmod_pinned(proc: &str) -> rustix::io::Result<()> {
+    #[cfg(test)]
+    if let Some(error) = CHMOD_ERROR.with(|e| e.get()) {
+        return Err(error);
+    }
+    fs::chmod(proc, Mode::from_raw_mode(0o700))
+}
+#[cfg(test)]
+type RemoveHook = Box<dyn FnMut(&CStr)>;
+#[cfg(test)]
+thread_local! {
+    static BEFORE_REOPEN: std::cell::RefCell<Option<RemoveHook>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_REMOVE: std::cell::RefCell<Option<RemoveHook>> = const { std::cell::RefCell::new(None) };
+    static CHMOD_ERROR: std::cell::Cell<Option<rustix::io::Errno>> = const { std::cell::Cell::new(None) };
+}
+fn remove_pinned_directory(parent: impl AsFd, name: &CStr, identity: &fs::Stat) -> io::Result<()> {
+    #[cfg(test)]
+    BEFORE_REMOVE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(name);
+        }
+    });
+    let named = fs::statat(parent.as_fd(), name, fs::AtFlags::SYMLINK_NOFOLLOW)?;
+    if (named.st_dev, named.st_ino) != (identity.st_dev, identity.st_ino) {
+        return Err(invalid(
+            "cleanup name no longer refers to the pinned directory; replacement preserved",
+        ));
+    }
+    // Linux has no unlink-by-fd: the residual fstatat/unlinkat race is narrowed, not closed.
+    fs::unlinkat(parent, name, fs::AtFlags::REMOVEDIR)?;
+    Ok(())
+}
+const CLEANUP_DEPTH_CAP: usize = 256;
 // One listing fd per frame; parents remain writable until their children are gone.
-fn walk(root: OwnedFd, remove: bool) -> io::Result<()> {
+fn walk(root: OwnedFd, remove: bool) -> io::Result<fs::Dir> {
     let mut dir = fs::Dir::new(root)?;
     // On btrfs, a long-lived fd opened before children existed can miss them after fchmod.
     // Dir::new preserves the offset; explicitly rewind each listing before reading.
     dir.rewind();
-    let mut stack = vec![(dir, None::<CString>)];
-    while let Some((dir, _)) = stack.last_mut() {
+    // Root is frame 1: root plus 255 descendants succeeds; directory 257 is refused.
+    let mut stack = vec![(dir, None::<(CString, fs::Stat)>)];
+    loop {
+        let (dir, _) = stack.last_mut().unwrap();
         if let Some(entry) = dir.read() {
             let entry = entry?;
             let name = entry.file_name();
@@ -201,34 +252,35 @@ fn walk(root: OwnedFd, remove: bool) -> io::Result<()> {
             let fd = dir.fd()?;
             let stat = fs::statat(fd, name, fs::AtFlags::SYMLINK_NOFOLLOW)?;
             if fs::FileType::from_raw_mode(stat.st_mode) == fs::FileType::Directory {
-                if stack.len() >= 256 {
+                if stack.len() >= CLEANUP_DEPTH_CAP {
                     return Err(invalid(
                         "cleanup directory depth exceeds 256; remaining tree preserved",
                     ));
                 }
                 let dir = &stack.last().unwrap().0;
-                writable_child(dir.fd()?, name)?;
-                let child = open_child_directory(dir.fd()?, name)?;
+                let (child, identity) = writable_child(dir.fd()?, name)?;
                 let mut child = fs::Dir::new(child)?;
                 child.rewind();
-                stack.push((child, Some(name.to_owned())));
+                stack.push((child, Some((name.to_owned(), identity))));
             } else if remove {
                 fs::unlinkat(fd, name, fs::AtFlags::empty())?;
             }
         } else {
-            let (_, name) = stack.pop().unwrap();
+            let (dir, name) = stack.pop().unwrap();
+            if stack.is_empty() {
+                return Ok(dir);
+            }
             if remove {
-                if let (Some((parent, _)), Some(name)) = (stack.last(), name) {
-                    fs::unlinkat(parent.fd()?, name.as_c_str(), fs::AtFlags::REMOVEDIR)?;
+                if let (Some((parent, _)), Some((name, identity))) = (stack.last(), name) {
+                    remove_pinned_directory(parent.fd()?, &name, &identity)?;
                 }
             }
         }
     }
-    Ok(())
 }
 pub(super) fn make_removable(root: OwnedFd) -> io::Result<()> {
     fs::fchmod(&root, Mode::from_raw_mode(0o700))?;
-    walk(root, false)
+    walk(root, false).map(|_| ())
 }
 pub(super) fn remove_tree(parent: &OwnedFd, name: &str) -> io::Result<()> {
     component(name)?;
@@ -242,9 +294,9 @@ pub(super) fn remove_tree(parent: &OwnedFd, name: &str) -> io::Result<()> {
         return Ok(());
     }
     let child = CString::new(name)?;
-    writable_child(parent, &child)?;
-    walk(open_child_directory(parent, &child)?, true)?;
-    fs::unlinkat(parent, name, fs::AtFlags::REMOVEDIR)?;
+    let (readable, identity) = writable_child(parent, &child)?;
+    let _root = walk(readable, true)?;
+    remove_pinned_directory(parent, &child, &identity)?;
     Ok(())
 }
 
@@ -252,6 +304,119 @@ pub(super) fn remove_tree(parent: &OwnedFd, name: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    struct HookScope;
+    impl Drop for HookScope {
+        fn drop(&mut self) {
+            BEFORE_REOPEN.with(|hook| *hook.borrow_mut() = None);
+            BEFORE_REMOVE.with(|hook| *hook.borrow_mut() = None);
+            CHMOD_ERROR.with(|error| error.set(None));
+        }
+    }
+    // Regression: chmod without a usable /proc magic link must fail closed, with no name fallback.
+    #[test]
+    fn regression_bench_cleanup_chmod_proc_unavailable_fails_closed() {
+        let _hooks = HookScope;
+        for error in [rustix::io::Errno::NOENT, rustix::io::Errno::ACCESS] {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = open_directory(dir.path()).unwrap();
+            let root = create_directory(&parent, "tree").unwrap();
+            std::fs::write(dir.path().join("tree/sentinel"), b"keep").unwrap();
+            fs::fchmod(&root, Mode::empty()).unwrap();
+            CHMOD_ERROR.with(|injected| injected.set(Some(error)));
+            let refusal = remove_tree(&parent, "tree").unwrap_err().to_string();
+            assert!(
+                refusal.contains("cannot set directory permissions through /proc/self/fd/"),
+                "{refusal}"
+            );
+            assert!(
+                refusal.contains("pinned /proc fd required, no name fallback"),
+                "{refusal}"
+            );
+            assert!(refusal.contains(&error.to_string()), "{refusal}");
+            assert_eq!(fs::fstat(&root).unwrap().st_mode & 0o777, 0);
+            CHMOD_ERROR.with(|injected| injected.set(None));
+            fs::fchmod(&root, Mode::from_raw_mode(0o700)).unwrap();
+            assert_eq!(
+                std::fs::read(dir.path().join("tree/sentinel")).unwrap(),
+                b"keep"
+            );
+            remove_tree(&parent, "tree").unwrap();
+        }
+    }
+    // Regression: swaps before reopen or after emptying must preserve replacements at child and root.
+    #[test]
+    fn regression_bench_cleanup_uses_pinned_fd_after_chmod() {
+        let _hooks = HookScope;
+        for (name, before_reopen) in [
+            ("victim", true),
+            ("tree", true),
+            ("victim", false),
+            ("tree", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = open_directory(dir.path()).unwrap();
+            let root = create_directory(&parent, "tree").unwrap();
+            let target = if name == "victim" {
+                create_directory(&root, name).unwrap();
+                dir.path().join("tree/victim")
+            } else {
+                dir.path().join("tree")
+            };
+            std::fs::create_dir(target.join("nested")).unwrap();
+            std::fs::write(target.join("nested/file"), b"original").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let replacement = dir.path().join("replacement");
+            std::fs::create_dir(&replacement).unwrap();
+            std::fs::write(replacement.join("sentinel"), b"replacement").unwrap();
+            let saved = dir.path().join("saved");
+            let (swap_target, swap_saved) = (target.clone(), saved.clone());
+            let swap: RemoveHook = Box::new(move |child| {
+                // Nested opens/pops also call the hooks: swap only this name, once.
+                if child.to_bytes() == name.as_bytes() && !swap_saved.exists() {
+                    if !before_reopen {
+                        assert_eq!(std::fs::read_dir(&swap_target).unwrap().count(), 0);
+                    }
+                    std::fs::rename(&swap_target, &swap_saved).unwrap();
+                    std::fs::rename(&replacement, &swap_target).unwrap();
+                }
+            });
+            if before_reopen {
+                BEFORE_REOPEN.with(|hook| *hook.borrow_mut() = Some(swap));
+            } else {
+                BEFORE_REMOVE.with(|hook| *hook.borrow_mut() = Some(swap));
+            }
+            let error = remove_tree(&parent, "tree").unwrap_err().to_string();
+            BEFORE_REOPEN.with(|hook| *hook.borrow_mut() = None);
+            BEFORE_REMOVE.with(|hook| *hook.borrow_mut() = None);
+            assert!(
+                error.contains("name no longer refers to the pinned directory"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read_dir(saved).unwrap().count(), 0);
+            assert_eq!(
+                std::fs::read(target.join("sentinel")).unwrap(),
+                b"replacement"
+            );
+            assert!(target.is_dir());
+            remove_tree(&parent, "tree").unwrap();
+        }
+    }
+    // Regression: the root is frame 1, so exactly 256 directories must remain admissible.
+    #[test]
+    fn regression_bench_cleanup_depth_256_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory(dir.path()).unwrap();
+        let root = create_directory(&parent, "tree").unwrap();
+        let mut current = create_directory(&root, "d").unwrap();
+        for _ in 1..255 {
+            current = create_directory(&current, "d").unwrap();
+        }
+        fs::fchmod(&current, Mode::from_raw_mode(0o500)).unwrap();
+        make_removable(root).unwrap();
+        assert_eq!(fs::fstat(&current).unwrap().st_mode & 0o777, 0o700);
+        remove_tree(&parent, "tree").unwrap();
+        assert!(!dir.path().join("tree").exists());
+    }
     // Regression: a long-lived empty-directory fd missed later children during recovery.
     // Reproduces only on filesystems with btrfs-like getdents behaviour; ext4/tmpfs may pass without rewind.
     #[test]
@@ -344,7 +509,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let parent = open_directory(dir.path()).unwrap();
         let mut current = create_directory(&parent, "tree").unwrap();
-        for _ in 0..257 {
+        for _ in 0..256 {
             current = create_directory(&current, "d").unwrap();
         }
         let error = remove_tree(&parent, "tree").unwrap_err();
