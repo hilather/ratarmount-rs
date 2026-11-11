@@ -2368,8 +2368,10 @@ mod tests {
                             break;
                         }
                         headers.push(line.clone());
-                        if let Some(v) = line.strip_prefix("Authorization:") {
-                            auth = Some(v.trim().to_string());
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("authorization") {
+                                auth = Some(value.trim().to_string());
+                            }
                         }
                         let lower = line.to_ascii_lowercase();
                         if let Some(rest) = lower.strip_prefix("x-aws-ec2-metadata-token:") {

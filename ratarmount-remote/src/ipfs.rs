@@ -971,10 +971,10 @@ mod tests {
                         if line == "\r\n" || line == "\n" || line.is_empty() {
                             break;
                         }
-                        if let Some(v) = line.strip_prefix("Range:") {
-                            range_hdr = Some(v.trim().to_string());
-                        }
                         if let Some((k, v)) = line.split_once(':') {
+                            if k.eq_ignore_ascii_case("range") {
+                                range_hdr = Some(v.trim().to_string());
+                            }
                             if k.eq_ignore_ascii_case("content-length") {
                                 content_len = v.trim().parse().unwrap_or(0);
                             }

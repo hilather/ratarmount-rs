@@ -1415,16 +1415,18 @@ mod tests {
                         if line == "\r\n" || line == "\n" || line.is_empty() {
                             break;
                         }
-                        if let Some(v) = line.strip_prefix("Content-Length:") {
-                            content_length = v.trim().parse().unwrap_or(0);
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                            if name.eq_ignore_ascii_case("authorization") {
+                                auth_hdr = Some(value.trim().to_string());
+                            }
+                            if name.eq_ignore_ascii_case("range") {
+                                range_hdr = Some(value.trim().to_string());
+                            }
                         }
-                        if let Some(v) = line.strip_prefix("Authorization:") {
-                            auth_hdr = Some(v.trim().to_string());
-                        }
-                        if let Some(v) = line.strip_prefix("Range:") {
-                            range_hdr = Some(v.trim().to_string());
-                        }
-                        // Header name is case-sensitive in our client; accept common variants.
+                        // Accept any casing for the Dropbox-API-Arg header name.
                         let lower = line.to_ascii_lowercase();
                         if lower.starts_with("dropbox-api-arg:") {
                             api_arg = Some(line.split_once(':').unwrap().1.trim().to_string());
@@ -1681,14 +1683,16 @@ mod tests {
                         if line == "\r\n" || line == "\n" || line.is_empty() {
                             break;
                         }
-                        if let Some(v) = line.strip_prefix("Content-Length:") {
-                            content_length = v.trim().parse().unwrap_or(0);
-                        }
-                        if let Some(v) = line.strip_prefix("Authorization:") {
-                            auth_hdr = Some(v.trim().to_string());
-                        }
-                        if let Some(v) = line.strip_prefix("Range:") {
-                            range_hdr = Some(v.trim().to_string());
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                            if name.eq_ignore_ascii_case("authorization") {
+                                auth_hdr = Some(value.trim().to_string());
+                            }
+                            if name.eq_ignore_ascii_case("range") {
+                                range_hdr = Some(value.trim().to_string());
+                            }
                         }
                         let lower = line.to_ascii_lowercase();
                         if lower.starts_with("dropbox-api-arg:") {

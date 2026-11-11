@@ -1483,8 +1483,10 @@ mod tests {
                 let start = line.len() - rest.len();
                 auth = Some(line[start..].trim().to_string());
             }
-            if let Some(v) = line.strip_prefix("Range:") {
-                range = Some(v.trim().to_string());
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("range") {
+                    range = Some(value.trim().to_string());
+                }
             }
         }
         let req = request_line.trim().to_string();
