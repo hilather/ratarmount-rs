@@ -28,6 +28,10 @@ case "$verb" in
     [[ $9 == --user && ${11} == --cpus && ${13} == --memory ]]
     [[ ${16} == sleep && ${17} == infinity && $# == 17 ]]
     [[ -d $tree && -f $tree/source.txt && ! -e $tree/changed ]]
+    [[ ! -f $state/many-directories || -d $tree/directory-1099 ]]
+    if [[ -f $state/archive-modes ]]; then
+      [[ $(stat -c %a "$tree/archive-zero") == 0 && $(stat -c %a "$tree/archive-write") == 300 ]]
+    fi
     printf '%s\n' "$tree" >> "$state/trees"
     touch "$state/starting"
     if [[ -f $state/late ]]; then sleep 0.3; fi
@@ -44,6 +48,12 @@ case "$verb" in
     [[ -d $tree ]]
     printf '%s\n' "$phase" >> "$state/phases"
     touch "$tree/changed"
+    if [[ -f $state/mode-000 && ! -d $tree/runtime-zero ]]; then mkdir -m 000 "$tree/runtime-zero"; fi
+    if [[ -f $state/mode-0500 && ! -d $tree/runtime-readonly ]]; then mkdir -p "$tree/runtime-readonly/child"; chmod 0500 "$tree/runtime-readonly"; fi
+    if [[ -f $state/depth-257 && ! -d $tree/deep ]]; then
+      path=$tree/deep
+      for ((i=0; i<257; i++)); do mkdir "$path"; path=$path/d; done
+    fi
     if [[ -f $state/exec-hang ]]; then
       touch "$state/executing"
       while [[ -f $state/container.$name ]]; do sleep 0.02; done
@@ -61,7 +71,10 @@ case "$verb" in
     tree=$(cat "$state/container.$name")
     [[ -d $tree ]] # Cleanup must not have started while a runtime is still owned.
     printf '%s\n' "$verb" >> "$state/stops"
-    if [[ $verb == rm ]]; then rm -- "$state/container.$name"; fi
+    if [[ $verb == rm ]]; then
+      rm -- "$state/container.$name"
+      if [[ -f $state/interrupt-after-stop ]]; then kill -INT "$PPID"; fi
+    fi
     ;;
   inspect)
     [[ -f $state/container.$1 ]]

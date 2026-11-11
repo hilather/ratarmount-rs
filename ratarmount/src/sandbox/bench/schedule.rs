@@ -448,7 +448,16 @@ mod tests {
     fn regression_bench_schedule_entry_cap_refused() {
         let mut value = fixture();
         let template = value["tasks"][0].clone();
-        value["tasks"] = serde_json::Value::Array((0..124).map(|_| template.clone()).collect());
+        value["tasks"] = serde_json::Value::Array(
+            (0..124)
+                .map(|i| {
+                    let mut task = template.clone();
+                    task["id"] = format!("task-{i}").into();
+                    task
+                })
+                .collect(),
+        );
+        valid(&value, true).unwrap();
         let options = Selection {
             repeats: Some(100),
             ..Selection::default()
@@ -457,6 +466,15 @@ mod tests {
             panic!("schedule entry cap was not enforced");
         };
         assert!(error.contains("100000 total-entry cap"));
+        // Regression: the neighboring legal schedule (123 * 812) was over-refused.
+        value["tasks"].as_array_mut().unwrap().pop();
+        valid(&value, true).unwrap();
+        assert_eq!(
+            build(&serde_json::to_vec(&value).unwrap(), &options)
+                .unwrap()
+                .len(),
+            99_876
+        );
     }
     // Regression: concurrent attempts were accepted despite a serial-only schedule contract.
     #[test]

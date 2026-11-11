@@ -9542,6 +9542,34 @@
     },
     {
       "configured_path": "rustix::fs::openat",
+      "item": "ratarmount::sandbox::bench::io::writable_child",
+      "leaf_digest": "cfd5875b8b607c6b2a5a0c6495a59c046313266b68defcce9efb9a50a51cc7da",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "benchmark-cleanup-directory",
+        "creation": {
+          "basis": "Existing owned directory only; no content read or creation. Symlinks and non-directories are unlinked without chmod.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-GAP0-B4A2-M08",
+        "item": "ratarmount::sandbox::bench::io::writable_child",
+        "reason": "Pin one no-follow directory child of a held private parent with O_PATH so mode-000 archive or runtime directories can be chmodded through its proc fd before confined cleanup."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4A2-M08\",\"item\":\"ratarmount::sandbox::bench::io::writable_child\",\"disposition\":\"out-of-family\",\"category\":\"benchmark-cleanup-directory\",\"reason\":\"Pin one no-follow directory child of a held private parent with O_PATH so mode-000 archive or runtime directories can be chmodded through its proc fd before confined cleanup.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing owned directory only; no content read or creation. Symlinks and non-directories are unlinked without chmod.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
       "item": "ratarmount::sandbox::bench::manifest::open_manifest",
       "leaf_digest": "cd3d6f32fdadb415777a52092249dc462d57d622a5a4bcc858f8e792fc20e9d0",
       "lint": "clippy::disallowed_methods",
