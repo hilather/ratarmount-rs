@@ -126,30 +126,24 @@ fn regression_index_blob_hash_keeps_index_lock() {
     drop(h);
 }
 
-/// Regression: the copy fallback of `snapshot_index_id` (hard link refused:
-/// an existing pin with other bytes) read the live index raw.
+/// Regression: snapshot sync/hash and reused-pin verification keep held SQLite locks.
 #[test]
-fn regression_index_id_copy_fallback_keeps_index_lock() {
+fn regression_index_pin_snapshot_keeps_index_lock() {
     let (_d, dir) = tempdir();
     let archive = dir.join("a.tar");
-    std::fs::write(&archive, b"tar").unwrap();
     let db = dir.join("a.tar.index.sqlite");
     database(&db, true);
-    let bytes = std::fs::read(&db).unwrap();
-    let id = crate::sha256_hex(&bytes);
     let (db, _alias, h) = held_existing(&dir, &db, "a.tar.index.sqlite");
-    let pin = index_id_path(&archive, &id).unwrap();
-    std::fs::write(&pin, b"stale pin bytes").unwrap();
-    assert_eq!(
-        snapshot_index_id(&archive, &db, &id).unwrap(),
-        Some(pin.clone())
-    );
-    assert_eq!(std::fs::read(&pin).unwrap(), bytes);
-    assert!(other_process_sees_lock(&db));
-    // The fallback copy itself, directly.
-    crate::location::atomic_copy_file(&db, &dir.join("copy")).unwrap();
+    let pin = snapshot_index_id(&archive, &db).unwrap();
     assert!(other_process_sees_lock(&db));
     negative_control(&db);
+    drop(h);
+    let h = holder(pin.path());
+    assert!(other_process_sees_lock(pin.path()));
+    let reused = snapshot_index_id(&archive, &db).unwrap();
+    assert_eq!(reused.id(), pin.id());
+    assert!(other_process_sees_lock(pin.path()));
+    negative_control(pin.path());
     drop(h);
 }
 
@@ -733,8 +727,8 @@ fn regression_index_publish_sync_keeps_aliased_database_lock() {
 }
 
 /// Regression: a failed mandatory read never yields a successful result:
-/// pointer loading, materialization probe, decompression, the snapshot copy
-/// fallback.
+/// pointer loading, materialization probe, decompression and the private
+/// publication snapshot.
 #[test]
 fn regression_index_input_read_failure_is_not_success() {
     use std::io::Write;
@@ -754,10 +748,7 @@ fn regression_index_input_read_failure_is_not_success() {
     enc.finish().unwrap();
     assert!(seams::with(fail_read(2), || materialize_index_file(&gz)).is_err());
     let archive = dir.join("a.tar");
-    let id = crate::sha256_hex(&std::fs::read(&db).unwrap());
-    let pin = index_id_path(&archive, &id).unwrap();
-    std::fs::write(&pin, b"stale").unwrap();
-    assert!(seams::with(fail_read(1), || snapshot_index_id(&archive, &db, &id)).is_err());
+    assert!(seams::with(fail_read(1), || snapshot_index_id(&archive, &db)).is_err());
 }
 
 // ---------------------------------------------------------------------------

@@ -83,6 +83,9 @@ pub fn is_ratarmount_sidecar_name(name: &str, sibling_exists: &dyn Fn(&str) -> b
     {
         return true;
     }
+    if name.starts_with(".ratarmount-index-snap-") && name.ends_with(".tmp-journal") {
+        return true;
+    }
     if name.starts_with("ratarmount-index-") && name.ends_with(".tmp.sqlite.index") {
         return true;
     }
@@ -131,6 +134,10 @@ mod tests {
             "a.tar.index.sqlite.tmp.123.4-wal",
             ".ratarmount-index-ptr-x.tmp",
             ".ratarmount-index-snap-x.tmp",
+            ".ratarmount-index-snap-x.tmp-journal",
+            &format!(".index.{id}.sqlite"),
+            ".index.ptr",
+            ".index.sqlite",
             "ratarmount-index-x.tmp.sqlite.index",
             ".tmpAb12Cd",
             "a.tar.ratarmount-commit-journal",
@@ -144,6 +151,8 @@ mod tests {
             assert!(!is(name, &[]), "{name} without its archive is content");
         }
         for name in [
+            ".ratarmount-index-snap-x.tmp-wal",
+            ".ratarmount-index-ptr-x.tmp-journal",
             ".tmpAb12C",
             ".tmpAb12Cde",
             "x.index.txt",

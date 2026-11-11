@@ -111,7 +111,7 @@ the [N-worker recipe and compatibility limits](sandbox.md#prepare-once-n-writabl
 | `--union-resolve-symlinks` | no (issue #160) | **added** (opt-in multi-hop resolve within winning source; B-4 dir>symlink unchanged; cheap `list_dirents` + per-symlink `lookup`, not fat `list()`) | `~` Rust-only FR-10: `lookup(join(listed_path, name))` may leave `S_IFLNK` on path-keyed archives listed through a symlink-to-dir |
 | `--index-file` / `:memory:` / folders | yes | yes | `[x]` |
 | `--index-id HEX` | no | **added** (required value; `{archive}.index.{sha256}.sqlite` or pointer-named well-known blob; tarstats mismatch / unknown id exit 2) | `[x]` Rust-only |
-| `--publish-index` / `--publish-index-to PATH_OR_URL` | no | **added** (local or hf/s3/gs/az blob + pointer publication; local keep-last-2; OCI referrer PUT residual) | `[x]` Rust-only |
+| `--publish-index` / `--publish-index-to PATH_OR_URL` | no | **added** (local or hf/s3/gs/az blob + pointer publication; local WAL-complete snapshot pin, keep-last-2, existing destination refused, destination directory must exist, Unix only; OCI referrer PUT residual) | `[x]` Rust-only |
 | `--publish-revision REV` / `--create-pr` | no | **added** (Hub publication branch / PR; `--create-pr` also supports live Hub archive write-back) | `[x]` Rust-only |
 | Remote/compressed index URL | yes | yes (`http(s)://` / `file://` + gzip/xz/zstd/bz2 decompress; auto `Link: describedby` on archive HEAD + http(s) sibling; OCI referrer on local `oci:{digest}` miss) | `[x]` |
 | `--verify-mtime` | yes | yes | `[x]` |

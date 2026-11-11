@@ -310,6 +310,9 @@ provided password for these operations until `close()`.
 ## Publish indexes
 
 ```python
+import os
+
+os.makedirs("published", exist_ok=True)
 with ratarmount_rs.open("shard.tar") as archive:
     published = archive.index.publish()  # shard.tar.index.ptr + immutable blob
     published = archive.index.publish("published/shard.tar.index.sqlite")
@@ -331,7 +334,15 @@ options; the Archive's active index is left alone. This can repeat an archive
 scan. Publication uses the CLI's existing validation, atomic local publication,
 blob-before-pointer object-store uploads and HF commit implementation.
 
-With no destination, a local archive gets `archive.index.sqlite`,
+The destination directory must already exist. An existing explicit local
+destination is refused; remove the old copy and companions after all users
+have stopped before repeating `publish(path)`.
+`--publish-index-to PATH` refuses an existing `PATH`, except when `PATH` is the index being published itself (the same path under another spelling, or a symlink that resolves to it); a hard link or a bind mount of that index and a `PATH` with a pin name are refused.
+Local publication creates a WAL-complete, read-only snapshot on Unix; see
+[index publication](formats.md#indexes) for durability and compatibility.
+
+With no destination, an existing `archive.index.sqlite` is kept (and it is
+created only when absent); a local archive gets
 `archive.index.ptr` and `archive.index.<index_id>.sqlite`. An explicit local
 destination names the SQLite file: a `.index.sqlite` suffix is replaced for
 pointer/blob names; otherwise `.index.ptr` and `.index.<id>.sqlite` are appended

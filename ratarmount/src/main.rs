@@ -2100,7 +2100,7 @@ fn main() {
         torrent_seed_upload_limit: args.seed_upload_limit,
         torrent_listen_port: args.torrent_listen_port,
         direct_io: args.direct_io,
-        zstd_readahead_bytes: if readahead_flag_on_argv(std::env::args()) {
+        zstd_readahead_bytes: if readahead_flag_on_argv(std::env::args_os()) {
             clamp_readahead(parse_byte_size(&args.readahead).unwrap_or_else(|e| {
                 eprintln!("error: invalid --readahead: {e}");
                 std::process::exit(2);
@@ -2766,7 +2766,7 @@ fn main() {
         eprintln!("warning: --sftp-subsystem ignores --sftp-bind and --sftp-authorized-keys");
     }
 
-    let readahead_on_argv = readahead_flag_on_argv(std::env::args());
+    let readahead_on_argv = readahead_flag_on_argv(std::env::args_os());
     #[cfg(feature = "gzip-rapidgzip")]
     let prefer_rapidgzip =
         ratarmount_compress::prefer_rapidgzip_gzip_backend(&open_opts.use_backends);
@@ -5397,11 +5397,11 @@ fn default_cli_parallelization() -> String {
 fn readahead_flag_on_argv<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<str>,
+    S: AsRef<std::ffi::OsStr>,
 {
     args.into_iter().any(|a| {
-        let a = a.as_ref();
-        a == "--readahead" || a.starts_with("--readahead=")
+        let a = a.as_ref().as_encoded_bytes();
+        a == b"--readahead" || a.starts_with(b"--readahead=")
     })
 }
 
@@ -5626,6 +5626,18 @@ mod readahead_auto_cli_tests {
         assert!(!path_looks_like_gzip_archive(Path::new("a.zip")));
         assert!(!path_looks_like_gzip_archive(Path::new("notgz")));
         assert!(!name_looks_like_gzip("archive.tar.gzz"));
+    }
+
+    /// Regression: scanning a non-UTF-8 publication path must not panic before publication.
+    #[test]
+    fn regression_readahead_flag_on_non_utf8_argv() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = std::ffi::OsString::from_vec(b"out-\xff/a.index.sqlite".to_vec());
+        assert!(!readahead_flag_on_argv([path.clone()]));
+        assert!(readahead_flag_on_argv([
+            path,
+            std::ffi::OsString::from("--readahead=1M")
+        ]));
     }
 
     #[test]

@@ -187,3 +187,31 @@ fn regression_docs_state_offline_symlink_refusal() {
         }
     }
 }
+
+/// Regression: publication docs preserve WAL limitations and the old-pin recovery instructions.
+#[test]
+fn regression_docs_state_index_wal_and_pin_limits() {
+    let formats = read("docs/formats.md");
+    for sentence in [
+        "A read-only mount can leave an empty `-wal` and a 32 KiB `-shm` beside the index; they hold no data and are harmless.",
+        "Side tables written after a publication can stay in the live index's `-wal` until the next writer checkpoints; they are not in the published pin (remaining limitation).",
+        "Copying the live `X.index.sqlite` without its `-wal` loses rows; copy the pin or use `--publish-index-to` instead.",
+        "`--publish-index-to PATH` refuses an existing `PATH`, except when `PATH` is the index being published itself (the same path under another spelling, or a symlink that resolves to it); a hard link or a bind mount of that index and a `PATH` with a pin name are refused.",
+        "ratarmount creates no directory for a publication: the directory of `--publish-index-to PATH` must exist.",
+        "ratarmount never opens an index file without a write permission bit for writing, also as root.",
+        "Local index publication is Unix-only.",
+        "An interrupted publication can leave files named `.ratarmount-index-snap-*.tmp`; they are not part of any published index.",
+    ] {assert!(formats.contains(sentence),"docs/formats.md lost {sentence}");}
+    let changelog = read("CHANGELOG.md");
+    for sentence in [
+        "Pins written by earlier releases are hard links of the live index (or of the `--publish-index-to` copy); they may already lack rows or no longer match the id in their name, and they are not migrated.",
+        "Re-publish with `ratarmount --no-mount --publish-index ARCHIVE` and use the new `index_id` from `ARCHIVE.index.ptr`.",
+        "`--publish-index-to PATH` refuses an existing `PATH`, except when `PATH` is the index being published itself (the same path under another spelling, or a symlink that resolves to it); a hard link or a bind mount of that index and a `PATH` with a pin name are refused.",
+    ] {assert!(changelog.contains(sentence),"CHANGELOG.md lost {sentence}");}
+    for (name, text) in [("docs/formats.md", formats), ("CHANGELOG.md", changelog)] {
+        assert!(
+            !text.contains("-links +1"),
+            "{name} must not identify invalid pins by link count"
+        );
+    }
+}

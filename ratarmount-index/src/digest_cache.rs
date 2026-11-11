@@ -282,6 +282,9 @@ struct Cache {
 /// depends only on this one.
 fn cache_target(index: Option<&Path>) -> Option<PathBuf> {
     let index = index?;
+    if crate::location::index_pin_refusal(index).is_some() {
+        return None;
+    }
     let metadata = fs::metadata(index).ok()?;
     if !metadata.is_file() || metadata.permissions().readonly() {
         return None;
@@ -294,16 +297,9 @@ fn cache_target(index: Option<&Path>) -> Option<PathBuf> {
         }
     }
     let index = index.canonicalize().ok()?;
-    let snapshot = index
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_suffix(".sqlite"))
-        .and_then(|name| name.rsplit_once(".index."))
-        .is_some_and(|(_, id)| crate::parse_index_id(id).is_ok());
     // Never add cache tables to published immutable snapshots or remote caches.
     if crate::is_meta_cache_path(&index)
         || crate::index_pointer_path_for_index_file(&index).is_file()
-        || snapshot
     {
         return None;
     }

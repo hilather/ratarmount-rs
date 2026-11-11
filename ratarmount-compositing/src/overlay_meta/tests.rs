@@ -1301,6 +1301,10 @@ fn writer_base(root: &Path) -> PathBuf {
 /// Run the real index writers inside `base` (publish, pointer, rotate and a
 /// cold build observed mid-way), calling `check(label)` after each step.
 fn run_index_writers(base: &Path, outside: &Path, check: &mut dyn FnMut(&str)) {
+    if !cfg!(unix) {
+        eprintln!("skip: local index publication is Unix-only");
+        return;
+    }
     let archive = base.join("a.tar");
     let dest = base.join("a.tar.index.sqlite");
     let mut index = ratarmount_index::SqliteIndex::create_writable(Some(&dest)).unwrap();
@@ -1308,15 +1312,21 @@ fn run_index_writers(base: &Path, outside: &Path, check: &mut dyn FnMut(&str)) {
     index.publish_tmp().unwrap();
     drop(index);
     check("index published");
+    let mut ids = std::collections::HashSet::new();
     for round in 0..3 {
         let blob = outside.join(format!("blob{round}.sqlite"));
         fs::copy(&dest, &blob).unwrap();
-        fs::write(
-            &blob,
-            [fs::read(&dest).unwrap(), vec![round as u8; 16]].concat(),
-        )
-        .unwrap();
-        ratarmount_index::publish_index_pointer(&archive, &blob, None).unwrap();
+        let c = rusqlite::Connection::open(&blob).unwrap();
+        c.execute_batch("CREATE TABLE publication_generation(n)")
+            .unwrap();
+        c.execute("INSERT INTO publication_generation VALUES (?)", [round])
+            .unwrap();
+        drop(c);
+        let ptr = ratarmount_index::publish_index_pointer(&archive, &blob, None).unwrap();
+        assert!(
+            ids.insert(ptr.index_id),
+            "each real generation must have a distinct id"
+        );
         check(&format!("pointer publish/rotate {round}"));
     }
 }
