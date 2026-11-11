@@ -2421,21 +2421,19 @@ fn main() {
                     continue;
                 }
                 match SqliteIndex::open_writable(idx_path) {
-                    Ok(idx) => {
-                        if let Err(e) = fill_content_hashes(&idx, input, &open_opts.hashes) {
-                            log::warn!(
-                                "failed to fill content hashes for {} (index {}): {e}",
-                                input.display(),
-                                idx_path.display()
-                            );
-                        } else {
-                            log::info!(
-                                "stored content hashes {:?} in {}",
-                                open_opts.hashes,
-                                idx_path.display()
-                            );
-                        }
-                    }
+                    Ok(idx) => match fill_content_hashes(&idx, input, &open_opts.hashes) {
+                        Err(e) => log::warn!(
+                            "failed to fill content hashes for {} (index {}): {e}",
+                            input.display(),
+                            idx_path.display()
+                        ),
+                        Ok(report) if report.filled > 0 => log::info!(
+                            "stored content hashes {:?} in {}",
+                            open_opts.hashes,
+                            idx_path.display()
+                        ),
+                        Ok(_) => {}
+                    },
                     Err(e) => {
                         log::warn!("cannot open index {} for --hashes: {e}", idx_path.display());
                     }

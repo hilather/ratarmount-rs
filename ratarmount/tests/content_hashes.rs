@@ -37,7 +37,12 @@ fn tar_bytes(parts: &[(&str, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn run(path: &Path, flags: &[&str]) -> Output {
+    run_with_env(path, flags, &[])
+}
+
+fn run_with_env(path: &Path, flags: &[&str], vars: &[(&str, &str)]) -> Output {
     let out = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .envs(vars.iter().copied())
         .args(flags)
         .arg(path)
         .output()
@@ -49,6 +54,26 @@ fn run(path: &Path, flags: &[&str]) -> Output {
         String::from_utf8_lossy(&out.stderr)
     );
     out
+}
+
+/// Regression: all-kept CLI fills must not claim to have stored content hashes.
+#[test]
+fn regression_303_cli_stored_message_only_when_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("A.tar");
+    let parts = [("text.txt", b"content hash\n".to_vec())];
+    fs::write(&path, tar_bytes(&parts)).unwrap();
+    let flags = ["--no-mount", "--hashes", "sha256"];
+    let vars = [("RUST_LOG", "info")];
+    let out = run_with_env(&path, &flags, &vars);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("stored content hashes"), "{stderr}");
+    check(&path, &parts, "sha256");
+    let out = run_with_env(&path, &flags, &vars);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("stored content hashes"), "{stderr}");
+    assert!(stderr.contains("filled=0"), "{stderr}");
+    check(&path, &parts, "sha256");
 }
 
 fn index(path: &Path) -> Connection {
