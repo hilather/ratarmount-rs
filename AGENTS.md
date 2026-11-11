@@ -91,6 +91,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 
 | Symptom / fix | Commands |
 |---------------|----------|
+| #303: decoded-content fill-only hashes, PAX/nested offsets, ZIP central-directory verification, 7z preservation, savepoints and managed decoder locks | `cargo test -p ratarmount-index --lib regression_303_` · `cargo test -p ratarmount-index --lib regression_content_hash_failure_does_not_store_partial_digest` · `cargo test -p ratarmount-compress --lib regression_303_decoder_rewinds_advanced_cursor` · `cargo test -p ratarmount --test content_hashes` |
 | Benchmark schedule: seeded order, balanced pairs, reference/warm-up/probe order, admission and dry-run JSONL without files | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --bin ratarmount sandbox::bench` · `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --test sandbox_bench` |
 | B4a1 gate r2: whole-selection FUSE refusal precedence, consistent source pins reaching extraction, failed-extraction outcome/cleanup and missing admission paths exiting 2 | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --test sandbox_bench regression_bench_manifest_unpinned_execution_refused` |
 | Native benchmark archive confinement, compressed/tar digests and deferred directory metadata | `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --bin ratarmount sandbox::bench::source` |

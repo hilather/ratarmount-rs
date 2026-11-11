@@ -60,6 +60,14 @@ impl std::ops::Deref for MemoryBody {
 }
 
 impl DecodedBody {
+    /// Private spool pathname, if this body spilled to a file.
+    pub fn temp_path(&self) -> Option<&Path> {
+        match &self.inner {
+            DecodedInner::Temp(tmp) => Some(tmp.path()),
+            DecodedInner::Memory(_) => None,
+        }
+    }
+
     /// Decode `reader` fully into memory (if ≤ `memory_cap`) or a temp file.
     pub fn from_decoder(
         path: &Path,

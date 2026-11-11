@@ -583,6 +583,80 @@ fn regression_content_hashes_keep_aliased_database_lock() {
     drop(h);
 }
 
+/// Regression: reader-backed and privately spooled codecs retain aliased locks.
+#[test]
+fn regression_303_compressed_hash_keeps_aliased_lock() {
+    use std::io::Write;
+    let (_d, dir) = tempdir();
+    let payload = vec![7; 8193];
+    for codec in ["gz", "zst", "lzma"] {
+        let bytes = match codec {
+            "gz" => {
+                let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                e.write_all(&payload).unwrap();
+                e.finish().unwrap()
+            }
+            "zst" => zstd::encode_all(&payload[..], 1).unwrap(),
+            _ => {
+                let stream = xz2::stream::Stream::new_lzma_encoder(
+                    &xz2::stream::LzmaOptions::new_preset(1).unwrap(),
+                )
+                .unwrap();
+                let mut e = xz2::write::XzEncoder::new_stream(Vec::new(), stream);
+                e.write_all(&payload).unwrap();
+                e.finish().unwrap()
+            }
+        };
+        for bad in [false, true] {
+            if bad && codec == "zst" {
+                continue;
+            }
+            let path = dir.join(format!("{codec}-{bad}.tar.{codec}"));
+            let bytes = if bad { &bytes[..3] } else { &bytes[..] };
+            std::fs::write(&path, bytes).unwrap();
+            let alias = path.with_extension(format!("alias.{codec}"));
+            std::fs::hard_link(&path, &alias).unwrap();
+            let lock = VfsLockHolder::shared(&path).unwrap();
+            assert!(other_process_sees_lock(&path));
+            let idx = SqliteIndex::create_writable(None).unwrap();
+            idx.insert_file(
+                "",
+                "a",
+                0,
+                0,
+                payload.len() as i64,
+                0.0,
+                0o100644,
+                0,
+                "",
+                0,
+                0,
+                true,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+            idx.store_metadata_key_value("backendName", "SQLiteIndexedTar")
+                .unwrap();
+            let result = fill_content_hashes(&idx, &alias, &["sha256".into()]);
+            if bad {
+                assert!(result.is_err(), "{codec}");
+                assert!(idx.list_xattr_keys(0).unwrap().is_empty());
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    idx.get_xattr(0, "user.hash.sha256").unwrap().unwrap(),
+                    hashing::sha256_hex(&payload).into_bytes()
+                );
+            }
+            assert!(other_process_sees_lock(&path), "{codec}, bad={bad}");
+            negative_control(&path);
+            drop(lock);
+        }
+    }
+}
+
 /// Regression: a member whose hash failed mid-stream must store no (partial)
 /// digest; the other member still gets one; an initial open failure
 /// propagates. Member `b` spans several hashing chunks and its second read
@@ -602,13 +676,13 @@ fn regression_content_hash_failure_does_not_store_partial_digest() {
         "", "b", 1, 100_000, big as i64, 0.0, 0o100644, 0, "", 0, 0, true, false, false, 0,
     )
     .unwrap();
-    // Read 1 is all of `a`; reads 2..=5 are `b`'s chunks: fail its second.
+    // Read 1 is detection; 2 is `a`; 3..=6 are `b`: fail its second chunk.
     let reads = Rc::new(Cell::new(0));
     let counted = Rc::clone(&reads);
     let probe = SqliteIndex::create_writable(None).unwrap();
     probe
         .insert_file(
-            "", "b", 1, 100_000, big as i64, 0.0, 0o100644, 0, "", 0, 0, true, false, false, 0,
+            "", "b", 0, 100_000, big as i64, 0.0, 0o100644, 0, "", 0, 0, true, false, false, 0,
         )
         .unwrap();
     seams::with(
@@ -621,11 +695,31 @@ fn regression_content_hash_failure_does_not_store_partial_digest() {
         || fill_content_hashes(&probe, &archive, &["sha256".into()]),
     )
     .unwrap();
-    assert_eq!(reads.get(), 4, "`b` alone takes four reads");
-    seams::with(fail_read(3), || {
-        fill_content_hashes(&idx, &archive, &["sha256".into()])
-    })
+    assert_eq!(reads.get(), 5, "head plus four payload reads for `b`");
+    let failed_at = Rc::new(Cell::new(0));
+    let observed = Rc::clone(&failed_at);
+    let mut read_number = 0;
+    seams::with(
+        move |s| {
+            if s == Seam::BeforeRead {
+                read_number += 1;
+                if read_number == 4 {
+                    // head (16), a (3000), b's first HASH_STREAM_CHUNK succeeded.
+                    assert_eq!(read_number - 1, 3);
+                    observed.set(read_number);
+                    return Err(io::Error::other("b second payload chunk"));
+                }
+            }
+            Ok(())
+        },
+        || fill_content_hashes(&idx, &archive, &["sha256".into()]),
+    )
     .unwrap();
+    assert_eq!(
+        failed_at.get(),
+        4,
+        "failure followed b's first supplied chunk"
+    );
     assert_eq!(idx.list_xattr_keys(0).unwrap().len(), 1, "`a` read fine");
     assert!(
         idx.list_xattr_keys(1).unwrap().is_empty(),

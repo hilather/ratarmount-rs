@@ -5503,6 +5503,7 @@ dependencies = [
  "libc",
  "log",
  "md-5",
+ "ratarmount-compress",
  "ratarmount-core",
  "rusqlite",
  "serde",
@@ -5513,6 +5514,7 @@ dependencies = [
  "thiserror 2.0.21",
  "ureq",
  "xz2",
+ "zip",
  "zstd",
 ]
 
