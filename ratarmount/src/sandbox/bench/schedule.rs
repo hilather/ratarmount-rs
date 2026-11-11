@@ -74,6 +74,11 @@ pub(super) struct Entry {
     pub runnable: bool,
     reasons: Vec<String>,
 }
+impl Entry {
+    pub(super) fn is_reference(&self) -> bool {
+        self.kind == Kind::Reference
+    }
+}
 // A scheduling projection, decoded only after B2 validates every manifest field.
 #[derive(Deserialize)]
 struct Manifest {
@@ -262,7 +267,7 @@ pub(super) fn build(bytes: &[u8], options: &Selection) -> Result<Vec<Entry>, Str
             entry.reasons.pop();
             entry
                 .reasons
-                .push("execution ungraded: verification unavailable until B4a2".into());
+                .push("execution available: graded against the native reference; stub runtime output is fixture-only".into());
         }
     }
     Ok(entries)

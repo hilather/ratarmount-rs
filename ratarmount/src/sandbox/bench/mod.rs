@@ -1,7 +1,8 @@
-//! Linux-only validation, scheduling and ungraded native lifecycle.
+//! Linux-only validation, scheduling and graded native lifecycle.
 
 mod io;
 mod manifest;
+mod record;
 mod run;
 mod runtime;
 mod schedule;
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Args)]
 #[command(
     group(ArgGroup::new("mode").required(true).multiple(false).args(["validate_only", "dry_run", "out"])),
-    after_help = "Example: ratarmount sandbox bench --manifest tasks.json --validate-only\nExample: ratarmount sandbox bench --manifest tasks.json --dry-run --jobs 1\n\nRequires Linux. Structural validation does not establish external qualification.\nDry-run emits a JSONL schedule without execution or file creation.\nInherited `--socket` is rejected; bench owns its supervisor.\n\nExit status:\n  0  Structurally valid (draft pins allowed unless --require-pins); schedule admitted if dry-run.\n  1  Operational/reporting failure, or ungraded native execution (verification unavailable).\n  2  Invalid arguments/manifest, unresolved strict pins or refused selection."
+    after_help = "Example: ratarmount sandbox bench --manifest tasks.json --validate-only\nExample: ratarmount sandbox bench --manifest tasks.json --dry-run --jobs 1\n\nRequires Linux. Structural validation does not establish external qualification.\nDry-run emits a JSONL schedule without execution or file creation.\nInherited `--socket` is rejected; bench owns its supervisor.\n\nExit status:\n  0  Structurally valid (draft pins allowed unless --require-pins); schedule admitted if dry-run; native execution: batch complete and every run passed (stub batches are fixtures).\n  1  Operational/reporting failure; failed or blocked runs; interrupted or incomplete batch.\n  2  Invalid arguments/manifest, unresolved strict pins or refused selection."
 )]
 pub(super) struct BenchArgs {
     /// JSON manifest using schema rrs-perl-tasks/1.
@@ -29,7 +30,7 @@ pub(super) struct BenchArgs {
     /// Refuse unresolved identities, counts and qualification.
     #[arg(long)]
     require_pins: bool,
-    /// Execute native/warm/archive entries into a fresh private output directory (ungraded).
+    /// Execute native/warm/archive entries into a fresh private output directory.
     #[arg(long, value_name = "DIR", requires = "runtime")]
     out: Option<PathBuf>,
     /// Existing scratch parent; explicit use requires --out. Need not be under --out.
@@ -38,11 +39,23 @@ pub(super) struct BenchArgs {
     /// Explicit local Docker-compatible executable; never pulls an image.
     #[arg(long, value_name = "PATH", requires = "out")]
     runtime: Option<PathBuf>,
+    /// Runtime classification: docker or stub (podman is refused, not yet qualified).
+    // Choosing requires = "out" keeps execution flags out of validate/dry-run.
+    #[arg(long, value_enum, value_name = "KIND", requires = "out")]
+    runtime_kind: Option<RuntimeKind>,
     /// Record and override an excessive or unavailable host-load reading.
     #[arg(long, requires = "out")]
     allow_high_load: bool,
     #[command(flatten)]
     selection: Selection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum RuntimeKind {
+    Docker,
+    Podman,
+    Stub,
 }
 
 #[derive(Debug, Default, Args)]
@@ -229,6 +242,7 @@ mod tests {
             out: None,
             work_root: "/var/tmp".into(),
             runtime: None,
+            runtime_kind: None,
             allow_high_load: false,
             selection: Selection::default(),
         };

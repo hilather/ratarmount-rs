@@ -3,7 +3,7 @@ use rustix::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::fs::{self, Mode, OFlags, CWD};
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 pub(super) fn invalid(message: impl Into<String>) -> io::Error {
@@ -77,7 +77,7 @@ pub(super) fn create_output(parent: &OwnedFd, name: &str) -> io::Result<File> {
     component(name)?;
     #[expect(
         clippy::disallowed_methods,
-        reason = r###"internal-read:v1 {"id":"IR-GAP0-B4A1-M05","item":"ratarmount::sandbox::bench::io::create_output","disposition":"output-owner","category":"benchmark-output","reason":"Create exclusive owned logs and ungraded status/control outputs relative to the private output root; move log descriptors into child stdio.","creation":{"policy":"exclusive-file-relative","basis":"O_EXCL and O_NOFOLLOW prevent replacement; initial mode 0600, never widened."}}"###
+        reason = r###"internal-read:v1 {"id":"IR-GAP0-B4A1-M05","item":"ratarmount::sandbox::bench::io::create_output","disposition":"output-owner","category":"benchmark-output","reason":"Create exclusive owned logs and benchmark record and control outputs relative to the private output root; move log descriptors into child stdio.","creation":{"policy":"exclusive-file-relative","basis":"O_EXCL and O_NOFOLLOW prevent replacement; initial mode 0600, never widened."}}"###
     )]
     let fd = fs::openat(
         parent,
@@ -102,11 +102,11 @@ pub(super) fn create_tree_file(parent: &OwnedFd, name: &str) -> io::Result<File>
     )?;
     Ok(File::from(fd))
 }
-pub(super) fn open_run_log(parent: &OwnedFd, name: &str) -> io::Result<Vec<u8>> {
+pub(super) fn open_run_log(parent: &OwnedFd, name: &str) -> io::Result<(Vec<u8>, bool)> {
     component(name)?;
     #[expect(
         clippy::disallowed_methods,
-        reason = r###"internal-read:v1 {"id":"IR-GAP0-B4A1-M07","item":"ratarmount::sandbox::bench::io::open_run_log","disposition":"out-of-family","category":"benchmark-completed-log","reason":"Read at most 64 KiB of a completed owned regular runtime log through its private root, without following symlinks or cloning the child stdio descriptor.","creation":{"policy":"none","basis":"Read-only completed owned log; no creation or truncation."}}"###
+        reason = r###"internal-read:v1 {"id":"IR-GAP0-B4A1-M07","item":"ratarmount::sandbox::bench::io::open_run_log","disposition":"out-of-family","category":"benchmark-completed-log","reason":"Read at most the final 64 KiB of a completed owned regular runtime log through its private root, without following symlinks or cloning the child stdio descriptor.","creation":{"policy":"none","basis":"Read-only completed owned log; no creation or truncation."}}"###
     )]
     let fd = fs::openat(
         parent,
@@ -114,13 +114,18 @@ pub(super) fn open_run_log(parent: &OwnedFd, name: &str) -> io::Result<Vec<u8>> 
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
-    let file = File::from(fd);
-    if !file.metadata()?.is_file() {
+    let mut file = File::from(fd);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(invalid("run log must be regular"));
+    }
+    let truncated = metadata.len() > 64 * 1024;
+    if truncated {
+        file.seek(SeekFrom::Start(metadata.len() - 64 * 1024))?;
     }
     let mut bytes = Vec::new();
     file.take(64 * 1024).read_to_end(&mut bytes)?;
-    Ok(bytes)
+    Ok((bytes, truncated))
 }
 
 #[derive(Debug)]
@@ -304,6 +309,21 @@ pub(super) fn remove_tree(parent: &OwnedFd, name: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    // Regression: prove summaries beyond the head were lost; truncation must be explicit (D6).
+    #[test]
+    fn regression_bench_completed_log_tail_and_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory(dir.path()).unwrap();
+        for large in [false, true] {
+            let mut bytes = vec![b'x'; if large { 100 * 1024 } else { 10 }];
+            bytes.extend_from_slice(b"\nResult: PASS\n");
+            std::fs::write(dir.path().join("log"), &bytes).unwrap();
+            let (tail, truncated) = open_run_log(&parent, "log").unwrap();
+            assert_eq!(truncated, large);
+            assert_eq!(tail.len(), bytes.len().min(64 * 1024));
+            assert!(tail.ends_with(b"Result: PASS\n"));
+        }
+    }
     struct HookScope;
     impl Drop for HookScope {
         fn drop(&mut self) {

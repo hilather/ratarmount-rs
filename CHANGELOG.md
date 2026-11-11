@@ -4,9 +4,10 @@
 
 ### Changes
 
-- Hidden Linux `sandbox bench --out DIR --runtime PATH` executes qualified native/warm/single-frame archive lifecycles with bounded extraction and runtime cleanup. Outcomes remain ungraded and return nonzero; verification is deferred. See [the benchmark guide](docs/sandbox-benchmarking.md).
+- Hidden Linux `sandbox bench --out DIR --runtime PATH` executes qualified native/warm/single-frame archive lifecycles with bounded extraction and runtime cleanup. Runs are graded against a native reference (see below). See [the benchmark guide](docs/sandbox-benchmarking.md).
 - Native sandbox benchmarks confine archive symlink targets independent of entry order, bound extraction descriptors, clean restrictive archive/runtime directories through held handles, preserve primary failures and record pre-runtime/interrupt outcomes. Admission uses the unique scratch leaf, retains default `/var/tmp`, and refuses canonical work-root containment or missing output parents with exit 2.
 - Native benchmark cleanup accepts non-UTF-8 runtime names, preserves existing scratch collisions and primary errors on outcome-write failure, and removes scratch leaves after execution errors. Work-root ancestor refusals also cover the runtime executable and placement output.
+- `sandbox bench --out` now requires `--runtime-kind docker|stub` (Podman is refused as not yet qualified), grades prove summaries against the native reference, writes `rrs-perl-bench/1` `batch.json`/`schedule.jsonl`/`runs.jsonl`/`batch-end.json` (replacing `outcomes.jsonl`), and exits 0 only when every run passes; interrupted batches are reported distinctly. Stub output is fixture-only.
 
 - Hidden Linux `sandbox bench --dry-run` emits deterministic seeded schedules with paired backend ordering, draft qualification reasons and CPU admission checks, without executing work. See [the benchmark guide](docs/sandbox-benchmarking.md).
 - Hidden Linux `sandbox bench --manifest PATH --validate-only` validates Perl task manifests and optional strict pins without execution. See [the validator guide](docs/sandbox-benchmarking.md).

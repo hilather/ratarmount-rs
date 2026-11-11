@@ -25,12 +25,16 @@ fn regression_bench_cli_hidden_and_explicit_help() {
     {
         assert!(leaf.status.success(), "{}", stderr(&leaf));
         let help = String::from_utf8_lossy(&leaf.stdout);
+        assert!(!help.contains("Choosing requires"), "{help}");
         for expected in [
             "Example:",
             "Linux",
             "Exit status:",
             "Inherited `--socket` is rejected; bench owns its supervisor.",
             "Example: ratarmount sandbox bench --manifest tasks.json --dry-run",
+            "--runtime-kind",
+            "every run passed (stub batches are fixtures)",
+            "interrupted or incomplete batch",
             "--dry-run",
             "JSONL schedule without execution or file creation",
         ] {
@@ -560,6 +564,16 @@ mod native {
             backend: &str,
             cache: &str,
         ) -> Command {
+            self.command_at_kind(out, work, backend, cache, Some("stub"))
+        }
+        fn command_at_kind(
+            &self,
+            out: &std::path::Path,
+            work: Option<&std::path::Path>,
+            backend: &str,
+            cache: &str,
+            kind: Option<&str>,
+        ) -> Command {
             let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
             command
                 .args(["sandbox", "bench", "--manifest"])
@@ -582,6 +596,9 @@ mod native {
                 .env("BENCH_STUB_STATE", self.dir.path().join("state"))
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            if let Some(kind) = kind {
+                command.args(["--runtime-kind", kind]);
+            }
             if let Some(work) = work {
                 command.arg("--work-root").arg(work);
             }
@@ -591,11 +608,30 @@ mod native {
             std::fs::write(self.dir.path().join("state").join(fault), "").unwrap();
         }
         fn rows(&self) -> Vec<Value> {
-            std::fs::read_to_string(self.dir.path().join("out/outcomes.jsonl"))
+            std::fs::read_to_string(self.dir.path().join("out/runs.jsonl"))
                 .unwrap()
                 .lines()
                 .map(|s| serde_json::from_str(s).unwrap())
                 .collect()
+        }
+        fn executed(&self) -> Vec<Value> {
+            self.rows()
+                .into_iter()
+                .filter(|r| r["outcome"] != "blocked")
+                .collect()
+        }
+        fn read(&self, name: &str) -> Value {
+            serde_json::from_slice(&std::fs::read(self.dir.path().join("out").join(name)).unwrap())
+                .unwrap()
+        }
+        fn kind(&self, kind: Option<&str>) -> Command {
+            self.command_at_kind(
+                &self.dir.path().join("out"),
+                Some(&self.dir.path().join("work")),
+                "native",
+                "warm",
+                kind,
+            )
         }
         fn calls(&self) -> String {
             std::fs::read_to_string(self.dir.path().join("state/calls")).unwrap_or_default()
@@ -719,7 +755,11 @@ mod native {
                 assert_eq!(result.status.code(), Some(1), "{}", stderr(&result));
                 assert!(stderr(&result).contains("tar-stream sha256 mismatch"));
                 let rows = f.rows();
-                assert_eq!(rows.len(), 1);
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0]["outcome"], "error");
+                assert!(rows[1..].iter().all(|r| r["outcome"] == "blocked"
+                    && r["blocked_by"] == 0
+                    && r["tree"].is_null()));
                 assert_eq!(rows[0]["execution_error"], "tar-stream sha256 mismatch");
                 assert!(rows[0]["phases"].as_array().unwrap().is_empty());
                 assert!(rows[0]["cleanup_error"].is_null());
@@ -752,9 +792,9 @@ mod native {
             }
         }
     }
-    // Regression: native success claimed verification; phase exits and stop failure lost diagnostics/state.
+    // Regression: native grading lost phase exits; phase exits and stop failure lost diagnostics/state.
     #[test]
-    fn regression_bench_cli_native_ungraded_outcome_is_explicit() {
+    fn regression_bench_cli_native_outcome_and_stop_failure_recorded() {
         use std::os::unix::fs::PermissionsExt;
         for fault in ["", "fail-configure", "fail-build", "fail-test", "stop-fail"] {
             let f = Fixture::new();
@@ -762,16 +802,33 @@ mod native {
                 f.fault(fault);
             }
             let output = f.command().output().unwrap();
-            assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(!fault.is_empty())),
+                "{}",
+                stderr(&output)
+            );
             let rows = f.rows();
-            assert!(!rows.is_empty());
-            for row in rows {
-                assert_eq!(row["outcome"], "ungraded");
-                assert_eq!(row["verification_available"], false);
-                assert!(row["reason"]
-                    .as_str()
-                    .unwrap()
-                    .contains("verification unavailable"));
+            assert_eq!(rows.len(), 3);
+            assert!(rows[if fault.is_empty() { 0 } else { 1 }..]
+                .iter()
+                .all(|r| r["outcome"]
+                    == if fault.is_empty() {
+                        "passed"
+                    } else {
+                        "blocked"
+                    }));
+            for row in f.executed() {
+                assert_eq!(
+                    row["outcome"],
+                    if fault.is_empty() {
+                        "passed"
+                    } else if fault == "stop-fail" {
+                        "error"
+                    } else {
+                        "failed"
+                    }
+                );
                 assert!(row.get("throughput").is_none());
                 assert!(row.get("verified").is_none());
                 let phases = row["phases"].as_array().unwrap();
@@ -802,7 +859,11 @@ mod native {
             );
             assert!(!String::from_utf8_lossy(&output.stdout).contains("coverage:"));
             if fault != "stop-fail" {
-                assert!(stderr(&output).contains("ungraded: benchmark verification unavailable"));
+                assert!(stderr(&output).contains(if fault.is_empty() {
+                    "passed:"
+                } else {
+                    "failed:"
+                }));
                 f.no_containers();
             }
         }
@@ -815,7 +876,9 @@ mod native {
         let output = f.command().output().unwrap();
         assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
         let rows = f.rows();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["outcome"], "failed");
+        assert!(rows[1..].iter().all(|r| r["outcome"] == "blocked"));
         assert_eq!(rows[0]["phases"][1]["error"], "timeout");
         f.no_containers();
         assert_eq!(
@@ -863,9 +926,10 @@ mod native {
     fn regression_bench_cli_native_fresh_tree_per_run() {
         let f = Fixture::new();
         let output = f.command().output().unwrap();
-        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
         let rows = f.rows();
         assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r["outcome"] == "passed"));
         let trees: std::collections::BTreeSet<_> =
             rows.iter().map(|r| r["tree"].as_str().unwrap()).collect();
         assert_eq!(trees.len(), 3);
@@ -1159,10 +1223,11 @@ mod native {
                 .command_at(&f.dir.path().join("out"), work, "native", "warm")
                 .output()
                 .unwrap();
-            assert_eq!(result.status.code(), Some(1), "{kind}: {}", stderr(&result));
-            assert!(stderr(&result).contains("ungraded: benchmark verification unavailable"));
+            assert_eq!(result.status.code(), Some(0), "{kind}: {}", stderr(&result));
+            assert!(stderr(&result).contains("passed:"));
             let rows = f.rows();
             assert_eq!(rows.len(), 3);
+            assert!(rows.iter().all(|r| r["outcome"] == "passed"));
             for row in rows {
                 assert!(row["execution_error"].is_null());
                 assert!(row["cleanup_error"].is_null());
@@ -1199,7 +1264,7 @@ mod native {
             });
         }
         let result = command.output().unwrap();
-        assert_eq!(result.status.code(), Some(1), "{}", stderr(&result));
+        assert_eq!(result.status.code(), Some(0), "{}", stderr(&result));
         assert_eq!(f.rows().len(), 3);
         assert!(f.rows().iter().all(|r| r["execution_error"].is_null()
             && r["cleanup_error"].is_null()
@@ -1222,15 +1287,20 @@ mod native {
             let result = f.command().output().unwrap();
             assert_eq!(
                 result.status.code(),
-                Some(1),
+                Some(i32::from(matches!(
+                    fault,
+                    "run-fail" | "interrupt-after-stop" | "depth-257"
+                ))),
                 "{fault}: {}",
                 stderr(&result)
             );
             let rows = f.rows();
-            assert!(!rows.is_empty());
+            assert_eq!(rows.len(), 3);
             f.no_containers();
             assert!(f.calls().contains("kill ") && f.calls().contains("rm -f "));
             if fault == "depth-257" {
+                assert_eq!(rows[0]["outcome"], "error");
+                assert!(rows[1..].iter().all(|r| r["outcome"] == "blocked"));
                 assert!(rows[0]["cleanup_error"]
                     .as_str()
                     .unwrap()
@@ -1239,7 +1309,7 @@ mod native {
                 f.remove_preserved_tree(&rows[0]);
             } else {
                 assert!(rows.iter().all(|r| r["cleanup_error"].is_null()));
-                for row in &rows {
+                for row in f.executed() {
                     let tree = std::path::Path::new(row["tree"].as_str().unwrap());
                     assert!(!tree.exists() && !tree.parent().unwrap().exists());
                 }
@@ -1255,12 +1325,14 @@ mod native {
                         .all(|phase| phase["exit_code"] == 0)));
             }
             if fault == "run-fail" {
-                assert_eq!(rows.len(), 1);
+                assert_eq!(f.executed().len(), 1);
                 assert_eq!(rows[0]["phases"][0]["exit_code"], 17);
                 assert_eq!(rows[0]["phases"].as_array().unwrap().len(), 1);
             }
             if fault == "interrupt-after-stop" {
-                assert_eq!(rows.len(), 2);
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[1]["outcome"], "interrupted");
+                assert_eq!(rows[2]["outcome"], "blocked");
                 assert_eq!(rows[1]["execution_error"], "interrupted");
                 assert_eq!(rows[1]["phases"], json!([]));
                 assert!(rows[0]["execution_error"].is_null());
@@ -1273,8 +1345,362 @@ mod native {
                 );
                 assert!(!f.dir.path().join("out/1-recovery.json").exists());
                 assert!(!stderr(&result).contains("bench native lifecycle: interrupted"));
-                assert!(stderr(&result).contains("ungraded: benchmark verification unavailable"));
+                assert!(stderr(&result).contains("interrupted:"));
             }
         }
+    }
+    fn no_performance_claims(value: &Value) {
+        match value {
+            Value::Object(fields) => {
+                assert!(!fields.contains_key("throughput") && !fields.contains_key("verified"));
+                for child in fields.values() {
+                    no_performance_claims(child);
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    no_performance_claims(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Regression: a failed native reference ran dependent measurements (6).
+    #[test]
+    fn regression_bench_reference_failure_blocks_measurements() {
+        let f = Fixture::new();
+        f.fault("fail-test");
+        let output = f.command().output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let rows = f.rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["outcome"], "failed");
+        assert!(rows[1..].iter().all(|r| r["outcome"] == "blocked"
+            && r["blocked_by"] == 0
+            && r["reason"].as_str().unwrap().contains("phase test exit")));
+        assert_eq!(f.read("batch-end.json")["status"], "failed");
+        assert_eq!(
+            f.calls()
+                .lines()
+                .filter(|s| s.starts_with("run -d"))
+                .count(),
+            1
+        );
+    }
+    // Regression: runtime classification was inferred from the executable or omitted (7).
+    #[test]
+    fn regression_bench_runtime_kind_is_explicit_and_recorded() {
+        let f = Fixture::new();
+        let output = f.kind(None).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(stderr(&output).contains("--runtime-kind docker|podman|stub is required"));
+        assert!(!f.dir.path().join("out").exists());
+        assert!(f.calls().is_empty());
+        assert_eq!(
+            std::fs::read_dir(f.dir.path().join("work"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let output = f.command().output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(f.read("batch.json")["runtime"]["kind"], "stub");
+        assert!(f.rows().iter().all(|r| r["runtime"]["kind"] == "stub"));
+    }
+    // Regression: unqualified Podman reached inspect/setup, or hid the FUSE refusal (8/N1).
+    #[test]
+    fn regression_bench_podman_not_yet_qualified_refused_before_setup() {
+        let f = Fixture::new();
+        let output = f.kind(Some("podman")).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(stderr(&output).contains("not yet qualified"));
+        assert!(!f.dir.path().join("out").exists());
+        assert!(f.calls().is_empty());
+        assert_eq!(
+            std::fs::read_dir(f.dir.path().join("work"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let mut f = Fixture::new();
+        f.value["tasks"][0]["backends"] = json!(["native", "fuse"]);
+        let mut evidence =
+            f.value["tasks"][0]["platforms"][0]["qualification"]["evidence"][0].clone();
+        evidence["backend"] = "fuse".into();
+        f.value["tasks"][0]["platforms"][0]["qualification"]["evidence"]
+            .as_array_mut()
+            .unwrap()
+            .push(evidence);
+        f.save();
+        for kind in [None, Some("podman")] {
+            let output = f
+                .command_at_kind(
+                    &f.dir.path().join("out"),
+                    Some(&f.dir.path().join("work")),
+                    "fuse",
+                    "warm",
+                    kind,
+                )
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert!(
+                stderr(&output).contains("FUSE execution unavailable"),
+                "{}",
+                stderr(&output)
+            );
+            assert!(f.calls().is_empty());
+            assert!(!f.dir.path().join("out").exists());
+        }
+    }
+    // Regression: stub results could be mistaken for publishable measurements (9).
+    #[test]
+    fn regression_bench_stub_records_are_fixture_only() {
+        let f = Fixture::new();
+        let output = f.command().output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stderr(&output).contains("stub fixture, not publishable"));
+        let batch = f.read("batch.json");
+        assert_eq!(batch["fixture"], true);
+        assert_eq!(batch["publishable"], false);
+        assert!(f
+            .rows()
+            .iter()
+            .all(|r| r["fixture"] == true && r["publishable"] == false));
+    }
+    // Regression: a successful stub batch lacked canonical identities, summaries or execution details (10/N5).
+    #[test]
+    fn regression_bench_cli_native_stub_success_records_jsonl() {
+        let mut f = Fixture::new();
+        // Regression: command -e arguments must not be recorded as environment options.
+        f.value["tasks"][0]["commands"]["configure"]["argv"] =
+            json!(["configure", "-e", "POSITIONAL_ONLY=1", "{jobs}"]);
+        // Regression: record the resolved artifact path through a symlinked parent.
+        let actual = f.dir.path().join("artifact-target");
+        std::fs::create_dir(&actual).unwrap();
+        std::fs::rename(
+            f.dir.path().join("source.tar.zst"),
+            actual.join("source.tar.zst"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("artifact-target", f.dir.path().join("artifact-alias")).unwrap();
+        f.value["tasks"][0]["artifact"]["path"] = "artifact-alias/source.tar.zst".into();
+        f.save();
+        let output = f.command().output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert!(stderr(&output).starts_with("sandbox bench: passed:"));
+        let batch = f.read("batch.json");
+        assert_eq!(
+            batch["tasks"][0]["artifact"]["path"],
+            "artifact-alias/source.tar.zst"
+        );
+        assert_eq!(
+            batch["tasks"][0]["artifact"]["resolved_path"],
+            actual.join("source.tar.zst").to_str().unwrap()
+        );
+
+        let end = f.read("batch-end.json");
+        let runs = f.rows();
+        let schedule: Vec<Value> = std::fs::read_to_string(f.dir.path().join("out/schedule.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(schedule.len(), 3);
+        assert_eq!(runs.len(), 3);
+        assert_eq!(end["status"], "passed");
+        assert_eq!(batch["record"], "batch");
+        assert_eq!(end["record"], "batch-end");
+        assert!(batch["manifest_sha256"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(batch["host"]["machine"].is_string());
+        assert!(batch["host"].get("nodename").is_none());
+        assert_eq!(batch["tasks"][0]["test_inventory"]["count"], 1);
+        assert_eq!(
+            batch["platforms"][0]["toolchain_sha256"],
+            f.value["platforms"][0]["toolchain_sha256"]
+        );
+        for record in std::iter::once(&batch)
+            .chain(std::iter::once(&end))
+            .chain(schedule.iter())
+            .chain(runs.iter())
+        {
+            assert_eq!(record["schema"], "rrs-perl-bench/1");
+            assert_eq!(record["batch_id"], batch["batch_id"]);
+        }
+        for (index, (planned, run)) in schedule.iter().zip(&runs).enumerate() {
+            assert_eq!(planned["record"], "schedule");
+            assert_eq!(run["record"], "run");
+            assert_eq!(planned["sequence"], index);
+            assert_eq!(run["index"], index);
+            assert_eq!(planned["run_id"], run["run_id"]);
+            assert_eq!(
+                run["run_id"],
+                format!("{}-{index}", batch["batch_id"].as_str().unwrap())
+            );
+            assert_eq!(planned["entry"], run["schedule"]);
+            assert_eq!(run["outcome"], "passed");
+            assert_eq!(run["summary"]["files"], 1);
+            assert_eq!(run["summary"]["tests"], 10);
+            assert_eq!(run["summary"]["result"], "PASS");
+            assert!(run["summary"]["skipped"].is_null());
+            if index > 0 {
+                assert_eq!(run["reference"], json!({"index":0,"files":1,"tests":10}));
+            }
+            assert_eq!(run["environment"], f.value["tasks"][0]["environment"]);
+            assert_eq!(run["environment"]["TZ"], "UTC");
+            assert_eq!(run["environment"]["PERL_HASH_SEED"], "0");
+            assert_eq!(
+                &run["startup_argv"].as_array().unwrap()[..4],
+                &[
+                    json!("run"),
+                    json!("-d"),
+                    json!("--init"),
+                    json!("--pull=never")
+                ]
+            );
+            for phase in run["phases"].as_array().unwrap() {
+                assert!(phase["elapsed_ms"].is_number());
+                assert!(phase["argv"].is_array());
+                assert_eq!(phase["stdout_truncated"], false);
+                assert_eq!(phase["stderr_truncated"], false);
+                if phase["phase"] != "run" {
+                    assert_eq!(phase["environment"], run["environment"]);
+                }
+            }
+            assert!(run["lifecycle_ms"]["total"].is_number());
+            assert!(run["lifecycle_ms"]["extract"].is_number());
+        }
+        assert!(!f.dir.path().join("out/outcomes.jsonl").exists());
+        f.no_containers();
+    }
+    // Regression: grading failures/count drift returned success or omitted blocked terminals (11/N9).
+    #[test]
+    fn regression_bench_cli_native_failure_batch_nonzero() {
+        for (fault, reason) in [
+            ("fail-build", "phase build exit"),
+            ("count-drift", "test counts differ from native reference"),
+            ("tap-fail-zero", "FAIL with exit 0"),
+            ("tap-notests", "NOTESTS"),
+            ("tap-bailout", "bailout"),
+            ("tap-missing", "missing or malformed prove summary"),
+        ] {
+            let f = Fixture::new();
+            f.fault(fault);
+            let output = f.command().output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{fault}: {}",
+                stderr(&output)
+            );
+            assert!(stderr(&output).starts_with("sandbox bench: failed:"));
+            let rows = f.rows();
+            assert_eq!(rows.len(), 3);
+            let failed = usize::from(fault == "count-drift");
+            assert_eq!(rows[failed]["outcome"], "failed");
+            assert!(
+                rows[failed]["reason"].as_str().unwrap().contains(reason),
+                "{fault}: {}",
+                rows[failed]
+            );
+            assert!(rows[..failed].iter().all(|r| r["outcome"] == "passed"));
+            assert!(rows[failed + 1..].iter().all(|r| r["outcome"] == "blocked"
+                && r["blocked_by"] == failed
+                && r["reason"] == rows[failed]["reason"]
+                && r["tree"].is_null()));
+            assert_eq!(f.read("batch-end.json")["status"], "failed");
+            no_performance_claims(&json!(rows));
+            no_performance_claims(&f.read("batch.json"));
+            no_performance_claims(&f.read("batch-end.json"));
+            for line in std::fs::read_to_string(f.dir.path().join("out/schedule.jsonl"))
+                .unwrap()
+                .lines()
+            {
+                no_performance_claims(&serde_json::from_str::<Value>(line).unwrap());
+            }
+            f.no_containers();
+        }
+    }
+    // Regression: SIGTERM during startup shared the successful/failed completion presentation (12).
+    #[test]
+    fn regression_bench_cli_interrupted_batch_presentation_distinct() {
+        let f = Fixture::new();
+        f.fault("late");
+        let child = f.command().spawn().unwrap();
+        let started = std::time::Instant::now();
+        while !f.dir.path().join("state/starting").exists() {
+            assert!(started.elapsed().as_secs() < 5);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let message = stderr(&output);
+        assert!(
+            message.starts_with("sandbox bench: interrupted:"),
+            "{message}"
+        );
+        for forbidden in ["passed:", "failed:", "ungraded"] {
+            assert!(!message.contains(forbidden));
+        }
+        assert_eq!(f.read("batch-end.json")["status"], "interrupted");
+        let rows = f.rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["outcome"], "interrupted");
+        assert!(rows[1..]
+            .iter()
+            .all(|r| r["outcome"] == "blocked" && r["reason"] == "interrupted"));
+        f.no_containers();
+        assert_eq!(
+            std::fs::read_dir(f.dir.path().join("work"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+    // Regression: interruption plus a cleanup failure lost interrupted stderr/end status (N3).
+    #[test]
+    fn regression_bench_cli_interrupted_lifecycle_error_presentation() {
+        let f = Fixture::new();
+        f.fault("exec-hang");
+        f.fault("depth-257");
+        let child = f.command().spawn().unwrap();
+        let started = std::time::Instant::now();
+        while !f.dir.path().join("state/executing").exists() {
+            assert!(started.elapsed().as_secs() < 5);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let message = stderr(&output);
+        assert!(
+            message.starts_with("sandbox bench: interrupted: batch incomplete; lifecycle error:"),
+            "{message}"
+        );
+        assert!(message.contains("depth exceeds 256"));
+        assert!(!message.contains("passed:"));
+        let end = f.read("batch-end.json");
+        assert_eq!(end["status"], "interrupted");
+        assert!(end["error"].as_str().unwrap().contains("depth exceeds 256"));
+        let rows = f.rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["outcome"], "interrupted");
+        assert!(rows[1..]
+            .iter()
+            .all(|r| r["outcome"] == "blocked" && r["reason"] == "interrupted"));
+        f.no_containers();
+        f.remove_preserved_tree(&rows[0]);
     }
 }
