@@ -2380,8 +2380,8 @@ fn main() {
 
     // Content-hash xattrs foundation: after a successful mount build, for each
     // path-backed local archive with an on-disk index, open the index writable and
-    // fill user.hash.* xattrs. Does not go through factory (TODO: hook during index
-    // finalization so compressed/nested sources hash via MountSource::open).
+    // fill missing user.hash.* keys from decoded content. Stored ZIP/7z build-time
+    // digests are kept unchanged; late ZIP fills require verified Stored members.
     if !open_opts.hashes.is_empty() {
         if open_opts.index_in_memory {
             log::warn!(

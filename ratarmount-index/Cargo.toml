@@ -16,6 +16,8 @@ test-hooks = []
 
 [dependencies]
 ratarmount-core.workspace = true
+ratarmount-compress.workspace = true
+zip = { version = "2", default-features = true }
 # Workspace rusqlite 0.32 has no `fts5` cargo feature. Bundled libsqlite3-sys
 # always compiles `-DSQLITE_ENABLE_FTS5`, so FTS5 cannot be compiled out of
 # this binary. Optional locate is the `files_fts` table + MATCH query.
