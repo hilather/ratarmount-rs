@@ -1,5 +1,5 @@
 //! Admission completes before private roots or runtime execution are created.
-use super::{io as owned, runtime, schedule, source, BenchArgs};
+use super::{io as owned, record, runtime, schedule, source, BenchArgs, RuntimeKind};
 use owned::invalid;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -83,7 +83,7 @@ fn host_load() -> io::Result<f64> {
 }
 // Resolve existing ancestors as well as lexical paths, exposing symlink aliases
 // even for an output or placement root that has not been created yet.
-fn resolve(path: &Path) -> io::Result<PathBuf> {
+pub(super) fn resolve(path: &Path) -> io::Result<PathBuf> {
     if path.exists() {
         return path.canonicalize();
     }
@@ -124,6 +124,17 @@ pub(super) fn execute(
                     "execution requires qualified native/warm/tar.zst-single-frame selections",
                 ));
             }
+        }
+        match args.runtime_kind {
+            None => {
+                return Err(invalid(
+                    "--runtime-kind docker|podman|stub is required for execution",
+                ))
+            }
+            Some(RuntimeKind::Podman) => {
+                return Err(invalid("--runtime-kind podman is not yet qualified"))
+            }
+            _ => {}
         }
         let executable = args
             .runtime
@@ -166,6 +177,7 @@ pub(super) fn execute(
             .parent()
             .ok_or_else(|| invalid("manifest has no parent"))?;
         let mut files = BTreeMap::new();
+        let mut artifacts = BTreeMap::new();
         let maximum = manifest
             .tasks
             .iter()
@@ -242,11 +254,13 @@ pub(super) fn execute(
             }
             let mut file = owned::open_artifact(&artifact)?;
             source::verify_artifact(&mut file, &task.artifact.sha256, task.resources.disk_bytes)?;
+            artifacts.insert(task.id.clone(), artifact);
             files.insert(task.id.clone(), file);
         }
-        Ok((executable, out, work, work_parent, id, files, load))
+        let paths = record::AdmittedPaths { catalog, artifacts };
+        Ok((executable, out, work, work_parent, id, files, load, paths))
     })();
-    let (executable, out, work, work_parent, id, mut files, load) = match admitted {
+    let (executable, out, work, work_parent, id, mut files, load, paths) = match admitted {
         Ok(value) => value,
         Err(error) => {
             eprintln!("sandbox bench: selection: {error}");
@@ -284,6 +298,9 @@ pub(super) fn execute(
         &executable,
         &out,
         Scratch {
+            args,
+            bytes,
+            paths: &paths,
             work: &work,
             parent: &work_parent,
             id: &id,
@@ -292,11 +309,28 @@ pub(super) fn execute(
         &load,
     );
     drop(signals);
-    result.map_err(|e| format!("bench native lifecycle: {e}"))?;
-    eprintln!("sandbox bench: ungraded: benchmark verification unavailable until B4a2");
-    Ok(1) // B4a2 is required for benchmark verification; never a successful benchmark.
+    let (code, message) = presentation(result)?;
+    eprintln!("{message}");
+    Ok(code)
 }
+fn presentation(result: io::Result<record::Finished>) -> Result<(i32, String), String> {
+    let finished = result.map_err(|e| record::lifecycle_error(false, &e))?;
+    if let Err(error) = finished.result {
+        let interrupted = finished.status.status == "interrupted";
+        let message = record::lifecycle_error(interrupted, &error);
+        return if interrupted {
+            Ok((1, message))
+        } else {
+            Err(message)
+        };
+    }
+    Ok(finished.status.presentation())
+}
+
 struct Scratch<'a> {
+    args: &'a BenchArgs,
+    bytes: &'a [u8],
+    paths: &'a record::AdmittedPaths,
     work: &'a Path,
     parent: &'a rustix::fd::OwnedFd,
     id: &'a str,
@@ -323,7 +357,7 @@ fn cleanup(parent: &rustix::fd::OwnedFd, name: &str) -> io::Result<()> {
     }
     owned::remove_tree(parent, name)
 }
-fn record(outcomes: &mut File, row: &serde_json::Value) -> io::Result<()> {
+pub(super) fn record(outcomes: &mut File, row: &serde_json::Value) -> io::Result<()> {
     #[cfg(test)]
     inject("record-fail")?;
     serde_json::to_writer(&mut *outcomes, row)?;
@@ -338,8 +372,12 @@ fn execute_owned(
     location: Scratch<'_>,
     files: &mut BTreeMap<String, File>,
     load: &Load,
-) -> io::Result<()> {
+) -> io::Result<record::Finished> {
+    let host = record::uname()?;
     let Scratch {
+        args,
+        bytes,
+        paths,
         work,
         parent: work_parent,
         id,
@@ -353,11 +391,20 @@ fn execute_owned(
         .and_then(|v| v.to_str())
         .ok_or_else(|| invalid("output name"))?;
     let logs = owned::create_directory(&out_parent, out_name)?;
-    let outcomes_file = owned::create_output(&logs, "outcomes.jsonl");
+    let header = record::batch(
+        args,
+        bytes,
+        entries,
+        executable,
+        paths,
+        host,
+        serde_json::to_value(load)?,
+    );
+    let records = header.and_then(|header| record::Records::create(&logs, id, header, entries));
     #[cfg(test)]
-    let outcomes_file = outcomes_file.and_then(|file| inject("outcomes-create").map(|()| file));
-    let mut outcomes = match outcomes_file {
-        Ok(file) => file,
+    let records = records.and_then(|file| inject("outcomes-create").map(|()| file));
+    let mut records = match records {
+        Ok(records) => records,
         Err(error) => {
             return Err(owned::with_cleanup(
                 error,
@@ -366,7 +413,7 @@ fn execute_owned(
         }
     };
     let scratch_path = work.join(id);
-    let mut row = serde_json::json!({"schema":"rrs-perl-bench-ungraded/1","outcome":"ungraded","verification_available":false,"reason":"benchmark verification unavailable until B4a2","schedule":entries.first(),"tree":scratch_path.join("0"),"load":load,"phases":[],"execution_error":null,"stop_error":null,"cleanup_error":null});
+    let mut row = records.row(0, &entries[0], Some(&scratch_path.join("0")));
     let scratch_directory = owned::create_directory(work_parent, id);
     #[cfg(test)]
     let scratch_directory = scratch_directory.and_then(|fd| inject("scratch-create").map(|()| fd));
@@ -380,9 +427,11 @@ fn execute_owned(
             };
             let error = owned::with_cleanup(error, cleanup);
             let (primary, secondary) = owned::error_parts(&error);
+            row["reason"] = primary.clone().into();
             row["execution_error"] = primary.into();
             row["cleanup_error"] = serde_json::json!(secondary);
-            return Err(owned::with_cleanup(error, record(&mut outcomes, &row)));
+            let recorded = records.terminal(&row);
+            return Ok(records.finish(entries, Err(owned::with_cleanup(error, recorded))));
         }
     };
     for (index, entry) in entries.iter().enumerate() {
@@ -398,9 +447,8 @@ fn execute_owned(
             .unwrap();
         let name = format!("{id}-{index}");
         let tree_path = scratch_path.join(index.to_string());
-        row["schedule"] = serde_json::to_value(entry)?;
-        row["tree"] = serde_json::json!(tree_path);
-        row["phases"] = serde_json::json!([]);
+        let started = std::time::Instant::now();
+        row = records.row(index, entry, Some(&tree_path));
         #[cfg(test)]
         if inject("interrupt-entry").is_err() {
             runtime::test_set_interrupted();
@@ -411,10 +459,15 @@ fn execute_owned(
             let cleanup = cleanup(work_parent, id);
             row["cleanup_error"] =
                 serde_json::json!(cleanup.as_ref().err().map(ToString::to_string));
-            return match record(&mut outcomes, &row) {
+            row["outcome"] = "interrupted".into();
+            row["reason"] = "interrupted".into();
+            row["lifecycle_ms"]["total"] = serde_json::json!(started.elapsed().as_millis());
+            let recorded = records.terminal(&row);
+            let result = match recorded {
                 Ok(()) => cleanup,
                 Err(error) => Err(owned::with_cleanup(error, cleanup)),
             };
+            return Ok(records.finish(entries, result));
         }
         let prepared = (|| -> io::Result<()> {
             let file = files.get_mut(&task.id).unwrap();
@@ -436,14 +489,19 @@ fn execute_owned(
             #[cfg(test)]
             inject("recovery-write")?;
             serde_json::to_writer(recovery_file, &recovery)?;
+            row["recovery"] = serde_json::json!(out.join(format!("{index}-recovery.json")));
             Ok(())
         })();
+        row["lifecycle_ms"]["extract"] = serde_json::json!(started.elapsed().as_millis());
         if let Err(error) = prepared {
             let error = owned::with_cleanup(error, cleanup(work_parent, id));
+            row["lifecycle_ms"]["total"] = serde_json::json!(started.elapsed().as_millis());
             let (primary, secondary) = owned::error_parts(&error);
+            row["reason"] = primary.clone().into();
             row["execution_error"] = primary.into();
             row["cleanup_error"] = serde_json::json!(secondary);
-            return Err(owned::with_cleanup(error, record(&mut outcomes, &row)));
+            let recorded = records.terminal(&row);
+            return Ok(records.finish(entries, Err(owned::with_cleanup(error, recorded))));
         }
         let mount = tree_path
             .to_str()
@@ -489,6 +547,7 @@ fn execute_owned(
             if inject("interrupt-spawn").is_err() {
                 runtime::test_set_interrupted();
             }
+            row["startup_argv"] = serde_json::json!(startup);
             phases.push(runtime.invoke("run", &startup, 30, true)?);
             if !phases.last().unwrap().success() {
                 return Ok(());
@@ -526,7 +585,25 @@ fn execute_owned(
             serde_json::json!(execution.as_ref().err().map(ToString::to_string));
         row["stop_error"] = serde_json::json!(stop.as_ref().err().map(ToString::to_string));
         row["cleanup_error"] = serde_json::json!(cleanup.as_ref().err().map(ToString::to_string));
-        let recorded = record(&mut outcomes, &row);
+        row["lifecycle_ms"]["total"] = serde_json::json!(started.elapsed().as_millis());
+        if phases
+            .iter()
+            .any(|p| p.error.as_deref() == Some("interrupted"))
+        {
+            row["outcome"] = "interrupted".into();
+            row["reason"] = "interrupted".into();
+        } else if execution.is_ok() && stop.is_ok() && cleanup.is_ok() {
+            records.grade(&mut row, entry, &phases);
+        }
+        if row["outcome"] == "error" {
+            row["reason"] = row["execution_error"]
+                .as_str()
+                .or(row["stop_error"].as_str())
+                .or(row["cleanup_error"].as_str())
+                .map(serde_json::Value::from)
+                .unwrap_or_default();
+        }
+        let recorded = records.terminal(&row);
         let stopped = stop.is_ok();
         let result = match (execution, stop, cleanup) {
             (Err(error), stop, cleanup) => Err(owned::with_cleanup(
@@ -541,28 +618,170 @@ fn execute_owned(
             Ok(()) => recorded,
         };
         if let Err(error) = result {
-            return Err(if stopped {
+            let error = if stopped {
                 owned::with_cleanup(error, self::cleanup(work_parent, id))
             } else {
                 error
-            });
+            };
+            return Ok(records.finish(entries, Err(error)));
         }
         #[cfg(test)]
         if inject("interrupt-between").is_err() {
             runtime::test_set_interrupted();
         }
-        if phases.iter().any(|p| !p.success()) {
+        if row["outcome"] != "passed" {
             break;
         }
     }
     // Also runs after the phase-failure break; the interrupt arm cleans up and returns above.
-    cleanup(work_parent, id)?;
-    Ok(())
+    #[cfg(test)]
+    if inject("interrupt-after-last").is_err() {
+        runtime::test_set_interrupted();
+    }
+    let result = cleanup(work_parent, id);
+    #[cfg(test)]
+    let result = result.and_then(|()| inject("cleanup-final-fail"));
+    Ok(records.finish(entries, result))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Regression: uname must fail explicitly before creating output or scratch (5b).
+    #[test]
+    fn regression_bench_uname_failure_creates_nothing() {
+        let _signals = runtime::InterruptScope::new();
+        let mut f = Fixture::new();
+        let _fault = FaultScope::new(&["uname-fail"]);
+        assert!(f
+            .run()
+            .unwrap_err()
+            .to_string()
+            .contains("host identity: uname failed"));
+        assert!(!f.dir.path().join("out").exists());
+        assert!(!f.dir.path().join("work/owned-test").exists());
+        assert!(!f.calls().contains("run -d"));
+    }
+    // Regression: header failures leaked output and end-marker/final-cleanup failures claimed passed (N2/N6).
+    #[test]
+    fn regression_bench_record_header_and_end_failures() {
+        let _signals = runtime::InterruptScope::new();
+        for name in ["batch.json", "schedule.jsonl", "batch-end.json"] {
+            let mut f = Fixture::new();
+            let fault = match name {
+                "batch.json" => "record-header-fail:batch.json",
+                "schedule.jsonl" => "record-header-fail:schedule.jsonl",
+                _ => "record-header-fail:batch-end.json",
+            };
+            let _fault = FaultScope::new(&[fault]);
+            let result = f.run_finished();
+            let error = match &result {
+                Ok(finished) => finished.result.as_ref().unwrap_err(),
+                Err(error) => error,
+            };
+            assert_eq!(owned::error_parts(error).0, fault);
+            assert!(presentation(result)
+                .unwrap_err()
+                .starts_with("bench native lifecycle:"));
+            assert!(!f.dir.path().join("out/batch-end.json").exists());
+            assert!(!f.dir.path().join("out/.batch-end.json.tmp").exists());
+            assert_eq!(f.dir.path().join("out").exists(), name == "batch-end.json");
+            assert!(!f.dir.path().join("work/owned-test").exists());
+        }
+        let mut f = Fixture::new();
+        let _fault = FaultScope::new(&["cleanup-final-fail"]);
+        assert!(f
+            .run()
+            .unwrap_err()
+            .to_string()
+            .contains("cleanup-final-fail"));
+        let end = f.end();
+        assert_eq!(end["status"], "error");
+        assert_eq!(end["error"], "cleanup-final-fail");
+        owned::remove_tree(
+            &owned::open_directory(&f.dir.path().join("work")).unwrap(),
+            "owned-test",
+        )
+        .unwrap();
+    }
+    // Regression: a late interrupt rewrote completed outcomes or a failure's blocked reason (14/N4).
+    #[test]
+    fn regression_bench_interrupt_after_last_entry_keeps_outcomes() {
+        let _signals = runtime::InterruptScope::new();
+        for fails in [false, true] {
+            let signals = runtime::Signals::install().unwrap();
+            let mut f = Fixture::new();
+            if fails {
+                std::fs::write(f.dir.path().join("state/tap-fail-zero"), "").unwrap();
+            }
+            let _fault = FaultScope::new(&["interrupt-after-last"]);
+            let status = f.run().unwrap();
+            assert_eq!(status.status, if fails { "failed" } else { "passed" });
+            assert!(status.interrupt_observed);
+            assert!(status.presentation().1.contains("; interrupt observed"));
+            assert!(status
+                .presentation()
+                .1
+                .contains(if fails { "failed:" } else { "passed:" }));
+            let rows = f.rows();
+            assert_eq!(rows.len(), 3);
+            assert_eq!(f.executed().len(), if fails { 1 } else { 3 });
+            if fails {
+                assert_eq!(rows[0]["outcome"], "failed");
+                assert!(rows[1..]
+                    .iter()
+                    .all(|r| r["outcome"] == "blocked" && r["reason"] == "FAIL with exit 0"));
+            } else {
+                assert!(rows.iter().all(|r| r["outcome"] == "passed"));
+            }
+            assert_eq!(f.end()["status"], status.status);
+            assert_eq!(f.end()["interrupt_observed"], true);
+            drop(signals);
+        }
+    }
+    // Regression: late signals and lifecycle errors made stderr disagree with the frozen end marker.
+    #[test]
+    fn regression_bench_late_signal_lifecycle_status_matches_end() {
+        let _scope = runtime::InterruptScope::new();
+        for (fault, lifecycle_error) in [
+            ("interrupt-after-status", true),
+            ("interrupt-after-last", true),
+            ("interrupt-after-status", false),
+        ] {
+            let _signals = runtime::Signals::install().unwrap();
+            let mut f = Fixture::new();
+            let mut faults = vec![fault];
+            if lifecycle_error {
+                faults.push("cleanup-final-fail");
+            }
+            let _fault = FaultScope::new(&faults);
+            let finished = f.run_finished().unwrap();
+            assert!(runtime::interrupted());
+            let end = f.end();
+            assert_eq!(
+                end["status"],
+                if lifecycle_error { "error" } else { "passed" }
+            );
+            assert_eq!(end["status"], finished.status.status);
+            assert_eq!(end["interrupt_observed"], fault == "interrupt-after-last");
+            assert_eq!(
+                end["interrupt_observed"],
+                finished.status.interrupt_observed
+            );
+            let shown = presentation(Ok(finished));
+            if lifecycle_error {
+                assert_eq!(
+                    shown.unwrap_err(),
+                    "bench native lifecycle: cleanup-final-fail"
+                );
+                assert_eq!(end["error"], "cleanup-final-fail");
+            } else {
+                let (code, message) = shown.unwrap();
+                assert_eq!(code, 0);
+                assert_eq!(message, "sandbox bench: passed: 3 runs graded; batch complete; stub fixture, not publishable");
+            }
+        }
+    }
     // Regression: an unavailable or excessive load silently passed without a recorded override.
     #[test]
     fn regression_bench_load_check_failure_and_override_recorded() {
@@ -597,6 +816,8 @@ mod tests {
         manifest: Manifest,
         entries: Vec<schedule::Entry>,
         files: BTreeMap<String, File>,
+        bytes: Vec<u8>,
+        args: BenchArgs,
     }
     impl Fixture {
         fn new() -> Self {
@@ -621,6 +842,7 @@ mod tests {
             value["tasks"][0]["artifact"]["tar_stream_sha256"] =
                 format!("sha256:{:x}", Sha256::digest(&tar)).into();
             let bytes = serde_json::to_vec(&value).unwrap();
+            std::fs::write(dir.path().join("tasks.json"), &bytes).unwrap();
             let manifest = serde_json::from_slice(&bytes).unwrap();
             let entries = schedule::build(
                 &bytes,
@@ -652,14 +874,32 @@ mod tests {
                 std::fs::Permissions::from_mode(0o700),
             )
             .unwrap();
+            let args = BenchArgs {
+                manifest: dir.path().join("tasks.json"),
+                validate_only: false,
+                dry_run: false,
+                require_pins: false,
+                out: Some(dir.path().join("out")),
+                runtime: Some(dir.path().join("runtime")),
+                runtime_kind: Some(RuntimeKind::Stub),
+                work_root: dir.path().join("work"),
+                allow_high_load: false,
+                selection: super::super::Selection::default(),
+            };
             Self {
+                bytes,
+                args,
                 dir,
                 manifest,
                 entries,
                 files,
             }
         }
-        fn run(&mut self) -> io::Result<()> {
+        fn run(&mut self) -> io::Result<record::Status> {
+            let finished = self.run_finished()?;
+            finished.result.map(|()| finished.status)
+        }
+        fn run_finished(&mut self) -> io::Result<record::Finished> {
             let work = self.dir.path().join("work");
             let parent = owned::open_directory(&work)?;
             execute_owned(
@@ -668,6 +908,15 @@ mod tests {
                 &self.dir.path().join("runtime"),
                 &self.dir.path().join("out"),
                 Scratch {
+                    args: &self.args,
+                    bytes: &self.bytes,
+                    paths: &record::AdmittedPaths {
+                        catalog: self.args.manifest.clone(),
+                        artifacts: BTreeMap::from([(
+                            "mojo".into(),
+                            self.dir.path().join("archive"),
+                        )]),
+                    },
                     work: &work,
                     parent: &parent,
                     id: "owned-test",
@@ -677,17 +926,29 @@ mod tests {
             )
         }
         fn rows(&self) -> Vec<serde_json::Value> {
-            std::fs::read_to_string(self.dir.path().join("out/outcomes.jsonl"))
+            std::fs::read_to_string(self.dir.path().join("out/runs.jsonl"))
                 .unwrap()
                 .lines()
                 .map(|line| serde_json::from_str(line).unwrap())
                 .collect()
         }
+        fn executed(&self) -> Vec<serde_json::Value> {
+            self.rows()
+                .into_iter()
+                .filter(|r| r["outcome"] != "blocked")
+                .collect()
+        }
+        fn end(&self) -> serde_json::Value {
+            serde_json::from_slice(
+                &std::fs::read(self.dir.path().join("out/batch-end.json")).unwrap(),
+            )
+            .unwrap()
+        }
         fn calls(&self) -> String {
             std::fs::read_to_string(self.dir.path().join("state/calls")).unwrap_or_default()
         }
     }
-    // Regression: pre-runtime create/write failures leaked roots or omitted ungraded outcomes (R-1).
+    // Regression: pre-runtime create/write failures leaked roots or omitted error terminals (R-1).
     #[test]
     fn regression_bench_pre_runtime_failures_recorded_and_removed() {
         let _signals = runtime::InterruptScope::new();
@@ -718,9 +979,11 @@ mod tests {
                 assert!(!f.dir.path().join("out").exists());
             } else {
                 let rows = f.rows();
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0]["outcome"], "ungraded");
-                assert_eq!(rows[0]["verification_available"], false);
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0]["outcome"], "error");
+                assert!(rows[1..]
+                    .iter()
+                    .all(|r| r["outcome"] == "blocked" && r["blocked_by"] == 0));
                 assert!(rows[0]["execution_error"].is_string());
                 assert_eq!(rows[0]["phases"], serde_json::json!([]));
                 assert!(rows[0]["cleanup_error"].is_null());
@@ -753,6 +1016,7 @@ mod tests {
                 "{error}"
             );
             let row = &f.rows()[0];
+            assert_eq!(row["outcome"], "error");
             assert_eq!(row["execution_error"], primary);
             assert_eq!(row["cleanup_error"], "cleanup-fail");
             assert_eq!(row["phases"], serde_json::json!([]));
@@ -777,6 +1041,7 @@ mod tests {
             b"previous run"
         );
         let row = &f.rows()[0];
+        assert_eq!(row["outcome"], "error");
         assert_eq!(row["execution_error"], error.to_string());
         assert!(row["cleanup_error"].is_null());
         assert_eq!(row["phases"], serde_json::json!([]));
@@ -838,6 +1103,7 @@ mod tests {
                         )
                     );
                     assert!(f.rows().is_empty());
+                    assert!(!f.dir.path().join("out/batch-end.json").exists());
                 } else {
                     if cleanup_fails {
                         assert_eq!(
@@ -848,7 +1114,20 @@ mod tests {
                         result.unwrap();
                     }
                     let rows = f.rows();
-                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows.len(), 3);
+                    assert_eq!(rows[0]["outcome"], "interrupted");
+                    assert!(rows[1..]
+                        .iter()
+                        .all(|r| r["outcome"] == "blocked" && r["reason"] == "interrupted"));
+                    let end: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(f.dir.path().join("out/batch-end.json")).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(end["status"], "interrupted");
+                    assert_eq!(
+                        end["error"],
+                        serde_json::json!(cleanup_fails.then_some("cleanup-fail"))
+                    );
                     let row = &rows[0];
                     assert_eq!(row["execution_error"], "interrupted");
                     assert_eq!(row["phases"], serde_json::json!([]));
@@ -874,6 +1153,7 @@ mod tests {
         let _fault = FaultScope::new(&["execution-fail"]);
         assert_eq!(f.run().unwrap_err().to_string(), "execution-fail");
         let row = &f.rows()[0];
+        assert_eq!(row["outcome"], "error");
         assert_eq!(row["execution_error"], "execution-fail");
         assert!(row["stop_error"].is_null() && row["cleanup_error"].is_null());
         assert_eq!(row["phases"].as_array().unwrap().len(), 1);
@@ -893,6 +1173,7 @@ mod tests {
                 && error.contains("make-removable-fail")
         );
         let row = &f.rows()[0];
+        assert_eq!(row["outcome"], "error");
         assert_eq!(row["execution_error"], "tar-stream sha256 mismatch");
         assert_eq!(row["cleanup_error"], "make-removable-fail");
         assert_eq!(row["phases"], serde_json::json!([]));
@@ -908,9 +1189,21 @@ mod tests {
             let signals = runtime::Signals::install().unwrap();
             let mut f = Fixture::new();
             let _fault = FaultScope::new(&[fault]);
-            f.run().unwrap();
+            let status = f.run().unwrap();
+            assert!(status.presentation().1.ends_with(&format!(
+                "{} runs not executed",
+                if fault == "interrupt-between" { 2 } else { 3 }
+            )));
             let rows = f.rows();
-            let row = rows.last().unwrap();
+            let interrupted = usize::from(fault == "interrupt-between");
+            let row = &rows[interrupted];
+            assert_eq!(row["outcome"], "interrupted");
+            if interrupted == 1 {
+                assert_eq!(rows[0]["outcome"], "passed");
+            }
+            assert!(rows[interrupted + 1..]
+                .iter()
+                .all(|r| r["outcome"] == "blocked"));
             if fault == "interrupt-spawn" {
                 assert_eq!(row["phases"][0]["error"], "interrupted");
                 assert_eq!(row["phases"][0]["stdout_log"], "");
@@ -931,7 +1224,7 @@ mod tests {
                 .count();
             assert_eq!(runs, usize::from(fault == "interrupt-between"));
             EXTRACTS.with(|count| assert_eq!(count.get(), usize::from(fault != "interrupt-entry")));
-            assert_eq!(rows.len(), if fault == "interrupt-between" { 2 } else { 1 });
+            assert_eq!(rows.len(), 3);
             assert!(!f.dir.path().join("work/owned-test").exists());
             assert!(
                 !f.dir

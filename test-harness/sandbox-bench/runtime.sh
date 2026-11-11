@@ -60,6 +60,20 @@ case "$verb" in
       exit 23
     fi
     printf '%s output\n' "$phase"
+    if [[ $phase == test || $phase == prove ]]; then
+      count=$(cat "$state/test-count" 2>/dev/null || printf 0)
+      printf '%s\n' "$((count+1))" > "$state/test-count"
+      tests=10
+      [[ ! -f $state/count-drift || $count == 0 ]] || tests=9
+      result=PASS
+      [[ ! -f $state/tap-fail-zero ]] || result=FAIL
+      if [[ -f $state/tap-notests ]]; then
+        printf 'Files=0, Tests=0,  0 wallclock secs\nResult: NOTESTS\n'
+      elif [[ ! -f $state/tap-missing ]]; then
+        [[ ! -f $state/tap-bailout ]] || printf 'Bailout called.  Further testing stopped: x\n'
+        printf 'All tests successful.\nFiles=1, Tests=%s,  0 wallclock secs\nResult: %s\n' "$tests" "$result"
+      fi
+    fi
     printf '%s diagnostic\n' "$phase" >&2
     [[ ! -f $state/fail-$phase ]] || exit 7
     ;;

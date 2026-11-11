@@ -113,7 +113,8 @@ manifest claim. `execution_available` and `runnable` are true only for qualified
 native/warm/`tar.zst-single-frame` entries. Dry-run `runnable` does not check
 execution's `--out` strict pins or its N6 `timeout_seconds` range of **1..=86400**.
 Other entries retain an unavailable
-reason; executable entries explicitly remain ungraded. These are planned entries, not results.
+reason; executable entries are graded against the native reference when executed.
+Stub runtime output is fixture-only. Dry-run entries are plans, not results.
 
 A cell is the canonical JSON tuple `[task, platform, base_form, jobs, cache]`.
 Cells sort by the lowercase SHA-256 digest of the JSON tuple
@@ -136,7 +137,7 @@ mounting, source preparation or runtime execution, and produces no benchmark num
 Native execution is available with an explicit local Docker-compatible executable:
 
 ```sh
-ratarmount sandbox bench --manifest tasks.json --backend native --cache warm --base-form tar.zst-single-frame --repeats 5 --out /results/batch-1 --work-root /scratch/bench --runtime /usr/bin/docker
+ratarmount sandbox bench --manifest tasks.json --backend native --cache warm --base-form tar.zst-single-frame --repeats 5 --out /results/batch-1 --work-root /scratch/bench --runtime /usr/bin/docker --runtime-kind docker
 ```
 
 `--out` creates a fresh private directory; its parent and `--work-root` must exist.
@@ -184,15 +185,18 @@ Bounds are 100000 entries, 128 path components,
 4096 path bytes, a 128 MiB decoder window and the smaller of `disk_bytes` or 16 GiB
 for each compressed/decoded stream. Directories start at 0700; recorded modes
 and mtimes are applied after descendants. Bench private roots stay 0700.
-An extraction failure records an ungraded outcome and removes the partial tree
-and private scratch root before returning exit **1**, without starting a runtime.
+An extraction failure records an `error` terminal and `blocked` terminals for
+the remaining entries, and removes the partial tree and private scratch root
+before returning exit **1**, without starting a runtime.
 
 The detached runtime uses `run -d --init --pull=never --name NAME`, binds the fresh
 tree at `/repo`, sets `/repo` as cwd, disables networking, drops all capabilities,
 sets no-new-privileges, limits PIDs and runs as the invoking UID:GID. Every run
 uses the same task CPU/memory limits and `IMAGE sleep infinity`. Configure,
 build and test are separate `exec` clients with `{jobs}` substitutions and
-owned 0600 stdout/stderr logs. Completed log reads are bounded to 64 KiB each.
+owned 0600 stdout/stderr logs. Completed log reads keep the final 64 KiB each; phase fields
+`stdout_truncated` and `stderr_truncated` are true if the corresponding log
+exceeded 64 KiB, false otherwise. Full logs remain available as artifacts.
 Execution timeouts must be **1..=86400 seconds** (one day), checked before any
 phase or deadline construction; validation-only mode retains the schema's positive-timeout rule.
 
@@ -200,10 +204,85 @@ Timeout/interruption stops and removes the container, reaps outstanding clients,
 and repeats stop/removal after a possibly late startup. Stop failure preserves
 the tree and recovery record and blocks deletion. Recovery records name the
 executable, container and tree; investigate failed stops before manual cleanup.
-`outcomes.jsonl` contains explicit ungraded lifecycle outcomes, phases, load and
-cleanup errors. Execution returns **1** even if every phase exits zero: benchmark
-verification is unavailable until B4a2. There is no verified canonical batch,
-throughput or benchmark-success claim.
+Execution writes four canonical files with schema `rrs-perl-bench/1`. Every
+record includes `schema`, a `record` discriminator and the same `batch_id`.
+Schedule and run rows share `run_id` (`<batch_id>-<index>`), which also names
+the runtime container. Each schedule sequence matches exactly one terminal index.
+
+- `batch.json` records catalog revision, admitted manifest path and manifest SHA-256; selected platform
+  image, OS, architecture, toolchain and dependency-lock pins; task artifact
+  paths (given and as opened by admission), compressed/tar-stream digests and test inventories;
+  runtime kind/path, consumed native settings, host load and start time.
+- `schedule.jsonl` records every planned entry and its sequence/run identity.
+- `runs.jsonl` records one terminal per scheduled entry: `passed`, `failed`,
+  `blocked`, `interrupted` or `error`. Executed rows retain tree/load/phases,
+  execution/stop/cleanup errors and recovery paths. They include exact startup
+  and phase argv, substituted environment, CPU/memory/PID/time limits, phase
+  `elapsed_ms`, extraction/total lifecycle times, prove summary and reference.
+  Blocked rows have `tree:null`, no phases, null summary/lifecycle errors,
+  and carry `blocked_by` and `reason` from the triggering terminal.
+- `batch-end.json` is written after final scratch cleanup. It records status,
+  `interrupt_observed`, lifecycle error, outcome counts, finish time and wall time.
+  It is exclusively created as `.batch-end.json.tmp`, written and synced before
+  a directory-relative rename publishes it; the output directory is then synced.
+  Failed publication removes the temporary file, preserving the primary error.
+  Final cleanup failure is reflected in its error/status. A failure writing this
+  file returns exit 1 and never prints `passed:`. After a run append fails, no
+  further terminals or end marker are written; a missing end marker means incomplete.
+
+Checked `libc::uname` supplies sysname, release, version and machine, without
+reading `/proc` or `/etc` for identity. Nodename is omitted. Uname failure is an
+explicit lifecycle error before output or scratch creation.
+
+A native reference must have zero phase exits, positive `Files=` and `Tests=`
+counts and a terminal `Result: PASS` prove summary. All later runs in that cell
+must match both counts exactly. FAIL with exit 0, NOTESTS, bailout, missing or
+malformed summaries, unequal counts, nonzero exits (including signals represented
+as 128+n), timeout and interruption refuse a pass. Unknown skipped-test counts
+remain null. `test_inventory` is recorded, not graded; comparison uses the native
+reference. The stub prints `Files=1, Tests=10` for both `test` and `prove` commands.
+
+Execution stops on the first unsuccessful entry and writes exactly one blocked
+terminal for each remaining entry. Batch status precedence is `interrupted`,
+`error`, `failed`, then `passed`. An interrupt at an entry gives that entry an
+`interrupted` terminal and blocks later entries with reason `interrupted`.
+An interrupt observed after completed terminals, including a failure break, keeps
+the outcome-derived status and failure reason, and records `interrupt_observed:true`.
+
+Exit **0** requires every scheduled run to pass; stub batches also exit 0 but
+remain fixtures. Exit **1** covers failed/blocked, interrupted/incomplete and
+operational/reporting failures. Exit **2** retains invalid arguments, manifest,
+pins and selection refusals. There is no exit 130. Stderr distinguishes:
+
+```text
+sandbox bench: passed: N runs graded; batch complete; stub fixture, not publishable
+sandbox bench: failed: batch complete with F failed and B blocked runs; see runs.jsonl
+sandbox bench: interrupted: batch incomplete; N runs not executed
+sandbox bench: interrupted: batch incomplete; lifecycle error: <error>
+```
+
+The interrupted count includes every entry without a passed/failed/error terminal,
+including the entry whose interrupt arm fired. Status and interrupt observation are
+frozen once for the end marker and stderr, including lifecycle errors.
+A late interrupt on a completed batch appends `; interrupt observed after completion`.
+Records make no throughput or verified-performance claim. `sandbox bench summarize`
+is not yet available.
+
+### Runtime kind
+
+Execution requires explicit `--runtime-kind docker|stub`; classification is not
+inferred from `--runtime PATH` and is not a manifest field. `podman` is parsed but
+refused as **not yet qualified** before runtime canonicalisation, load checks,
+artifact opening, inspect, uname or any creation. FUSE and unrunnable selections
+retain refusal precedence. `docker` identifies real execution; `stub` records
+`fixture:true`, `publishable:false` in batch/run records, and appends
+`; stub fixture, not publishable` to successful completion. Docker records use
+`fixture:false`, `publishable:true`; that label alone establishes no qualification.
+All automated CLI integration uses the stub; it never invokes real Docker/Podman.
+
+The flag is unnecessary for validate-only and dry-run. We choose Clap's
+`requires = "out"` for this execution flag: explicitly supplying it with either
+mode is refused, just as explicitly supplying `--runtime` is refused.
 
 Scheduling is capped at **100000 total entries**, with exit **2** through
 `selection:` before allocating the full entry list or starting execution. A cell
@@ -234,4 +313,5 @@ This interrupt arm cleans up exactly once before writing the row, with
 `cleanup_error` null on success or containing the cleanup failure.
 An interrupt before runtime spawn records a phase error with empty `stdout_log`
 and `stderr_log` strings and creates no phase logs. Kill/rm cleanup still runs.
-These outcomes keep the existing ungraded exit **1** presentation.
+These outcomes exit **1** with the distinct `interrupted:` presentation and
+`batch-end.json` status `interrupted`, including when lifecycle cleanup also fails.

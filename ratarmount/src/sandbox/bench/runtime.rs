@@ -141,7 +141,7 @@ impl Effects for Local<'_> {
         Ok(())
     }
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub(super) struct Phase {
     phase: String,
     pub exit_code: Option<i32>,
@@ -150,8 +150,19 @@ pub(super) struct Phase {
     stderr_log: String,
     stdout: Option<String>,
     stderr: Option<String>,
+    elapsed_ms: Option<u64>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    argv: Vec<String>,
+    environment: std::collections::BTreeMap<String, String>,
 }
 impl Phase {
+    pub(super) fn stdout(&self) -> Option<&str> {
+        self.stdout.as_deref()
+    }
+    pub(super) fn phase(&self) -> &str {
+        &self.phase
+    }
     pub fn success(&self) -> bool {
         self.exit_code == Some(0) && self.error.is_none()
     }
@@ -190,6 +201,20 @@ impl<'a, E: Effects> Runtime<'a, E> {
                 stderr_log: String::new(),
                 stdout: None,
                 stderr: None,
+                elapsed_ms: Some(0),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                argv: args.to_vec(),
+                environment: args
+                    .get(1..)
+                    .unwrap_or_default()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .take_while(|w| w[0] == "-e")
+                    .filter_map(|w| w[1].split_once('='))
+                    .map(|(k, v)| (k.into(), v.into()))
+                    .collect(),
             });
         }
         self.serial += 1;
@@ -205,6 +230,20 @@ impl<'a, E: Effects> Runtime<'a, E> {
             stderr_log,
             stdout: None,
             stderr: None,
+            elapsed_ms: Some(0),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            argv: args.to_vec(),
+            environment: args
+                .get(1..)
+                .unwrap_or_default()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .take_while(|w| w[0] == "-e")
+                .filter_map(|w| w[1].split_once('='))
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
         };
         let mut child = self.effects.spawn(args, stdout, stderr)?;
         let started = self.effects.now();
@@ -233,15 +272,14 @@ impl<'a, E: Effects> Runtime<'a, E> {
         if result.exit_code.is_none() {
             self.pending.push(child);
         } else {
-            result.stdout = Some(
-                String::from_utf8_lossy(&owned::open_run_log(self.logs, &result.stdout_log)?)
-                    .into_owned(),
-            );
-            result.stderr = Some(
-                String::from_utf8_lossy(&owned::open_run_log(self.logs, &result.stderr_log)?)
-                    .into_owned(),
-            );
+            let (stdout, truncated) = owned::open_run_log(self.logs, &result.stdout_log)?;
+            result.stdout = Some(String::from_utf8_lossy(&stdout).into_owned());
+            result.stdout_truncated = truncated;
+            let (stderr, truncated) = owned::open_run_log(self.logs, &result.stderr_log)?;
+            result.stderr = Some(String::from_utf8_lossy(&stderr).into_owned());
+            result.stderr_truncated = truncated;
         }
+        result.elapsed_ms = Some(self.effects.now().saturating_sub(started).as_millis() as u64);
         Ok(result)
     }
     fn control(&mut self, verb: &str) -> io::Result<()> {
@@ -383,6 +421,7 @@ mod tests {
         fail_stop: bool,
         hang: bool,
         events: Vec<String>,
+        log_lengths: (usize, usize),
     }
     impl Effects for Fake {
         type Client = String;
@@ -396,7 +435,10 @@ mod tests {
             self.interrupt && self.time >= Duration::from_secs(1)
         }
         fn spawn(&mut self, args: &[String], stdout: File, stderr: File) -> io::Result<String> {
-            drop((stdout, stderr));
+            use std::io::Write;
+            for (mut file, len) in [(stdout, self.log_lengths.0), (stderr, self.log_lengths.1)] {
+                file.write_all(&vec![b'x'; len])?;
+            }
             self.events.push(args[0].clone());
             Ok(args[0].clone())
         }
@@ -421,6 +463,25 @@ mod tests {
         let logs = owned::open_directory(dir.path()).unwrap();
         let mut runtime = Runtime::new(fake, &logs, "unit".into());
         run(&mut runtime);
+    }
+    // Regression: the runtime dropped D6 truncation flags when serializing phase records.
+    #[test]
+    fn regression_bench_phase_log_truncation_flags() {
+        for lengths in [(70 * 1024, 10), (10, 70 * 1024), (10, 10)] {
+            exercise(
+                Fake {
+                    log_lengths: lengths,
+                    ..Fake::default()
+                },
+                |r| {
+                    let phase = r.invoke("run", &["run".into()], 1, true).unwrap();
+                    let row = serde_json::to_value(&phase).unwrap();
+                    assert_eq!(row["stdout_truncated"], lengths.0 > 64 * 1024);
+                    assert_eq!(row["stderr_truncated"], lengths.1 > 64 * 1024);
+                    assert_eq!(phase.stdout().unwrap().len(), lengths.0.min(64 * 1024));
+                },
+            );
+        }
     }
     // Regression: phase failures lost their exit code or hid the timeout upper bound (N6).
     #[test]
@@ -515,13 +576,9 @@ mod tests {
                 ..Fake::default()
             },
             |r| {
-                assert_eq!(
-                    r.invoke("run", &["run".into()], 1, true)
-                        .unwrap()
-                        .error
-                        .as_deref(),
-                    Some("timeout")
-                );
+                let phase = r.invoke("run", &["run".into()], 1, true).unwrap();
+                assert_eq!(phase.error.as_deref(), Some("timeout"));
+                assert_eq!(phase.elapsed_ms, Some(1000));
                 r.stop().unwrap();
                 assert_eq!(
                     r.effects.events,

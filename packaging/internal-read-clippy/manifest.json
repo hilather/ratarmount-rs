@@ -9386,7 +9386,7 @@
         "disposition": "output-owner",
         "id": "IR-GAP0-B4A1-M05",
         "item": "ratarmount::sandbox::bench::io::create_output",
-        "reason": "Create exclusive owned logs and ungraded status/control outputs relative to the private output root; move log descriptors into child stdio."
+        "reason": "Create exclusive owned logs and benchmark record and control outputs relative to the private output root; move log descriptors into child stdio."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -9396,7 +9396,7 @@
         "cli-no-default",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4A1-M05\",\"item\":\"ratarmount::sandbox::bench::io::create_output\",\"disposition\":\"output-owner\",\"category\":\"benchmark-output\",\"reason\":\"Create exclusive owned logs and ungraded status/control outputs relative to the private output root; move log descriptors into child stdio.\",\"creation\":{\"policy\":\"exclusive-file-relative\",\"basis\":\"O_EXCL and O_NOFOLLOW prevent replacement; initial mode 0600, never widened.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4A1-M05\",\"item\":\"ratarmount::sandbox::bench::io::create_output\",\"disposition\":\"output-owner\",\"category\":\"benchmark-output\",\"reason\":\"Create exclusive owned logs and benchmark record and control outputs relative to the private output root; move log descriptors into child stdio.\",\"creation\":{\"policy\":\"exclusive-file-relative\",\"basis\":\"O_EXCL and O_NOFOLLOW prevent replacement; initial mode 0600, never widened.\"}}",
       "resolved": "rustix::fs::at::openat",
       "rule_reason": "inventory-op:rustix::openat"
     },
@@ -9526,7 +9526,7 @@
         "disposition": "out-of-family",
         "id": "IR-GAP0-B4A1-M07",
         "item": "ratarmount::sandbox::bench::io::open_run_log",
-        "reason": "Read at most 64 KiB of a completed owned regular runtime log through its private root, without following symlinks or cloning the child stdio descriptor."
+        "reason": "Read at most the final 64 KiB of a completed owned regular runtime log through its private root, without following symlinks or cloning the child stdio descriptor."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -9536,7 +9536,7 @@
         "cli-no-default",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4A1-M07\",\"item\":\"ratarmount::sandbox::bench::io::open_run_log\",\"disposition\":\"out-of-family\",\"category\":\"benchmark-completed-log\",\"reason\":\"Read at most 64 KiB of a completed owned regular runtime log through its private root, without following symlinks or cloning the child stdio descriptor.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Read-only completed owned log; no creation or truncation.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4A1-M07\",\"item\":\"ratarmount::sandbox::bench::io::open_run_log\",\"disposition\":\"out-of-family\",\"category\":\"benchmark-completed-log\",\"reason\":\"Read at most the final 64 KiB of a completed owned regular runtime log through its private root, without following symlinks or cloning the child stdio descriptor.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Read-only completed owned log; no creation or truncation.\"}}",
       "resolved": "rustix::fs::at::openat",
       "rule_reason": "inventory-op:rustix::openat"
     },
