@@ -361,6 +361,7 @@ enum HashBackend {
     Zip,
     SevenZip,
     Libarchive,
+    Unverifiable,
 }
 
 // EOF is a format miss only beyond the probed stream's metadata length.
@@ -473,7 +474,12 @@ pub(crate) fn fill_content_hashes_report(
         Some("ZipMountSource") => HashBackend::Zip,
         Some("SevenZipMountSource") => HashBackend::SevenZip,
         Some("LibarchiveMountSource") => HashBackend::Libarchive,
-        Some(_) => HashBackend::Offsets,
+        Some(
+            "SQLiteIndexedTar" | "ARMountSource" | "CpioMountSource" | "WARCMountSource"
+            | "ISO9660MountSource",
+        ) => HashBackend::Offsets,
+        // ASAR shares xattr slots; tensors also index generated inline content.
+        Some(_) => HashBackend::Unverifiable,
         None => classify(&mut *stream, &head[..n], &fill.rows[0])?,
     };
     let mut zip_windows = HashMap::new();
@@ -522,7 +528,10 @@ pub(crate) fn fill_content_hashes_report(
             u64::try_from(row.offset).ok()
         };
         if row.unverifiable
-            || matches!(backend, HashBackend::SevenZip | HashBackend::Libarchive)
+            || matches!(
+                backend,
+                HashBackend::SevenZip | HashBackend::Libarchive | HashBackend::Unverifiable
+            )
             || offset.is_none()
         {
             fill.report.unverifiable += 1;
@@ -1020,13 +1029,27 @@ mod tests {
                 idx.get_xattr(0, "user.hash.sha256").unwrap().unwrap(),
                 b"deadbeef"
             );
-            if sparse || zip {
+            if sparse || zip || backend == Some("SomeUnknownMountSource") {
                 assert_eq!(report.unverifiable, 1);
                 assert!(idx.get_xattr(0, "user.hash.crc32").unwrap().is_none());
             } else {
                 assert_hash(&idx, 0, "crc32", if tar { &data } else { &bytes });
             }
         }
+    }
+
+    /// Regression: CAB offsets must not hash archive headers as member content.
+    #[test]
+    fn regression_303_unlisted_backend_is_unverifiable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("A.cab");
+        std::fs::write(&path, [9; 40]).unwrap();
+        let idx = make_index(None, &[(0, 0, 20)], Some("CABMountSource"));
+        let (report, result) = report_fill(&idx, &path);
+        result.unwrap();
+        assert_eq!(report.unverifiable, 1);
+        assert_eq!(report.filled, 0);
+        assert!(idx.list_xattr_keys(0).unwrap().is_empty());
     }
 
     /// Regression: physical TAR size zero must not discard effective PAX size 700.
@@ -1180,7 +1203,7 @@ mod tests {
             (0o040755, None, 0),
             (0o120777, None, 0),
         ] {
-            let idx = make_index(None, &[(0, 0, 20), (0, 20, size)], Some("ASARMountSource"));
+            let idx = make_index(None, &[(0, 0, 20), (0, 20, size)], Some("SQLiteIndexedTar"));
             idx.with_conn(|c| {
                 c.execute(
                     "UPDATE files SET mode=?1, isgenerated=?2 WHERE name='m1'",
