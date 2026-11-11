@@ -310,9 +310,18 @@ fn prepare_fill(index: &SqliteIndex, algorithms: &[String]) -> Result<FillState>
     let rows = index.regular_file_payloads()?;
     // Retain the established candidate query (including nested/PAX rows). Load
     // sparse flags and existing keys before any detection or decoder acquisition.
-    let (sparse, existing) = index.with_conn(|conn| {
+    let (sparse, shared, existing) = index.with_conn(|conn| {
         let mut stmt = conn.prepare("SELECT offsetheader FROM files WHERE issparse")?;
         let sparse = stmt
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<std::result::Result<HashSet<_>, _>>()?;
+        // Every row owns its xattr slot, even empty/generated/non-regular rows
+        // excluded from the payload candidates.
+        let mut stmt = conn.prepare(
+            "SELECT offsetheader FROM files WHERE offsetheader IS NOT NULL
+             GROUP BY offsetheader HAVING COUNT(*) > 1",
+        )?;
+        let shared = stmt
             .query_map([], |r| r.get::<_, i64>(0))?
             .collect::<std::result::Result<HashSet<_>, _>>()?;
         let mut stmt =
@@ -320,12 +329,8 @@ fn prepare_fill(index: &SqliteIndex, algorithms: &[String]) -> Result<FillState>
         let existing = stmt
             .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
             .collect::<std::result::Result<HashSet<_>, _>>()?;
-        Ok((sparse, existing))
+        Ok((sparse, shared, existing))
     })?;
-    let mut slots = HashMap::new();
-    for (oh, _, _) in &rows {
-        *slots.entry(*oh).or_insert(0usize) += 1;
-    }
     for (i, (oh, offset, size)) in rows.into_iter().enumerate() {
         let missing: Vec<_> = algos
             .iter()
@@ -340,7 +345,7 @@ fn prepare_fill(index: &SqliteIndex, algorithms: &[String]) -> Result<FillState>
             offset,
             size,
             algos: missing,
-            unverifiable: sparse.contains(&oh) || slots[&oh] > 1,
+            unverifiable: sparse.contains(&oh) || shared.contains(&oh),
         });
     }
     fill.report.kept_existing = fill.kept.len();
@@ -353,6 +358,19 @@ enum HashBackend {
     Zip,
     SevenZip,
     Libarchive,
+}
+
+fn read_probe<R: Read + ?Sized>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut count = 0;
+    while count < buf.len() {
+        match reader.read(&mut buf[count..]) {
+            Ok(0) => break,
+            Ok(n) => count += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(count)
 }
 
 fn classify(
@@ -377,7 +395,7 @@ fn classify(
         head.len()
     } else if first.oh >= 0 {
         stream.seek(SeekFrom::Start(first.oh as u64))?;
-        stream.read(&mut local)?
+        read_probe(stream, &mut local)?
     } else {
         0
     };
@@ -408,7 +426,7 @@ pub(crate) fn fill_content_hashes_report(
         detect_compression_head, open_decompressed_reader, CompressionFormat,
     };
     let mut head = [0; 16];
-    let n = archive.read(&mut head)?;
+    let n = read_probe(&mut archive, &mut head)?;
     let setup = (|| {
         let format = detect_compression_head(&head[..n], &mut archive, path)?;
         let mut stream: Box<dyn ratarmount_compress::SeekRead> =
@@ -422,7 +440,7 @@ pub(crate) fn fill_content_hashes_report(
             n
         } else {
             stream.seek(SeekFrom::Start(0))?;
-            stream.read(&mut decoded_head)?
+            read_probe(&mut *stream, &mut decoded_head)?
         };
         Ok::<_, ratarmount_compress::CompressError>((stream, decoded_head, count))
     })();
@@ -532,7 +550,8 @@ fn insert_missing_batch(
     pending: &[PendingHash],
     fill: &mut FillState,
 ) -> Result<()> {
-    let (filled, kept) = index.with_conn(|conn| {
+    let mut kept = HashSet::new();
+    let result = index.with_conn(|conn| {
         conn.execute_batch("SAVEPOINT fill_hashes")?;
         let result = (|| {
             let mut stmt = conn.prepare_cached(
@@ -541,7 +560,6 @@ fn insert_missing_batch(
                 (SELECT 1 FROM "xattrs" WHERE offsetheader = ?1 AND key = ?2)"#,
             )?;
             let mut filled = HashSet::new();
-            let mut kept = HashSet::new();
             for (i, oh, key, value) in pending {
                 // sqlite3_changes excludes INSTEAD OF trigger writes; total_changes
                 // includes them and also works for legacy plain xattrs tables.
@@ -554,7 +572,7 @@ fn insert_missing_batch(
                 }
             }
             conn.execute_batch("RELEASE fill_hashes")?;
-            Ok((filled, kept))
+            Ok(filled)
         })();
         if result.is_err() {
             let rollback = conn.execute_batch("ROLLBACK TO fill_hashes");
@@ -563,11 +581,12 @@ fn insert_missing_batch(
             release?;
         }
         result
-    })?;
-    fill.filled.extend(filled);
+    });
+    // Rollback preserves keys that already existed before this batch.
     fill.kept.extend(kept);
-    fill.report.filled = fill.filled.len();
     fill.report.kept_existing = fill.kept.len();
+    fill.filled.extend(result?);
+    fill.report.filled = fill.filled.len();
     Ok(())
 }
 
@@ -1064,6 +1083,41 @@ mod tests {
         }
     }
 
+    /// Regression: an empty or otherwise ineligible sibling still shares its slot.
+    #[test]
+    fn regression_303_shared_slot_with_empty_sibling_unverifiable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("A.asar");
+        std::fs::write(&path, [9; 40]).unwrap();
+        for (mode, generated, size) in [
+            (0o100644, false, 0),
+            (0o040755, false, 0),
+            (0o120777, false, 0),
+            (0o100644, true, 20),
+        ] {
+            let idx = make_index(None, &[(0, 0, 20), (0, 20, size)], Some("ASARMountSource"));
+            idx.with_conn(|c| {
+                c.execute(
+                    "UPDATE files SET mode=?1, isgenerated=?2 WHERE name='m1'",
+                    rusqlite::params![mode, generated],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(idx.regular_file_payloads().unwrap().len(), 1);
+            let (report, result) = report_fill(&idx, &path);
+            result.unwrap();
+            assert_eq!(
+                report,
+                FillReport {
+                    unverifiable: 1,
+                    ..FillReport::default()
+                }
+            );
+            assert!(idx.list_xattr_keys(0).unwrap().is_empty());
+        }
+    }
+
     /// Regression: decoder failures report kept hashes before returning the error.
     #[test]
     fn regression_303_decode_failure_stores_nothing() {
@@ -1271,6 +1325,61 @@ mod tests {
         check_zip(&bytes, &rows, &parts, None, true, false, true);
     }
 
+    /// Regression: short/Interrupted probe reads accumulate through EOF.
+    #[test]
+    fn regression_303_probe_short_reads_and_interruptions() {
+        struct Probe(bool, Cursor<&'static [u8]>);
+        impl Read for Probe {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.0 {
+                    self.0 = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.1.read(&mut buf[..1])
+            }
+        }
+        let mut reader = Probe(false, Cursor::new(b"abc"));
+        let mut buf = [0; 4];
+        assert_eq!(read_probe(&mut reader, &mut buf).unwrap(), 3);
+        assert_eq!(&buf[..3], b"abc");
+    }
+
+    /// Regression: ZIP prefix/local-header signatures may cross zstd frames.
+    #[test]
+    fn regression_303_short_decoded_probes_verify_legacy_zip() {
+        let (mut bytes, rows, parts) = zip_bytes(false, false);
+        // A raw-offset fallback must have enough bytes to produce a wrong digest.
+        bytes.extend([0; 700]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("A.zip.zst");
+        for nonzero_header in [false, true] {
+            let split = if nonzero_header {
+                rows[1].0 as usize + 1
+            } else {
+                1
+            };
+            let mut compressed = encoded(&bytes[..split], "zst");
+            compressed.extend(encoded(&bytes[split..], "zst"));
+            std::fs::write(&path, compressed).unwrap();
+            let candidates = if nonzero_header {
+                vec![rows[1]]
+            } else {
+                rows.iter().map(|&(oh, _, size)| (oh, 0, size)).collect()
+            };
+            let idx = make_index(None, &candidates, None);
+            let (report, result) = report_fill(&idx, &path);
+            result.unwrap();
+            assert_eq!(report.filled, usize::from(!nonzero_header));
+            assert_eq!(report.unverifiable, 1);
+            assert!(idx.list_xattr_keys(rows[1].0).unwrap().is_empty());
+            if !nonzero_header {
+                for algo in algorithms() {
+                    assert_hash(&idx, rows[0].0, &algo, &parts[0]);
+                }
+            }
+        }
+    }
+
     /// Regression: a TAR with ZIP-shaped prefix fails closed without an EOCD.
     #[test]
     fn regression_303_legacy_tar_named_like_zip_header() {
@@ -1353,33 +1462,60 @@ mod tests {
         assert!(idx.get_xattr(32, "user.hash.crc32").unwrap().is_none());
     }
 
+    fn copy_7z_bytes(payload: &[u8]) -> Vec<u8> {
+        // Real one-folder Copy stream + one UTF-16 filename, no timestamps.
+        // 7z's variable uint encoding uses two bytes for these small fixtures.
+        let n = payload.len() as u16;
+        let size = [0x80 | (n >> 8) as u8, n as u8];
+        let mut next = vec![1, 4, 6, 0, 1, 9];
+        next.extend(size);
+        next.extend([0, 7, 11, 1, 0, 1, 1, 0, 12]);
+        next.extend(size);
+        next.extend([0, 8, 10, 1]);
+        next.extend(crc32fast::hash(payload).to_le_bytes());
+        next.extend([0, 0, 5, 1, 17, 5, 0, b'a', 0, 0, 0, 0, 0]);
+        let mut envelope = vec![0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c, 0, 4, 0, 0, 0, 0];
+        envelope.extend((payload.len() as u64).to_le_bytes());
+        envelope.extend((next.len() as u64).to_le_bytes());
+        envelope.extend(crc32fast::hash(&next).to_le_bytes());
+        let crc = crc32fast::hash(&envelope[12..32]);
+        envelope[8..12].copy_from_slice(&crc.to_le_bytes());
+        envelope.extend(payload);
+        envelope.extend(next);
+        envelope
+    }
+
+    /// Regression: a split decoded 7z signature must never enable raw-offset fills.
+    #[test]
+    fn regression_303_short_decoded_probe_preserves_legacy_7z() {
+        let payload = vec![7; 700];
+        let bytes = copy_7z_bytes(&payload);
+        let mut compressed = encoded(&bytes[..1], "zst");
+        compressed.extend(encoded(&bytes[1..], "zst"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("A.7z.zst");
+        std::fs::write(&path, compressed).unwrap();
+        let idx = make_index(None, &[(32, 0, payload.len() as u64)], None);
+        let (report, result) = report_fill(&idx, &path);
+        result.unwrap();
+        assert_eq!(
+            report,
+            FillReport {
+                unverifiable: 1,
+                ..FillReport::default()
+            }
+        );
+        assert!(idx.list_xattr_keys(32).unwrap().is_empty());
+    }
+
     /// Regression: a Copy 7z containing TAR cannot fill a second absent algorithm.
     #[test]
     fn regression_303_legacy_copy_7z_with_tar_member() {
         let (tar, _) = tar_bytes(&[vec![42; 700]]);
         for payload in [tar.clone(), vec![7; 700]] {
-            // Real one-folder Copy stream + one UTF-16 filename, no timestamps.
-            // 7z's variable uint encoding uses two bytes for these small fixtures.
-            let n = payload.len() as u16;
-            let size = [0x80 | (n >> 8) as u8, n as u8];
-            let mut next = vec![1, 4, 6, 0, 1, 9];
-            next.extend(size);
-            next.extend([0, 7, 11, 1, 0, 1, 1, 0, 12]);
-            next.extend(size);
-            next.extend([0, 8, 10, 1]);
-            next.extend(crc32fast::hash(&payload).to_le_bytes());
-            next.extend([0, 0, 5, 1, 17, 5, 0, b'a', 0, 0, 0, 0, 0]);
-            let mut envelope = vec![0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c, 0, 4, 0, 0, 0, 0];
-            envelope.extend((payload.len() as u64).to_le_bytes());
-            envelope.extend((next.len() as u64).to_le_bytes());
-            envelope.extend(crc32fast::hash(&next).to_le_bytes());
-            let crc = crc32fast::hash(&envelope[12..32]);
-            envelope[8..12].copy_from_slice(&crc.to_le_bytes());
-            envelope.extend(&payload);
-            envelope.extend(next);
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("A.7z");
-            std::fs::write(&path, envelope).unwrap();
+            std::fs::write(&path, copy_7z_bytes(&payload)).unwrap();
             let idx = make_index(None, &[(32, 0, payload.len() as u64)], None);
             idx.insert_xattr(32, "user.hash.sha256", sha256_hex(&payload).as_bytes())
                 .unwrap();
@@ -1494,6 +1630,62 @@ mod tests {
         drop(idx);
         let idx = SqliteIndex::open_writable(&db).unwrap();
         assert!(idx.list_xattr_keys(0).unwrap().is_empty());
+        assert_eq!(
+            idx.get_xattr(999, "user.caller").unwrap().unwrap(),
+            b"earlier"
+        );
+    }
+
+    /// Regression: batch rollback preserves late-kept accounting and its warning.
+    #[test]
+    fn regression_303_failed_batch_reports_late_kept_hash() {
+        capture_logs();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("A.bin");
+        let db = dir.path().join("index.sqlite");
+        std::fs::write(&path, [9; 100]).unwrap();
+        let idx = published_index(&db, &[(0, 0, 20), (32, 20, 20)]);
+        idx.with_conn(|c| { c.execute_batch("CREATE TRIGGER fail_hash BEFORE INSERT ON xattrsdata WHEN NEW.offsetheader=32 BEGIN SELECT RAISE(ABORT, 'injected hash failure'); END;")?; Ok(()) }).unwrap();
+        idx.begin_write().unwrap();
+        idx.insert_xattr(999, "user.caller", b"earlier").unwrap();
+        let mut fill = prepare_fill(&idx, &algorithms()).unwrap();
+        assert_eq!(fill.report.kept_existing, 0);
+        idx.insert_xattr(0, "user.hash.sha256", b"late value")
+            .unwrap();
+        let cursor = crate::managed_read::ManagedReadCursor::open(&path).unwrap();
+        let err = fill_content_hashes_report(&idx, &path, cursor, &mut fill).unwrap_err();
+        assert!(err.to_string().contains("injected hash failure"));
+        assert_eq!(
+            fill.report,
+            FillReport {
+                kept_existing: 1,
+                ..FillReport::default()
+            }
+        );
+        assert!(!idx.with_conn(|c| Ok(c.is_autocommit())).unwrap());
+        assert_eq!(
+            idx.get_xattr(0, "user.hash.sha256").unwrap().unwrap(),
+            b"late value"
+        );
+        assert!(idx.get_xattr(0, "user.hash.crc32").unwrap().is_none());
+        assert!(idx.list_xattr_keys(32).unwrap().is_empty());
+        drop(fill);
+        assert_remedy();
+        MESSAGES.with(|m| {
+            assert!(m
+                .borrow()
+                .iter()
+                .any(|s| s.contains("filled=0, kept_existing=1")))
+        });
+        idx.commit_write().unwrap();
+        drop(idx);
+        let idx = SqliteIndex::open_writable(&db).unwrap();
+        assert_eq!(
+            idx.get_xattr(0, "user.hash.sha256").unwrap().unwrap(),
+            b"late value"
+        );
+        assert!(idx.get_xattr(0, "user.hash.crc32").unwrap().is_none());
+        assert!(idx.list_xattr_keys(32).unwrap().is_empty());
         assert_eq!(
             idx.get_xattr(999, "user.caller").unwrap().unwrap(),
             b"earlier"
