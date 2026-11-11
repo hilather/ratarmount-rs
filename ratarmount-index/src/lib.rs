@@ -18,6 +18,8 @@ pub mod checked_open;
 mod digest_cache;
 mod dirent_order;
 mod hashing;
+#[doc(hidden)]
+pub mod http_client;
 #[cfg(all(test, unix))]
 mod internal_reads_tests;
 mod local_cache;

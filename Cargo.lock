@@ -5513,6 +5513,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "ureq",
+ "url",
  "xz2",
  "zip",
  "zstd",
