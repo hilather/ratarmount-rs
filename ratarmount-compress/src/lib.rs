@@ -184,12 +184,85 @@ pub fn detect_compression(path: &Path) -> Result<CompressionFormat> {
     let mut f = File::open(path)?;
     let mut magic = [0u8; 16];
     let n = f.read(&mut magic)?;
-    let by_magic = detect_compression_magic(&magic[..n])?;
-    let by_magic = refine_skippable_format(&mut f, by_magic, &magic[..n])?;
+    detect_compression_head(&magic[..n], &mut f, path)
+}
+
+/// Detect compression using an already-read head, refining skippable frames.
+pub fn detect_compression_head<R: Read + Seek>(
+    head: &[u8],
+    reader: &mut R,
+    path: &Path,
+) -> Result<CompressionFormat> {
+    let by_magic = detect_compression_magic(head)?;
+    let by_magic = refine_skippable_format(reader, by_magic, head)?;
     if by_magic != CompressionFormat::None {
         return Ok(by_magic);
     }
     Ok(detect_compression_extension(path).unwrap_or(CompressionFormat::None))
+}
+
+/// Open decoded content from an admitted reader, never opening `label`.
+///
+/// Decodes from byte 0 regardless of the reader's current position. Path-only
+/// codecs reopen only a private spool, retained until the returned reader drops.
+pub fn open_decompressed_reader<R>(
+    mut reader: R,
+    label: &Path,
+    format: CompressionFormat,
+) -> Result<Box<dyn SeekRead>>
+where
+    R: Read + Seek + Send + 'static,
+{
+    reader.seek(SeekFrom::Start(0))?;
+    use CompressionFormat::*;
+    match format {
+        None => Err(CompressError::Unsupported("uncompressed reader")),
+        Gzip => Ok(Box::new(open_seekable_gzip_from_reader(
+            reader,
+            DEFAULT_GZIP_SEEK_SPACING,
+            label,
+        )?)),
+        Bzip2 => Ok(open_seekable_bzip2_from_reader(reader, label)?.open_reader()?),
+        Xz => Ok(open_seekable_xz_from_reader(reader, label)?.open_reader()?),
+        Zstd => Ok(open_seekable_zstd_from_reader(reader, label)?.open_reader()?),
+        _ => {
+            let spool = DecodedBody::from_decoder(label, "spool", reader, 0)?;
+            let path = spool.temp_path().ok_or_else(|| {
+                CompressError::Msg(format!("empty or non-file spool for {format:?}"))
+            })?;
+            let inner = match format {
+                Lz4 => open_seekable_lz4(path)?.open_reader()?,
+                Lzip => open_seekable_lzip(path)?.open_reader()?,
+                Lzo => open_seekable_lzo(path)?.open_reader()?,
+                CompressZ => open_seekable_compress_z(path)?.open_reader()?,
+                Lzma => open_seekable_lzma(path)?.open_reader()?,
+                Zlib => open_seekable_zlib(path)?.open_reader()?,
+                Lrzip => Box::new(materialize_lrzip(path)?.0) as Box<dyn SeekRead>,
+                _ => unreachable!(),
+            };
+            Ok(Box::new(SpooledReader {
+                inner,
+                _spool: spool,
+            }))
+        }
+    }
+}
+
+struct SpooledReader {
+    inner: Box<dyn SeekRead>,
+    _spool: Arc<DecodedBody>,
+}
+
+impl Read for SpooledReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for SpooledReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
 }
 
 /// Zstd and LZ4 share skippable-frame magic; inspect the first data frame.
@@ -791,6 +864,75 @@ pub fn path_buf(tmp: &NamedTempFile) -> PathBuf {
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
+
+    /// Regression: detection/refinement must not leave decoder input advanced.
+    #[test]
+    fn regression_303_decoder_rewinds_advanced_cursor() {
+        use std::io::Cursor;
+        let mut tar = vec![0u8; 10_240];
+        tar[257..263].copy_from_slice(b"ustar\0");
+        tar[512..1212].fill(b'r');
+        for format in [
+            CompressionFormat::Gzip,
+            CompressionFormat::Zstd,
+            CompressionFormat::Lzma,
+            CompressionFormat::Zlib,
+        ] {
+            let bytes = match format {
+                CompressionFormat::Gzip => {
+                    let mut e =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                    e.write_all(&tar).unwrap();
+                    e.finish().unwrap()
+                }
+                CompressionFormat::Zstd => {
+                    let mut b = vec![0x50, 0x2a, 0x4d, 0x18, 80, 0, 0, 0];
+                    b.resize(88, 0);
+                    b.extend(zstd::encode_all(&tar[..], 1).unwrap());
+                    b
+                }
+                CompressionFormat::Lzma => {
+                    let stream = xz2::stream::Stream::new_lzma_encoder(
+                        &xz2::stream::LzmaOptions::new_preset(1).unwrap(),
+                    )
+                    .unwrap();
+                    let mut e = xz2::write::XzEncoder::new_stream(Vec::new(), stream);
+                    e.write_all(&tar).unwrap();
+                    e.finish().unwrap()
+                }
+                CompressionFormat::Zlib => {
+                    let mut e =
+                        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+                    e.write_all(&tar).unwrap();
+                    e.finish().unwrap()
+                }
+                _ => unreachable!(),
+            };
+            let mut cursor = Cursor::new(bytes);
+            let mut head = [0; 16];
+            cursor.read_exact(&mut head).unwrap();
+            let label = Path::new("never-open-this-archive.tar.lzma");
+            assert_eq!(
+                detect_compression_head(&head, &mut cursor, label).unwrap(),
+                format
+            );
+            if format == CompressionFormat::Zstd {
+                assert!(cursor.position() > 16);
+            }
+            let mut reader = open_decompressed_reader(cursor, label, format).unwrap();
+            let mut decoded = Vec::new();
+            reader.read_to_end(&mut decoded).unwrap();
+            assert_eq!(decoded, tar, "{format:?}");
+        }
+        let err = open_decompressed_reader(
+            Cursor::new(Vec::<u8>::new()),
+            Path::new("empty.lzma"),
+            CompressionFormat::Lzma,
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("empty or non-file spool"));
+    }
 
     #[test]
     fn stencil_concat() {
