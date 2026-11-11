@@ -942,15 +942,15 @@ mod native {
                 }
                 "ancestor" => {
                     work = "/".into();
-                    "ancestor containment"
+                    "work-root is an ancestor of the runtime executable"
                 }
                 "contains-source" => {
                     f.value["tasks"][0]["placement"]["source"] = json!("work/src");
-                    "ancestor containment"
+                    "work-root is an ancestor of placement.source"
                 }
                 "contains-output" => {
                     f.value["tasks"][0]["placement"]["output"] = json!("work/output");
-                    "ancestor containment"
+                    "work-root is an ancestor of placement.output"
                 }
                 "under-source" => {
                     f.value["tasks"][0]["placement"]["source"] = json!("work");
@@ -986,6 +986,113 @@ mod native {
             assert!(!f.calls().contains("run -d"));
         }
     }
+    // Regression: each protected-root ancestor refusal must identify its own isolated rule.
+    #[test]
+    fn regression_bench_work_root_ancestor_specific_reasons() {
+        use std::os::unix::fs::symlink;
+        for (case, reason) in [
+            ("contains-out", "work-root is an ancestor of --out"),
+            (
+                "contains-catalog",
+                "work-root is an ancestor of the catalog directory",
+            ),
+            (
+                "contains-artifact-parent",
+                "work-root is an ancestor of the artifact parent",
+            ),
+        ] {
+            let mut f = Fixture::new();
+            let work = f.dir.path().join(if case == "contains-out" {
+                "outputs"
+            } else {
+                "work"
+            });
+            let out = if case == "contains-out" {
+                std::fs::create_dir_all(work.join("run")).unwrap();
+                work.join("run/out")
+            } else {
+                f.dir.path().join("out")
+            };
+            if case == "contains-catalog" {
+                let catalog = work.join("catalog");
+                std::fs::create_dir(&catalog).unwrap();
+                f.path = catalog.join("tasks.json");
+            }
+            let artifact = if case == "contains-artifact-parent" {
+                let artifacts = work.join("artifacts");
+                std::fs::create_dir(&artifacts).unwrap();
+                let artifact = artifacts.join("source.tar.zst");
+                std::fs::rename(f.dir.path().join("source.tar.zst"), &artifact).unwrap();
+                artifact
+            } else {
+                f.dir.path().join("source.tar.zst")
+            };
+            f.value["tasks"][0]["artifact"]["path"] = json!(artifact);
+            let catalog = f.path.parent().unwrap();
+            // Existing outward targets are outside work and are not ancestors of work.
+            for field in ["source", "output"] {
+                let target = f.dir.path().join(format!("external-{field}"));
+                std::fs::create_dir(&target).unwrap();
+                let target = target.canonicalize().unwrap();
+                let work = work.canonicalize().unwrap();
+                assert!(!target.starts_with(&work) && !work.starts_with(&target));
+                let link = format!("placement-{field}");
+                let relative_target = if case == "contains-catalog" {
+                    PathBuf::from("../..").join(format!("external-{field}"))
+                } else {
+                    PathBuf::from(format!("external-{field}"))
+                };
+                symlink(relative_target, catalog.join(&link)).unwrap();
+                assert_eq!(catalog.join(&link).canonicalize().unwrap(), target);
+                f.value["tasks"][0]["placement"][field] = json!(link);
+            }
+            f.save();
+            let work = work.canonicalize().unwrap();
+            let artifact_parent = artifact.parent().unwrap().canonicalize().unwrap();
+            // Fresh --out has an existing parent; resolve ancestors before appending its leaf.
+            let resolved_out = out
+                .parent()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .join(out.file_name().unwrap());
+            // Exactly one of the six ancestor clauses applies, even before ordered dispatch.
+            assert_eq!(
+                [
+                    f.runtime.canonicalize().unwrap().starts_with(&work),
+                    resolved_out.starts_with(&work),
+                    catalog.canonicalize().unwrap().starts_with(&work),
+                    artifact_parent.starts_with(&work),
+                    catalog
+                        .join("placement-source")
+                        .canonicalize()
+                        .unwrap()
+                        .starts_with(&work),
+                    catalog
+                        .join("placement-output")
+                        .canonicalize()
+                        .unwrap()
+                        .starts_with(&work),
+                ]
+                .into_iter()
+                .filter(|matches| *matches)
+                .count(),
+                1
+            );
+            let result = f
+                .command_at(&out, Some(&work), "native", "warm")
+                .output()
+                .unwrap();
+            assert_eq!(result.status.code(), Some(2), "{case}: {}", stderr(&result));
+            assert!(
+                stderr(&result).contains(&format!("sandbox bench: selection: {reason}")),
+                "{case}: {}",
+                stderr(&result)
+            );
+            assert!(!out.exists());
+            assert!(f.calls().is_empty());
+        }
+    }
     fn runtime_ancestor_refused(case: &str) {
         use std::os::unix::fs::{symlink, PermissionsExt};
         let mut f = if case == "var-tmp" {
@@ -1016,7 +1123,8 @@ mod native {
         assert_eq!(result.status.code(), Some(2), "{case}: {}", stderr(&result));
         let error = stderr(&result);
         assert!(
-            error.contains("sandbox bench: selection:") && error.contains("ancestor containment"),
+            error.contains("sandbox bench: selection:")
+                && error.contains("work-root is an ancestor of the runtime executable"),
             "{case}: {error}"
         );
         assert!(!error.contains("bench native lifecycle:"));

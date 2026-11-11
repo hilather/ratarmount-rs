@@ -199,15 +199,26 @@ pub(super) fn execute(
             if work.starts_with(&source) {
                 return Err(invalid("work-root equals or is under placement.source"));
             }
-            if executable.starts_with(&work)
-                || (work != Path::new("/var/tmp")
-                    && [&out, parent, &artifact_dir, &source, &output]
-                        .iter()
-                        .any(|p| p.starts_with(&work)))
-            {
+            if executable.starts_with(&work) {
                 return Err(invalid(
-                    "work-root ancestor containment of protected root refused",
+                    "work-root is an ancestor of the runtime executable",
                 ));
+            }
+            if work != Path::new("/var/tmp") {
+                for (path, reason) in [
+                    (out.as_path(), "work-root is an ancestor of --out"),
+                    (parent, "work-root is an ancestor of the catalog directory"),
+                    (
+                        &artifact_dir,
+                        "work-root is an ancestor of the artifact parent",
+                    ),
+                    (&source, "work-root is an ancestor of placement.source"),
+                    (&output, "work-root is an ancestor of placement.output"),
+                ] {
+                    if path.starts_with(&work) {
+                        return Err(invalid(reason));
+                    }
+                }
             }
             let groups = [
                 vec![
@@ -293,6 +304,7 @@ struct Scratch<'a> {
 #[cfg(test)]
 thread_local! {
     static FAULTS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CLEANUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EXTRACTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
@@ -305,7 +317,10 @@ pub(super) fn inject(name: &str) -> io::Result<()> {
 }
 fn cleanup(parent: &rustix::fd::OwnedFd, name: &str) -> io::Result<()> {
     #[cfg(test)]
-    inject("cleanup-fail")?;
+    {
+        CLEANUPS.with(|count| count.set(count.get() + 1));
+        inject("cleanup-fail")?;
+    }
     owned::remove_tree(parent, name)
 }
 fn record(outcomes: &mut File, row: &serde_json::Value) -> io::Result<()> {
@@ -392,8 +407,14 @@ fn execute_owned(
         }
         if runtime::interrupted() {
             row["execution_error"] = "interrupted".into();
-            record(&mut outcomes, &row)?;
-            break;
+            row["stop_error"] = serde_json::Value::Null;
+            let cleanup = cleanup(work_parent, id);
+            row["cleanup_error"] =
+                serde_json::json!(cleanup.as_ref().err().map(ToString::to_string));
+            return match record(&mut outcomes, &row) {
+                Ok(()) => cleanup,
+                Err(error) => Err(owned::with_cleanup(error, cleanup)),
+            };
         }
         let prepared = (|| -> io::Result<()> {
             let file = files.get_mut(&task.id).unwrap();
@@ -534,6 +555,7 @@ fn execute_owned(
             break;
         }
     }
+    // Also runs after the phase-failure break; the interrupt arm cleans up and returns above.
     cleanup(work_parent, id)?;
     Ok(())
 }
@@ -561,6 +583,7 @@ mod tests {
         fn new(faults: &[&'static str]) -> Self {
             FAULTS.with(|f| *f.borrow_mut() = faults.to_vec());
             EXTRACTS.with(|count| count.set(0));
+            CLEANUPS.with(|count| count.set(0));
             Self
         }
     }
@@ -784,6 +807,62 @@ mod tests {
                     assert!(!f.dir.path().join("work/owned-test").exists());
                 }
                 owned::remove_tree(&parent, "owned-test").unwrap();
+            }
+        }
+    }
+    // Regression: interrupt-entry record failures leaked the leaf and cleanup failures were lost.
+    #[test]
+    fn regression_bench_interrupt_record_and_cleanup_outcomes() {
+        let _scope = runtime::InterruptScope::new();
+        for record_fails in [false, true] {
+            for cleanup_fails in [false, true] {
+                let signals = runtime::Signals::install().unwrap();
+                let mut f = Fixture::new();
+                let mut faults = vec!["interrupt-entry"];
+                if record_fails {
+                    faults.push("record-fail");
+                }
+                if cleanup_fails {
+                    faults.push("cleanup-fail");
+                }
+                let _fault = FaultScope::new(&faults);
+                let result = f.run();
+                CLEANUPS.with(|count| assert_eq!(count.get(), 1));
+                if record_fails {
+                    let error = result.unwrap_err();
+                    assert_eq!(
+                        owned::error_parts(&error),
+                        (
+                            "record-fail".into(),
+                            cleanup_fails.then(|| "cleanup-fail".into())
+                        )
+                    );
+                    assert!(f.rows().is_empty());
+                } else {
+                    if cleanup_fails {
+                        assert_eq!(
+                            owned::error_parts(&result.unwrap_err()),
+                            ("cleanup-fail".into(), None)
+                        );
+                    } else {
+                        result.unwrap();
+                    }
+                    let rows = f.rows();
+                    assert_eq!(rows.len(), 1);
+                    let row = &rows[0];
+                    assert_eq!(row["execution_error"], "interrupted");
+                    assert_eq!(row["phases"], serde_json::json!([]));
+                    assert!(row["stop_error"].is_null());
+                    assert_eq!(
+                        row["cleanup_error"],
+                        serde_json::json!(cleanup_fails.then_some("cleanup-fail"))
+                    );
+                }
+                assert!(!f.calls().contains("run -d"));
+                assert_eq!(f.dir.path().join("work/owned-test").exists(), cleanup_fails);
+                let parent = owned::open_directory(&f.dir.path().join("work")).unwrap();
+                owned::remove_tree(&parent, "owned-test").unwrap();
+                drop(signals);
             }
         }
     }

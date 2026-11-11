@@ -9570,6 +9570,34 @@
     },
     {
       "configured_path": "rustix::fs::openat",
+      "item": "ratarmount::sandbox::bench::io::writable_child",
+      "leaf_digest": "40bf178739fbbd8ecbc582881d726b63ba6130098d39bace78ca80069c61677e",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "benchmark-cleanup-reopen",
+        "creation": {
+          "basis": "Existing pinned directory only; read-only fd-relative reopen without creation or proc lookup.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-GAP0-B4B-M09",
+        "item": "ratarmount::sandbox::bench::io::writable_child",
+        "reason": "Reopen the chmodded O_PATH directory pin through dot for confined cleanup listing without another parent/name lookup; retain its pinned identity for guarded removal."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4B-M09\",\"item\":\"ratarmount::sandbox::bench::io::writable_child\",\"disposition\":\"out-of-family\",\"category\":\"benchmark-cleanup-reopen\",\"reason\":\"Reopen the chmodded O_PATH directory pin through dot for confined cleanup listing without another parent/name lookup; retain its pinned identity for guarded removal.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing pinned directory only; read-only fd-relative reopen without creation or proc lookup.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
       "item": "ratarmount::sandbox::bench::manifest::open_manifest",
       "leaf_digest": "cd3d6f32fdadb415777a52092249dc462d57d622a5a4bcc858f8e792fc20e9d0",
       "lint": "clippy::disallowed_methods",

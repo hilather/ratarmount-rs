@@ -155,6 +155,10 @@ runtime executable. Exactly `/var/tmp` permits the catalog, artifact, output and
 placement paths beneath it when the unique scratch leaf does not overlap them;
 the runtime executable has no such exception. A catalog directly in `/var/tmp` still
 conflicts with its parent. Each refusal exits **2** with a selection reason.
+After equality and under-source checks, the six reasons use
+`work-root is an ancestor of ...`, checked in order with these suffixes:
+`the runtime executable`, `--out`, `the catalog directory`, `the artifact parent`,
+`placement.source`, then `placement.output`.
 Any selected FUSE entry takes refusal precedence with
 `FUSE execution unavailable: lifecycle deferred to B5a1a`.
 Artifact final symlinks are refused. Artifact SHA-256 and the exact local image's
@@ -172,9 +176,10 @@ the pinned single-frame zstd artifact and verifies the complete tar-stream diges
 Extraction permits regular files and directories. Relative symlink targets are
 accepted only when they stay inside the tree lexically and do not pass through
 an archive-created symlink, independent of entry order. Final-component confined
-symlink chains remain legal. Links are published after stream/digest acceptance,
-before directory metadata. Extraction refuses duplicate or unsafe paths,
-extended/special headers and mode bits above 0777. No descent follows archive symlinks.
+symlink chains remain legal. Links are published after tar-stream digest acceptance,
+before directory metadata. The exactly-one-zstd-frame check runs after links
+are published and directory metadata has been applied. Extraction refuses duplicate
+or unsafe paths, extended/special headers and mode bits above 0777. No descent follows archive symlinks.
 Bounds are 100000 entries, 128 path components,
 4096 path bytes, a 128 MiB decoder window and the smaller of `disk_bytes` or 16 GiB
 for each compressed/decoded stream. Directories start at 0700; recorded modes
@@ -206,15 +211,27 @@ has at most one reference, two warm-ups, `2*repeats` measurements and one FUSE
 probe (204 at repeats=100). This cap also applies to dry-run.
 
 Cleanup walks top-down through held directory handles, chmodding pinned directories
-to 0700 via `/proc/self/fd` before listing them. Symlinks are unlinked without
-chmodding their targets. The iterative walk caps depth at 256; overflow or missing
-`/proc` preserves the remaining tree and records `cleanup_error`. Rootless Podman
+to 0700 via `/proc/self/fd` before reopening each O_PATH pin with fd-relative
+`openat(pin, ".")` for listing. Only one listing fd per frame survives the reopen.
+Symlinks are unlinked without chmodding their targets. Before removing a directory
+by name, cleanup checks that its dev/ino still matches the saved O_PATH identity;
+a mismatch refuses removal and preserves the replacement. Linux has no unlink-by-fd:
+a residual race remains between `fstatat` and `unlinkat`; the check narrows it.
+The iterative walk caps depth at 256 frames, counting its root as frame 1; root
+plus 255 descendants succeeds, and the 257th directory is refused. Starting at
+the scratch leaf leaves 254 directory levels below tree `0`; starting at tree `0`
+for `make_removable` or per-entry cleanup leaves 255. Extraction caps paths at
+128 components; deeper trees can be runtime-created. Overflow or missing
+`/proc` preserves the remaining tree and records `cleanup_error`; an inaccessible
+`/proc` magic link also fails closed, with no by-name chmod fallback. Rootless Podman
 without keep-id may return EPERM for subuid-owned directories; Podman qualification
 remains out of scope. Extraction caches the last parent descriptor rather than
 holding one descriptor per archive directory.
 
 An interrupt before extraction records `execution_error: "interrupted"` with
 `phases: []`; between entries it prevents the next extract and runtime start.
+This interrupt arm cleans up exactly once before writing the row, with
+`cleanup_error` null on success or containing the cleanup failure.
 An interrupt before runtime spawn records a phase error with empty `stdout_log`
 and `stderr_log` strings and creates no phase logs. Kill/rm cleanup still runs.
 These outcomes keep the existing ungraded exit **1** presentation.
