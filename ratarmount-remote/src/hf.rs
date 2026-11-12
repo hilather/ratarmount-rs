@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, SystemTime};
 
 use ratarmount_core::{ArchiveRead, CheapDirent, FileInfo, ListResult, MountSource, UserData};
+use ratarmount_index::http_client::{HttpError, HttpResponse};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -30,8 +31,8 @@ fn error(message: impl Into<String>) -> RemoteError {
     RemoteError::Hf(message.into())
 }
 
-pub(crate) fn map_http_error(repo: &str, err: ureq::Error) -> RemoteError {
-    let ureq::Error::Status(status, response) = err else {
+pub(crate) fn map_http_error(repo: &str, err: HttpError) -> RemoteError {
+    let HttpError::Status(status, response) = err else {
         return error(format!("Hub request failed for {repo}"));
     };
     let code = response.header("X-Error-Code").map(str::to_owned);
@@ -636,15 +637,15 @@ impl HfRepo {
         )
     }
 
-    fn get_api(&self, url: &str) -> Result<ureq::Response> {
+    fn get_api(&self, url: &str) -> Result<HttpResponse> {
         self.get_with_retries(url, MAX_API_RETRIES)
     }
 
-    fn get(&self, url: &str) -> Result<ureq::Response> {
+    fn get(&self, url: &str) -> Result<HttpResponse> {
         self.get_with_retries(url, 0)
     }
 
-    fn get_with_retries(&self, url: &str, retries: usize) -> Result<ureq::Response> {
+    fn get_with_retries(&self, url: &str, retries: usize) -> Result<HttpResponse> {
         self.config.online()?;
         let parsed = Url::parse(url).map_err(|_| error("invalid Hub API URL"))?;
         if parsed.origin() != self.config.endpoint.origin()
@@ -666,7 +667,7 @@ impl HfRepo {
                 );
             }
             match req.call() {
-                Err(ureq::Error::Status(429, response)) if attempt < retries => {
+                Err(HttpError::Status(429, response)) if attempt < retries => {
                     let wait = retry_after(response.header("Retry-After"), SystemTime::now());
                     drop(response);
                     std::thread::sleep(wait);
@@ -801,7 +802,7 @@ impl HfRepo {
         };
         // Some Hub/CDN HEAD responses omit Accept-Ranges.
         let response = match source.request("GET", Some((0, 0))) {
-            Err(ureq::Error::Status(416, response))
+            Err(HttpError::Status(416, response))
                 if response.header("Content-Range") == Some("bytes */0") =>
             {
                 let source = Arc::new(source);

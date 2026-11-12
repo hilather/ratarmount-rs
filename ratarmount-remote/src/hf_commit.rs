@@ -6,6 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use ratarmount_index::http_client::{HttpError, HttpResponse};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -70,16 +71,16 @@ fn error(message: impl Into<String>) -> RemoteError {
     RemoteError::Hf(message.into())
 }
 
-fn write_error(repo: &str, stage: &str, err: ureq::Error) -> RemoteError {
+fn write_error(repo: &str, stage: &str, err: HttpError) -> RemoteError {
     match err {
-        ureq::Error::Status(status, _) => error(format!(
+        HttpError::Status(status, _) => error(format!(
             "Hub {stage} HTTP {status} for {repo}; publishing requires a token with write scope and repository write access; if this repository requires Xet and refuses LFS, Xet uploads are unsupported"
         )),
         _ => error(format!("Hub {stage} request failed for {repo}")),
     }
 }
 
-fn read_json(response: ureq::Response) -> Result<Value> {
+fn read_json(response: HttpResponse) -> Result<Value> {
     let mut bytes = Vec::new();
     response
         .into_reader()

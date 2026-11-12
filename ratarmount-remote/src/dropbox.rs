@@ -59,6 +59,7 @@ use ratarmount_core::{
     create_root_file_info, is_dir_mode, normpath, CheapDirent, FileInfo, ListResult, MountSource,
     UserData, S_IFDIR, S_IFMT, S_IFREG,
 };
+use ratarmount_index::http_client::HttpError;
 use tempfile::NamedTempFile;
 
 use crate::{
@@ -453,7 +454,7 @@ fn probe_dropbox_download(
         .send_bytes(&[])
     {
         Ok(r) => r,
-        Err(ureq::Error::Status(status, r)) => {
+        Err(HttpError::Status(status, r)) => {
             let body = r.into_string().unwrap_or_else(|_| String::new());
             let detail = redact_token(&body, token);
             let summary = extract_error_summary(&detail).unwrap_or(detail.as_str());
@@ -597,7 +598,7 @@ fn fetch_dropbox_full_body(
         .send_bytes(&[])
     {
         Ok(r) => r,
-        Err(ureq::Error::Status(status, r)) => {
+        Err(HttpError::Status(status, r)) => {
             let body = r.into_string().unwrap_or_else(|_| String::new());
             let detail = redact_token(&body, token);
             let summary = extract_error_summary(&detail).unwrap_or(detail.as_str());
@@ -672,7 +673,7 @@ fn dropbox_download_request(
 
     let resp = match req.send_bytes(&[]) {
         Ok(r) => r,
-        Err(ureq::Error::Status(status, r)) => {
+        Err(HttpError::Status(status, r)) => {
             let body = r.into_string().unwrap_or_else(|_| String::new());
             let detail = redact_token(&body, token);
             let summary = extract_error_summary(&detail).unwrap_or(detail.as_str());

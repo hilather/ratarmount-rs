@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use log::debug;
+use ratarmount_index::http_client::HttpError;
 use serde_json::Value;
 use url::Url;
 
@@ -432,7 +433,7 @@ fn registry_get_bytes(url: &str, bearer: Option<&str>, hint_size: u64) -> Result
                 .map_err(|e| RemoteError::Http(format!("reading {url}: {e}")))?;
             Ok(buf)
         }
-        Err(ureq::Error::Status(status, resp)) => {
+        Err(HttpError::Status(status, resp)) => {
             let body = resp.into_string().unwrap_or_default();
             let snippet: String = body.chars().take(200).collect();
             Err(RemoteError::Http(format!(
@@ -804,13 +805,13 @@ fn registry_get_json(
                 FetchErr::Other(RemoteError::Http(format!("OCI JSON from {url}: {e}")))
             })
         }
-        Err(ureq::Error::Status(401, resp)) => {
+        Err(HttpError::Status(401, resp)) => {
             let ch = resp
                 .header("WWW-Authenticate")
                 .and_then(parse_bearer_challenge);
             Err(FetchErr::Unauthorized(ch))
         }
-        Err(ureq::Error::Status(status, resp)) => {
+        Err(HttpError::Status(status, resp)) => {
             let body = resp.into_string().unwrap_or_default();
             let snippet: String = body.chars().take(200).collect();
             Err(FetchErr::Other(RemoteError::Http(format!(
@@ -868,10 +869,10 @@ fn fetch_bearer_token(
             }
             Ok(Some(token.to_string()))
         }
-        Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
+        Err(HttpError::Status(401, _)) | Err(HttpError::Status(403, _)) => {
             Err(auth_denied(loc, "token"))
         }
-        Err(ureq::Error::Status(status, resp)) => {
+        Err(HttpError::Status(status, resp)) => {
             let body = resp.into_string().unwrap_or_default();
             let snippet: String = body.chars().take(200).collect();
             Err(RemoteError::Http(format!(
@@ -1184,7 +1185,7 @@ impl Read for OciBlobRangeFile {
             req = req.set("Authorization", &format!("Bearer {t}"));
         }
         let resp = req.call().map_err(|e| match e {
-            ureq::Error::Status(401, _) | ureq::Error::Status(403, _) => io::Error::new(
+            HttpError::Status(401, _) | HttpError::Status(403, _) => io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("OCI blob 401/403 for {}", self.url),
             ),

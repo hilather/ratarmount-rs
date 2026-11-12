@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use log::debug;
 use ratarmount_core::{ArchiveRead, MountSource};
+use ratarmount_index::http_client::{HttpError, HttpResponse};
 use url::Url;
 
 use crate::{
@@ -592,23 +593,23 @@ fn ls_via_http(api_base: &str, loc: &IpfsLocation) -> Result<String> {
         .set("User-Agent", USER_AGENT)
         .call()
     {
-        Ok(resp) => read_ureq_body(resp, "ls"),
-        Err(ureq::Error::Status(code, _)) if code == 404 || code == 405 => {
+        Ok(resp) => read_http_body(resp, "ls"),
+        Err(HttpError::Status(code, _)) if code == 404 || code == 405 => {
             // Some gateways only allow GET on /api/v0/ls.
             match crate::http_pool::get(url_s)
                 .timeout(API_TIMEOUT)
                 .set("User-Agent", USER_AGENT)
                 .call()
             {
-                Ok(resp) => read_ureq_body(resp, "ls"),
-                Err(e) => Err(map_ureq(e, "ls")),
+                Ok(resp) => read_http_body(resp, "ls"),
+                Err(e) => Err(map_http(e, "ls")),
             }
         }
-        Err(e) => Err(map_ureq(e, "ls")),
+        Err(e) => Err(map_http(e, "ls")),
     }
 }
 
-fn read_ureq_body(resp: ureq::Response, what: &str) -> Result<String> {
+fn read_http_body(resp: HttpResponse, what: &str) -> Result<String> {
     let status = resp.status();
     let text = resp
         .into_string()
@@ -622,9 +623,9 @@ fn read_ureq_body(resp: ureq::Response, what: &str) -> Result<String> {
     Ok(text)
 }
 
-fn map_ureq(e: ureq::Error, what: &str) -> RemoteError {
+fn map_http(e: HttpError, what: &str) -> RemoteError {
     match e {
-        ureq::Error::Status(_code, resp) => {
+        HttpError::Status(_code, resp) => {
             let status = resp.status();
             let text = resp.into_string().unwrap_or_default();
             ipfs_err(format!(
@@ -772,7 +773,7 @@ fn gateway_looks_like_directory(url: &str) -> bool {
         .call()
     {
         Ok(resp) => content_type_is_html(resp.header("Content-Type")),
-        Err(ureq::Error::Status(_, resp)) => content_type_is_html(resp.header("Content-Type")),
+        Err(HttpError::Status(_, resp)) => content_type_is_html(resp.header("Content-Type")),
         Err(_) => match crate::http_pool::get(url)
             .timeout(API_TIMEOUT)
             .set("User-Agent", USER_AGENT)
@@ -780,7 +781,7 @@ fn gateway_looks_like_directory(url: &str) -> bool {
             .call()
         {
             Ok(resp) => content_type_is_html(resp.header("Content-Type")),
-            Err(ureq::Error::Status(_, resp)) => content_type_is_html(resp.header("Content-Type")),
+            Err(HttpError::Status(_, resp)) => content_type_is_html(resp.header("Content-Type")),
             Err(_) => false,
         },
     }
