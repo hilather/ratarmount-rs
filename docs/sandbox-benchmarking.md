@@ -278,10 +278,12 @@ A non-interrupted lifecycle error with a frozen `interrupt_observed:true` append
 any `; cleanup: …` chain.
 
 The defensive line `sandbox bench: error: batch stopped with E errored, F failed and B blocked runs; see runs.jsonl`
-should not occur; indicates an internal inconsistency (an error status without a
+should not occur; it indicates an internal inconsistency (an error status without a
 lifecycle error). Its observed-interrupt suffix is `; interrupt observed`.
 Bind-path conversion and phase-serialization errors record an error terminal,
 block remaining entries and clean scratch through the normal lifecycle error path.
+A host-load serialization failure (`host load: …`) happens before the output directory is created.
+A serialization failure after an execution failure is appended as `; phase serialization: <error>`.
 A phase-serialization failure leaves `phases: []` in the terminal row.
 Records make no throughput or verified-performance claim. `sandbox bench summarize`
 is not yet available.
