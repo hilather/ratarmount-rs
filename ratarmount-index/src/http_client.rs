@@ -576,3 +576,5 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_behaviour;

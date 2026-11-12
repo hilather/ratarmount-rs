@@ -40,5 +40,9 @@ xz2 = { version = "0.1", features = ["static"] }
 zstd = "0.13"
 bzip2 = { version = "0.5", features = ["static"] }
 
+[dev-dependencies]
+# Portable SO_LINGER resets for HTTP body-error contract tests.
+socket2 = "0.6"
+
 [lints]
 workspace = true
