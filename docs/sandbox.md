@@ -7,9 +7,12 @@ the base unchanged. The [SWE-bench recipe](recipes/swe-bench-sandboxes.md)
 shows a larger harness; the [supervisor API](#sandbox-supervisor-api) manages
 fleets of attempts.
 
-The hidden Linux [`sandbox bench` validator](sandbox-benchmarking.md) checks
-Perl benchmark manifests, including unpinned drafts, and can emit a deterministic
-dry-run schedule. It executes no workloads and establishes no external qualification.
+The hidden Linux [`sandbox bench` command](sandbox-benchmarking.md) validates
+Perl benchmark manifests, including unpinned drafts, emits a deterministic dry-run
+schedule, runs native lifecycles for qualified warm `tar.zst-single-frame` cells
+(stub fixtures or local Docker) and summarizes a batch's records with
+`summarize DIR`. FUSE execution is not yet available, and the command establishes
+no external qualification.
 
 ## Worked example: snapshot to graded bundle
 
