@@ -219,7 +219,11 @@ fn request<T: serde::de::DeserializeOwned>(
 /// listener accepts or closes, for as long as the socket's send timeout
 /// allows, so that timeout is set before connecting. The socket comes from
 /// `process::stream_socket` for the CLOEXEC alternative's reviewed reasons.
-fn connect(path: &Path, left: &dyn Fn() -> io::Result<Duration>) -> io::Result<UnixStream> {
+/// Also used by Linux bench, with one deadline per supervisor exchange.
+pub(super) fn connect(
+    path: &Path,
+    left: &dyn Fn() -> io::Result<Duration>,
+) -> io::Result<UnixStream> {
     use rustix::net::{sockopt, SocketAddrUnix};
     let address = SocketAddrUnix::new(path)?;
     let socket = super::process::stream_socket()?;
