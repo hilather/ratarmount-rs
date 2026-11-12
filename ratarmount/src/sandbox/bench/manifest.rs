@@ -56,7 +56,7 @@ fn read_manifest(
 }
 // serde_json::Value normally overwrites duplicate map keys. Walk every object
 // before typed deserialization so dynamic environment maps obey the same rule.
-struct UniqueValue(Value);
+pub(super) struct UniqueValue(pub(super) Value);
 
 impl<'de> Deserialize<'de> for UniqueValue {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {

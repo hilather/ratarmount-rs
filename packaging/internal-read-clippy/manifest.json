@@ -9625,6 +9625,62 @@
       "rule_reason": "inventory-op:rustix::openat"
     },
     {
+      "configured_path": "rustix::fs::openat",
+      "item": "ratarmount::sandbox::bench::summarize::open_record_dir",
+      "leaf_digest": "da97f2f6da18a16038c2e028b40182f86eef0f09cd28969bd7822855545e2b5a",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "benchmark-record-input",
+        "creation": {
+          "basis": "Read-only existing record directory; no creation or truncation.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-GAP0-B4B5-M01",
+        "item": "ratarmount::sandbox::bench::summarize::open_record_dir",
+        "reason": "Open the user-selected existing record directory with O_DIRECTORY and O_NOFOLLOW after removing trailing separators."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4B5-M01\",\"item\":\"ratarmount::sandbox::bench::summarize::open_record_dir\",\"disposition\":\"out-of-family\",\"category\":\"benchmark-record-input\",\"reason\":\"Open the user-selected existing record directory with O_DIRECTORY and O_NOFOLLOW after removing trailing separators.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Read-only existing record directory; no creation or truncation.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
+      "item": "ratarmount::sandbox::bench::summarize::open_record_input",
+      "leaf_digest": "1f66d37f22de2e042dfbcd25e9b34ac14c8571b0ef00c51f22cf25e72fd838c2",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "benchmark-record-input",
+        "creation": {
+          "basis": "Read-only existing records; no creation or truncation.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-GAP0-B4B5-M02",
+        "item": "ratarmount::sandbox::bench::summarize::open_record_input",
+        "reason": "Read only the four fixed record names relative to the held directory, without following symlinks or blocking on FIFOs; require regular files and bound reads."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B4B5-M02\",\"item\":\"ratarmount::sandbox::bench::summarize::open_record_input\",\"disposition\":\"out-of-family\",\"category\":\"benchmark-record-input\",\"reason\":\"Read only the four fixed record names relative to the held directory, without following symlinks or blocking on FIFOs; require regular files and bound reads.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Read-only existing records; no creation or truncation.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
       "configured_path": "tempfile::NamedTempFile::new_in",
       "item": "ratarmount::sandbox::daemon::atomic_json",
       "leaf_digest": "ecd765e905e2b5ffee59a27637ffa3e15186b38a15eb130320aaac06d8d2129b",

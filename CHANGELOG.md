@@ -4,6 +4,7 @@
 
 ### Changes
 
+- Hidden Linux `sandbox bench summarize DIR` validates batch records and reports measured distributions, matched ratios and passed-batch throughput; `wall_ms` now starts at execution entry, including shared artifact admission and image inspection.
 - **Library API (experimental):** `ratarmount_index::fill_content_hashes` now returns `Result<FillReport>` instead of `Result<()>`, reporting members filled, kept with existing hashes, and unverifiable.
 - Hidden Linux `sandbox bench --out DIR --runtime PATH` executes qualified native/warm/single-frame archive lifecycles with bounded extraction and runtime cleanup. Runs are graded against a native reference (see below). See [the benchmark guide](docs/sandbox-benchmarking.md).
 - Native sandbox benchmarks confine archive symlink targets independent of entry order, bound extraction descriptors, clean restrictive archive/runtime directories through held handles, preserve primary failures and record pre-runtime/interrupt outcomes. Admission uses the unique scratch leaf, retains default `/var/tmp`, and refuses canonical work-root containment or missing output parents with exit 2.

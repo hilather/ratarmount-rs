@@ -212,7 +212,8 @@ the runtime container. Each schedule sequence matches exactly one terminal index
 - `batch.json` records catalog revision, admitted manifest path and manifest SHA-256; selected platform
   image, OS, architecture, toolchain and dependency-lock pins; task artifact
   paths (given and as opened by admission), compressed/tar-stream digests and test inventories;
-  runtime kind/path, consumed native settings, host load and start time.
+  runtime kind/path, consumed native settings, host load and `started_unix_ms`
+  (the header time, after pre-header preparation).
 - `schedule.jsonl` records every planned entry and its sequence/run identity.
 - `runs.jsonl` records one terminal per scheduled entry: `passed`, `failed`,
   `blocked`, `interrupted` or `error`. Executed rows retain tree/load/phases,
@@ -223,6 +224,11 @@ the runtime container. Each schedule sequence matches exactly one terminal index
   and carry `blocked_by` and `reason` from the triggering terminal.
 - `batch-end.json` is written after final scratch cleanup. It records status,
   `interrupt_observed`, lifecycle error, outcome counts, finish time and wall time.
+  `wall_ms` runs from the start of execution, before manifest parsing inside
+  execution, shared artifact admission and image inspection, through final cleanup
+  to the end marker. Manifest opening, validation and schedule building precede
+  execution. `started_unix_ms` remains the header time, so subtracting it from
+  `finished_unix_ms` omits pre-header preparation and differs from `wall_ms`.
   It is exclusively created as `.batch-end.json.tmp`, written and synced before
   a directory-relative rename publishes it; the output directory is then synced.
   Failed publication removes the temporary file; a directory-sync failure after
@@ -285,8 +291,68 @@ block remaining entries and clean scratch through the normal lifecycle error pat
 A host-load serialization failure (`host load: …`) happens before the output directory is created.
 A serialization failure after an execution failure is appended as `; phase serialization: <error>`.
 A phase-serialization failure leaves `phases: []` in the terminal row.
-Records make no throughput or verified-performance claim. `sandbox bench summarize`
-is not yet available.
+Records make no throughput or verified-performance claim; summarize derives
+verified throughput only for complete passed batches.
+
+### Summarizing records
+
+```sh
+ratarmount sandbox bench summarize results/batch
+```
+
+Summarize reads one batch directory without a manifest or runtime. It writes one
+JSON object to stdout and one status line to stderr. Execution flags such as
+`--manifest` and `--out` conflict with this subcommand. The inputs are `batch.json`,
+`schedule.jsonl`, `runs.jsonl` and, when complete, `batch-end.json`. A missing end
+marker means incomplete, including a partial final run append. A partial final
+run line with an end marker is invalid. Other JSONL inputs must end with a newline;
+the header and end marker must each contain exactly one JSON line.
+
+Validation rejects duplicate JSON keys, wrong schemas or record discriminators,
+foreign batch/run identities, duplicate or out-of-order sequences/indexes,
+duplicate measured repeats of a cell and backend, extra
+terminals, incompatible settings and any whole-value difference between a run's
+schedule and its planned entry. Header task/platform identities, seed, repeats,
+attempts, catalog revision and selected base forms/cache/jobs must match. Run
+runtime, fixture, publishable and load fields must match the header. Unknown
+kinds/outcomes, invalid integer timings, empty schedules, missing terminals in a
+completed batch, inconsistent end counts/status and truncated records are refused.
+The directory and files must not be symlinks; input files must be regular files.
+Bounds are 16 MiB for the header, 1 MiB for the end marker, 32 MiB per JSONL line
+and 100,000 lines per JSONL file.
+
+Exit **0** means complete and passed. Exit **1** means valid failed, error,
+interrupted or incomplete records, or a report-write failure. Exit **2** means
+invalid arguments or unreadable, missing, oversized or malformed record input.
+Missing or unreadable record input therefore differs from a missing or unreadable
+manifest, which exits **1** in validation/execution modes.
+
+The report includes `status`, `batch_id`, `fixture`, `publishable`, outcome `counts`
+by entry kind and `graded_attempts` (passed plus failed rows across all kinds).
+Only passed measured rows contribute timing samples. References, warm-ups,
+probes and unsuccessful measured rows remain in the counts.
+
+Each distribution groups by cell (task, platform, base form, jobs and cache),
+catalog revision, entry schema (`rrs-perl-bench-schedule/1`), paired setting, seed,
+repeats, attempts, CPUs, oversubscription settings and qualification. Backend is
+reported separately. Kind, repeat, discarded and backend-derived execution
+availability/runnable/reasons do not split groups. `samples` counts measurements;
+`attempt_ms` contains sorted `lifecycle_ms.total` values. `median_ms` and `p95_ms`
+use integer nearest rank: `sorted[(p*n + 99)/100 - 1]` for p=50 or 95, with integer
+division (the lower middle for even sample counts).
+
+`ratios` matches passed measured FUSE/native rows by repeat within a group and
+divides FUSE total by native total, skipping zero native totals and unmatched
+repeats. It reports pair count, median and p95 using the same nearest-rank rule.
+Real FUSE execution remains deferred to B5a; current producer batches have no
+ratios. Synthetic paired fixtures exercise this calculation in tests.
+
+`verified_attempts_per_hour` is passed measured count times 3,600,000 divided by
+the batch's `wall_ms`, only when status is passed. Shared preparation, references,
+warm-ups, probes, extraction and cleanup enter the denominator once per batch,
+across all cells. Other statuses report null. Zero wall time reports null with
+`throughput_note: "zero wall time"`. Stub reports retain `fixture:true` and
+`publishable:false`, and stderr labels them `stub fixture, not publishable`.
 
 ### Runtime kind
 

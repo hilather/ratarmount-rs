@@ -51,7 +51,7 @@ pub struct SandboxArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Validate a Perl benchmark manifest or emit a dry-run schedule (Linux only).
+    /// Validate a Perl benchmark manifest, emit a dry-run schedule, run native lifecycles or summarize records (Linux only).
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
     Bench(bench::BenchArgs),

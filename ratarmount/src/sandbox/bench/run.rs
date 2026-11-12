@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -110,6 +111,7 @@ pub(super) fn execute(
     bytes: &[u8],
     entries: &[schedule::Entry],
 ) -> Result<i32, String> {
+    let started = Instant::now();
     let manifest: Manifest = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     let admitted = (|| -> io::Result<_> {
         // B5a1a replaces this FUSE refusal; no mount/finalize work is done here.
@@ -172,7 +174,7 @@ pub(super) fn execute(
                 return Err(invalid("unsupported runtime bind path"));
             }
         }
-        let catalog = args.manifest.canonicalize()?;
+        let catalog = args.manifest().canonicalize()?;
         let parent = catalog
             .parent()
             .ok_or_else(|| invalid("manifest has no parent"))?;
@@ -254,6 +256,10 @@ pub(super) fn execute(
             }
             let mut file = owned::open_artifact(&artifact)?;
             source::verify_artifact(&mut file, &task.artifact.sha256, task.resources.disk_bytes)?;
+            #[cfg(test)]
+            if inject("admission-slow").is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
             artifacts.insert(task.id.clone(), artifact);
             files.insert(task.id.clone(), file);
         }
@@ -298,6 +304,7 @@ pub(super) fn execute(
         &executable,
         &out,
         Scratch {
+            started,
             args,
             bytes,
             paths: &paths,
@@ -342,6 +349,7 @@ fn presentation(result: io::Result<record::Finished>) -> Result<(i32, String), S
 }
 
 struct Scratch<'a> {
+    started: Instant,
     args: &'a BenchArgs,
     bytes: &'a [u8],
     paths: &'a record::AdmittedPaths,
@@ -393,6 +401,7 @@ fn execute_owned(
     let load = load.and_then(|value| inject("load-serialize").map(|()| value));
     let load = load.map_err(|error| io::Error::new(error.kind(), format!("host load: {error}")))?;
     let Scratch {
+        started,
         args,
         bytes,
         paths,
@@ -410,7 +419,8 @@ fn execute_owned(
         .ok_or_else(|| invalid("output name"))?;
     let logs = owned::create_directory(&out_parent, out_name)?;
     let header = record::batch(args, bytes, entries, executable, paths, host, load);
-    let records = header.and_then(|header| record::Records::create(&logs, id, header, entries));
+    let records =
+        header.and_then(|header| record::Records::create(&logs, id, header, entries, started));
     #[cfg(test)]
     let records = records.and_then(|file| inject("outcomes-create").map(|()| file));
     let mut records = match records {
@@ -970,7 +980,8 @@ mod tests {
             )
             .unwrap();
             let args = BenchArgs {
-                manifest: dir.path().join("tasks.json"),
+                command: None,
+                manifest: Some(dir.path().join("tasks.json")),
                 validate_only: false,
                 dry_run: false,
                 require_pins: false,
@@ -1003,10 +1014,11 @@ mod tests {
                 &self.dir.path().join("runtime"),
                 &self.dir.path().join("out"),
                 Scratch {
+                    started: Instant::now(),
                     args: &self.args,
                     bytes: &self.bytes,
                     paths: &record::AdmittedPaths {
-                        catalog: self.args.manifest.clone(),
+                        catalog: self.args.manifest().to_owned(),
                         artifacts: BTreeMap::from([(
                             "mojo".into(),
                             self.dir.path().join("archive"),
@@ -1042,6 +1054,48 @@ mod tests {
         fn calls(&self) -> String {
             std::fs::read_to_string(self.dir.path().join("state/calls")).unwrap_or_default()
         }
+    }
+    // Regression: wall time omitted shared artifact admission before the record header (R-CLOCK).
+    #[test]
+    fn regression_bench_batch_wall_time_includes_admission() {
+        let _signals = runtime::InterruptScope::new();
+        let _fault = FaultScope::new(&["admission-slow"]);
+        let mut f = Fixture::new();
+        let mut value: serde_json::Value = serde_json::from_slice(&f.bytes).unwrap();
+        value["platforms"][0]["architecture"] = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => other,
+        }
+        .into();
+        let artifact = value["tasks"][0]["artifact"]["path"].as_str().unwrap();
+        std::fs::write(
+            f.dir.path().join(artifact),
+            std::fs::read(f.dir.path().join("archive")).unwrap(),
+        )
+        .unwrap();
+        f.bytes = serde_json::to_vec(&value).unwrap();
+        std::fs::write(f.args.manifest(), &f.bytes).unwrap();
+        f.args.allow_high_load = true;
+        assert_eq!(execute(&f.args, &f.bytes, &f.entries).unwrap(), 0);
+        let header: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(f.dir.path().join("out/batch.json")).unwrap())
+                .unwrap();
+        let end = f.end();
+        let difference = i128::from(end["wall_ms"].as_u64().unwrap())
+            - (i128::from(end["finished_unix_ms"].as_u64().unwrap())
+                - i128::from(header["started_unix_ms"].as_u64().unwrap()));
+        eprintln!("admission clock difference: {difference} ms");
+        assert!(
+            difference >= 400,
+            "admission clock difference: {difference} ms"
+        );
+        assert_eq!(
+            std::fs::read_dir(f.dir.path().join("work"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
     // Regression: pre-runtime create/write failures leaked roots or omitted error terminals (R-1).
     #[test]
