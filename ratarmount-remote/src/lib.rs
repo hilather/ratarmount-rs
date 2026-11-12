@@ -98,6 +98,7 @@ use std::sync::Arc;
 
 pub use http_pool::HttpRangeSource;
 use http_pool::Prefetch;
+use ratarmount_index::http_client::HttpError;
 pub use ratarmount_index::ContentToken;
 use secrecy::SecretString;
 
@@ -416,12 +417,12 @@ fn http_status_err(status: u16, url: &str) -> RemoteError {
     }
 }
 
-fn map_ureq_http_error(err: ureq::Error, url: &str) -> RemoteError {
+fn map_http_client_error(err: HttpError, url: &str) -> RemoteError {
     match err {
-        ureq::Error::Status(401, _) => http_unauthorized(url),
-        ureq::Error::Status(code, _) => http_status_err(code, url),
+        HttpError::Status(401, _) => http_unauthorized(url),
+        HttpError::Status(code, _) => http_status_err(code, url),
         // Transport Display (and its source chain) may contain a signed CDN URL.
-        ureq::Error::Transport(err) => RemoteError::Http(format!(
+        HttpError::Transport(err) => RemoteError::Http(format!(
             "HTTP {:?} for {}",
             err.kind(),
             http_pool::redacted_url(url)
@@ -827,13 +828,13 @@ fn probe_http_source(source: &HttpRangeSource) -> Result<HttpProbe> {
                 resp.status()
             );
         }
-        Err(ureq::Error::Status(401, _)) => {
+        Err(HttpError::Status(401, _)) => {
             return Err(http_unauthorized(url));
         }
         Err(e) => {
             debug!(
                 "HEAD failed: {}, probing with Range GET",
-                map_ureq_http_error(e, url)
+                map_http_client_error(e, url)
             );
         }
     }
@@ -858,11 +859,11 @@ fn probe_range_size(source: &HttpRangeSource) -> Result<Option<HttpProbe>> {
     let url = source.url();
     let resp = match source.request("GET", Some((0, 0))) {
         Ok(r) => r,
-        Err(ureq::Error::Status(401, _)) => {
+        Err(HttpError::Status(401, _)) => {
             return Err(http_unauthorized(url));
         }
         Err(e) => {
-            debug!("Range probe failed: {}", map_ureq_http_error(e, url));
+            debug!("Range probe failed: {}", map_http_client_error(e, url));
             return Ok(None);
         }
     };
@@ -922,7 +923,7 @@ pub fn fetch_http_range_bytes(url: &str, start: u64, end_inclusive: u64) -> Resu
         loc.cookie.as_deref(),
     )
     .call()
-    .map_err(|e| map_ureq_http_error(e, loc.url.as_str()))?;
+    .map_err(|e| map_http_client_error(e, loc.url.as_str()))?;
     let status = resp.status();
     if status != 206 && !(200..300).contains(&status) {
         return Err(http_status_err(status, loc.url.as_str()));
@@ -954,7 +955,7 @@ pub fn hash_http_range_sha256(url: &str, start: u64, end_inclusive: u64) -> Resu
         loc.cookie.as_deref(),
     )
     .call()
-    .map_err(|e| map_ureq_http_error(e, loc.url.as_str()))?;
+    .map_err(|e| map_http_client_error(e, loc.url.as_str()))?;
     let status = resp.status();
     if status != 206 && !(200..300).contains(&status) {
         return Err(http_status_err(status, loc.url.as_str()));
@@ -997,7 +998,7 @@ pub fn fetch_http_bytes_capped_with_auth(
     let source = HttpRangeSource::new(parse_http_url(url)?, options);
     let resp = source
         .request("GET", None)
-        .map_err(|e| map_ureq_http_error(e, source.url()))?;
+        .map_err(|e| map_http_client_error(e, source.url()))?;
     let status = resp.status();
     if !(200..300).contains(&status) {
         return Err(http_status_err(status, source.url()));
@@ -1063,7 +1064,7 @@ fn fetch_http_full_get(loc: &HttpLocation) -> Result<(NamedTempFile, u64)> {
         loc.cookie.as_deref(),
     )
     .call()
-    .map_err(|e| map_ureq_http_error(e, &loc.url))?;
+    .map_err(|e| map_http_client_error(e, &loc.url))?;
     if !(200..300).contains(&resp.status()) {
         return Err(http_status_err(resp.status(), &loc.url));
     }
@@ -1101,7 +1102,7 @@ fn fetch_http_via_ranges(loc: &HttpLocation, size: u64) -> Result<(NamedTempFile
             loc.cookie.as_deref(),
         )
         .call()
-        .map_err(|e| map_ureq_http_error(e, &loc.url))?;
+        .map_err(|e| map_http_client_error(e, &loc.url))?;
         let status = resp.status();
         if status == 206 {
             http_pool::validate_content_range(&resp, start, end, Some(size))?;
@@ -1191,7 +1192,7 @@ impl HttpRangeFile {
         }
         let resp = source
             .request("GET", None)
-            .map_err(|e| map_ureq_http_error(e, source.url()))?;
+            .map_err(|e| map_http_client_error(e, source.url()))?;
         if !(200..300).contains(&resp.status()) {
             return Err(http_status_err(resp.status(), source.url()));
         }

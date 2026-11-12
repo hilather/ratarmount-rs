@@ -13,6 +13,7 @@ use ratarmount_core::{
     create_root_file_info, is_dir_mode, normpath, ArchiveRead, CheapDirent, FileInfo, ListResult,
     MountSource, UserData, S_IFDIR, S_IFMT, S_IFREG,
 };
+use ratarmount_index::http_client::HttpError;
 use url::Url;
 
 use crate::s3::{
@@ -761,7 +762,7 @@ fn http_head_content_type(
     );
     match req.call() {
         Ok(resp) => Ok(resp.header("Content-Type").map(|s| s.to_string())),
-        Err(ureq::Error::Status(_, resp)) => Ok(resp.header("Content-Type").map(|s| s.to_string())),
+        Err(HttpError::Status(_, resp)) => Ok(resp.header("Content-Type").map(|s| s.to_string())),
         Err(e) => Err(RemoteError::Http(e.to_string())),
     }
 }

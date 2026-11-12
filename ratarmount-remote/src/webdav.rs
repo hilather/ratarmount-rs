@@ -6,6 +6,7 @@
 use std::io::{self, Seek, SeekFrom, Write};
 
 use log::debug;
+use ratarmount_index::http_client::HttpError;
 use tempfile::NamedTempFile;
 use url::Url;
 
@@ -215,7 +216,7 @@ pub fn propfind_entries(loc: &WebDavLocation, depth: u32) -> Result<Vec<WebDavDi
     let req = apply_auth(req, loc);
     let resp = match req.send_string(PROPFIND_BODY) {
         Ok(r) => r,
-        Err(ureq::Error::Status(code, resp)) => {
+        Err(HttpError::Status(code, resp)) => {
             let body = resp.into_string().unwrap_or_default();
             return Err(RemoteError::WebDav(format!(
                 "PROPFIND HTTP {code} for {}: {body}",
@@ -462,7 +463,7 @@ fn propfind_self_is_collection(loc: &WebDavLocation) -> Result<bool> {
     let req = apply_auth(req, loc);
     let resp = match req.send_string(PROPFIND_BODY) {
         Ok(r) => r,
-        Err(ureq::Error::Status(code, _)) => {
+        Err(HttpError::Status(code, _)) => {
             debug!("PROPFIND {} -> HTTP {code}", loc.http_url);
             return Ok(false);
         }

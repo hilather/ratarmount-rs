@@ -133,7 +133,7 @@ fn fetch(url: &str, timeout: std::time::Duration) -> io::Result<Vec<u8>> {
     .without_range_cache();
     let response = source
         .request_with_timeout("GET", None, Some(timeout))
-        .map_err(|e| io::Error::other(crate::map_ureq_http_error(e, url).to_string()))?;
+        .map_err(|e| io::Error::other(crate::map_http_client_error(e, url).to_string()))?;
     let bytes = crate::read_at_most(&mut response.into_reader(), MAX_META)?;
     if bytes.len() as u64 > MAX_META {
         return Err(invalid("torrent metadata exceeds 64 MiB"));
