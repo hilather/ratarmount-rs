@@ -388,6 +388,10 @@ fn execute_owned(
     load: &Load,
 ) -> io::Result<record::Finished> {
     let host = record::uname()?;
+    let load = serde_json::to_value(load).map_err(io::Error::from);
+    #[cfg(test)]
+    let load = load.and_then(|value| inject("load-serialize").map(|()| value));
+    let load = load.map_err(|error| io::Error::new(error.kind(), format!("host load: {error}")))?;
     let Scratch {
         args,
         bytes,
@@ -405,15 +409,7 @@ fn execute_owned(
         .and_then(|v| v.to_str())
         .ok_or_else(|| invalid("output name"))?;
     let logs = owned::create_directory(&out_parent, out_name)?;
-    let header = record::batch(
-        args,
-        bytes,
-        entries,
-        executable,
-        paths,
-        host,
-        serde_json::to_value(load)?,
-    );
+    let header = record::batch(args, bytes, entries, executable, paths, host, load);
     let records = header.and_then(|header| record::Records::create(&logs, id, header, entries));
     #[cfg(test)]
     let records = records.and_then(|file| inject("outcomes-create").map(|()| file));
@@ -616,7 +612,10 @@ fn execute_owned(
             }
             // The row retains phases: [] when serialization fails.
             (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(primary)) => Err(owned::with_cleanup(primary, Err(error))),
+            (Err(error), Err(primary)) => Err(io::Error::new(
+                primary.kind(),
+                format!("{primary}; phase serialization: {error}"),
+            )),
         };
         row["execution_error"] =
             serde_json::json!(execution.as_ref().err().map(ToString::to_string));
@@ -700,11 +699,11 @@ mod tests {
         assert!(!f.dir.path().join("work/owned-test").exists());
         assert!(!f.calls().contains("run -d"));
     }
-    // Regression: every outer lifecycle error retains the interrupt form, including uname.
+    // Regression: every outer lifecycle error retains the interrupt form, including uname and host-load serialization before output creation.
     #[test]
     fn regression_bench_outer_lifecycle_error_keeps_interrupted_form() {
         let _scope = runtime::InterruptScope::new();
-        for fault in ["outcomes-create", "uname-fail"] {
+        for fault in ["outcomes-create", "uname-fail", "load-serialize"] {
             for interrupted in [false, true] {
                 let _signals = runtime::Signals::install().unwrap();
                 let mut f = Fixture::new();
@@ -713,10 +712,10 @@ mod tests {
                     runtime::test_set_interrupted();
                 }
                 let result = f.run_finished();
-                let error = if fault == "uname-fail" {
-                    "host identity: uname failed: uname-fail"
-                } else {
-                    "outcomes-create"
+                let error = match fault {
+                    "uname-fail" => "host identity: uname failed: uname-fail",
+                    "load-serialize" => "host load: load-serialize",
+                    _ => "outcomes-create",
                 };
                 assert_eq!(result.as_ref().unwrap_err().to_string(), error);
                 assert_eq!(
@@ -729,6 +728,9 @@ mod tests {
                 );
                 assert!(!f.dir.path().join("out").exists());
                 assert!(!f.dir.path().join("out/batch-end.json").exists());
+                if fault == "load-serialize" {
+                    assert!(!f.dir.path().join("work/owned-test").exists());
+                }
             }
         }
     }
@@ -1289,6 +1291,27 @@ mod tests {
         leak_exit("phases-serialize", true);
         let _scope = runtime::InterruptScope::new();
         let mut f = Fixture::new();
+        let _fault = FaultScope::new(&["execution-fail", "phases-serialize"]);
+        let finished = f.run_finished().unwrap();
+        let error = "execution-fail; phase serialization: phases-serialize";
+        assert_eq!(
+            owned::error_parts(finished.result.as_ref().unwrap_err()),
+            (error.into(), None)
+        );
+        let rows = f.rows();
+        assert_eq!(rows.len(), f.entries.len());
+        assert_eq!(rows[0]["outcome"], "error");
+        assert_eq!(rows[0]["execution_error"], error);
+        assert_eq!(rows[0]["reason"], error);
+        assert!(rows[0]["cleanup_error"].is_null());
+        assert_eq!(rows[0]["phases"], serde_json::json!([]));
+        assert!(rows[1..].iter().all(|r| r["outcome"] == "blocked"));
+        assert!(!f.dir.path().join("work/owned-test").exists());
+        assert_eq!(
+            presentation(Ok(finished)),
+            Err(format!("bench native lifecycle: {error}"))
+        );
+        let mut f = Fixture::new();
         let _fault = FaultScope::new(&[
             "execution-fail",
             "phases-serialize",
@@ -1298,9 +1321,9 @@ mod tests {
         let finished = f.run_finished().unwrap();
         assert_eq!(
             finished.result.as_ref().unwrap_err().to_string(),
-            "execution-fail; cleanup: phases-serialize; record-fail"
+            "execution-fail; phase serialization: phases-serialize; cleanup: record-fail"
         );
-        assert_eq!(presentation(Ok(finished)), Ok((1, "sandbox bench: interrupted: batch incomplete; lifecycle error: execution-fail; cleanup: phases-serialize; record-fail".into())));
+        assert_eq!(presentation(Ok(finished)), Ok((1, "sandbox bench: interrupted: batch incomplete; lifecycle error: execution-fail; phase serialization: phases-serialize; cleanup: record-fail".into())));
         assert!(!f.dir.path().join("work/owned-test").exists());
     }
     // Regression: execution I/O failure after startup removed the tree but leaked its empty scratch leaf.
