@@ -7,6 +7,7 @@ mod run;
 mod runtime;
 mod schedule;
 mod source;
+mod summarize;
 
 use clap::{ArgGroup, Args};
 use std::io::Write;
@@ -14,13 +15,16 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Args)]
 #[command(
+    args_conflicts_with_subcommands = true, subcommand_negates_reqs = true,
     group(ArgGroup::new("mode").required(true).multiple(false).args(["validate_only", "dry_run", "out"])),
-    after_help = "Example: ratarmount sandbox bench --manifest tasks.json --validate-only\nExample: ratarmount sandbox bench --manifest tasks.json --dry-run --jobs 1\n\nRequires Linux. Structural validation does not establish external qualification.\nDry-run emits a JSONL schedule without execution or file creation.\nInherited `--socket` is rejected; bench owns its supervisor.\n\nExit status:\n  0  Structurally valid (draft pins allowed unless --require-pins); schedule admitted if dry-run; native execution: batch complete and every run passed (stub batches are fixtures).\n  1  Operational/reporting failure; failed or blocked runs; interrupted or incomplete batch.\n  2  Invalid arguments/manifest, unresolved strict pins or refused selection."
+    after_help = "Example: ratarmount sandbox bench --manifest tasks.json --validate-only\nExample: ratarmount sandbox bench --manifest tasks.json --dry-run --jobs 1\nExample: ratarmount sandbox bench summarize results/batch\n\nRequires Linux. Structural validation does not establish external qualification.\nDry-run emits a JSONL schedule without execution or file creation.\nInherited `--socket` is rejected; bench owns its supervisor.\n\nExit status:\n  0  Structurally valid (draft pins allowed unless --require-pins); schedule admitted if dry-run; native execution: batch complete and every run passed (stub batches are fixtures).\n  1  Operational/reporting failure; failed or blocked runs; interrupted or incomplete batch.\n  2  Invalid arguments/manifest, unresolved strict pins or refused selection.\nSummarize: 0 passed; 1 failed/error/interrupted/incomplete or report failure; 2 invalid/unreadable records."
 )]
 pub(super) struct BenchArgs {
+    #[command(subcommand)]
+    command: Option<BenchCommand>,
     /// JSON manifest using schema rrs-perl-tasks/1.
-    #[arg(long, value_name = "PATH")]
-    manifest: PathBuf,
+    #[arg(long, required = true, value_name = "PATH")]
+    manifest: Option<PathBuf>,
     /// Validate without opening artifacts or running commands.
     #[arg(long)]
     validate_only: bool,
@@ -48,6 +52,19 @@ pub(super) struct BenchArgs {
     allow_high_load: bool,
     #[command(flatten)]
     selection: Selection,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum BenchCommand {
+    /// Summarize one completed output directory without a manifest or runtime.
+    Summarize { dir: PathBuf },
+}
+impl BenchArgs {
+    fn manifest(&self) -> &Path {
+        self.manifest
+            .as_deref()
+            .expect("clap requires --manifest without a subcommand")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
@@ -95,13 +112,16 @@ pub(super) fn run(args: &BenchArgs, socket: Option<&Path>) -> Result<i32, String
         eprintln!("sandbox bench: inherited --socket is rejected; bench owns its supervisor");
         return Ok(2);
     }
+    if let Some(BenchCommand::Summarize { dir }) = &args.command {
+        return summarize::run(dir);
+    }
     if usize::from(args.validate_only) + usize::from(args.dry_run) + usize::from(args.out.is_some())
         != 1
     {
         eprintln!("sandbox bench: exactly one of --validate-only, --dry-run or --out is required");
         return Ok(2);
     }
-    let bytes = match manifest::open_manifest(&args.manifest) {
+    let bytes = match manifest::open_manifest(args.manifest()) {
         Ok(bytes) => bytes,
         Err((code, error)) => {
             eprintln!("sandbox bench: {error}");
@@ -112,7 +132,7 @@ pub(super) fn run(args: &BenchArgs, socket: Option<&Path>) -> Result<i32, String
         if strict && !args.require_pins && args.out.is_none() {
             break;
         }
-        if let Err(error) = manifest::validate(&bytes, &args.manifest, strict) {
+        if let Err(error) = manifest::validate(&bytes, args.manifest(), strict) {
             eprintln!("sandbox bench: {prefix}: {error}");
             return Ok(2);
         }
@@ -235,7 +255,8 @@ mod tests {
         refusal(Err(error.clone()), "unknown field");
         assert!(!error.contains(['\x1b', '\n']) && !error.contains("line: 0"));
         let args = BenchArgs {
-            manifest: FILE.into(),
+            command: None,
+            manifest: Some(FILE.into()),
             validate_only: false,
             require_pins: false,
             dry_run: false,

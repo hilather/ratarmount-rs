@@ -103,7 +103,7 @@ fn regression_bench_cli_no_positional_steal() {
     assert!(stderr(&strict).contains("unpinned"));
     let positional = cli(&["bench", "--manifest", path, "--validate-only", "mountpoint"]);
     assert_eq!(positional.status.code(), Some(2));
-    assert!(stderr(&positional).contains("unexpected argument 'mountpoint'"));
+    assert!(stderr(&positional).contains("the subcommand 'mountpoint' cannot be used with:"));
     let hash = format!("sha256:{}", "a".repeat(64));
     let mut pinned = draft();
     pinned["tasks"].as_array_mut().unwrap().truncate(1);
@@ -1467,6 +1467,148 @@ mod native {
             .rows()
             .iter()
             .all(|r| r["fixture"] == true && r["publishable"] == false));
+    }
+    // Regression: summarize required a manifest/runtime or accepted execution flags (B4b-5a/5).
+    #[test]
+    fn regression_bench_cli_summarize_needs_no_manifest_or_runtime() {
+        let help = cli(&["bench", "--help"]);
+        assert!(help.status.success(), "{}", stderr(&help));
+        let help = String::from_utf8_lossy(&help.stdout);
+        for expected in [
+            "Validate a Perl benchmark manifest, emit a dry-run schedule, run native lifecycles",
+            "summarize records (Linux only)",
+            "Commands:",
+            "summarize",
+        ] {
+            assert!(help.contains(expected), "{help}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let entry = json!({"schema":"rrs-perl-bench-schedule/1","catalog_revision":"fixture-1",
+            "cell":{"task":"task","platform":"platform","base_form":"tar.zst-single-frame","jobs":1,"cache":"warm"},
+            "backend":"native","kind":"measured","repeat":1,"paired":false,"seed":1,"repeats":1,"attempts":1,
+            "cpus":1,"allow_oversubscription":false,"oversubscribed":false,"qualified":true});
+        let header = json!({"schema":"rrs-perl-bench/1","record":"batch","batch_id":"fixture",
+            "catalog_revision":"fixture-1","tasks":[{"id":"task"}],"platforms":[{"id":"platform"}],
+            "fixture":true,"publishable":false,"runtime":{"kind":"stub"},"load":{},
+            "settings":{"native":{"seed":1,"repeats":1,"attempts":1,"base_form":["tar.zst-single-frame"],"cache":["warm"],"jobs":[1]}}});
+        for (name, row) in [
+            ("batch.json", header.clone()),
+            (
+                "schedule.jsonl",
+                json!({"schema":"rrs-perl-bench/1","record":"schedule","batch_id":"fixture","run_id":"fixture-0","sequence":0,"entry":entry}),
+            ),
+            (
+                "runs.jsonl",
+                json!({"schema":"rrs-perl-bench/1","record":"run","batch_id":"fixture","run_id":"fixture-0","index":0,"schedule":entry,"outcome":"passed","runtime":header["runtime"],"fixture":true,"publishable":false,"load":{},"lifecycle_ms":{"total":100}}),
+            ),
+            (
+                "batch-end.json",
+                json!({"schema":"rrs-perl-bench/1","record":"batch-end","batch_id":"fixture","status":"passed","error":null,"wall_ms":1000,"counts":{"passed":1,"failed":0,"blocked":0,"interrupted":0,"error":0}}),
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), format!("{row}\n")).unwrap();
+        }
+        let result = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+            .args(["sandbox", "bench", "summarize"])
+            .arg(dir.path())
+            .env("PATH", "")
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(0), "{}", stderr(&result));
+        let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["groups"][0]["samples"], 1);
+        assert_eq!(report["verified_attempts_per_hour"], 3600.0);
+        assert_eq!(stderr(&result).lines().count(), 1);
+        let path = dir.path().to_str().unwrap();
+        for flags in [
+            vec!["bench", "--manifest", "absent.json", "summarize", path],
+            vec!["bench", "--out", "absent-output", "summarize", path],
+        ] {
+            let result = cli(&flags);
+            assert_eq!(result.status.code(), Some(2), "{}", stderr(&result));
+            assert!(
+                stderr(&result).contains("cannot be used"),
+                "{}",
+                stderr(&result)
+            );
+        }
+        for (args, required) in [
+            (vec!["bench", "--dry-run"], "--manifest"),
+            (
+                vec!["bench", "--manifest", "absent.json"],
+                "--validate-only",
+            ),
+        ] {
+            let result = cli(&args);
+            assert_eq!(result.status.code(), Some(2), "{}", stderr(&result));
+            assert!(stderr(&result).contains(required), "{}", stderr(&result));
+            assert!(stderr(&result).contains("required"), "{}", stderr(&result));
+        }
+    }
+    // Regression: real stub producer records failed to round-trip through summarize (B4b-5a/6).
+    #[test]
+    fn regression_bench_cli_native_producer_round_trips_summary() {
+        for failed in [false, true] {
+            let f = Fixture::new();
+            if failed {
+                f.fault("tap-fail-zero");
+            }
+            let produced = f.command().output().unwrap();
+            assert_eq!(
+                produced.status.code(),
+                Some(i32::from(failed)),
+                "{}",
+                stderr(&produced)
+            );
+            let summarized = cli(&[
+                "bench",
+                "summarize",
+                f.dir.path().join("out").to_str().unwrap(),
+            ]);
+            assert_eq!(
+                summarized.status.code(),
+                Some(i32::from(failed)),
+                "{}",
+                stderr(&summarized)
+            );
+            let report: Value = serde_json::from_slice(&summarized.stdout).unwrap();
+            assert_eq!(report["status"], if failed { "failed" } else { "passed" });
+            assert_eq!(report["fixture"], true);
+            assert_eq!(report["publishable"], false);
+            assert_eq!(report["ratios"], json!([]));
+            assert_eq!(
+                String::from_utf8_lossy(&summarized.stdout).lines().count(),
+                1
+            );
+            let message = stderr(&summarized);
+            assert_eq!(message.lines().count(), 1);
+            assert!(message.starts_with("sandbox bench summarize:"), "{message}");
+            assert!(
+                message.contains("stub fixture, not publishable"),
+                "{message}"
+            );
+            if failed {
+                assert!(report["verified_attempts_per_hour"].is_null());
+            } else {
+                let schedule =
+                    std::fs::read_to_string(f.dir.path().join("out/schedule.jsonl")).unwrap();
+                let measured = schedule
+                    .lines()
+                    .map(|s| serde_json::from_str::<Value>(s).unwrap())
+                    .filter(|s| s["entry"]["kind"] == "measured")
+                    .count();
+                let samples: u64 = report["groups"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|g| g["samples"].as_u64().unwrap())
+                    .sum();
+                assert_eq!(samples, measured as u64);
+                assert!(report["verified_attempts_per_hour"].as_f64().unwrap() > 0.0);
+            }
+            f.no_containers();
+        }
     }
     // Regression: a successful stub batch lacked canonical identities, summaries or execution details (10/N5).
     #[test]

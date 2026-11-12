@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const SCHEMA: &str = "rrs-perl-bench/1";
+pub(super) const SCHEMA: &str = "rrs-perl-bench/1";
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct Summary {
     files: Option<u64>,
@@ -284,8 +284,8 @@ impl<'a> Records<'a> {
         id: &str,
         mut header: Value,
         entries: &[schedule::Entry],
+        started: Instant,
     ) -> io::Result<Self> {
-        let started = Instant::now();
         header["batch_id"] = id.into();
         write_record_file(dir, "batch.json", &[header.clone()])?;
         let rows: Vec<_> = entries.iter().enumerate().map(|(index,entry)| json!({"schema":SCHEMA,"record":"schedule", "batch_id":id,"run_id":format!("{id}-{index}"),"sequence":index,"entry":entry})).collect();
@@ -578,7 +578,8 @@ mod tests {
         let manifest = dir.join("tasks.json");
         std::fs::write(&manifest, &bytes).unwrap();
         let args = BenchArgs {
-            manifest,
+            command: None,
+            manifest: Some(manifest),
             validate_only: false,
             dry_run: false,
             require_pins: false,
@@ -612,7 +613,7 @@ mod tests {
             let fixture = kind == RuntimeKind::Stub;
             let dir = tempfile::tempdir().unwrap();
             let (fd, header, entries) = records(dir.path(), kind);
-            let records = Records::create(&fd, "id", header, &entries).unwrap();
+            let records = Records::create(&fd, "id", header, &entries, Instant::now()).unwrap();
             let batch: Value =
                 serde_json::from_slice(&std::fs::read(dir.path().join("batch.json")).unwrap())
                     .unwrap();
@@ -661,7 +662,7 @@ mod tests {
         for interrupted in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let (fd, header, entries) = records(dir.path(), RuntimeKind::Stub);
-            let mut records = Records::create(&fd, "id", header, &entries).unwrap();
+            let mut records = Records::create(&fd, "id", header, &entries, Instant::now()).unwrap();
             records.broken = true;
             if interrupted {
                 runtime::test_set_interrupted();
