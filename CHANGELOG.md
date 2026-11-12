@@ -4,9 +4,10 @@
 
 ### Changes
 
+- B5a1a-1 adds the Linux bench FUSE lifecycle core: Docker allow_other preflight preserves its diagnostic, stub stays owner-only, passthrough is off, and failures keep state with recovery logs/records. Refinements and real acceptance remain required before merge.
 - Hidden Linux `sandbox bench summarize DIR` validates batch records and reports measured distributions, matched ratios and passed-batch throughput; `wall_ms` now starts at execution entry, including shared artifact admission and image inspection.
 - **Library API (experimental):** `ratarmount_index::fill_content_hashes` now returns `Result<FillReport>` instead of `Result<()>`, reporting members filled, kept with existing hashes, and unverifiable.
-- Hidden Linux `sandbox bench --out DIR --runtime PATH` executes qualified native/warm/single-frame archive lifecycles with bounded extraction and runtime cleanup. Runs are graded against a native reference (see below). See [the benchmark guide](docs/sandbox-benchmarking.md).
+- Hidden Linux `sandbox bench --out DIR --runtime PATH` executes qualified native/FUSE warm single-frame archive lifecycles with bounded extraction and runtime cleanup. Runs are graded against a native reference (see below). See [the benchmark guide](docs/sandbox-benchmarking.md).
 - Native sandbox benchmarks confine archive symlink targets independent of entry order, bound extraction descriptors, clean restrictive archive/runtime directories through held handles, preserve primary failures and record pre-runtime/interrupt outcomes. Admission uses the unique scratch leaf, retains default `/var/tmp`, and refuses canonical work-root containment or missing output parents with exit 2.
 - Native benchmark cleanup accepts non-UTF-8 runtime names, preserves existing scratch collisions and primary errors on outcome-write failure, and removes scratch leaves after execution errors. Work-root ancestor refusals also cover the runtime executable and placement output.
 - `sandbox bench --out` now requires `--runtime-kind docker|stub` (Podman is refused as not yet qualified), grades prove summaries against the native reference, writes `rrs-perl-bench/1` `batch.json`/`schedule.jsonl`/`runs.jsonl`/`batch-end.json` (replacing `outcomes.jsonl`), and exits 0 only when every run passes; interrupted batches are reported distinctly. Stub output is fixture-only.

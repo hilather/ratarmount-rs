@@ -542,7 +542,7 @@
       "file": "ratarmount/src/sandbox/process.rs",
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
-      "reason": "Reviewed Linux parent-death setup and mountinfo reads, macOS getmntinfo, platform unmount arguments and explicit unsupported fallback. R1c-1: the inspection connect's stream socket takes SOCK_CLOEXEC atomically at socket() on Linux (rustix socket_with); macOS has no SOCK_CLOEXEC and sets FD_CLOEXEC right after socket() — safe because the supervisor's serve thread, the only caller, is also the only thread that spawns children."
+      "reason": "Reviewed Linux parent-death setup and mountinfo reads, macOS getmntinfo, platform unmount arguments and explicit unsupported fallback. R1c-1: the inspection connect's stream socket takes SOCK_CLOEXEC atomically at socket() on Linux (rustix socket_with); macOS has no SOCK_CLOEXEC and sets FD_CLOEXEC right after socket() — its existing supervisor serve thread is the only caller and child-spawning thread. B5a1a-1 review at c1401e7e (2026-11-12): Linux-only bench now reuses inspection::connect while owning runtime children, requiring atomic CLOEXEC; no new acquisition site or non-Linux caller. Provenance: PLAN-B5a1a-r1.3.4 section 3.4 and its binding addendum."
     },
     {
       "file": "ratarmount/src/sandbox/run.rs",

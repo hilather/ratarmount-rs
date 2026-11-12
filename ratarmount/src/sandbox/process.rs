@@ -676,8 +676,10 @@ pub fn mountpoints() -> io::Result<Vec<PathBuf>> {
 /// A blocking Unix stream socket with CLOEXEC. `SOCK_CLOEXEC` is taken
 /// atomically at `socket()` on Linux, where it exists; on macOS `FD_CLOEXEC`
 /// is set right after `socket()` because no `SOCK_CLOEXEC` exists: the
-/// supervisor's serve thread, the only caller, is also the only thread that
-/// spawns children, so none can inherit the socket in between.
+/// existing supervisor serve thread is the only non-Linux caller and the only
+/// thread spawning children there. Linux bench also connects while owning runtime
+/// children; atomic CLOEXEC prevents inheritance. Bench is Linux-only; the reviewed
+/// non-Linux fallback remains limited to the existing supervisor caller.
 pub(crate) fn stream_socket() -> io::Result<rustix::fd::OwnedFd> {
     use rustix::net::{AddressFamily, SocketType};
     #[cfg(target_os = "linux")]

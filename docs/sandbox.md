@@ -9,10 +9,9 @@ fleets of attempts.
 
 The hidden Linux [`sandbox bench` command](sandbox-benchmarking.md) validates
 Perl benchmark manifests, including unpinned drafts, emits a deterministic dry-run
-schedule, runs native lifecycles for qualified warm `tar.zst-single-frame` cells
+schedule, runs native/FUSE lifecycles for qualified warm `tar.zst-single-frame` cells
 (stub fixtures or local Docker) and summarizes a batch's records with
-`summarize DIR`. FUSE execution is not yet available, and the command establishes
-no external qualification.
+`summarize DIR`. Bench FUSE is Linux-only; the command establishes no external qualification.
 
 ## Worked example: snapshot to graded bundle
 
@@ -1516,6 +1515,32 @@ that selection, including for the in-tree test stub. The runtime must use the
 local host's mount namespace; a remote Docker daemon cannot bind this mount.
 Non-root FUSE mounts require `user_allow_other` in `/etc/fuse.conf`; the command
 checks this before mounting and reports the existing actionable diagnostic.
+
+Bench FUSE uses a separate owned daemon and private sibling `<work>/<id>-fuse`.
+Docker requires `allow_other`, checked with the existing validator before FUSE
+effects; stub is owner-only, and both use passthrough off. Supervisor exchanges
+have per-exchange 3600 s deadlines; readiness has 30 s and daemon `--timeout 3600`
+is a per-operation cap. Supervisor and worst-case inspect sockets are validated
+before creation: the inspection path adds `len(id)+49` bytes beyond the work root,
+strictly below sun_path. Default `/var/tmp` passes; deeper project paths often do not.
+Separate `fuse-daemon.stdout.log`, `fuse-daemon.stderr.log` and immediate
+`fuse-recovery.json` support diagnosis; readiness only proves the socket is bound.
+Executed rows add `mount`; native-only settings.fuse is `{"applicable":false}`.
+FUSE rows have tree null, lifecycle timings and separate preparation_ms. Ratios
+compare wall time, including different native/FUSE lifecycle operations.
+Failures keep a dead mount plus on-disk state after owned Child::kill and reap,
+without destroy/Shutdown. An aborted new points recovery at the batch record;
+look under `<state>/attempts`. Otherwise Shutdown is sent once, using a single
+1 s connect/write/read deadline whenever interrupted at send time, including
+batch end; reap is bounded at 2 s before kill-and-keep. Remove the leaf only after
+reap, before finishing records. For kept state, unmount with fusermount3 -u (or
+lazy), confirm no mount remains, chmod -R u+w the leaf, then remove it. Never
+restart a daemon on a kept leaf. After a bench crash, verify /proc/PID/cmdline
+against recorded socket/state; prefer the supervisor shutdown command for teardown,
+never an unchecked recorded-PID kill. Held-fd verification does not cover the
+daemon's later artifact open; the equal 3600 s caps can race into uncertainty keep.
+Slice-1 refinement/real-acceptance limits and the separate-squash merge requirement
+are detailed in the [benchmark guide](sandbox-benchmarking.md).
 
 A credentialed remote `--base URL` is passed to the mount child on its command line, so
 other local users can see it in `ps`. Everything ratarmount itself prints or stores
