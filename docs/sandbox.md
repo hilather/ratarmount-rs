@@ -1528,18 +1528,31 @@ Separate `fuse-daemon.stdout.log`, `fuse-daemon.stderr.log` and immediate
 Executed rows add `mount`; native-only settings.fuse is `{"applicable":false}`.
 FUSE rows have tree null, lifecycle timings and separate preparation_ms. Ratios
 compare wall time, including different native/FUSE lifecycle operations.
-Failures keep a dead mount plus on-disk state after owned Child::kill and reap,
-without destroy/Shutdown. An aborted new points recovery at the batch record;
+Finalize retries only typed writers_active under one 3600 s deadline with >=1 s
+backoff and the same request ID. Full bounded manifest/diagnostic artifacts are
+copied before destroy, synced per file and once on the output directory before
+publishing supervisor_artifacts descriptors. Copy/overflow failures keep state.
+Known idle attempt interrupts may destroy after successful runtime stop and copy,
+using one flag-tolerant 15 s deadline, then one 1 s Shutdown. Aborted new and
+failed/in-flight finalize/destroy, stop/copy and ordinary I/O errors keep state.
+A client timeout cannot cancel server cleanup; a lost/late reply keeps the remaining
+sibling leaf without Shutdown, even if the attempt root has already disappeared.
+Kept state has a dead mount plus on-disk state after owned Child::kill and reap. An aborted new points recovery at the batch record;
 look under `<state>/attempts`. Otherwise Shutdown is sent once, using a single
 1 s connect/write/read deadline whenever interrupted at send time, including
 batch end; reap is bounded at 2 s before kill-and-keep. Remove the leaf only after
-reap, before finishing records. For kept state, unmount with fusermount3 -u (or
+reap and a mount-table check; equality, descendants or a read error keep the leaf.
+FUSE error rows include bounded privilege_status diagnostics; unwritable rows use
+stderr after the primary. Runtime Phase.error triggers this; ordinary grading
+failure does not. overlay_usage records logical Stats before runtime stop, absent
+on native/blocked or incomplete-Stats rows. FUSE artifact paths must be UTF-8.
+For kept state, unmount with fusermount3 -u (or
 lazy), confirm no mount remains, chmod -R u+w the leaf, then remove it. Never
 restart a daemon on a kept leaf. After a bench crash, verify /proc/PID/cmdline
 against recorded socket/state; prefer the supervisor shutdown command for teardown,
 never an unchecked recorded-PID kill. Held-fd verification does not cover the
 daemon's later artifact open; the equal 3600 s caps can race into uncertainty keep.
-Slice-1 refinement/real-acceptance limits and the separate-squash merge requirement
+Artifact caps, diagnostics, real-acceptance limits and the separate-squash merge requirement
 are detailed in the [benchmark guide](sandbox-benchmarking.md).
 
 A credentialed remote `--base URL` is passed to the mount child on its command line, so

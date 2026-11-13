@@ -9626,6 +9626,62 @@
     },
     {
       "configured_path": "rustix::fs::openat",
+      "item": "ratarmount::sandbox::bench::run::open_privilege_status",
+      "leaf_digest": "38ffb45cc6048c6675b4042003508545987a59848112f5d2b58e97a8df5ceef0",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "benchmark-privilege-status",
+        "creation": {
+          "basis": "Fixed existing proc status, read-only no-follow nonblocking CLOEXEC; no creation or caller path.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-GAP0-B5A1A2-M02",
+        "item": "ratarmount::sandbox::bench::run::open_privilege_status",
+        "reason": "Read fixed /proc/self/status solely for secondary diagnostics after FUSE lifecycle errors; bound the stream to 64 KiB plus one overflow byte."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B5A1A2-M02\",\"item\":\"ratarmount::sandbox::bench::run::open_privilege_status\",\"disposition\":\"out-of-family\",\"category\":\"benchmark-privilege-status\",\"reason\":\"Read fixed /proc/self/status solely for secondary diagnostics after FUSE lifecycle errors; bound the stream to 64 KiB plus one overflow byte.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Fixed existing proc status, read-only no-follow nonblocking CLOEXEC; no creation or caller path.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
+      "item": "ratarmount::sandbox::bench::run::open_supervisor_artifact",
+      "leaf_digest": "cb84f1391183de0995f4b07c35c794a27423d05b4e7876dfed00da7e08f134e3",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "benchmark-supervisor-artifact",
+        "creation": {
+          "basis": "Existing supervisor artifacts only; read-only, no following, creation or truncation.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-GAP0-B5A1A2-M01",
+        "item": "ratarmount::sandbox::bench::run::open_supervisor_artifact",
+        "reason": "Read only fixed diagnostic and finalized manifest children of held no-follow supervisor directories before destroy; require caller-owned regular single-link files and full bounded content."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "cli-nfsv4",
+        "cli-no-default",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-GAP0-B5A1A2-M01\",\"item\":\"ratarmount::sandbox::bench::run::open_supervisor_artifact\",\"disposition\":\"out-of-family\",\"category\":\"benchmark-supervisor-artifact\",\"reason\":\"Read only fixed diagnostic and finalized manifest children of held no-follow supervisor directories before destroy; require caller-owned regular single-link files and full bounded content.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing supervisor artifacts only; read-only, no following, creation or truncation.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
       "item": "ratarmount::sandbox::bench::summarize::open_record_dir",
       "leaf_digest": "da97f2f6da18a16038c2e028b40182f86eef0f09cd28969bd7822855545e2b5a",
       "lint": "clippy::disallowed_methods",

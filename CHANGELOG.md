@@ -4,6 +4,8 @@
 
 ### Changes
 
+- B5a1a-2 preserves bounded supervisor artifacts before destroy, retries writers_active finalize within one deadline, adds conservative interrupt teardown, mount-aware cleanup and privilege diagnostics, and refuses non-UTF-8 FUSE artifacts before setup.
+
 - B5a1a-1 adds the Linux bench FUSE lifecycle core: Docker allow_other preflight preserves its diagnostic, stub stays owner-only, passthrough is off, and failures keep state with recovery logs/records. Refinements and real acceptance remain required before merge.
 - Hidden Linux `sandbox bench summarize DIR` validates batch records and reports measured distributions, matched ratios and passed-batch throughput; `wall_ms` now starts at execution entry, including shared artifact admission and image inspection.
 - **Library API (experimental):** `ratarmount_index::fill_content_hashes` now returns `Result<FillReport>` instead of `Result<()>`, reporting members filled, kept with existing hashes, and unverifiable.
