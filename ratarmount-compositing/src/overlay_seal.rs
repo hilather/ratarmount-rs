@@ -2092,7 +2092,9 @@ mod tests {
                 .contains("in use by another ratarmount process"));
         }
         drop(writer);
-        fs::remove_file(f.dir.join("plain")).unwrap();
+        // A row without its host entry. `plain` has no row since #328, so
+        // removing it would leave a consistent overlay; the symlink keeps one.
+        fs::remove_file(f.dir.join("link")).unwrap();
         assert!(seal(&f.dir, f.base.clone())
             .unwrap_err()
             .to_string()

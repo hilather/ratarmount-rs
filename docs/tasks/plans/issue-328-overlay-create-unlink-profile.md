@@ -242,6 +242,11 @@ Before implementing, check these against the regression catalog:
 - import marker N5 / hot journal R4-I1: not affected (offline, own
   connection).
 
+**Implemented** for regular-file creates and for unlinks/rmdirs of names the
+lower view lacks; mkdir and symlinks keep their rows. Analysis, tests and
+measurements (disk `full`: 7.1 / 6.6 → 0.12 / 0.07 ms per create / unlink):
+[`issue-328-option-a.md`](issue-328-option-a.md).
+
 **A2. Smaller per-op transactions.** The Deleted row keeps an `xattrs` reset
 row for names that never had base xattrs (19 vs 12 pwrites, and unbounded
 table growth). Write it only when the base entry has xattrs. Gain: a few

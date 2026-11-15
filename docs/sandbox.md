@@ -718,8 +718,10 @@ pending database rows were saved. The checker makes one directory walk and one
 1 for unrepaired inconsistencies, and 2 for an operational error.
 
 Host entries without a `files` row are normal: copy-on-write edits of existing
-base or lower-layer files publish host content without inserting a row. Their
-count, including implicit parent directories, is informational (`unrowed`);
+base or lower-layer files publish host content without inserting a row, and
+regular files created (or unlinked) under names the base and lower layers do
+not have write no row at all, which keeps those operations free of a durable
+SQLite transaction (#328). Their count, including implicit parent directories, is informational (`unrowed`);
 the compatibility field `orphan_content`
 is always 0 and does not contribute to errors. Repair does not invent rows for
 these entries.
