@@ -44,10 +44,10 @@ the [N-worker recipe and compatibility limits](sandbox.md#prepare-once-n-writabl
 | `--base-digest sha256:HEX\|none` | no | **added** (trust supplied identity without hashing, or disable identity checking with a warning; requires a writable top) | `[x]` Rust-only |
 | `--force-base-mismatch` | no | **added** (override cheap remount identity check, record override time) | `[x]` Rust-only |
 | `--overlay-allow GLOBS` | no | **added** (exceptions to read-only rules; most literal components wins, allow wins ties) | `[x]` Rust-only |
-| `--journal FILE` | no | **added** (FUSE operation JSONL, including on read-only data mounts; separate from append-commit journal) | `[x]` Rust-only |
+| `--journal FILE` | no | **added** (FUSE operation JSONL with observation settings and a clean end marker, including on read-only data mounts; one active writer per inode; separate from append-commit journal) | `[x]` Rust-only |
 | `--journal-reads all\|first` | no | **added** (all coalesced ranges or first nonempty range per handle; complete byte/request counters in either mode) | `[x]` Rust-only |
 | `--journal-exclude GLOB` | no | **added** (repeatable root-anchored path rules; marks retained) | `[x]` Rust-only |
-| `--journal-sync` | no | **added** (fsync operation journal at unmount) | `[x]` Rust-only |
+| `--journal-sync` | no | **added** (fsync operation records at unmount before publishing `end`; the marker itself is not fsynced) | `[x]` Rust-only |
 | `--overlay-readonly GLOBS` | no | **added** (protected overlay paths; EROFS across write frontends) | `[x]` Rust-only |
 | `--overlay-quota SIZE` / `--overlay-quota-files N` | no | **added** (shared logical content/file caps including copy-up; EDQUOT; xattr metadata excluded) | `[x]` Rust-only |
 | `--sandbox` | no | **added** (allow_other + noatime + caller uid/gid; RAM overlay unless explicit `-w`; Linux) | `[x]` Rust-only |
@@ -67,7 +67,7 @@ the [N-worker recipe and compatibility limits](sandbox.md#prepare-once-n-writabl
 | `overlay-stats OVERLAY [--json]` | no | **added** (overlay usage/deletions without mounting) | `[x]` Rust-only |
 | `diff OVERLAY [BASE]` | no | **added** (patch/Git/manifest/hash/stat/names, normalization, `--lower`, `--between`; exits 0 unchanged, 1 changed, 2 error, 3 limit; hash/manifest success is 0) | `[x]` Rust-only |
 | `overlay info\|seal\|unseal\|verify\|fsck\|import\|import-upperdir\|pack\|unpack` | no | **added** (offline layer identity, integrity, import and transport) | `[x]` Rust-only |
-| `journal summarize\|mark` | no | **added** (operation summaries and root-xattr turn markers) | `[x]` Rust-only |
+| `journal summarize\|mark` | no | **added** (operation summaries with explicit [coverage](sandbox.md#coverage-and-completeness), and root-xattr turn markers) | `[x]` Rust-only |
 | `sandbox run` | no | **added** (container attempt, cleanup, hash/manifest/journal report; optional seal/pack) | `[x]` Rust-only |
 | `sandbox daemon\|create-base\|new\|list\|diff\|stats\|finalize\|destroy\|shutdown` | no | **added** (Linux supervisor; Unix socket and pure-Python client; `finalize ID [--pack] [--request-id ID]` stops, seals, hashes and syncs an attempt; `new --retain` keeps finalized attempts in `retained/ID`, `list --all` lists them and `daemon --max-retained N` bounds them) | `[x]` Rust-only |
 | `snapshot GIT_BASE OUT.tar.zst [--with-index]` | no | **added** (deterministic committed tree export and optional mount index) | `[x]` Rust-only |

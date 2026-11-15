@@ -121,6 +121,8 @@ ratarmount sandbox run --base base.tar.zst --top attempt-07 --image busybox \
 Each attempt gets a private top over the same snapshot and optional sealed
 `--lower` layers. The runner executes a container, cleans up the mount, and
 reports its exit status, strict patch hash, manifest and journal summary as JSON.
+Journal reports include [observation completeness](docs/sandbox.md#coverage-and-completeness);
+missing read records never prove that a file was not read.
 Offline commands import patches, seal and verify layers, compare attempts, and
 pack portable bundles. The supervisor API manages fleets of attempts. Registration
 prepares the shared base/index once; its writable workers use immutable prepared

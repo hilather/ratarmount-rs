@@ -265,7 +265,9 @@ pub fn finalize_top(
             )]
             serde_json::to_writer(File::create(path)?, &summary)?;
             Some(
-                json!({"path":path, "files_read":summary.files_read.len(), "files_read_then_written":summary.files_read_then_written.len(), "files_written_blind":summary.files_written_blind.len()}),
+                // Coverage in brief; the full object is in the summary file.
+                json!({"path":path, "files_read":summary.files_read.len(), "files_read_then_written":summary.files_read_then_written.len(), "files_written_blind":summary.files_written_blind.len(),
+                    "complete":summary.coverage.complete, "reasons":summary.coverage.reasons}),
             )
         }
         None => None,

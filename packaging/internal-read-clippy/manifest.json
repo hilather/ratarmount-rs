@@ -1342,15 +1342,15 @@
       "rule_reason": "inventory-op:fs::create_dir_all"
     },
     {
-      "configured_path": "std::fs::create_dir_all",
+      "configured_path": "std::fs::create_dir",
       "item": "<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_parent",
-      "leaf_digest": "437d07daf52b1883acfb972b69941d006bfa356a0d52bf64979f4a5fe45eec6c",
+      "leaf_digest": "0995b3269388392a00c09e2cf21f0429c5d4d7c2619e66ea56b3cafd46b9ad82",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "overlay-directory",
         "creation": {
-          "basis": "Only a missing parent represented as a base directory is materialized; host directory creation keeps existing default/umask behavior.",
-          "policy": "recursive-directory"
+          "basis": "Create checked ancestors one at a time; only successful mkdir calls initialize the base mode under the mutation gate. Host owner rwx is retained, with the visible mode preserved in overlay metadata when needed.",
+          "policy": "exclusive-directory"
         },
         "disposition": "output-owner",
         "id": "IR-E0008-M01",
@@ -1363,9 +1363,9 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0008-M01\",\"item\":\"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_parent\",\"disposition\":\"output-owner\",\"category\":\"overlay-directory\",\"reason\":\"Materialize an archive parent directory inside the checked overlay root before a mutation.\",\"creation\":{\"policy\":\"recursive-directory\",\"basis\":\"Only a missing parent represented as a base directory is materialized; host directory creation keeps existing default/umask behavior.\"}}",
-      "resolved": "std::fs::create_dir_all",
-      "rule_reason": "inventory-op:fs::create_dir_all"
+      "reason": "internal-read:v1 {\"id\":\"IR-E0008-M01\",\"item\":\"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_parent\",\"disposition\":\"output-owner\",\"category\":\"overlay-directory\",\"reason\":\"Materialize an archive parent directory inside the checked overlay root before a mutation.\",\"creation\":{\"policy\":\"exclusive-directory\",\"basis\":\"Create checked ancestors one at a time; only successful mkdir calls initialize the base mode under the mutation gate. Host owner rwx is retained, with the visible mode preserved in overlay metadata when needed.\"}}",
+      "resolved": "std::fs::create_dir",
+      "rule_reason": "inventory-op:fs::create_dir"
     },
     {
       "configured_path": "std::fs::create_dir_all",

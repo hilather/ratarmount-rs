@@ -429,8 +429,10 @@ mod protocol {
                 .skip(1)
                 .map(|r| r["op"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["open", "read", "mark", "denied", "readdir"]
+            ["open", "read", "mark", "denied", "readdir", "end"]
         );
+        // The session's DESTROY wrote `end` with the records after the header.
+        assert_eq!(records[6]["records"], 5);
         assert_eq!(records[1]["pid"], 4242);
         assert_eq!(records[2]["pid"], 4242);
         assert_eq!(records[2]["ranges"], serde_json::json!([[0, 7]]));
