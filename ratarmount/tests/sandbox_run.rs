@@ -356,6 +356,9 @@ fn regression_run_fuse_writes_manifest_seal_pack_and_journal() {
     assert_eq!(report["bytes_written"], 6);
     assert!(Path::new(report["manifest_path"].as_str().unwrap()).exists());
     assert!(Path::new(report["journal_summary"]["path"].as_str().unwrap()).exists());
+    // The mount was unmounted cleanly before the summary: every record is in.
+    assert_eq!(report["journal_summary"]["complete"], true, "{report}");
+    assert_eq!(report["journal_summary"]["reasons"], json!([]));
     assert!(bundle.exists());
     // The script's opens drive the journal counts; their exact values
     // depend on the host's shell (T1b).

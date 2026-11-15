@@ -565,7 +565,9 @@ pub(super) fn widest_report(attempt: &Attempt, root: &Path) -> Value {
         "erofs_denied": u64::MAX,
         "manifest_path": path("manifest.jsonl"),
         "journal_summary": {"path": path("journal.summary.json"), "files_read": u64::MAX,
-            "files_read_then_written": u64::MAX, "files_written_blind": u64::MAX},
+            "files_read_then_written": u64::MAX, "files_written_blind": u64::MAX,
+            // Every reason of the closed set, the widest `reasons`.
+            "complete": false, "reasons": crate::journal_cmd::COVERAGE_REASONS},
         "bundle": path("bundle.tar.zst"),
     })
 }
