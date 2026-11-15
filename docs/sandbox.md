@@ -1208,7 +1208,15 @@ For these rules:
 | Operation | `t/suite` | `t/agent` | `t/agent/leaf` | `outside` |
 | --- | --- | --- | --- | --- |
 | Create, mkdir, write, truncate, unlink, chmod, setxattr | EROFS | allowed | allowed | allowed |
-| Rename endpoint, rmdir, reset | EROFS | EROFS | allowed | allowed |
+| Rename endpoint, rmdir, reset | EROFS | EROFS¹ | allowed | allowed |
+
+¹ `rmdir` of an exception root is allowed when the overlay created it: an empty
+`t/agent` that neither the base nor any `--lower` layer has can be removed again
+(`rm -rf t/agent` after `mkdir t/agent`), leaving no tombstone and no entry for
+`t/agent`. (The base parent `t`, materialized on the host by the mkdir, keeps
+the daemon's umask mode and can show as a mode-only change.)
+A `t/agent` the base or a lower layer provides stays anchored (EROFS), as do
+rename and reset of either.
 
 The second row also checks possible protected descendants. Exception roots inside
 protected subtrees stay anchored: renaming `t` or `t/agent` is refused; renaming an allowed leaf within

@@ -851,6 +851,71 @@ fn reserved_control_name_rejected() {
     agree(root, &overlay, &cache, &[]);
 }
 
+/// #326: under `--overlay-readonly 'bin/**' --overlay-allow 'bin/agent/**'`,
+/// `rm -rf bin/agent` of the exception root the agent created succeeds, leaves
+/// no `files` row, tombstone or manifest row, and every verb agrees.
+#[test]
+fn rmdir_overlay_created_exception_root() {
+    if !available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _writable = Writable(tmp.path());
+    let root = tmp.path();
+    let cache = root.join("cache");
+    let base = root.join("base.tar");
+    base_tar(&base);
+    let rules = [
+        std::ffi::OsStr::new("--overlay-readonly"),
+        std::ffi::OsStr::new("bin/**"),
+        std::ffi::OsStr::new("--overlay-allow"),
+        std::ffi::OsStr::new("bin/agent/**"),
+    ];
+    let overlay = root.join("overlay");
+    let mnt = root.join("mnt");
+    let mount = Mount::start_with(&base, Some(&overlay), &rules, &[], &mnt, "Makefile");
+    let agent = mnt.join("bin/agent");
+    fs::create_dir(&agent).unwrap();
+    fs::write(agent.join("x.t"), b"1\n").unwrap();
+    let rm = Command::new("rm").arg("-rf").arg(&agent).status().unwrap();
+    assert!(rm.success(), "rm -rf bin/agent: {rm}");
+    assert!(!agent.exists());
+    // The base-provided parent stays protected.
+    assert_eq!(
+        fs::remove_file(mnt.join("bin/tool"))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EROFS)
+    );
+    edit(&mnt);
+    mount.unmount();
+    assert!(!overlay.join("bin/agent").exists());
+    assert!(
+        files_rows(&overlay)
+            .iter()
+            .all(|(path, name, _)| !path.starts_with("/bin/agent") && name != "agent"),
+        "{:?}",
+        files_rows(&overlay)
+    );
+
+    // No manifest row for the removed root (the issue's manifest difference).
+    // The materialized parent `bin` may differ in mode when the umask does not
+    // match the base's directory mode; that is pre-existing and not #326.
+    let manifest = expect(
+        run(
+            &[Path::new("diff"), &overlay, Path::new("--manifest")],
+            &cache,
+        ),
+        0,
+    );
+    for line in manifest.lines() {
+        let row: Value = serde_json::from_str(line).unwrap();
+        let path = row["path"].as_str().unwrap_or_default();
+        assert!(!path.starts_with("bin/agent"), "{manifest}");
+    }
+    agree(root, &overlay, &cache, &[]);
+}
+
 /// C2: an archive base mounted with the hash gate shut leaves the digest
 /// `pending`; `overlay seal` resolves it and every verb agrees.
 #[test]
