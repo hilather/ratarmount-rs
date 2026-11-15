@@ -440,3 +440,53 @@ fn regression_import_refuses_control_dir_paths() {
     );
     assert!(dest.join("sub/.ratarmount-control/x").is_file());
 }
+
+/// Regression (#329): a Git patch that deletes file `x` and adds `x/y` failed
+/// with "x/y: parent /x is not a directory"; the reverse (delete `x/y`, add
+/// file `x`) failed with "added file already exists". Both import, seal and
+/// verify against the base.
+#[test]
+fn regression_import_file_directory_type_change_cli() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    fs::create_dir_all(base.join("d")).unwrap();
+    fs::write(base.join("x"), b"file\n").unwrap();
+    fs::write(base.join("d/y"), b"child\n").unwrap();
+    let patch: &[u8] = b"diff --git a/d b/d\nnew file mode 100644\n--- /dev/null\n+++ b/d\n@@ -0,0 +1 @@\n+now a file\ndiff --git a/d/y b/d/y\ndeleted file mode 100644\n--- a/d/y\n+++ /dev/null\n@@ -1 +0,0 @@\n-child\ndiff --git a/x b/x\ndeleted file mode 100644\n--- a/x\n+++ /dev/null\n@@ -1 +0,0 @@\n-file\ndiff --git a/x/y b/x/y\nnew file mode 100644\n--- /dev/null\n+++ b/x/y\n@@ -0,0 +1 @@\n+inside\n";
+    let dest = root.path().join("overlay");
+    let output = import(&base, &dest, patch, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dest.join("x").is_dir());
+    assert_eq!(fs::read(dest.join("x/y")).unwrap(), b"inside\n");
+    assert_eq!(fs::read(dest.join("d")).unwrap(), b"now a file\n");
+    let verify = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .args(["overlay", "verify", "--json"])
+        .arg(&dest)
+        .arg(&base)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let names = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .arg("diff")
+        .arg(&dest)
+        .arg(&base)
+        .arg("--name-status")
+        .output()
+        .unwrap();
+    assert_eq!(
+        names.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&names.stderr)
+    );
+    assert_eq!(names.stdout, b"T\td\nD\td/y\nT\tx\nA\tx/y\n");
+}
