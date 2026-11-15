@@ -330,6 +330,7 @@ impl RatarmountSftp {
         attrs: &ratarmount_compositing::OverlayMetadata,
     ) -> Result<(), i32> {
         let ov = self.overlay()?;
+        let requested = size.is_some() || !attrs.is_empty();
         let filtered;
         let attrs = if attrs.uid.is_some() || attrs.gid.is_some() {
             // A chown to the owner already presented is a no-op (#327).
@@ -345,10 +346,12 @@ impl RatarmountSftp {
             attrs
         };
         let path = self.realpath(path);
-        ov.set_attributes(&path, size, attrs).map_err(|e| {
-            let e = overlay_to_io(e);
-            e.raw_os_error().unwrap_or_else(|| io_to_errno(&e))
-        })?;
+        if requested {
+            ov.set_attributes(&path, size, attrs).map_err(|e| {
+                let e = overlay_to_io(e);
+                e.raw_os_error().unwrap_or_else(|| io_to_errno(&e))
+            })?;
+        }
         let id = self.inodes.id_for_path(&path);
         self.bump(id);
         Ok(())
@@ -450,6 +453,59 @@ mod tests {
 
     use ratarmount_core::{create_root_file_info, ListResult, S_IFREG};
     use ratarmount_export_core::fill_read;
+
+    /// Regression: SFTP must retain read-only denials after filtering chown,
+    /// and refuse a real owner change before applying a combined truncate (#327).
+    #[test]
+    fn regression_327_chown_preserves_policy_and_readonly() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("member"), b"base").unwrap();
+        let source = Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+        for protected in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut ov =
+                crate::test_overlay::new_overlay(source.clone(), directory.path()).unwrap();
+            let rules = Arc::new(ratarmount_compositing::ReadOnlyGlobs::new(["member"]).unwrap());
+            if protected {
+                ov.set_policy(Some(rules.clone()));
+            }
+            let ov = Arc::new(ov);
+            for writable in [true, false] {
+                let fs =
+                    RatarmountSftp::with_overlay(ov.clone(), 0, 8, writable.then(|| ov.clone()))
+                        .with_attribute_mapping(
+                            ratarmount_core::AttributeMapping::parse("uid=12345,gid=23456")
+                                .unwrap(),
+                        );
+                let id = fs.id_for_path("/member");
+                let chown = |size: Option<u64>, uid| {
+                    let attrs = ratarmount_compositing::OverlayMetadata {
+                        uid: Some(uid),
+                        gid: Some(23456),
+                        ..Default::default()
+                    };
+                    fs.setstat(&fs.path_for_id(id).unwrap(), size, &attrs)
+                };
+                if !writable || protected {
+                    assert_eq!(chown(None, 12345).unwrap_err(), libc::EROFS);
+                } else {
+                    assert!(chown(None, 12345).is_ok());
+                    assert_eq!(chown(Some(0), 12346).unwrap_err(), libc::EPERM);
+                }
+                if writable {
+                    // An empty request did not attempt an ownership change.
+                    fs.setstat_metadata(
+                        "/member",
+                        &ratarmount_compositing::OverlayMetadata::default(),
+                    )
+                    .unwrap();
+                }
+                assert!(!ov.has_file("/member"));
+                assert_eq!(ov.lookup("/member", 0).unwrap().size, 4);
+            }
+            assert_eq!(rules.erofs_denied(), u64::from(protected));
+        }
+    }
 
     /// Regression: `cp -p` over SFTP failed because a SETSTAT to the owner
     /// already presented was refused with EPERM (#327).

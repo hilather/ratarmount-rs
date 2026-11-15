@@ -383,6 +383,7 @@ impl RatarmountNfs4 {
             atime: attrs.atime.as_ref().map(time),
             mtime: attrs.mtime.as_ref().map(time),
         };
+        let requested = !metadata.is_empty() || attrs.size.is_some();
         if metadata.uid.is_some() || metadata.gid.is_some() {
             // A chown to the owner already presented is a no-op (#327).
             if let Ok(fi) = self.file_info_for_id(id) {
@@ -394,7 +395,7 @@ impl RatarmountNfs4 {
                 );
             }
         }
-        if !metadata.is_empty() || attrs.size.is_some() {
+        if requested {
             ov.set_attributes(&path, attrs.size, &metadata)
                 .map_err(|e| match &e {
                     ratarmount_compositing::OverlayError::Io(io)
@@ -1622,6 +1623,60 @@ mod tests {
 #[cfg(test)]
 mod sandbox_attr_tests {
     use super::*;
+
+    /// Regression: NFSv4 must retain read-only denials after filtering chown,
+    /// and refuse a real owner change before applying a combined truncate (#327).
+    #[test]
+    fn regression_327_chown_preserves_policy_and_readonly() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("member"), b"base").unwrap();
+        let source = Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+        for protected in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut ov =
+                crate::test_overlay::new_overlay(source.clone(), directory.path()).unwrap();
+            let rules = Arc::new(ratarmount_compositing::ReadOnlyGlobs::new(["member"]).unwrap());
+            if protected {
+                ov.set_policy(Some(rules.clone()));
+            }
+            let ov = Arc::new(ov);
+            for writable in [true, false] {
+                let fs = RatarmountNfs4::with_overlay(ov.clone(), 0, writable.then(|| ov.clone()))
+                    .with_attribute_mapping(
+                        ratarmount_core::AttributeMapping::parse("uid=12345,gid=23456").unwrap(),
+                    );
+                let id = fs.lookup_sync(1, "member").unwrap();
+                let chown = |size: Option<u64>, uid| {
+                    let attrs = OverlayMetadata {
+                        uid: Some(uid),
+                        gid: Some(23456),
+                        ..Default::default()
+                    };
+                    fs.setattr_sync(
+                        id,
+                        &SetAttrs {
+                            uid: attrs.uid,
+                            gid: attrs.gid,
+                            size,
+                            ..Default::default()
+                        },
+                    )
+                };
+                if !writable || protected {
+                    assert_eq!(chown(None, 12345).unwrap_err(), FsError::ReadOnly);
+                } else {
+                    assert!(chown(None, 12345).is_ok());
+                    assert_eq!(
+                        chown(Some(0), 12346).unwrap_err(),
+                        FsError::PermissionDenied
+                    );
+                }
+                assert!(!ov.has_file("/member"));
+                assert_eq!(ov.lookup("/member", 0).unwrap().size, 4);
+            }
+            assert_eq!(rules.erofs_denied(), u64::from(protected));
+        }
+    }
 
     /// Regression: `cp -p` over NFSv4 failed because a SETATTR to the owner
     /// already presented was refused with EPERM (#327).

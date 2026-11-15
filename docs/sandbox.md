@@ -1218,8 +1218,10 @@ These are policy decisions; normal filesystem errors and directory-rename
 limitations still apply.
 
 A protected path rejects creation, write opens, writes, truncate, COW copy-up,
-unlink, rmdir, mkdir, chmod, timestamp updates, setxattr and symlink creation
-with `EROFS` (read-only filesystem).
+unlink, rmdir, mkdir, chmod, chown (including a same-owner request), timestamp
+updates, setxattr and symlink creation with `EROFS` (read-only filesystem).
+This also applies to unsupported POSIX ACL sets: policy denials take precedence
+over `EOPNOTSUPP` and are counted and journaled once.
 Both rename endpoints are checked. Host parent symlinks are resolved as well,
 so a symlink alias cannot bypass rules for pre-existing overlay content; unlinking
 the alias itself remains allowed. Rename, rmdir and overlay reset also reject
@@ -1705,12 +1707,15 @@ NFSv3/v4 SETATTR, 9P Tsetattr and SFTP SETSTAT also apply mode and time changes.
 SFTP OPEN honors requested creation permissions. The current NFSv3 server dependency
 does not forward MKDIR attributes to the filesystem adapter, so newly created
 NFSv3 directories initially use mode 0755; SETATTR can change it afterwards.
-A chown to the owner an entry is already shown with (after any
+A chown on a writable path to the owner an entry is already shown with (after any
 `-o uid=...,gid=...` mapping) succeeds as a no-op, so ownership-preserving tools
 such as `cp -p` and `sed -i` work, also as root; each ID is
 compared separately. Any other ownership change is refused with `EPERM` (the
 corresponding permission status for SFTP); it neither chowns host files nor
-invents stored owners. Use `-o uid=...,gid=...` for presentation mapping.
+invents stored owners. Read-only mounts and protected paths still return `EROFS`,
+even for a same-owner request. Detached FUSE inodes compare against their held
+descriptor's presented owner; a read-only descriptor permits the ownership
+no-op but still cannot truncate. Use `-o uid=...,gid=...` for presentation mapping.
 POSIX ACLs are not stored: setting `system.posix_acl_access` or
 `system.posix_acl_default` over FUSE returns `EOPNOTSUPP`, which `cp -p` and
 `sed -i` read as "no ACL support" and fall back to the mode without a

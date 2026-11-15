@@ -53,7 +53,7 @@ the [N-worker recipe and compatibility limits](sandbox.md#prepare-once-n-writabl
 | `--sandbox` | no | **added** (allow_other + noatime + caller uid/gid; RAM overlay unless explicit `-w`; Linux) | `[x]` Rust-only |
 | `--overlay-tmpfs[=SIZE]` | no | **added** (verified Linux tmpfs; optional logical byte quota, not a RAM reservation; discarded on cleanup) | `[x]` Rust-only |
 | `--overlay-tmpfs-allow-commit` | no | **added** (explicitly permits live commit from a RAM overlay) | `[x]` Rust-only |
-| `-o uid=UID,gid=GID,umask=MASK` | yes | **added** (reported attrs in FUSE/NFS/9P/SFTP; stored ownership unchanged; a chown to the reported owner is a no-op, any other is `EPERM`) | `[x]` |
+| `-o uid=UID,gid=GID,umask=MASK` | yes | **added** (reported attrs in FUSE/NFS/9P/SFTP; stored ownership unchanged; a chown to the reported owner is a no-op on writable paths, any other is refused; read-only mounts and protected paths retain `EROFS`) | `[x]` |
 | `--bind /PATH=SOURCE` | no | **added** (per-source mount path before union; repeatable) | `[x]` Rust-only |
 | `--git` / `--git-ref REV` / `repo@REV` | mixed | **added** (explicit worktree Git selection and revision; bad refs fail) | `[x]` Rust-only selectors |
 | `--git-prefix PATH` / `--git-synthetic-head` | no | **added** (subtree; history-free one-commit `.git`; private writes with overlay) | `[x]` Rust-only |

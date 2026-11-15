@@ -3277,6 +3277,11 @@ impl WriteOverlay {
         size: Option<u64>,
         attrs: &OverlayMetadata,
     ) -> Result<()> {
+        // A frontend may have removed a same-owner chown. It still needs the
+        // policy and existence checks, without writing metadata or copying up.
+        if size.is_none() && attrs.is_empty() {
+            return self.set_metadata(path, attrs);
+        }
         if !attrs.is_empty() {
             let _policy = self.policy_lock();
             self.check_mutation(OverlayMutation::Write, &[path])?;

@@ -2569,13 +2569,11 @@ impl RatarmountFs {
             return self.setattr_detached(ino, size, fh, attrs);
         }
         let path = self.path_for_ino(ino).ok_or(ENOENT)?;
+        let requested = size.is_some() || !attrs.is_empty();
         let filtered;
         let attrs = if self.overlay.is_some() && (attrs.uid.is_some() || attrs.gid.is_some()) {
             // A chown to the owner already presented is a no-op (#327).
-            let presented = self
-                .file_info_for_ino(ino)
-                .or_else(|| self.source.lookup(&path, 0))
-                .unwrap_or_else(ratarmount_core::create_root_file_info);
+            let presented = self.file_info_for_ino(ino).ok_or(ENOENT)?;
             filtered = without_presented_owner(
                 self.attribute_mapping,
                 presented.uid,
@@ -2586,7 +2584,7 @@ impl RatarmountFs {
         } else {
             attrs
         };
-        if size.is_some() || !attrs.is_empty() {
+        if requested {
             self.overlay
                 .as_ref()
                 .ok_or(EROFS)?
@@ -2622,16 +2620,13 @@ impl RatarmountFs {
             return Err(EACCES);
         };
         let path = self.mutation_path(ino)?;
+        let requested_metadata = !attrs.is_empty();
         self.with_overlay_handle(fh, &path, EACCES, |file| {
             let fd = file.as_raw_fd();
             #[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0048-M01","item":"<ratarmount_fuse::RatarmountFs>::setattr_detached","disposition":"out-of-family","category":"descriptor-control","reason":"Read the detached overlay descriptor flags before choosing append/write behavior.","creation":{"policy":"none","basis":"F_GETFL queries an already-held FUSE file descriptor; no pathname is opened and no descriptor is duplicated."}}"###)]
 let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             if flags < 0 {
                 return Err(EIO);
-            }
-            let acc = flags & libc::O_ACCMODE;
-            if acc != libc::O_WRONLY && acc != libc::O_RDWR {
-                return Err(EACCES);
             }
             let filtered;
             let attrs = if attrs.uid.is_some() || attrs.gid.is_some() {
@@ -2645,7 +2640,13 @@ let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             } else {
                 attrs
             };
-            if !attrs.is_empty() {
+            let acc = flags & libc::O_ACCMODE;
+            if (size.is_some() || !attrs.is_empty())
+                && acc != libc::O_WRONLY && acc != libc::O_RDWR
+            {
+                return Err(EACCES);
+            }
+            if requested_metadata {
                 self.overlay
                     .as_ref()
                     .ok_or(EROFS)?
@@ -2686,13 +2687,18 @@ let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             return result;
         }
         let overlay = self.overlay.as_ref().ok_or(EROFS)?;
+        let path = self.path_for_ino(ino).ok_or(EACCES)?;
         // POSIX ACLs are not stored. EOPNOTSUPP is what coreutils and sed read
         // as "no ACL support" and fall back to chmod quietly; EPERM made
         // `sed -i` warn "preserving permissions ... Operation not permitted" (#327).
         if name.starts_with("system.posix_acl_") {
+            // Even unsupported metadata requests must retain read-only/control
+            // path refusals and their denial accounting. Empty metadata is not stored.
+            overlay
+                .set_metadata(&path, &OverlayMetadata::default())
+                .map_err(|e| metadata_errno(&e))?;
             return Err(libc::EOPNOTSUPP);
         }
-        let path = self.path_for_ino(ino).ok_or(EACCES)?;
         // macFUSE passes the native CREATE=2/REPLACE=4 bits; the storage API
         // uses the Linux CREATE=1/REPLACE=2 encoding on every platform.
         #[cfg(target_os = "macos")]
@@ -9165,11 +9171,26 @@ mod sandbox_attr_tests {
         u64,
         (u32, u32),
     ) {
+        owner_fs_with_policy(mapping, None)
+    }
+
+    fn owner_fs_with_policy(
+        mapping: &str,
+        policy: Option<Arc<dyn ratarmount_compositing::OverlayPolicy>>,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        RatarmountFs,
+        u64,
+        (u32, u32),
+    ) {
         let base = tempfile::tempdir().unwrap();
         std::fs::write(base.path().join("member"), b"base").unwrap();
         let directory = tempfile::tempdir().unwrap();
         let source = Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
-        let overlay = Arc::new(crate::test_overlay::new_overlay(source, directory.path()).unwrap());
+        let mut overlay = crate::test_overlay::new_overlay(source, directory.path()).unwrap();
+        overlay.set_policy(policy);
+        let overlay = Arc::new(overlay);
         let fs = RatarmountFs::new(overlay.clone(), Some(overlay))
             .with_attribute_mapping(AttributeMapping::parse(mapping).unwrap());
         let (ino, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("member")).unwrap();
@@ -9189,6 +9210,182 @@ mod sandbox_attr_tests {
             },
         )
         .map(|_| ())
+    }
+
+    /// Regression: filtering a same-owner chown or rejecting an ACL must not
+    /// bypass read-only rules or lose/double-count the journal denial (#327).
+    #[test]
+    fn regression_327_chown_and_acl_preserve_policy_denials() {
+        let rules = Arc::new(ratarmount_compositing::ReadOnlyGlobs::new(["member"]).unwrap());
+        let (_b, _d, fs, ino, _) = owner_fs_with_policy("uid=12345,gid=23456", Some(rules.clone()));
+        let journal_dir = tempfile::tempdir().unwrap();
+        let journal = journal_dir.path().join("journal");
+        let fs = fs
+            .with_activity(
+                &journal_dir.path().join("mnt"),
+                oplog::MountActivity {
+                    journal: Some(oplog::JournalOptions {
+                        path: journal.clone(),
+                        exclude: vec![],
+                        reads: oplog::Reads::All,
+                        sync: false,
+                    }),
+                    readonly: Some(rules.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            fs.oplog
+                .observe(oplog::Caller::default(), "chmod", "/member", || {
+                    chown(&fs, ino, Some(12345), Some(23456))
+                }),
+            Err(EROFS)
+        );
+        assert_eq!(rules.erofs_denied(), 1);
+        for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+            assert_eq!(
+                fs.oplog
+                    .observe(oplog::Caller::default(), "setxattr", "/member", || {
+                        fs.setxattr_entry(ino, name, b"\x02\0\0\0", 0)
+                    }),
+                Err(EROFS)
+            );
+        }
+        assert_eq!(rules.erofs_denied(), 3);
+        assert!(!fs.overlay.as_ref().unwrap().has_file("/member"));
+        drop(fs);
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(journal)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|event: &serde_json::Value| event["op"] == "denied")
+            .collect();
+        assert_eq!(events.len(), 3);
+        for (event, what) in events.iter().zip(["chmod", "setxattr", "setxattr"]) {
+            assert_eq!(event["path"], "member");
+            assert_eq!(event["what"], what);
+            assert_eq!(event["errno"], EROFS);
+        }
+    }
+
+    /// Regression: same-owner chown must not fabricate a root attribute reply
+    /// for a missing entry, or succeed on an entirely read-only mount (#327).
+    #[test]
+    fn regression_327_chown_missing_and_readonly() {
+        let (_b, _d, fs, _, _) = owner_fs("uid=12345,gid=23456");
+        let readonly =
+            RatarmountFs::new(fs.source.clone(), None).with_attribute_mapping(fs.attribute_mapping);
+        let ro_ino = readonly
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("member"))
+            .unwrap()
+            .0;
+        assert_eq!(
+            chown(&readonly, ro_ino, Some(12345), Some(23456)),
+            Err(EROFS)
+        );
+        assert_eq!(
+            readonly.setxattr_entry(ro_ino, "system.posix_acl_access", b"", 0),
+            Err(EROFS)
+        );
+        let (_, attr, _) = fs
+            .create_entry(FUSE_ROOT_ID, OsStr::new("gone"), 0o644)
+            .unwrap();
+        let ino = attr.ino.0;
+        // The overlay name can disappear before the frontend detaches its inode.
+        fs.overlay.as_ref().unwrap().unlink("/gone").unwrap();
+        assert!(fs.file_info_for_ino(ino).is_none());
+        assert_eq!(chown(&fs, ino, Some(12345), Some(23456)), Err(ENOENT));
+    }
+
+    /// Regression: detached same-owner chown must still authorize the original
+    /// path, including a descriptor opened before policy enforcement (#327).
+    #[test]
+    fn regression_327_chown_detached_preserves_policy() {
+        let base = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let source = Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+        let mut ov = crate::test_overlay::new_overlay(source, directory.path()).unwrap();
+        let fd = ov.create_file("/member", 0o644).unwrap();
+        let fi = ov.lookup("/member", 0).unwrap();
+        let rules = Arc::new(ratarmount_compositing::ReadOnlyGlobs::new(["member"]).unwrap());
+        ov.set_policy(Some(rules.clone()));
+        let ov = Arc::new(ov);
+        let fs = RatarmountFs::new(ov.clone(), Some(ov))
+            .with_attribute_mapping(AttributeMapping::parse("uid=12345,gid=23456").unwrap());
+        let (ino, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("member")).unwrap();
+        fs.handles
+            .lock()
+            .unwrap()
+            .insert(77, OpenBackend::OverlayFd(fd));
+        // Model an already-held descriptor whose name disappeared before the
+        // request; the replacement path must never authorize the old inode.
+        std::fs::remove_file(directory.path().join("member")).unwrap();
+        fs.detach_unlinked("/member", Some(ino), None, Some(fi), BTreeMap::new());
+        assert_eq!(
+            fs.setattr_metadata_entry(
+                ino,
+                None,
+                Some(77),
+                &OverlayMetadata {
+                    uid: Some(12345),
+                    gid: Some(23456),
+                    ..Default::default()
+                }
+            )
+            .unwrap_err(),
+            EROFS
+        );
+        assert_eq!(rules.erofs_denied(), 1);
+    }
+
+    /// Regression: a detached read-only descriptor can preserve its presented
+    /// owner without gaining permission to truncate or change ownership (#327).
+    #[test]
+    fn regression_327_chown_detached_readonly_handle() {
+        let (_b, _d, fs, _, _) = owner_fs("uid=12345,gid=23456");
+        let ov = fs.overlay.as_ref().unwrap();
+        for name in ["/src", "/dst"] {
+            ov.close_overlay_fd(ov.create_file(name, 0o644).unwrap());
+        }
+        let (ino, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("dst")).unwrap();
+        let (write_fh, _) = fs.open_inode(ino, libc::O_RDWR).unwrap();
+        fs.write_handle(ino, write_fh, 0, b"old").unwrap();
+        let (read_fh, _) = fs.open_inode(ino, libc::O_RDONLY).unwrap();
+        fs.rename_paths(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "dst", 0)
+            .unwrap();
+        let attrs = OverlayMetadata {
+            uid: Some(12345),
+            gid: Some(23456),
+            ..Default::default()
+        };
+        let (_, reply) = fs
+            .setattr_metadata_entry(ino, None, Some(read_fh), &attrs)
+            .unwrap();
+        assert_eq!(
+            (reply.uid, reply.gid, reply.size, reply.nlink),
+            (12345, 23456, 3, 0)
+        );
+        assert_eq!(
+            fs.setattr_metadata_entry(ino, Some(0), Some(read_fh), &attrs)
+                .unwrap_err(),
+            EACCES
+        );
+        assert_eq!(
+            fs.setattr_metadata_entry(
+                ino,
+                Some(0),
+                Some(write_fh),
+                &OverlayMetadata {
+                    uid: Some(12346),
+                    ..attrs
+                }
+            )
+            .unwrap_err(),
+            libc::EPERM
+        );
+        assert_eq!(fs.read_handle(read_fh, 0, 8).unwrap(), b"old");
+        assert_eq!(ov.lookup("/dst", 0).unwrap().size, 0);
     }
 
     /// Regression: `cp -p` / `sed -i` into a write mount failed with EPERM

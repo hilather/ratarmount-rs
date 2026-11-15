@@ -7641,6 +7641,29 @@ fn regression_overlay_chmod_nested_and_create_modes() {
     assert_eq!(ov.lookup("/dir", 0).unwrap().mode & 0o7777, 0o750);
 }
 
+/// Regression: a filtered same-owner SETATTR must check policy and existence
+/// while leaving both payload and metadata storage untouched (#327).
+#[test]
+fn regression_327_filtered_setattr_validates_path_without_changes() {
+    let base = tempfile::tempdir().unwrap();
+    fs::write(base.path().join("member"), b"base").unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let source = Arc::new(crate::FolderMountSource::new(base.path()).unwrap());
+    let mut ov = WriteOverlay::new_for_tests(source, directory.path()).unwrap();
+    let attrs = OverlayMetadata::default();
+    ov.set_attributes("/member", None, &attrs).unwrap();
+    assert!(!ov.has_file("/member"));
+    assert!(ov.metadata_for_path("/member").is_none());
+    assert_eq!(ov.files_deleted_flag("/member").unwrap(), None);
+    assert!(matches!(ov.set_attributes("/missing", None, &attrs),
+        Err(OverlayError::Io(e)) if e.raw_os_error() == Some(libc::ENOENT)));
+    let rules = Arc::new(crate::ReadOnlyGlobs::new(["member"]).unwrap());
+    ov.set_policy(Some(rules.clone()));
+    assert!(matches!(ov.set_attributes("/member", None, &attrs),
+        Err(OverlayError::Io(e)) if e.kind() == io::ErrorKind::ReadOnlyFilesystem));
+    assert_eq!(rules.erofs_denied(), 1);
+}
+
 /// Regression: a combined truncate/touch must keep the requested mtime;
 /// failed chown must not truncate and chmod must never follow a host symlink.
 #[test]
