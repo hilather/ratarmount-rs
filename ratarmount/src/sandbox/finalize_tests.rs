@@ -276,6 +276,7 @@ impl Env {
                 lowers: vec![],
                 journal: journal.then(JournalSpec::default),
                 retain,
+                overlay_durability: Default::default(),
             })
             .unwrap();
         let attempt: Attempt = serde_json::from_value(result[0].clone()).unwrap();
@@ -675,6 +676,7 @@ fn new_with_id(env: &mut Env, request_id: &str) -> Result<Value, ApiError> {
         lowers: vec![],
         journal: None,
         retain: false,
+        overlay_durability: Default::default(),
     })
 }
 
@@ -1147,6 +1149,7 @@ fn regression_supervisor_finalize_linux_only() {
         lowers: vec![],
         journal: None,
         retain: false,
+        overlay_durability: Default::default(),
     })
     .unwrap();
     sup.handle(Operation::Destroy {
@@ -1568,6 +1571,7 @@ impl Env {
                     .collect(),
                 journal: None,
                 retain,
+                overlay_durability: Default::default(),
             })
             .unwrap();
         let attempt: Attempt = serde_json::from_value(result[0].clone()).unwrap();
@@ -2394,6 +2398,7 @@ pub(super) fn kill_child(point: &str) {
             lowers: vec![],
             journal: None,
             retain,
+            overlay_durability: Default::default(),
         })
         .unwrap();
     let attempt: Attempt = serde_json::from_value(result[0].clone()).unwrap();
@@ -3910,6 +3915,7 @@ impl Env {
                 .collect(),
             journal: None,
             retain,
+            overlay_durability: Default::default(),
         })
     }
 
@@ -4126,6 +4132,7 @@ fn regression_supervisor_retain_linux_only() {
                 lowers: vec![],
                 journal: None,
                 retain: true,
+                overlay_durability: Default::default(),
             })
             .unwrap_err();
         assert_eq!(error.code, "invalid_request", "{}", error.message);
@@ -4146,6 +4153,7 @@ fn regression_supervisor_retain_linux_only() {
         lowers: vec![],
         journal: None,
         retain: false,
+        overlay_durability: Default::default(),
     })
     .unwrap();
 }
@@ -4804,6 +4812,7 @@ fn regression_supervisor_retain_preflight() {
             lowers: vec![],
             journal: None,
             retain: true,
+            overlay_durability: Default::default(),
         })
         .unwrap_err();
     assert_eq!(error.code, "capacity", "{}", error.message);
@@ -5437,6 +5446,7 @@ fn regression_supervisor_retain_crash_points() {
                         lowers: vec![],
                         journal: None,
                         retain: true,
+                        overlay_durability: Default::default(),
                     })
                     .unwrap_err();
                 assert_eq!(error.code, "capacity", "{}", error.message);
@@ -6130,6 +6140,7 @@ fn regression_supervisor_retain_new_checks_mounts_in_the_index_tree() {
         lowers,
         journal: None,
         retain: true,
+        overlay_durability: Default::default(),
     };
     env.fake.0.lock().unwrap().extra_mounts = vec![indexes.join("x")];
     let error = env.sup.handle(new_retain(vec![])).unwrap_err();
@@ -8068,4 +8079,166 @@ fn regression_supervisor_finalize_reports_an_earlier_tries_bundle() {
             assert_eq!(line["paths"]["bundle"], json!(bundle));
         }
     }
+}
+
+/// #328: a relaxed attempt of `env`, its overlay created and edited as a
+/// relaxed child would (the marker written, then cleared by the clean close).
+fn relaxed_attempt(env: &mut Env, retain: bool) -> Attempt {
+    use super::protocol::OverlayDurability;
+    let result = env
+        .sup
+        .handle(OperationV2::New {
+            base: "task".into(),
+            count: 1,
+            overlay: Overlay::Disk,
+            quota: None,
+            readonly_globs: vec![],
+            request_id: None,
+            lowers: vec![],
+            journal: None,
+            retain,
+            overlay_durability: OverlayDurability::Relaxed,
+        })
+        .unwrap();
+    let attempt: Attempt = serde_json::from_value(result[0].clone()).unwrap();
+    assert_eq!(
+        env.fake.0.lock().unwrap().specs.last().unwrap().durability,
+        OverlayDurability::Relaxed
+    );
+    let overlay = crate::base_identity::fixtures::overlay_over_with(
+        env.view(),
+        &attempt.overlay_dir,
+        env.base.to_str().unwrap(),
+        Vec::new(),
+        BaseDigestRequest::Compute,
+    )
+    .unwrap();
+    overlay
+        .set_durability(ratarmount_compositing::OverlayDurability::Relaxed)
+        .unwrap();
+    assert!(overlay
+        .meta_value(ratarmount_compositing::relaxed_durability::RELAXED_DURABILITY_KEY)
+        .unwrap()
+        .is_some());
+    overlay.create_symlink("/link", "/target").unwrap();
+    overlay.unlink("/g").unwrap();
+    drop(overlay);
+    assert_eq!(relaxed_marker(&attempt.overlay_dir), None, "clean close");
+    attempt
+}
+
+fn relaxed_marker(overlay: &Path) -> Option<String> {
+    OverlayMeta::read_no_recovery(overlay)
+        .unwrap()
+        .and_then(|meta| {
+            meta.get(ratarmount_compositing::relaxed_durability::RELAXED_DURABILITY_KEY)
+                .map(str::to_owned)
+        })
+}
+
+fn plant_relaxed_marker(overlay: &Path, value: &str) {
+    let conn = rusqlite::Connection::open(overlay.join(ratarmount_compositing::HIDDEN_DB)).unwrap();
+    OverlayMeta::set(
+        &conn,
+        ratarmount_compositing::relaxed_durability::RELAXED_DURABILITY_KEY,
+        value,
+    )
+    .unwrap();
+}
+
+/// Regression (#328): a relaxed attempt that closed cleanly, or whose mount
+/// process was killed on this boot (its writes reached the kernel), finalizes
+/// and seals, leaving no marker, also retained; one whose marker names
+/// another boot (the machine went down while it was relaxed) is refused
+/// before anything is written, the marker kept: `fsck --repair` would clear
+/// it once `PRAGMA integrity_check` passes, which does not bring back lost
+/// rows, so the layer is never sealed or retained.
+#[test]
+fn regression_supervisor_finalize_relaxed_attempt() {
+    if !linux() {
+        return;
+    }
+    let mut env = Env::new();
+    // Clean close: sealed, no marker.
+    let clean = relaxed_attempt(&mut env, false);
+    let report = env.finalize(&clean.id, false, None).unwrap();
+    assert_eq!(report["status"], "finalized");
+    assert!(sealed(&clean.overlay_dir));
+    assert_eq!(relaxed_marker(&clean.overlay_dir), None);
+
+    // A same-boot marker (a killed child): accepted, the seal clears it.
+    match ratarmount_compositing::relaxed_durability::current_boot_id() {
+        Some(boot) => {
+            let killed = relaxed_attempt(&mut env, false);
+            plant_relaxed_marker(&killed.overlay_dir, &format!("{boot}:1"));
+            let report = env.finalize(&killed.id, false, None).unwrap();
+            assert_eq!(report["status"], "finalized");
+            assert!(sealed(&killed.overlay_dir));
+            assert_eq!(relaxed_marker(&killed.overlay_dir), None);
+        }
+        None => eprintln!("skip: same-boot row: no readable boot ID"),
+    }
+
+    // Another boot, also with `retain` and under a request ID: refused,
+    // nothing sealed, written or retained, the marker kept; every retry
+    // answers the same.
+    for retain in [false, true] {
+        let crashed = relaxed_attempt(&mut env, retain);
+        plant_relaxed_marker(&crashed.overlay_dir, "another-boot:4242");
+        let db = crashed.overlay_dir.join(ratarmount_compositing::HIDDEN_DB);
+        let before = fs::read(&db).unwrap();
+        for request_id in [None, Some("relaxed-crash"), Some("relaxed-crash")] {
+            let request_id = request_id.map(|id| format!("{id}-{retain}"));
+            let error = env
+                .finalize(&crashed.id, false, request_id.as_deref())
+                .unwrap_err();
+            assert_eq!(error.code, "io", "{}", error.message);
+            for needle in [
+                "--overlay-durability=relaxed",
+                "another-boot:4242",
+                "destroy it",
+            ] {
+                assert!(error.message.contains(needle), "{}", error.message);
+            }
+            assert!(!sealed(&crashed.overlay_dir));
+            assert_eq!(
+                relaxed_marker(&crashed.overlay_dir).as_deref(),
+                Some("another-boot:4242")
+            );
+            assert_eq!(fs::read(&db).unwrap(), before, "nothing written");
+            let root = crashed.path.parent().unwrap();
+            assert!(!root.join("manifest.jsonl").exists());
+            assert!(root.exists(), "never retained");
+        }
+        assert!(!env.sup.retained.contains_key(&crashed.id));
+        env.sup.destroy(&crashed.id).unwrap();
+    }
+}
+
+/// Regression (#328): a daemon restart never adopts an attempt, relaxed or
+/// not, whatever boot its marker names: `reconcile` removes it, so no layer a
+/// crash may have corrupted is ever served or finalized after a restart.
+#[test]
+fn regression_supervisor_restart_discards_relaxed_attempts() {
+    if !linux() {
+        return;
+    }
+    let mut env = Env::new();
+    let same = relaxed_attempt(&mut env, false);
+    let other = relaxed_attempt(&mut env, true);
+    if let Some(boot) = ratarmount_compositing::relaxed_durability::current_boot_id() {
+        plant_relaxed_marker(&same.overlay_dir, &format!("{boot}:1"));
+    }
+    plant_relaxed_marker(&other.overlay_dir, "another-boot:4242");
+    let mut env = env.reopen();
+    assert!(env.sup.attempts.is_empty());
+    for attempt in [&same, &other] {
+        assert!(!attempt.path.parent().unwrap().exists());
+        let error = env.finalize(&attempt.id, false, None).unwrap_err();
+        assert_eq!(error.code, "not_found", "{}", error.message);
+    }
+    assert_eq!(
+        fs::read_dir(env.sup.root.join("retained")).unwrap().count(),
+        0
+    );
 }

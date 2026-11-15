@@ -11,6 +11,7 @@
 
 use ratarmount_compositing::overlay_changes::{self, ChangeOptions, Normalize};
 use ratarmount_compositing::overlay_seal::{SealOperation, SealOutcome};
+use ratarmount_compositing::relaxed_durability::{self, MarkerState};
 use ratarmount_compositing::{overlay_fsck, ClassifiedBase, OverlayMeta};
 use ratarmount_core::MountSource;
 use serde_json::{json, Value};
@@ -115,9 +116,21 @@ fn check(top: &Path, repair: Repair) -> io::Result<String> {
         // The read that fsck makes: an unsealed, writable top's hot journal
         // (a mount process killed mid-write) is rolled back, as `fsck(top,
         // true)` would; a sealed top's is refused and never written.
-        Repair::UnlessSealed => !OverlayMeta::read(top)
-            .map_err(meta_error)?
-            .is_some_and(|meta| meta.layer_sealed()),
+        Repair::UnlessSealed => {
+            let meta = OverlayMeta::read(top).map_err(meta_error)?;
+            // #328: `fsck --repair` would clear a relaxed marker of another
+            // boot once `PRAGMA integrity_check` passes, but a passing check
+            // does not bring back lost rows. A supervised attempt that lived
+            // through an OS crash is never sealed (or retained): it is
+            // refused here, before anything is written.
+            if let MarkerState::Unclean(value) = relaxed_durability::marker_state(meta.as_ref()) {
+                return Err(io::Error::other(format!(
+                    "{}; this attempt cannot be finalized: destroy it",
+                    relaxed_durability::unclean_message(&value)
+                )));
+            }
+            !meta.is_some_and(|meta| meta.layer_sealed())
+        }
     };
     let fsck = overlay_fsck::fsck(top, repair)?;
     if !fsck.is_clean() {

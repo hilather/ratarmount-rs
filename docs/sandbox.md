@@ -1932,6 +1932,9 @@ a machine failure, so a killed mount also needs `fsck --repair`. A seal never
 carries the marker into a sealed layer. Like every overlay lock claim, a
 daemonized mount holds no kernel lock on its database after its fork (#183).
 
+The sandbox supervisor takes the same option per attempt (protocol version 2
+`new` with `overlay_durability`); see [relaxed attempts](#relaxed-attempts).
+
 Measured with `benchmarks/overlay-create-unlink.sh` on one ext4 disk
 (N=200, REPS=3; see the #328 profile in
 `docs/tasks/plans/issue-328-overlay-create-unlink-profile.md`): about **58×**
@@ -2449,8 +2452,10 @@ batch (see [protocol version 2](#protocol-version-2)). Repeated `--lower PATH`
 [lower stacks](#lower-stacks) and [journals](#journals)); the three journal
 options need `--journal`. Lower paths are sent unchanged: a relative one is
 refused by the daemon, never resolved by the client. `--retain` sends version 2
-too (see [retained attempts](#retained-attempts)). Without these flags, `new`
-sends exactly the version 1 request. `finalize ID [--pack] [--request-id ID]`
+too (see [retained attempts](#retained-attempts)), and so does
+`--overlay-durability relaxed` (see [relaxed attempts](#relaxed-attempts));
+`--overlay-durability full` is the default and sends nothing. Without these
+flags, `new` sends exactly the version 1 request. `finalize ID [--pack] [--request-id ID]`
 (version 2, Linux only) prints the [finalize](#finalize) report, and
 `list --all` sends a version 2 `list` with `all`, which adds served retained
 attempts, including ones restored after a restart; without `--all`, `list`
@@ -2567,7 +2572,8 @@ errors include a bounded excerpt of the failing mount's log when available.
 ### Protocol version 2
 
 Version 2 has the version 1 operations, fields and defaults; `new` also takes
-a `request_id`, `lowers`, a `journal` and `retain`, `list` takes `all`, and
+a `request_id`, `lowers`, a `journal`, `retain` and `overlay_durability`,
+`list` takes `all`, and
 `finalize` exists only in version 2. Field defaults never change within version
 2; later releases only add fields, and a daemon refuses fields it does not know
 with `invalid_request`, so an older daemon fails closed on a newer client.
@@ -2589,11 +2595,14 @@ with `invalid_request`, so an older daemon fails closed on a newer client.
   ASCII letter or digit first, then letters, digits, `.`, `_` or `-`. A
   malformed ID is `invalid_request` and writes nothing. `"request_id": null`
   is refused (`invalid_request`), never read as "no ID". Without a
-  `request_id`, `lowers`, `journal` or `retain`, a version 2 `new` behaves as
-  version 1's.
+  `request_id`, `lowers`, `journal`, `retain` or a relaxed
+  `overlay_durability`, a version 2 `new` behaves as version 1's.
 - **`lowers` and `journal`** (`new` only) stack sealed layers under every
   attempt and record a per-attempt operation journal; see
   [lower stacks](#lower-stacks) and [journals](#journals).
+- **`overlay_durability`** (`new` only) is `"full"` (the default; never
+  serialized, so it hashes as absent) or `"relaxed"`; see
+  [relaxed attempts](#relaxed-attempts).
 - **`finalize` and `retain`** stop, seal and hash an attempt and keep it in
   `retained/ID` (Linux only); see [finalize](#finalize),
   [retained attempts](#retained-attempts) and [durability](#durability).
@@ -3051,6 +3060,46 @@ locked overlay each hold it for up to the smaller of `--timeout` and 10 s. On
 1 s and back off. `destroy` keeps its own policy: it still unmounts lazily if
 it must and stops the mount process, also for a `finalizing` attempt.
 
+#### Relaxed attempts
+
+```json
+{"version":2,"op":"new","base":"task","count":8,"overlay_durability":"relaxed"}
+```
+
+A version 2 `new` with `overlay_durability: "relaxed"` (CLI `sandbox new
+--overlay-durability relaxed`, Python `new(..., overlay_durability="relaxed")`)
+starts each attempt's mount with `--overlay-durability=relaxed` (see
+[relaxed overlay durability](#relaxed-overlay-durability)): its overlay
+database stops waiting for the disk on every create, unlink and rename (200
+creates plus 100 unlinks through FUSE took about 2.2 s with `full` and 0.1 s
+relaxed on one SSD). Only the string `"full"` or `"relaxed"` is accepted;
+`null`, another spelling or an unknown value is `invalid_request` before
+anything exists. `"full"` is never serialized, so it hashes like an absent
+field; `"relaxed"` is another body for a `request_id`. A relaxed `new` is
+checked by the mount CLI's parser, like a layered or journaled one, before the
+RAM root, any attempt directory or child exists. The mount refuses relaxed
+durability only with archive commits, which the supervisor never passes, so
+the supervisor refuses nothing else: it works with `tmpfs` overlays (where it
+changes nothing that matters), lowers, journals and `retain`.
+
+What a crash costs here: an attempt's mount clears its marker when it is
+unmounted cleanly, and `finalize` seals only after that unmount. A finalize
+whose top still carries a marker of this boot (its mount process was killed;
+its writes reached the kernel) proceeds, and the seal clears the marker. A
+marker of another boot (or an unknown one) means the machine went down while
+the attempt was relaxed: `finalize` answers `io` naming the marker and "destroy
+it" after the stop (the attempt is then unmounted and `finalizing`) but before
+fsck, so nothing in the overlay is written, and it never seals or retains that layer
+(`overlay fsck --repair` would clear the marker once `PRAGMA integrity_check`
+passes, but that does not bring back lost rows, so finalize does not repair
+it). In practice the supervisor never meets such a top: a restart discards
+every attempt that is not retained, whatever its durability or boot, so a
+relaxed attempt that lived through an OS crash is removed, never served. A
+retained attempt was finalized with `full` semantics already: its marker was
+cleared in a `synchronous=FULL` commit and step S synced its tree before its
+`retained.jsonl` record, so a retained relaxed layer survives a crash like any
+other.
+
 #### Retained attempts
 
 ```json
@@ -3467,9 +3516,11 @@ journal, and `None` otherwise, including for `list()` results.
 
 `finalize(id, pack=False, request_id=None)` and
 `Attempt.finalize(pack=False, request_id=None)` send protocol version 2 and
-return the [finalize](#finalize) report; `new(..., retain=True)` and
-`list(all=True)` send version 2 too (`retain=False` sends no key, and
-`list(all=False)` is the version 1 request). An `Attempt` the client owns takes
+return the [finalize](#finalize) report; `new(..., retain=True)`,
+`new(..., overlay_durability="relaxed")` and `list(all=True)` send version 2
+too (`retain=False` and `overlay_durability="full"`, the default, send no key,
+and `list(all=False)` is the version 1 request; see
+[relaxed attempts](#relaxed-attempts)). An `Attempt` the client owns takes
 `status`, `path`, `overlay_dir` and, when set, `journal_path` from the report's
 `attempt`, also when `finalize` is called on the client. A finalized attempt
 that was not retained stays owned

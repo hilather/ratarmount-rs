@@ -1,7 +1,8 @@
 """Stdlib-only client for the ratarmount sandbox protocol (Python 3.9+).
 
 Requests use protocol v1, except finalize(), list(all=True) and new() with
-request_id, lowers, journal or retain=True, which send protocol v2. A client
+request_id, lowers, journal, retain=True or overlay_durability="relaxed",
+which send protocol v2. A client
 context destroys only attempts it created, never the shared daemon. Transport
 failures are not retried automatically: a timed-out mutation may have
 completed. Retry new() or finalize() with the same request_id and arguments,
@@ -184,9 +185,10 @@ class RatarmountSandbox:
         return self._call("create_base", name=name, source=str(source), options=options)
 
     def new(self, base, count=1, overlay="disk", quota=None, readonly_globs=None, *,
-            request_id=None, lowers=None, journal=None, retain=False):
+            request_id=None, lowers=None, journal=None, retain=False,
+            overlay_durability=None):
         """Start attempts. Any of these keywords sends protocol v2, and an
-        omitted one (or retain=False) sends no key:
+        omitted one (or retain=False, overlay_durability="full") sends no key:
 
         - request_id: a retry with the same ID and arguments returns the stored
           answer instead of a second batch.
@@ -196,13 +198,20 @@ class RatarmountSandbox:
           "first") and "sync" (bool); see Attempt.journal_path.
         - retain: finalize() keeps each attempt in the daemon's retained/ID/
           directory instead of leaving it to be destroyed; see finalize().
+        - overlay_durability: "relaxed" stops the attempts' overlay databases
+          from waiting for the disk on every create, unlink and rename (much
+          faster for builds); an OS crash or power loss can then corrupt an
+          attempt's layer, and finalize() refuses one that lived through such
+          a crash (destroy it). "full" (the default) sends nothing.
 
         An attempt this client saw retained is returned but never owned again,
         so a replay cannot hand it back to this client's cleanup.
         """
         fields = dict(base=base, count=count, overlay=overlay, quota=quota,
                       readonly_globs=readonly_globs or [])
-        if request_id is None and lowers is None and journal is None and not retain:
+        relaxed = overlay_durability not in (None, "full")
+        if request_id is None and lowers is None and journal is None and not retain \
+                and not relaxed:
             data = self._call("new", **fields)
         else:
             if request_id is not None:
@@ -216,6 +225,9 @@ class RatarmountSandbox:
                 fields["journal"] = dict(journal)
             if retain:
                 fields["retain"] = True
+            if relaxed:
+                # Any other value is sent as given: the daemon refuses it.
+                fields["overlay_durability"] = overlay_durability
             data = self._call("new", version=_VERSION_2, **fields)
         attempts = [Attempt(self, item, journal=journal is not None) for item in data]
         self._owned.update((a.id, a) for a in attempts if a.id not in self._retained)
