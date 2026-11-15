@@ -743,6 +743,11 @@ hold an exclusive SQLite transaction, but host changes and SQLite are not one
 atomic transaction: stop direct host writers and rerun after an interrupted
 repair. A consistency check does not verify content hashes.
 
+A leftover `relaxed_durability` marker from another boot (see "Relaxed
+overlay durability") makes the check exit 2 with the cause; `--repair` first
+runs `PRAGMA integrity_check` (exit 2 and nothing changed if it fails), then
+clears the marker. `--repair` also clears a marker of the current boot.
+
 ## diff
 
 Compare an overlay with its composed lower view without mounting it:
@@ -1527,7 +1532,10 @@ ratarmount sandbox run --base source.tar.zst --lower prepared \
 Repeat `--lower`, `--readonly`, `--allow`, and `--env K=V` for multiple values.
 The default container working directory and bind destination are `/repo`; change
 both with `--bind /path`. `--cpus N` and `--memory SIZE` are passed to the runtime.
-`--network` accepts `none` (default), `bridge`, or `host`. The command runs as the
+`--network` accepts `none` (default), `bridge`, or `host`.
+`--overlay-durability relaxed` passes the mount's `--overlay-durability=relaxed`
+(see "Relaxed overlay durability"); the default `full` leaves the mount's argv
+unchanged. The command runs as the
 calling user's UID/GID. The container is hardened by default:
 `--cap-drop ALL`, `--security-opt no-new-privileges` and `--pids-limit 4096`
 are always passed. `--pids-limit N` changes the process cap (`0` or `-1`
@@ -1862,6 +1870,80 @@ Changes are discarded by default. `--commit-overlay-on-exit` or
 `--overlay-tmpfs-allow-commit` flag with `--overlay-tmpfs`; this deliberately
 allows changes to reach the base archive and retains the existing supported
 live-commit archive formats. Temporary overlay data is removed after commit.
+
+## Relaxed overlay durability
+
+By default every create, unlink, rename or chmod in a `-w` overlay is one
+SQLite transaction on the overlay database that waits for the disk (about
+7 ms on an ordinary SSD; a build that creates and deletes thousands of
+temporary files spends most of its time there). `--overlay-durability=relaxed`
+runs the mount's own overlay connection with `PRAGMA synchronous=OFF`: SQLite
+still writes every transaction into the kernel page cache, so a killed or
+crashed ratarmount process loses nothing, but it no longer waits for the disk
+(about 0.1 ms per operation, like `--overlay-tmpfs`). The journal mode stays
+`DELETE`; no other connection (indexes, `overlay` verbs, seal, import)
+changes. The default is `--overlay-durability=full`. The flag requires
+`-w`, `--overlay-tmpfs` or `--sandbox`. `relaxed` conflicts with every
+archive commit (`--commit-overlay`, `--commit-overlay-on-exit`,
+`--commit-overlay-interval`, `--roll-every`): a relaxed overlay is
+throwaway. Explicit `full` permits archive commits; a zero interval (including
+`0s`, `0m` and `0h`) disables interval commits in either mode.
+Either mistake exits 2. On `--overlay-tmpfs` it changes
+nothing that matters: RAM is gone after a crash anyway.
+
+What a crash costs: after an OS crash or power loss while the mount was
+relaxed, the overlay database may be corrupt, or structurally intact but
+missing (or half-applying) the last changes, for example deletions that
+reappear. Use relaxed durability for throwaway attempt overlays on disk
+that are discarded rather than repaired after a machine failure; keep `full`
+for overlays whose edits must survive one, or that are committed into an
+archive. `full` protects the database transactions; it does not itself fsync
+every payload file and parent directory, so it does not guarantee that every
+acknowledged filesystem edit survives power loss.
+
+The mount records the meta row `relaxed_durability` = `<boot_id>:<pid>`
+(`/proc/sys/kernel/random/boot_id`; `unknown` off Linux or when it cannot be
+read) in a `synchronous=FULL` commit before its first relaxed write. A clean
+unmount restores `FULL` and deletes the row in a commit whose fsync also
+flushes every earlier relaxed write. The pid is diagnostic only (a daemonized
+mount records its launcher's). A leftover row is judged by its boot ID:
+
+| Leftover marker | Meaning | Behavior |
+|-----------------|---------|----------|
+| none | clean unmount, or `full` | normal |
+| this boot | the process died; its writes reached the kernel | accepted; the next writable open (or `overlay seal`) clears it; read-only checks accept it |
+| another boot, or `unknown` | the machine went down while relaxed | the writable open, `overlay fsck`, `overlay seal`, `diff` and offline `--commit-overlay` refuse, naming the cause and `overlay fsck --repair` |
+
+Startup also refuses archive-journal recovery when its overlay record has an
+unclean marker, including with `--force-base-mismatch`. Admitted archive
+recovery finishes under `FULL` before the mount enables relaxed writes, so
+the updated base identity is durable before its recovery journal is removed.
+Forced sealing also checks the marker before replacing any recorded base identity.
+
+`ratarmount overlay fsck --repair DIR` runs `PRAGMA integrity_check` inside
+its exclusive transaction before any other repair. If it reports a problem,
+fsck exits 2 and changes nothing: discard the overlay. If it passes, the
+marker is cleared and the normal repair runs. A passing check proves only that
+the database structure is intact: recent changes may still be lost. SQLite
+rolls back a hot `-journal` on the first open before the marker can be read,
+and the rollback journal itself was not synced while relaxed. Without a
+readable boot ID (macOS, masked `/proc`), every leftover marker is treated as
+a machine failure, so a killed mount also needs `fsck --repair`. A seal never
+carries the marker into a sealed layer. Like every overlay lock claim, a
+daemonized mount holds no kernel lock on its database after its fork (#183).
+
+Measured with `benchmarks/overlay-create-unlink.sh` on one ext4 disk
+(N=200, REPS=3; see the #328 profile in
+`docs/tasks/plans/issue-328-overlay-create-unlink-profile.md`): about **58×**
+faster for the combined create/unlink workload (2.72 s → 0.047 s).
+
+| Variant | create ms/op | unlink ms/op | 200 create+unlink, s |
+|---------|-------------:|-------------:|---------------------:|
+| plain ext4 directory (no FUSE) | 0.009 | 0.007 | 0.003 |
+| `-w` disk, `full` | 7.04 | 6.55 | 2.72 |
+| `-w` disk, `relaxed` | 0.155 | 0.078 | 0.047 |
+| `-w` disk, `relaxed` + read-only rules | 0.132 | 0.084 | 0.043 |
+| `--overlay-tmpfs` | 0.111 | 0.065 | 0.035 |
 
 ## Image + repository rootfs
 

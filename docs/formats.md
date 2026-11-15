@@ -304,7 +304,12 @@ The complete status against the Python original is in the
    and refuse to touch members in earlier zstd frames; the offline commit is
    the escape hatch. Gzip, bzip2 and xz TARs commit offline through GNU tar.
    Create-if-missing offline is uncompressed `.tar` only. Details in
-   [Writing into archives](write-overlay.md#known-limits).
+   [Writing into archives](write-overlay.md#known-limits). The opt-in
+   `--overlay-durability=relaxed` skips overlay database fsyncs and cannot be
+   combined with archive commits; explicit `full` retains commit support.
+   After a machine failure, a leftover relaxed marker requires
+   `overlay fsck --repair` before reuse. See
+   [Relaxed overlay durability](sandbox.md#relaxed-overlay-durability).
 5. **Platforms.** Linux and macOS on Apple silicon. No Intel macOS package (no
    CI runner), no Windows CLI. The library crates compile on Windows.
 6. **Tensor manifests.** Local regular files only; no scheme paths, overlapping

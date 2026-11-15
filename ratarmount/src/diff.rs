@@ -264,6 +264,9 @@ impl Drop for ProgressToStderr {
 
 fn read_meta(dir: &Path, strict: bool) -> io::Result<Option<OverlayMeta>> {
     let meta = OverlayMeta::read(dir).map_err(io::Error::other)?;
+    // #328: a relaxed mount that did not survive a reboot.
+    ratarmount_compositing::relaxed_durability::refuse_unclean(meta.as_ref())
+        .map_err(|e| io::Error::other(format!("{}: {e}", dir.display())))?;
     if strict && !meta.as_ref().is_some_and(OverlayMeta::layer_sealed) {
         return Err(io::Error::other(format!(
             "{}: unsealed overlay refused by --strict",

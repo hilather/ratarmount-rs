@@ -430,6 +430,8 @@ fn seal_impl_locked(
     if let Some(meta) = meta.as_ref().filter(|meta| meta.layer_sealed()) {
         return finish_recorded_seal(dir, &root, meta);
     }
+    // #328: before any write (the pending-digest resolution below writes).
+    crate::relaxed_durability::refuse_unclean(meta.as_ref()).map_err(overlay_error)?;
     let archive_guard = archive.map(|(base, path)| {
         if std::iter::once(path.as_path()).chain(base.actual().typed_named.as_deref())
             .any(|path| ratarmount_compress::check_for_split_file_in_folder(path).is_some())
@@ -468,6 +470,16 @@ fn seal_impl_locked(
     {
         return Err(io::Error::other("overlay was sealed while starting; retry"));
     }
+    // #328: re-checked under the writer reservation. A marker of this boot (a
+    // killed relaxed mount) is safe and must not be sealed into the layer:
+    // after a reboot it would read as unclean and nothing could clear it.
+    crate::relaxed_durability::refuse_unclean(
+        OverlayMeta::from_opened(&conn)
+            .map_err(overlay_error)?
+            .as_ref(),
+    )
+    .map_err(overlay_error)?;
+    crate::relaxed_durability::clear_marker(&conn).map_err(overlay_error)?;
     let report = crate::overlay_fsck::check_connection(&conn, &root, false, false)?;
     if report.import_incomplete > 0 {
         return Err(io::Error::other(

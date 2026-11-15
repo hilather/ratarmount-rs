@@ -962,6 +962,242 @@ fn pending_archive_digest_then_seal() {
     assert_eq!(meta_get(&overlay, "base_digest"), Some(expected));
 }
 
+fn run_env(args: &[&Path], cache: &Path, env: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    cmd.env("XDG_CACHE_HOME", cache).env("HOME", cache);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.args(args).output().unwrap()
+}
+
+/// Many creates and unlinks, the workload relaxed durability is for.
+fn churn(mnt: &Path) {
+    for i in 0..40 {
+        fs::write(mnt.join(format!("churn-{i}.txt")), b"x\n").unwrap();
+    }
+    for i in (0..40).step_by(2) {
+        fs::remove_file(mnt.join(format!("churn-{i}.txt"))).unwrap();
+    }
+}
+
+/// Regression (#328): `--overlay-durability=relaxed` on a real `-w` mount.
+/// A clean unmount leaves no marker and the same canonical hash as a `full`
+/// mount with the same edits (diff, fsck, seal, verify, pack, unpack agree).
+/// A SIGKILLed relaxed mount leaves this boot's marker, which a remount
+/// accepts and clears. The same marker seen from another boot (the
+/// `RATARMOUNT_TEST_BOOT_ID` seam) is refused by the remount, `diff`, `seal`
+/// and `fsck` until `fsck --repair` passes its integrity check.
+#[test]
+fn regression_relaxed_durability_clean_killed_and_rebooted() {
+    if !available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _writable = Writable(tmp.path());
+    let root = tmp.path();
+    let cache = root.join("cache");
+    let base = root.join("base.tar");
+    base_tar(&base);
+    let relaxed = [std::ffi::OsStr::new("--overlay-durability=relaxed")];
+
+    // Clean unmount: no marker, same hash as full durability.
+    let full = root.join("full");
+    let mount = Mount::start(&base, &full, &root.join("mnt-full"));
+    edit(&root.join("mnt-full"));
+    churn(&root.join("mnt-full"));
+    mount.unmount();
+    let overlay = root.join("relaxed");
+    let mount = Mount::start_with(
+        &base,
+        Some(&overlay),
+        &relaxed,
+        &[],
+        &root.join("mnt-relaxed"),
+        "Makefile",
+    );
+    edit(&root.join("mnt-relaxed"));
+    churn(&root.join("mnt-relaxed"));
+    mount.unmount();
+    assert_eq!(meta_get(&overlay, "relaxed_durability"), None);
+    assert_eq!(meta_get(&full, "relaxed_durability"), None);
+    let full_hash = expect(
+        run(&[Path::new("diff"), &full, Path::new("--hash")], &cache),
+        0,
+    );
+    let relaxed_hash = expect(
+        run(&[Path::new("diff"), &overlay, Path::new("--hash")], &cache),
+        0,
+    );
+    assert_eq!(relaxed_hash, full_hash);
+    assert_eq!(agree(root, &overlay, &cache, &[]), full_hash.trim());
+
+    // SIGKILL (same boot): the marker stays, the remount accepts and clears it.
+    let killed = root.join("killed");
+    let mnt = root.join("mnt-killed");
+    let mut mount = Mount::start_with(&base, Some(&killed), &relaxed, &[], &mnt, "Makefile");
+    edit(&mnt);
+    churn(&mnt);
+    mount.child.kill().unwrap();
+    mount.child.wait().unwrap();
+    drop(mount);
+    let marker = meta_get(&killed, "relaxed_durability").expect("marker left by SIGKILL");
+    let (boot, _pid) = marker.rsplit_once(':').unwrap();
+    expect(
+        run(&[Path::new("overlay"), Path::new("fsck"), &killed], &cache),
+        0,
+    );
+    let mnt = root.join("mnt-killed-2");
+    let mount = Mount::start(&base, &killed, &mnt);
+    assert_eq!(fs::read(mnt.join("new.txt")).unwrap(), b"new\n");
+    assert!(!mnt.join("docs/gone.txt").exists());
+    assert!(mnt.join("churn-1.txt").exists() && !mnt.join("churn-0.txt").exists());
+    mount.unmount();
+    assert_eq!(meta_get(&killed, "relaxed_durability"), None);
+    assert_eq!(
+        expect(
+            run(&[Path::new("diff"), &killed, Path::new("--hash")], &cache),
+            0
+        ),
+        full_hash
+    );
+
+    // The same SIGKILL seen after a reboot: refused until fsck --repair.
+    let crashed = root.join("crashed");
+    let mnt = root.join("mnt-crashed");
+    let mut mount = Mount::start_with(&base, Some(&crashed), &relaxed, &[], &mnt, "Makefile");
+    edit(&mnt);
+    mount.child.kill().unwrap();
+    mount.child.wait().unwrap();
+    drop(mount);
+    assert!(meta_get(&crashed, "relaxed_durability")
+        .unwrap()
+        .starts_with(&format!("{boot}:")));
+    let rebooted = [("RATARMOUNT_TEST_BOOT_ID", "another-boot")];
+    let refused = |args: &[&Path]| {
+        let out = run_env(args, &cache, &rebooted);
+        assert_ne!(out.status.code(), Some(0), "{args:?} accepted");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--overlay-durability=relaxed") && stderr.contains("fsck --repair"),
+            "{args:?}: {stderr}"
+        );
+    };
+    let p = Path::new;
+    refused(&[p("overlay"), p("fsck"), &crashed]);
+    assert_eq!(
+        run_env(&[p("overlay"), p("fsck"), &crashed], &cache, &rebooted)
+            .status
+            .code(),
+        Some(2),
+        "an unclean relaxed marker is an operational error"
+    );
+    refused(&[p("diff"), &crashed, p("--hash")]);
+    refused(&[p("overlay"), p("seal"), &crashed]);
+    refused(&[
+        p("--no-mount"),
+        p("--index-file"),
+        p(":memory:"),
+        p("-w"),
+        &crashed,
+        &base,
+    ]);
+    assert!(meta_get(&crashed, "relaxed_durability").is_some());
+    expect(
+        run_env(
+            &[p("overlay"), p("fsck"), &crashed, p("--repair")],
+            &cache,
+            &rebooted,
+        ),
+        0,
+    );
+    assert_eq!(meta_get(&crashed, "relaxed_durability"), None);
+    expect(
+        run_env(&[p("overlay"), p("fsck"), &crashed], &cache, &rebooted),
+        0,
+    );
+    let mount = Mount::start(&base, &crashed, &root.join("mnt-crashed-2"));
+    assert_eq!(
+        fs::read(root.join("mnt-crashed-2/new.txt")).unwrap(),
+        b"new\n"
+    );
+    mount.unmount();
+}
+
+/// Regression (#328): the forked launcher's exit must keep the marker, while
+/// the serving child's clean exit must flush and clear it before process::exit.
+#[test]
+fn regression_relaxed_durability_daemon_clean_close() {
+    if !available() {
+        return;
+    }
+    struct Mounted(Option<PathBuf>);
+    impl Drop for Mounted {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                let _ = Command::new("fusermount3").arg("-uz").arg(path).status();
+            }
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base.tar");
+    base_tar(&base);
+    let overlay = tmp.path().join("overlay");
+    let mount = tmp.path().join("mnt");
+    fs::create_dir(&mount).unwrap();
+    let mut mounted = Mounted(Some(mount.clone()));
+    let p = Path::new;
+    expect(
+        run(
+            &[
+                p("--passthrough"),
+                p("off"),
+                p("--index-file"),
+                p(":memory:"),
+                p("--overlay-durability=relaxed"),
+                p("-w"),
+                &overlay,
+                &base,
+                &mount,
+            ],
+            &tmp.path().join("cache"),
+        ),
+        0,
+    );
+    assert!(
+        meta_get(&overlay, "relaxed_durability").is_some(),
+        "launcher cleared the child's marker"
+    );
+    churn(&mount);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !Command::new("fusermount3")
+        .arg("-u")
+        .arg(&mount)
+        .status()
+        .unwrap()
+        .success()
+    {
+        assert!(Instant::now() < deadline, "unmount stayed busy");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    mounted.0 = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while meta_get(&overlay, "relaxed_durability").is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "serving child did not clear the marker"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    expect(
+        run(
+            &[p("overlay"), p("fsck"), &overlay],
+            &tmp.path().join("cache"),
+        ),
+        0,
+    );
+}
+
 /// `agree_with` for a layer that is sealed already, as a supervisor finalize
 /// leaves it: `fsck` checks it read-only (`--repair` is refused on a sealed
 /// overlay) and `seal` only reads the recorded digest back. `diff --hash`,

@@ -204,6 +204,26 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
             "overlay was sealed while fsck started; retry read-only",
         ));
     }
+    // #328, before any repair acts on the rows: a relaxed mount that did not
+    // survive a reboot may have left a corrupt database. A check refuses;
+    // `--repair` runs `PRAGMA integrity_check` (refusing on failure) and then
+    // clears the marker, also one a killed mount of this boot left behind.
+    let relaxed = crate::relaxed_durability::read_marker(&conn).map_err(overlay_error)?;
+    if let Some(value) = relaxed.as_deref() {
+        let unclean = matches!(
+            crate::relaxed_durability::classify(Some(value)),
+            crate::relaxed_durability::MarkerState::Unclean(_)
+        );
+        if repair {
+            crate::relaxed_durability::integrity_check(&conn).map_err(overlay_error)?;
+            crate::relaxed_durability::clear_marker(&conn).map_err(overlay_error)?;
+        } else if unclean {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::relaxed_durability::unclean_message(value),
+            ));
+        }
+    }
     let report = check_connection(&conn, &root, repair, sealed)?;
     conn.execute_batch("COMMIT").map_err(io::Error::other)?;
     Ok(report)
