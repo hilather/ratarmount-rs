@@ -851,11 +851,11 @@ fn reserved_control_name_rejected() {
     agree(root, &overlay, &cache, &[]);
 }
 
-/// #326: under `--overlay-readonly 'bin/**' --overlay-allow 'bin/agent/**'`,
+/// Regression (#326): under `--overlay-readonly 'bin/**' --overlay-allow 'bin/agent/**'`,
 /// `rm -rf bin/agent` of the exception root the agent created succeeds, leaves
 /// no `files` row, tombstone or manifest row, and every verb agrees.
 #[test]
-fn rmdir_overlay_created_exception_root() {
+fn regression_rmdir_overlay_created_exception_root() {
     if !available() {
         return;
     }
@@ -877,6 +877,11 @@ fn rmdir_overlay_created_exception_root() {
     let agent = mnt.join("bin/agent");
     fs::create_dir(&agent).unwrap();
     fs::write(agent.join("x.t"), b"1\n").unwrap();
+    assert_eq!(
+        fs::remove_dir(&agent).unwrap_err().raw_os_error(),
+        Some(libc::ENOTEMPTY)
+    );
+    assert_eq!(fs::read(agent.join("x.t")).unwrap(), b"1\n");
     let rm = Command::new("rm").arg("-rf").arg(&agent).status().unwrap();
     assert!(rm.success(), "rm -rf bin/agent: {rm}");
     assert!(!agent.exists());
@@ -910,7 +915,7 @@ fn rmdir_overlay_created_exception_root() {
     );
     for line in manifest.lines() {
         let row: Value = serde_json::from_str(line).unwrap();
-        let path = row["path"].as_str().unwrap_or_default();
+        let path = row["path"].as_str().expect("UTF-8 fixture path");
         assert!(!path.starts_with("bin/agent"), "{manifest}");
     }
     agree(root, &overlay, &cache, &[]);

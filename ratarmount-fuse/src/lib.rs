@@ -90,6 +90,8 @@ fn io_to_errno(err: &std::io::Error) -> i32 {
         ErrorKind::NotFound => ENOENT,
         ErrorKind::PermissionDenied => EACCES,
         ErrorKind::IsADirectory => EISDIR,
+        ErrorKind::NotADirectory => libc::ENOTDIR,
+        ErrorKind::DirectoryNotEmpty => libc::ENOTEMPTY,
         ErrorKind::AlreadyExists => EEXIST,
         ErrorKind::InvalidInput => EINVAL,
         ErrorKind::Unsupported => ENOSYS,
@@ -4378,6 +4380,23 @@ mod tests {
                 io_to_errno(&std::io::Error::from_raw_os_error(raw)),
                 expected,
                 "raw {raw}"
+            );
+        }
+    }
+
+    /// Regression (#326): the overlay's kind-only rmdir errors became EIO
+    /// after an overlay-created exception root passed its policy check.
+    #[test]
+    fn regression_rmdir_kind_only_errors_keep_errno() {
+        for (kind, expected) in [
+            (ErrorKind::DirectoryNotEmpty, libc::ENOTEMPTY),
+            (ErrorKind::NotADirectory, libc::ENOTDIR),
+        ] {
+            let error = io::Error::new(kind, "rmdir");
+            assert_eq!(error.raw_os_error(), None);
+            assert_eq!(
+                overlay_errno(&ratarmount_compositing::OverlayError::Io(error)),
+                expected
             );
         }
     }

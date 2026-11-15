@@ -1213,8 +1213,10 @@ For these rules:
 ¹ `rmdir` of an exception root is allowed when the overlay created it: an empty
 `t/agent` that neither the base nor any `--lower` layer has can be removed again
 (`rm -rf t/agent` after `mkdir t/agent`), leaving no tombstone and no entry for
-`t/agent`. (The base parent `t`, materialized on the host by the mkdir, keeps
-the daemon's umask mode and can show as a mode-only change.)
+`t/agent`. Through FUSE, `rmdir` still returns `ENOTEMPTY` for a nonempty
+overlay-created root and `ENOTDIR` for a file. (The base parent `t`, materialized
+on the host by the mkdir, keeps the daemon's umask mode and can show as a
+mode-only change.)
 A `t/agent` the base or a lower layer provides stays anchored (EROFS), as do
 rename and reset of either.
 

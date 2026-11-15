@@ -856,7 +856,6 @@ mod tests {
     /// An overlay-created exception root may be removed; a base-provided one,
     /// protected descendants, rename and reset stay anchored. Also through
     /// the composite policy and with the overlay root set (production shape).
-    #[cfg(unix)]
     #[test]
     fn regression_rmdir_overlay_created_exception_root() {
         use OverlayMutation::*;
@@ -892,7 +891,13 @@ mod tests {
         let rules =
             ReadOnlyGlobs::with_allow(["t/**", "t/agent/private/**"], ["t/agent/**"]).unwrap();
         assert!(rules.check_rmdir("/t/agent", false).is_err());
-        // A host symlink aliasing the root through another parent stays anchored.
+    }
+
+    /// Regression: an alias must not bypass the exception-root anchor when
+    /// the caller's lower-existence check describes a different spelling.
+    #[cfg(unix)]
+    #[test]
+    fn regression_rmdir_overlay_created_exception_root_host_alias() {
         let aliased = tempfile::tempdir().unwrap();
         fs::create_dir_all(aliased.path().join("t/agent")).unwrap();
         std::os::unix::fs::symlink("t", aliased.path().join("alias")).unwrap();
@@ -900,18 +905,60 @@ mod tests {
             .unwrap()
             .with_overlay_root(aliased.path())
             .unwrap();
-        assert!(rules.check_rmdir("/alias/agent", false).is_err());
+        assert_eq!(
+            rules.check_rmdir("/alias/agent", false).unwrap_err().kind(),
+            io::ErrorKind::ReadOnlyFilesystem
+        );
         rules.check_rmdir("/t/agent", false).unwrap();
     }
 
-    fn files_row(root: &Path, parent: &str, name: &str) -> Option<i64> {
-        let db = Connection::open(root.join(crate::HIDDEN_DB)).unwrap();
-        db.query_row(
-            r#"SELECT COALESCE(deleted, 0) FROM "files" WHERE path=?1 AND name=?2"#,
-            [parent, name],
-            |r| r.get(0),
-        )
-        .ok()
+    /// Regression: relaxing the exception-root anchor must still reject
+    /// nonempty directories and non-directories without changing their contents.
+    #[cfg(unix)]
+    #[test]
+    fn regression_rmdir_overlay_created_exception_root_requires_empty_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut overlay =
+            crate::WriteOverlay::new_for_tests(archive_with_paths(&["t/suite"]), root.path())
+                .unwrap();
+        let rules = Arc::new(
+            ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**"])
+                .unwrap()
+                .with_overlay_root(root.path())
+                .unwrap(),
+        );
+        overlay.set_policy(Some(Arc::new(CompositeOverlayPolicy(vec![
+            rules.clone(),
+            Arc::new(OverlayQuota::new(root.path(), None, None).unwrap()),
+        ]))));
+        overlay.mkdir("/t/agent", 0o755).unwrap();
+        let file = new_file(&overlay, "/t/agent/child");
+        overlay
+            .write_at(&file, "/t/agent/child", 0, b"keep")
+            .unwrap();
+        overlay.finish_owned_write_fd(file);
+        denied(overlay.rmdir("/t/agent"), io::ErrorKind::DirectoryNotEmpty);
+        assert_eq!(
+            fs::read(root.path().join("t/agent/child")).unwrap(),
+            b"keep"
+        );
+        assert!(!overlay.is_deleted("/t/agent"));
+
+        overlay.unlink("/t/agent/child").unwrap();
+        overlay.mkdir("/t/agent/empty", 0o755).unwrap();
+        denied(overlay.rmdir("/t/agent"), io::ErrorKind::DirectoryNotEmpty);
+        assert!(overlay.is_dir("/t/agent/empty"));
+        overlay.rmdir("/t/agent/empty").unwrap();
+        overlay.rmdir("/t/agent").unwrap();
+        assert!(overlay.lookup("/t/agent", 0).is_none());
+        assert!(!root.path().join("t/agent").exists());
+
+        let file = new_file(&overlay, "/t/agent");
+        overlay.write_at(&file, "/t/agent", 0, b"file").unwrap();
+        overlay.finish_owned_write_fd(file);
+        denied(overlay.rmdir("/t/agent"), io::ErrorKind::NotADirectory);
+        assert_eq!(fs::read(root.path().join("t/agent")).unwrap(), b"file");
+        assert_eq!(rules.erofs_denied(), 0);
     }
 
     /// Regression (#326): mkdir, write, unlink and rmdir of an exception root
@@ -921,6 +968,24 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn regression_rmdir_overlay_created_exception_root_leaves_no_residue() {
+        // Keep this helper under the test's Unix cfg too. Query failures must
+        // fail the test, rather than masquerading as an absent row.
+        fn files_row(root: &Path, parent: &str, name: &str) -> Option<i64> {
+            use rusqlite::OptionalExtension;
+            let db = Connection::open_with_flags(
+                root.join(crate::HIDDEN_DB),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            db.query_row(
+                r#"SELECT COALESCE(deleted, 0) FROM "files" WHERE path=?1 AND name=?2"#,
+                [parent, name],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+        }
+
         let rules = |root: &Path| {
             Arc::new(
                 ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**"])
@@ -937,6 +1002,14 @@ mod tests {
                 crate::WriteOverlay::new_for_tests(base.clone(), root.path()).unwrap();
             overlay.set_policy(Some(rules(root.path())));
             overlay.mkdir("/t/agent", 0o755).unwrap();
+        }
+        // The writer holds an exclusive database lock. Inspect durable rows
+        // only after it closes, and prove the probe sees the pre-removal row.
+        assert_eq!(files_row(root.path(), "/t", "agent"), Some(0));
+        {
+            let mut overlay =
+                crate::WriteOverlay::new_for_tests(base.clone(), root.path()).unwrap();
+            overlay.set_policy(Some(rules(root.path())));
             let file = new_file(&overlay, "/t/agent/x.t");
             overlay.write_at(&file, "/t/agent/x.t", 0, b"1\n").unwrap();
             overlay.finish_owned_write_fd(file);
@@ -945,7 +1018,6 @@ mod tests {
             assert!(!root.path().join("t/agent").exists());
             assert!(overlay.lookup("/t/agent", 0).is_none());
             assert!(!overlay.is_deleted("/t/agent"));
-            assert_eq!(files_row(root.path(), "/t", "agent"), None);
             // A missing exception root is ENOENT, not a policy denial.
             denied(overlay.rmdir("/t/agent"), io::ErrorKind::NotFound);
         }
@@ -982,6 +1054,8 @@ mod tests {
         let mut overlay = crate::WriteOverlay::new_for_tests(base, root.path()).unwrap();
         let policy = rules(root.path());
         overlay.set_policy(Some(policy.clone()));
+        overlay.ensure_modifiable("/t/agent").unwrap();
+        assert!(root.path().join("t/agent").is_dir());
         overlay.unlink("/t/agent/base").unwrap();
         denied(overlay.rmdir("/t/agent"), ro);
         assert!(overlay.lookup("/t/agent", 0).is_some());
@@ -1005,8 +1079,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut overlay = crate::WriteOverlay::new_for_tests(stack, root.path()).unwrap();
         overlay.set_policy(Some(rules(root.path())));
+        overlay.ensure_modifiable("/t/agent").unwrap();
+        assert!(root.path().join("t/agent").is_dir());
         denied(overlay.rmdir("/t/agent"), ro);
         assert!(overlay.lookup("/t/agent", 0).is_some());
+        drop(overlay);
         assert_eq!(files_row(root.path(), "/t", "agent"), None);
     }
 
