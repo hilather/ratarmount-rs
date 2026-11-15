@@ -13,6 +13,13 @@ pub(super) struct FilePatch {
     pub copy: bool,
     pub hunks: Vec<Hunk>,
     pub literal: Option<Vec<u8>>,
+    /// Inflated forward `delta` section, structurally validated against its
+    /// own declared sizes; applied to the preimage at import time.
+    pub delta: Option<Vec<u8>>,
+    /// The `index <old>..<new>` object ids (lowercase hex), when present.
+    pub index: Option<(String, String)>,
+    /// The raw `GIT binary patch` lines, for a `.rej` file.
+    pub binary_raw: Vec<u8>,
     headers: bool,
 }
 
@@ -289,24 +296,34 @@ fn decode85(line: &[u8]) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn literal(lines: &[&[u8]], pos: &mut usize, max_bytes: u64) -> io::Result<Vec<u8>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Literal,
+    Delta,
+}
+
+/// Read one `literal N` or `delta N` section: base85 lines up to a blank
+/// line, zlib-inflated to exactly N bytes.
+fn binary_section(
+    lines: &[&[u8]],
+    pos: &mut usize,
+    max_bytes: u64,
+) -> io::Result<(Section, Vec<u8>)> {
     let header = trim_lf(
         lines
             .get(*pos)
             .ok_or_else(|| invalid("missing binary literal"))?,
     );
-    if header.starts_with(b"delta ") {
-        return Err(invalid(
-            "delta binary sections are unsupported; supply literal sections",
-        ));
-    }
-    let size = number(
-        header
-            .strip_prefix(b"literal ")
-            .ok_or_else(|| invalid("missing binary literal"))?,
-    )?;
+    let (kind, name, size) = if let Some(size) = header.strip_prefix(b"literal ") {
+        (Section::Literal, "binary literal", size)
+    } else if let Some(size) = header.strip_prefix(b"delta ") {
+        (Section::Delta, "delta", size)
+    } else {
+        return Err(invalid("missing binary literal"));
+    };
+    let size = number(size)?;
     if size as u64 > max_bytes {
-        return Err(invalid("binary literal exceeds --max-patch-bytes"));
+        return Err(invalid(format!("{name} exceeds --max-patch-bytes")));
     }
     *pos += 1;
     let mut compressed = Vec::new();
@@ -320,7 +337,7 @@ fn literal(lines: &[&[u8]], pos: &mut usize, max_bytes: u64) -> io::Result<Vec<u
     }
     let capacity = size
         .checked_add(1)
-        .ok_or_else(|| invalid("binary literal size overflow"))?;
+        .ok_or_else(|| invalid(format!("{name} size overflow")))?;
     let mut data = Vec::new();
     data.try_reserve_exact(capacity).map_err(invalid)?;
     let mut decoder = flate2::Decompress::new(true);
@@ -331,9 +348,183 @@ fn literal(lines: &[&[u8]], pos: &mut usize, max_bytes: u64) -> io::Result<Vec<u
         || data.len() != size
         || decoder.total_in() != compressed.len() as u64
     {
-        return Err(invalid("binary literal size or compressed stream mismatch"));
+        return Err(invalid(format!(
+            "{name} size or compressed stream mismatch"
+        )));
     }
-    Ok(data)
+    Ok((kind, data))
+}
+
+/// Git's delta header size: little-endian base-128, continuation bit 0x80.
+fn varint(data: &[u8], pos: &mut usize) -> io::Result<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *data
+            .get(*pos)
+            .ok_or_else(|| invalid("truncated delta size header"))?;
+        *pos += 1;
+        let bits = u64::from(byte & 0x7f);
+        if shift >= 64 || (shift > 0 && bits >> (64 - shift) != 0) {
+            return Err(invalid("delta size header overflows"));
+        }
+        value |= bits << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+    }
+}
+
+/// Walk a Git delta (git's `patch_delta`). With `source`, its length must
+/// equal the declared source size and the target is built; without it, only
+/// the opcodes are checked against the declared sizes and nothing is
+/// allocated. The declared target must be within `limit` before allocation.
+pub(super) fn walk_delta(
+    delta: &[u8],
+    source: Option<&[u8]>,
+    limit: u64,
+) -> io::Result<(u64, u64, Option<Vec<u8>>)> {
+    let mut pos = 0;
+    let source_size = varint(delta, &mut pos)?;
+    let target_size = varint(delta, &mut pos)?;
+    if let Some(source) = source {
+        if source.len() as u64 != source_size {
+            return Err(invalid(format!(
+                "delta source size {source_size} does not match the preimage size {}",
+                source.len()
+            )));
+        }
+    }
+    if target_size > limit {
+        return Err(invalid(format!(
+            "delta target size {target_size} exceeds --max-patch-bytes"
+        )));
+    }
+    let mut out = match source {
+        Some(_) => {
+            let mut out = Vec::new();
+            out.try_reserve_exact(
+                usize::try_from(target_size).map_err(|_| invalid("delta target size overflow"))?,
+            )
+            .map_err(invalid)?;
+            Some(out)
+        }
+        None => None,
+    };
+    let mut remaining = target_size;
+    while let Some(&cmd) = delta.get(pos) {
+        pos += 1;
+        let mut operand = |bit: u8, shift: u32| -> io::Result<u64> {
+            if cmd & bit == 0 {
+                return Ok(0);
+            }
+            let byte = *delta
+                .get(pos)
+                .ok_or_else(|| invalid("truncated delta copy operand"))?;
+            pos += 1;
+            Ok(u64::from(byte) << shift)
+        };
+        if cmd & 0x80 != 0 {
+            let offset =
+                operand(0x01, 0)? | operand(0x02, 8)? | operand(0x04, 16)? | operand(0x08, 24)?;
+            let mut size = operand(0x10, 0)? | operand(0x20, 8)? | operand(0x40, 16)?;
+            if size == 0 {
+                size = 0x10000;
+            }
+            let end = offset
+                .checked_add(size)
+                .filter(|end| *end <= source_size)
+                .ok_or_else(|| invalid("delta copy lies outside the source"))?;
+            if size > remaining {
+                return Err(invalid("delta output exceeds its target size"));
+            }
+            if let (Some(out), Some(source)) = (&mut out, source) {
+                out.extend_from_slice(&source[offset as usize..end as usize]);
+            }
+            remaining -= size;
+        } else if cmd != 0 {
+            let insert = delta
+                .get(pos..pos + usize::from(cmd))
+                .ok_or_else(|| invalid("truncated delta insert"))?;
+            if u64::from(cmd) > remaining {
+                return Err(invalid("delta output exceeds its target size"));
+            }
+            if let Some(out) = &mut out {
+                out.extend_from_slice(insert);
+            }
+            pos += usize::from(cmd);
+            remaining -= u64::from(cmd);
+        } else {
+            return Err(invalid("reserved delta opcode 0"));
+        }
+    }
+    if remaining != 0 {
+        return Err(invalid("delta output is shorter than its target size"));
+    }
+    Ok((source_size, target_size, out))
+}
+
+/// Git blob object ids of `data`: SHA-1 and SHA-256 (lowercase hex).
+pub(super) fn blob_ids(data: &[u8]) -> [String; 2] {
+    use sha1::Digest as _;
+    let header = format!("blob {}\0", data.len());
+    let mut sha1 = sha1::Sha1::new();
+    sha1.update(header.as_bytes());
+    sha1.update(data);
+    let mut sha256 = sha2::Sha256::new();
+    sha256.update(header.as_bytes());
+    sha256.update(data);
+    [hex(&sha1.finalize()), hex(&sha256.finalize())]
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Apply a forward delta to `preimage`, as `git apply` does: the preimage's
+/// blob id must match the index line's old id, and the result's the new id.
+/// An abbreviated id is a prefix of a full SHA-1 or SHA-256 id (both ids
+/// under one object format); `git apply` itself requires full ids.
+pub(super) fn apply_delta(
+    preimage: &[u8],
+    delta: &[u8],
+    index: &(String, String),
+    limit: u64,
+) -> Result<Vec<u8>, String> {
+    let (old, new) = index;
+    let before = blob_ids(preimage);
+    let formats: Vec<usize> = (0..2)
+        .filter(|&i| before[i].starts_with(old.as_str()))
+        .collect();
+    if formats.is_empty() {
+        return Err(format!(
+            "delta preimage blob {} does not match index {old} (sha1 information is lacking or useless)",
+            before[0]
+        ));
+    }
+    let (_, _, out) = walk_delta(delta, Some(preimage), limit).map_err(|e| e.to_string())?;
+    let out = out.expect("built with a source");
+    let after = blob_ids(&out);
+    if !formats.iter().any(|&i| after[i].starts_with(new.as_str())) {
+        return Err(format!(
+            "delta creates blob {} but index expects {new}",
+            after[formats[0]]
+        ));
+    }
+    Ok(out)
+}
+
+/// `index <old>..<new>[ <mode>]`: two hex object ids, lowercased.
+fn index_line(value: &[u8]) -> Option<(String, String)> {
+    let value = std::str::from_utf8(value).ok()?;
+    let ids = value.split(' ').next()?;
+    let (old, new) = ids.split_once("..")?;
+    let id = |s: &str| {
+        (!s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| s.to_ascii_lowercase())
+    };
+    Some((id(old)?, id(new)?))
 }
 
 fn finish(mut patch: FilePatch, patches: &mut Vec<FilePatch>) -> io::Result<()> {
@@ -348,6 +539,30 @@ fn finish(mut patch: FilePatch, patches: &mut Vec<FilePatch>) -> io::Result<()> 
     }
     if patch.old.is_none() && patch.new.is_none() {
         return Err(invalid("patch deletes and adds no path"));
+    }
+    if patch.delta.is_some() {
+        let refuse = |why: &str| invalid(format!("{}: {why}", patch.path()));
+        if patch.old.is_none() || patch.new.is_none() {
+            return Err(refuse(
+                "a delta binary section needs an existing preimage and a postimage",
+            ));
+        }
+        if !patch.hunks.is_empty() {
+            return Err(refuse(
+                "a delta binary section cannot be combined with text hunks",
+            ));
+        }
+        let Some((old, new)) = &patch.index else {
+            return Err(refuse(
+                "a delta binary section needs an index line with blob ids (sha1 information is lacking or useless)",
+            ));
+        };
+        let zero = |id: &str| id.bytes().all(|b| b == b'0');
+        if old.len() < 4 || new.len() < 4 || zero(old) || zero(new) {
+            return Err(refuse(
+                "a delta binary section needs non-zero index blob ids of at least 4 hex digits (sha1 information is lacking or useless)",
+            ));
+        }
     }
     patches.push(patch);
     Ok(())
@@ -450,17 +665,38 @@ pub(super) fn parse(input: &[u8], max_bytes: u64) -> io::Result<Vec<FilePatch>> 
                 patch.hunks.push(hunk(&lines, &mut pos)?);
                 return Ok(());
             } else if line == b"GIT binary patch" {
+                if patch.literal.is_some() || patch.delta.is_some() {
+                    return Err(invalid("repeated binary patch for one file"));
+                }
+                let start = pos;
                 pos += 1;
-                let data = literal(&lines, &mut pos, literal_budget)?;
+                let (kind, data) = binary_section(&lines, &mut pos, literal_budget)?;
                 literal_budget -= data.len() as u64;
-                patch.literal = Some(data);
+                match kind {
+                    Section::Literal => patch.literal = Some(data),
+                    Section::Delta => {
+                        // Structure and declared sizes need no preimage.
+                        walk_delta(&data, None, max_bytes)?;
+                        patch.delta = Some(data);
+                    }
+                }
                 if lines
                     .get(pos)
                     .is_some_and(|l| l.starts_with(b"literal ") || l.starts_with(b"delta "))
                 {
-                    literal(&lines, &mut pos, max_bytes)?; // Validate reverse; only apply forward.
+                    // Validate reverse; only apply forward.
+                    let (kind, data) = binary_section(&lines, &mut pos, max_bytes)?;
+                    if kind == Section::Delta {
+                        walk_delta(&data, None, max_bytes)?;
+                    }
                 }
+                patch.binary_raw = lines[start..pos].concat();
                 return Ok(());
+            } else if let Some(value) = line.strip_prefix(b"index ") {
+                // Only the extended header's line, before any content.
+                if patch.hunks.is_empty() && patch.literal.is_none() && patch.delta.is_none() {
+                    patch.index = index_line(value);
+                }
             } else if line.starts_with(b"Binary files ") {
                 return Err(invalid("binary patch has no content"));
             } else if line.starts_with(b"delta ")
@@ -489,7 +725,7 @@ pub(super) fn parse(input: &[u8], max_bytes: u64) -> io::Result<Vec<FilePatch>> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// Regression: base85 padding, invalid digits, length and integer overflow.
@@ -508,15 +744,13 @@ mod tests {
         }
     }
 
-    fn binary_patch(compressed: &[u8], size: usize) -> Vec<u8> {
+    /// Git base85 lines (one per 52 bytes) followed by the blank terminator.
+    pub(crate) fn encode85(data: &[u8]) -> Vec<u8> {
         const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
-        let mut patch = format!(
-            "diff --git a/bin b/bin\nnew file mode 100644\nGIT binary patch\nliteral {size}\n"
-        )
-        .into_bytes();
-        for chunk in compressed.chunks(52) {
+        let mut out = Vec::new();
+        for chunk in data.chunks(52) {
             let n = chunk.len() as u8;
-            patch.push(if n <= 26 { b'A' + n - 1 } else { b'a' + n - 27 });
+            out.push(if n <= 26 { b'A' + n - 1 } else { b'a' + n - 27 });
             for word in chunk.chunks(4) {
                 let mut bytes = [0; 4];
                 bytes[..word.len()].copy_from_slice(word);
@@ -526,11 +760,28 @@ mod tests {
                     *digit = ALPHABET[(value % 85) as usize];
                     value /= 85;
                 }
-                patch.extend_from_slice(&digits);
+                out.extend_from_slice(&digits);
             }
-            patch.push(b'\n');
+            out.push(b'\n');
         }
-        patch.push(b'\n');
+        out.push(b'\n');
+        out
+    }
+
+    pub(crate) fn zlib(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn binary_patch(compressed: &[u8], size: usize) -> Vec<u8> {
+        let mut patch = format!(
+            "diff --git a/bin b/bin\nnew file mode 100644\nGIT binary patch\nliteral {size}\n"
+        )
+        .into_bytes();
+        patch.extend(encode85(compressed));
         patch
     }
 
@@ -560,5 +811,368 @@ mod tests {
         delta.extend_from_slice(b"delta 0\n\n");
         let error = parse(&delta, 128).unwrap_err().to_string();
         assert!(error.contains("bin: delta"), "{error}");
+    }
+
+    pub(crate) fn varint_bytes(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return out;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    /// A minimal git delta from `pre` to `post`: copy the common prefix,
+    /// insert the changed middle, copy the common suffix.
+    pub(crate) fn make_delta(pre: &[u8], post: &[u8]) -> Vec<u8> {
+        fn copy(out: &mut Vec<u8>, offset: usize, size: usize) {
+            for (start, len) in (0..size)
+                .step_by(0xff_ffff)
+                .map(|s| (s, (size - s).min(0xff_ffff)))
+            {
+                let (offset, len) = ((offset + start) as u32, len as u32);
+                let mut cmd = 0x80u8;
+                let mut operands = Vec::new();
+                for i in 0..4 {
+                    let byte = (offset >> (8 * i)) as u8;
+                    if byte != 0 {
+                        cmd |= 1 << i;
+                        operands.push(byte);
+                    }
+                }
+                for i in 0..3 {
+                    let byte = (len >> (8 * i)) as u8;
+                    if byte != 0 {
+                        cmd |= 0x10 << i;
+                        operands.push(byte);
+                    }
+                }
+                out.push(cmd);
+                out.extend(operands);
+            }
+        }
+        let prefix = pre.iter().zip(post).take_while(|(a, b)| a == b).count();
+        let suffix = pre[prefix..]
+            .iter()
+            .rev()
+            .zip(post[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let mut ops = Vec::new();
+        copy(&mut ops, 0, prefix);
+        for chunk in post[prefix..post.len() - suffix].chunks(127) {
+            ops.push(chunk.len() as u8);
+            ops.extend(chunk);
+        }
+        copy(&mut ops, pre.len() - suffix, suffix);
+        delta(pre.len() as u64, post.len() as u64, &ops)
+    }
+
+    fn delta(source: u64, target: u64, ops: &[u8]) -> Vec<u8> {
+        [varint_bytes(source), varint_bytes(target), ops.to_vec()].concat()
+    }
+
+    fn source() -> Vec<u8> {
+        (0..0x10000 + 64u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect()
+    }
+
+    fn apply(source: &[u8], delta: &[u8]) -> io::Result<Vec<u8>> {
+        walk_delta(delta, Some(source), u64::MAX).map(|(_, _, out)| out.unwrap())
+    }
+
+    /// Regression: every copy opcode encoding (each offset/size byte selected,
+    /// including selected zero bytes; size 0 means 0x10000) applies like git (#343).
+    #[test]
+    fn regression_delta_copy_every_operand_combination() {
+        let src = source();
+        for cmd in 0x80u8..=0xff {
+            // Nonzero low byte when selected; higher selected bytes are zero.
+            let mut ops = vec![cmd];
+            let mut offset = 0usize;
+            for bit in 0..4 {
+                if cmd & (1 << bit) != 0 {
+                    let byte = if bit == 0 { 7 } else { 0 };
+                    offset |= (byte as usize) << (8 * bit);
+                    ops.push(byte);
+                }
+            }
+            let mut size = 0usize;
+            for bit in 0..3 {
+                if cmd & (0x10 << bit) != 0 {
+                    let byte = if bit == 0 { 9 } else { 0 };
+                    size |= (byte as usize) << (8 * bit);
+                    ops.push(byte);
+                }
+            }
+            if size == 0 {
+                size = 0x10000;
+            }
+            let d = delta(src.len() as u64, size as u64, &ops);
+            assert_eq!(
+                apply(&src, &d).unwrap(),
+                &src[offset..offset + size],
+                "{cmd:#x}"
+            );
+        }
+        // Multi-byte operands: offset 0x0102, size 0x0304, and 3-byte sizes.
+        let d = delta(src.len() as u64, 0x0304, &[0xb3, 0x02, 0x01, 0x04, 0x03]);
+        assert_eq!(apply(&src, &d).unwrap(), &src[0x0102..0x0102 + 0x0304]);
+        let d = delta(src.len() as u64, 0x01_0041, &[0xf0, 0x41, 0x00, 0x01]);
+        assert!(apply(&src, &d).is_err(), "0x10041 exceeds the source");
+        let d = delta(src.len() as u64, 0x01_0010, &[0xf0, 0x10, 0x00, 0x01]);
+        assert_eq!(apply(&src, &d).unwrap(), &src[..0x01_0010]);
+        // 4-byte offsets are read in full.
+        let d = delta(src.len() as u64, 1, &[0x9f, 0, 0, 0, 1, 1]);
+        assert!(apply(&src, &d).unwrap_err().to_string().contains("outside"));
+    }
+
+    /// Regression: inserts of 1 and 127 bytes, mixed with copies (#343).
+    #[test]
+    fn regression_delta_inserts_and_mixed_ops() {
+        let src = b"0123456789".to_vec();
+        let long: Vec<u8> = (0..127).collect();
+        let mut ops = vec![1, b'x', 127];
+        ops.extend(&long);
+        ops.extend([0x91, 2, 3]);
+        let d = delta(10, 1 + 127 + 3, &ops);
+        let mut expected = b"x".to_vec();
+        expected.extend(&long);
+        expected.extend(b"234");
+        assert_eq!(apply(&src, &d).unwrap(), expected);
+        // Without a source only the declared sizes are checked.
+        let (s, t, out) = walk_delta(&d, None, u64::MAX).unwrap();
+        assert_eq!((s, t, out), (10, 131, None));
+        assert_eq!(apply(b"", &delta(0, 0, &[])).unwrap(), b"");
+    }
+
+    /// Regression: malformed deltas are refused, never panic or over-allocate (#343).
+    #[test]
+    fn regression_delta_malformed_vectors() {
+        let src = b"0123456789".to_vec();
+        let cases: &[(&str, Vec<u8>, &str)] = &[
+            ("opcode 0", delta(10, 1, &[0]), "reserved delta opcode 0"),
+            ("empty", Vec::new(), "truncated delta size"),
+            (
+                "truncated source varint",
+                vec![0x8a],
+                "truncated delta size",
+            ),
+            (
+                "truncated target varint",
+                vec![10, 0x81],
+                "truncated delta size",
+            ),
+            (
+                "overflowing varint",
+                [vec![0xff; 9], vec![0x7f]].concat(),
+                "overflows",
+            ),
+            ("copy out of range", delta(10, 5, &[0x91, 8, 5]), "outside"),
+            (
+                "offset+size overflow",
+                delta(
+                    10,
+                    0xff_ffff,
+                    &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                ),
+                "outside",
+            ),
+            (
+                "truncated copy operand",
+                delta(10, 1, &[0x91, 1]),
+                "truncated delta copy",
+            ),
+            (
+                "truncated insert",
+                delta(10, 3, &[3, b'a']),
+                "truncated delta insert",
+            ),
+            (
+                "trailing bytes",
+                delta(10, 1, &[1, b'a', 1, b'b']),
+                "exceeds its target",
+            ),
+            (
+                "trailing copy",
+                delta(10, 1, &[1, b'a', 0x91, 0, 1]),
+                "exceeds its target",
+            ),
+            (
+                "short output",
+                delta(10, 4, &[1, b'a']),
+                "shorter than its target",
+            ),
+            (
+                "copy beyond target",
+                delta(10, 2, &[0x91, 0, 3]),
+                "exceeds its target",
+            ),
+        ];
+        for (name, d, message) in cases {
+            let error = apply(&src, d).unwrap_err().to_string();
+            assert!(error.contains(message), "{name}: {error}");
+            // Structural checks do not need the source.
+            assert!(walk_delta(d, None, u64::MAX).is_err(), "{name}");
+        }
+        let error = apply(&src, &delta(9, 0, &[])).unwrap_err().to_string();
+        assert!(
+            error.contains("does not match the preimage size 10"),
+            "{error}"
+        );
+        // A huge declared target is refused before any allocation.
+        let huge = delta(10, u64::MAX >> 1, &[0x91, 0, 1]);
+        let error = walk_delta(&huge, Some(&src), 1 << 20)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds --max-patch-bytes"), "{error}");
+        assert!(walk_delta(&huge, None, 1 << 20).is_err());
+    }
+
+    /// Regression: base85 line lengths at the 1/4/5/26/27/52-byte edges round-trip;
+    /// a length character that disagrees with the line is refused (#343).
+    #[test]
+    fn regression_import_base85_line_length_edges() {
+        for len in [1usize, 3, 4, 5, 26, 27, 51, 52] {
+            let data: Vec<u8> = (0..len as u8).map(|b| b.wrapping_mul(37) ^ 0xa5).collect();
+            let encoded = encode85(&data);
+            let line = trim_lf(encoded.split_inclusive(|b| *b == b'\n').next().unwrap());
+            assert_eq!(decode85(line).unwrap(), data, "{len}");
+            // A length character one five-digit group off is refused.
+            let mut wrong = line.to_vec();
+            let other = if len + 4 <= 52 { len + 4 } else { len - 4 } as u8;
+            wrong[0] = if other <= 26 {
+                b'A' + other - 1
+            } else {
+                b'a' + other - 27
+            };
+            assert!(decode85(&wrong).is_err(), "{len}");
+        }
+        assert!(decode85(b"{00000").is_err());
+        let two = encode85(&[7; 53]);
+        assert_eq!(two.split(|b| *b == b'\n').next().unwrap()[0], b'z');
+    }
+
+    fn delta_patch(index: Option<&str>, d: &[u8]) -> Vec<u8> {
+        let mut patch = b"diff --git a/bin b/bin\n".to_vec();
+        if let Some(index) = index {
+            patch.extend(format!("index {index} 100644\n").as_bytes());
+        }
+        patch.extend(format!("GIT binary patch\ndelta {}\n", d.len()).as_bytes());
+        patch.extend(encode85(&zlib(d)));
+        patch
+    }
+
+    /// Regression: blob ids are checked like `git apply` (full SHA-1 or SHA-256,
+    /// or a prefix of either); a missing or zero index line refuses the delta (#343).
+    #[test]
+    fn regression_delta_index_blob_ids() {
+        let pre = b"\x00preimage bytes".to_vec();
+        let d = delta(pre.len() as u64, 4, &[0x91, 1, 3, 1, b'!']);
+        let post = apply(&pre, &d).unwrap();
+        assert_eq!(post, b"pre!");
+        let [old1, old256] = blob_ids(&pre);
+        let [new1, new256] = blob_ids(&post);
+        // `git hash-object` (SHA-1 and SHA-256 object formats) of an empty blob.
+        assert_eq!(
+            blob_ids(b""),
+            [
+                "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+                "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813"
+            ]
+        );
+        for (old, new) in [
+            (old1.clone(), new1.clone()),
+            (old1[..7].to_string(), new1[..7].to_string()),
+            (old256.clone(), new256.clone()),
+            (old256[..50].to_string(), new256[..50].to_string()),
+            (old1.to_uppercase(), new1.to_uppercase()),
+        ] {
+            let patch = delta_patch(Some(&format!("{old}..{new}")), &d);
+            let parsed = parse(&patch, 1 << 20).unwrap();
+            let p = &parsed[0];
+            assert_eq!(
+                apply_delta(
+                    &pre,
+                    p.delta.as_ref().unwrap(),
+                    p.index.as_ref().unwrap(),
+                    1 << 20
+                )
+                .unwrap(),
+                post
+            );
+        }
+        let check = |index: (String, String), pre: &[u8]| apply_delta(pre, &d, &index, 1 << 20);
+        let error = check((old1.clone(), new1.clone()), b"\x00preimage bytez").unwrap_err();
+        assert!(
+            error.contains("sha1 information is lacking or useless"),
+            "{error}"
+        );
+        let error = check((old1.clone(), old1.clone()), &pre).unwrap_err();
+        assert!(error.contains("index expects"), "{error}");
+        // Mixed object formats do not verify.
+        assert!(check((old1.clone(), new256[..40].to_string()), &pre).is_err());
+        for index in [
+            None,
+            Some(format!("0000000..{}", &new1[..7])),
+            Some(format!("{}..{}", "0".repeat(40), new1)),
+            Some(format!("{}..{}", &old1[..3], &new1[..7])),
+            Some(format!("{old1}..xyz")),
+        ] {
+            let error = parse(&delta_patch(index.as_deref(), &d), 1 << 20)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("bin: a delta binary section needs"),
+                "{index:?}: {error}"
+            );
+        }
+        // A delta needs a preimage and a postimage.
+        for header in ["new file mode 100644\n", "deleted file mode 100644\n"] {
+            let mut patch = b"diff --git a/bin b/bin\n".to_vec();
+            patch.extend(header.as_bytes());
+            patch.extend(format!("index {old1}..{new1}\n").as_bytes());
+            patch.extend(&delta_patch(None, &d)[b"diff --git a/bin b/bin\n".len()..]);
+            let error = parse(&patch, 1 << 20).unwrap_err().to_string();
+            assert!(error.contains("existing preimage"), "{error}");
+        }
+    }
+
+    /// Regression: a delta's declared target over --max-patch-bytes is refused at
+    /// parse time, before any target allocation; the delta stream is charged to
+    /// the decoded-literal budget, and a reverse delta is validated (#343).
+    #[test]
+    fn regression_delta_budget_and_reverse_section() {
+        let d = delta(4, 1 << 40, &[0x80 | 0x40, 1]);
+        let patch = delta_patch(Some("abcd..ef01"), &d);
+        let error = parse(&patch, 1 << 20).unwrap_err().to_string();
+        assert!(error.contains("exceeds --max-patch-bytes"), "{error}");
+        let small = delta(4, 2, &[0x90, 2]);
+        let patch = delta_patch(Some("abcd..ef01"), &small);
+        parse(&patch, 1 << 20).unwrap();
+        // The retained delta itself counts toward the budget.
+        assert!(parse(&patch, small.len() as u64 - 1).is_err());
+        let mut two = patch.clone();
+        two.extend(&delta_patch(Some("abcd..ef01"), &small)["diff --git a/bin b/bin\n".len()..]);
+        assert!(parse(&two, 1 << 20)
+            .unwrap_err()
+            .to_string()
+            .contains("repeated"));
+        // Reverse section: a valid delta passes, a malformed one is refused.
+        let mut ok = patch.clone();
+        ok.extend(format!("delta {}\n", small.len()).as_bytes());
+        ok.extend(encode85(&zlib(&small)));
+        assert!(parse(&ok, 1 << 20).unwrap()[0].delta.is_some());
+        let bad = delta(4, 2, &[0]);
+        let mut ko = patch;
+        ko.extend(format!("delta {}\n", bad.len()).as_bytes());
+        ko.extend(encode85(&zlib(&bad)));
+        let error = parse(&ko, 1 << 20).unwrap_err().to_string();
+        assert!(error.contains("bin: reserved delta opcode 0"), "{error}");
     }
 }

@@ -251,13 +251,23 @@ fn import(
                 .as_ref()
                 .map_or(&[][..], |(_, bytes)| bytes.as_slice());
             let (content, failed) = apply_hunks(preimage, &patch.hunks, args.max_patch_bytes)?;
-            if !failed.is_empty() {
+            // A failed delta (#343) is handled like a failed hunk.
+            let (content, delta_failure) =
+                match delta_postimage(patch, original.as_ref(), args.max_patch_bytes) {
+                    None => (content, None),
+                    Some(Ok(bytes)) => (bytes, None),
+                    Some(Err(error)) => (content, Some(error)),
+                };
+            if !failed.is_empty() || delta_failure.is_some() {
                 if !args.reject {
-                    return Err(format!(
-                        "{}: hunk #{} failed (exact context not found)",
-                        patch.path(),
-                        failed[0] + 1
-                    ));
+                    return Err(match &delta_failure {
+                        Some(error) => format!("{}: {error}", patch.path()),
+                        None => format!(
+                            "{}: hunk #{} failed (exact context not found)",
+                            patch.path(),
+                            failed[0] + 1
+                        ),
+                    });
                 }
                 // The lower view is the original even if an earlier section in
                 // this patch stream changed this path.
@@ -291,6 +301,12 @@ fn import(
                 });
                 for i in failed {
                     reject.extend_from_slice(&patch.hunks[i].raw);
+                }
+                if delta_failure.is_some() {
+                    if let Some((old, new)) = &patch.index {
+                        reject.extend_from_slice(format!("index {old}..{new}\n").as_bytes());
+                    }
+                    reject.extend_from_slice(&patch.binary_raw);
                 }
                 continue;
             }
@@ -701,6 +717,26 @@ fn replace_directory(
     Ok(Replace::Removed(
         deletions.into_iter().map(|(path, j)| (j, path)).collect(),
     ))
+}
+
+/// The postimage of a `delta` section, or `None` without one. `Err` names
+/// why the delta does not apply (missing or non-regular preimage, blob id or
+/// size mismatch); the caller rejects or refuses it like a failed hunk.
+fn delta_postimage(
+    patch: &parse::FilePatch,
+    original: Option<&(FileInfo, Vec<u8>)>,
+    limit: u64,
+) -> Option<Result<Vec<u8>, String>> {
+    let delta = patch.delta.as_deref()?;
+    // The parser refuses a delta without an index line.
+    let index = patch.index.as_ref()?;
+    Some(match original {
+        None => Err("delta preimage does not exist".into()),
+        Some((fi, _)) if fi.mode & S_IFMT != S_IFREG => {
+            Err("delta preimage is not a regular file".into())
+        }
+        Some((_, bytes)) => parse::apply_delta(bytes, delta, index, limit),
+    })
 }
 
 fn read_entry(

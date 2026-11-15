@@ -530,3 +530,176 @@ fn regression_import_deleted_lower_symlink_cannot_copy_outside() {
         b"outside secret\n"
     );
 }
+
+/// Git base85 lines (52 bytes each) plus the blank terminator.
+fn base85(data: &[u8]) -> Vec<u8> {
+    const ALPHABET: &[u8] =
+        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
+    let mut out = Vec::new();
+    for chunk in data.chunks(52) {
+        let n = chunk.len() as u8;
+        out.push(if n <= 26 { b'A' + n - 1 } else { b'a' + n - 27 });
+        for word in chunk.chunks(4) {
+            let mut bytes = [0; 4];
+            bytes[..word.len()].copy_from_slice(word);
+            let mut value = u32::from_be_bytes(bytes);
+            let mut digits = [0; 5];
+            for digit in digits.iter_mut().rev() {
+                *digit = ALPHABET[(value % 85) as usize];
+                value /= 85;
+            }
+            out.extend_from_slice(&digits);
+        }
+        out.push(b'\n');
+    }
+    out.push(b'\n');
+    out
+}
+
+fn blob_sha1(data: &[u8]) -> String {
+    use sha1::Digest as _;
+    let mut hash = sha1::Sha1::new();
+    hash.update(format!("blob {}\0", data.len()).as_bytes());
+    hash.update(data);
+    hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A `delta N` section from `pre` to `post`: copy prefix, insert middle, copy suffix.
+fn delta_section(pre: &[u8], post: &[u8]) -> Vec<u8> {
+    fn varint(mut value: usize, out: &mut Vec<u8>) {
+        while value >= 0x80 {
+            out.push((value as u8 & 0x7f) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+    fn copy(offset: usize, size: usize, out: &mut Vec<u8>) {
+        assert!(size > 0 && size < 1 << 24 && offset < 1 << 32);
+        let mut cmd = 0x80u8;
+        let mut operands = Vec::new();
+        for (i, byte) in (offset as u32).to_le_bytes().into_iter().enumerate() {
+            if byte != 0 {
+                cmd |= 1 << i;
+                operands.push(byte);
+            }
+        }
+        for (i, byte) in (size as u32).to_le_bytes()[..3].iter().enumerate() {
+            if *byte != 0 {
+                cmd |= 0x10 << i;
+                operands.push(*byte);
+            }
+        }
+        out.push(cmd);
+        out.extend(operands);
+    }
+    let prefix = pre.iter().zip(post).take_while(|(a, b)| a == b).count();
+    let suffix = pre[prefix..]
+        .iter()
+        .rev()
+        .zip(post[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut delta = Vec::new();
+    varint(pre.len(), &mut delta);
+    varint(post.len(), &mut delta);
+    copy(0, prefix, &mut delta);
+    for chunk in post[prefix..post.len() - suffix].chunks(127) {
+        delta.push(chunk.len() as u8);
+        delta.extend(chunk);
+    }
+    copy(pre.len() - suffix, suffix, &mut delta);
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&delta).unwrap();
+    let mut section = format!("delta {}\n", delta.len()).into_bytes();
+    section.extend(base85(&encoder.finish().unwrap()));
+    section
+}
+
+/// Regression (#343): a test patch modifying a binary `.docx` fixture with a
+/// `delta` section failed "delta binary sections are unsupported; supply
+/// literal sections". It imports, seals and verifies, and `diff --git` of the
+/// result imports to the same `diff --hash`.
+#[test]
+fn regression_import_binary_delta_docx_cli() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    fs::create_dir_all(base.join("t/etc")).unwrap();
+    let mut pre = b"PK\x03\x04\x14\x00\x06\x00\x08\x00\x00\x00!\x00[Content_Types].xml".to_vec();
+    let mut x = 0x9e37_79b9u32;
+    pre.extend((0..6000).map(|_| {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        x as u8
+    }));
+    pre.extend(b"PK\x05\x06\x00\x00\x00\x00");
+    let mut post = pre.clone();
+    post[3000..3016].copy_from_slice(b"edited document!");
+    let path = "t/etc/MsOffice-Word-Surgeon.docx";
+    fs::write(base.join(path), &pre).unwrap();
+    let mut patch = format!(
+        "diff --git a/{path} b/{path}\nindex {}..{} 100644\nGIT binary patch\n",
+        blob_sha1(&pre),
+        blob_sha1(&post)
+    )
+    .into_bytes();
+    patch.extend(delta_section(&pre, &post));
+    patch.extend(delta_section(&post, &pre));
+    let dest = root.path().join("overlay");
+    let output = import(&base, &dest, &patch, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(dest.join(path)).unwrap(), post);
+    let verify = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .args(["overlay", "verify", "--json"])
+        .arg(&dest)
+        .arg(&base)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let diff = |dir: &Path, mode: &str| {
+        Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+            .arg("diff")
+            .arg(dir)
+            .arg(&base)
+            .arg(mode)
+            .output()
+            .unwrap()
+    };
+    let again = root.path().join("again");
+    let literal = diff(&dest, "--git");
+    assert_eq!(literal.status.code(), Some(1));
+    let output = import(&base, &again, &literal.stdout, &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (first, second) = (diff(&dest, "--hash"), diff(&again, "--hash"));
+    assert!(first.status.success() && second.status.success());
+    assert_eq!(first.stdout, second.stdout);
+    // The same patch against an edited base is refused by blob id (exit 2).
+    let mut other = pre.clone();
+    other[10] ^= 1;
+    fs::write(base.join(path), &other).unwrap();
+    let refused = root.path().join("refused");
+    let output = import(&base, &refused, &patch, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(path) && stderr.contains("sha1 information is lacking or useless"),
+        "{stderr}"
+    );
+    assert!(!refused.exists());
+    for dir in [&dest, &again] {
+        ratarmount_compositing::overlay_seal::unseal(dir).unwrap();
+    }
+}
