@@ -293,6 +293,21 @@ class Contract(unittest.TestCase):
         rows = targets(metadata, ["--workspace", "--lib", "--bins"])
         self.assertEqual({r["crate"] for r in rows}, {"derive", "driver"})
 
+    def test_regression_328_boot_id_target_review_and_manifest_configuration(self):
+        """Regression: the Linux boot-ID reader needs an N4 source review too."""
+        here = Path(__file__).parent
+        config = json.loads((here / "policy.json").read_text())
+        reviews = [r for r in config["reviewed_target_files"]
+                   if r["file"] == "ratarmount-compositing/src/relaxed_durability.rs"]
+        self.assertEqual(len(reviews), 1)
+        for field in ("reviewer", "provenance", "reason"):
+            self.assertTrue(reviews[0][field])
+        approved = json.loads((here / "manifest.json").read_text())
+        files = ["clippy.toml", "profiles.json", "policy.json", "diagnostics.py",
+                 "policy.py", "dispatch.py"]
+        self.assertEqual(approved["policy"]["configuration"],
+                         policy.digest(b"".join((here / f).read_bytes() for f in files)))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 # #328 profile: write-overlay create+unlink cost
 
-Measurement only. No production code changed. Plan context:
+Initial profile measured `c1401e7`; the implemented opt-in durability mode and
+its follow-up measurements are recorded under B1 below. Plan context:
 [`issues-326-329-plan.md`](issues-326-329-plan.md) (#328 section).
 
 ## Summary
@@ -296,7 +297,9 @@ of risk for a much larger gain. Not worth a mode of its own.
 boot-ID marker; no COW directory-fsync change; relaxed refuses archive
 commits instead of switching them back to FULL). Measured N=200, REPS=3 on
 ext4: `-w` 7.04 / 6.55 ms per create / unlink, relaxed 0.155 / 0.078,
-`--overlay-tmpfs` 0.111 / 0.065. See docs/sandbox.md, "Relaxed overlay
+`--overlay-tmpfs` 0.111 / 0.065. The combined workload fell from 2.72 s to
+0.047 s (about 58×); the earlier 85× figure describes the local experiment,
+not this implementation measurement. See docs/sandbox.md, "Relaxed overlay
 durability".
 
 ### Out of scope

@@ -52,7 +52,7 @@ the [N-worker recipe and compatibility limits](sandbox.md#prepare-once-n-writabl
 | `--overlay-quota SIZE` / `--overlay-quota-files N` | no | **added** (shared logical content/file caps including copy-up; EDQUOT; xattr metadata excluded) | `[x]` Rust-only |
 | `--sandbox` | no | **added** (allow_other + noatime + caller uid/gid; RAM overlay unless explicit `-w`; Linux) | `[x]` Rust-only |
 | `--overlay-tmpfs[=SIZE]` | no | **added** (verified Linux tmpfs; optional logical byte quota, not a RAM reservation; discarded on cleanup) | `[x]` Rust-only |
-| `--overlay-durability full\|relaxed` | no | **added** (relaxed: `synchronous=OFF` on the mount's overlay database behind a boot-ID crash marker; an OS crash refuses later use until `overlay fsck --repair`; no archive commits; #328) | `[x]` Rust-only |
+| `--overlay-durability full\|relaxed` | no | **added** (relaxed: `synchronous=OFF` on the mount's overlay database behind a boot-ID crash marker; an OS crash refuses later use until `overlay fsck --repair`; relaxed forbids archive commits, explicit full permits them; #328) | `[x]` Rust-only |
 | `--overlay-tmpfs-allow-commit` | no | **added** (explicitly permits live commit from a RAM overlay) | `[x]` Rust-only |
 | `-o uid=UID,gid=GID,umask=MASK` | yes | **added** (reported attrs in FUSE/NFS/9P/SFTP; stored ownership unchanged) | `[x]` |
 | `--bind /PATH=SOURCE` | no | **added** (per-source mount path before union; repeatable) | `[x]` Rust-only |

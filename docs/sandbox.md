@@ -1833,7 +1833,9 @@ changes. The default is `--overlay-durability=full`. The flag requires
 `-w`, `--overlay-tmpfs` or `--sandbox`. `relaxed` conflicts with every
 archive commit (`--commit-overlay`, `--commit-overlay-on-exit`,
 `--commit-overlay-interval`, `--roll-every`): a relaxed overlay is
-throwaway. Either mistake exits 2. On `--overlay-tmpfs` it changes
+throwaway. Explicit `full` permits archive commits; a zero interval (including
+`0s`, `0m` and `0h`) disables interval commits in either mode.
+Either mistake exits 2. On `--overlay-tmpfs` it changes
 nothing that matters: RAM is gone after a crash anyway.
 
 What a crash costs: after an OS crash or power loss while the mount was
@@ -1842,7 +1844,9 @@ missing (or half-applying) the last changes, for example deletions that
 reappear. Use relaxed durability for throwaway attempt overlays on disk
 that are discarded rather than repaired after a machine failure; keep `full`
 for overlays whose edits must survive one, or that are committed into an
-archive.
+archive. `full` protects the database transactions; it does not itself fsync
+every payload file and parent directory, so it does not guarantee that every
+acknowledged filesystem edit survives power loss.
 
 The mount records the meta row `relaxed_durability` = `<boot_id>:<pid>`
 (`/proc/sys/kernel/random/boot_id`; `unknown` off Linux or when it cannot be
@@ -1856,6 +1860,12 @@ mount records its launcher's). A leftover row is judged by its boot ID:
 | none | clean unmount, or `full` | normal |
 | this boot | the process died; its writes reached the kernel | accepted; the next writable open (or `overlay seal`) clears it; read-only checks accept it |
 | another boot, or `unknown` | the machine went down while relaxed | the writable open, `overlay fsck`, `overlay seal`, `diff` and offline `--commit-overlay` refuse, naming the cause and `overlay fsck --repair` |
+
+Startup also refuses archive-journal recovery when its overlay record has an
+unclean marker, including with `--force-base-mismatch`. Admitted archive
+recovery finishes under `FULL` before the mount enables relaxed writes, so
+the updated base identity is durable before its recovery journal is removed.
+Forced sealing also checks the marker before replacing any recorded base identity.
 
 `ratarmount overlay fsck --repair DIR` runs `PRAGMA integrity_check` inside
 its exclusive transaction before any other repair. If it reports a problem,
@@ -1871,7 +1881,8 @@ daemonized mount holds no kernel lock on its database after its fork (#183).
 
 Measured with `benchmarks/overlay-create-unlink.sh` on one ext4 disk
 (N=200, REPS=3; see the #328 profile in
-`docs/tasks/plans/issue-328-overlay-create-unlink-profile.md`): 
+`docs/tasks/plans/issue-328-overlay-create-unlink-profile.md`): about **58×**
+faster for the combined create/unlink workload (2.72 s → 0.047 s).
 
 | Variant | create ms/op | unlink ms/op | 200 create+unlink, s |
 |---------|-------------:|-------------:|---------------------:|

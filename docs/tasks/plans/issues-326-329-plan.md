@@ -1,7 +1,10 @@
 # Plan: issues #326–#329 (opened 2026-11-15)
 
-Status: draft plan, nothing implemented. All four issues were filed from cpanmine
-runs on 0.2.0; none has comments yet. Each section labels its root cause as
+Status: original investigation plan. #328 has since been measured and its
+opt-in relaxed mode implemented; see the
+[#328 profile](issue-328-overlay-create-unlink-profile.md). The other sections
+remain proposed work here. All four issues were filed from cpanmine
+runs on 0.2.0. Each section labels its root cause as
 **read from code** (not yet run) or **reproduced**.
 
 Suggested order: #329 → #326 → #327 → #328. The first three are small and
@@ -205,7 +208,10 @@ are listed there.
 
 ## #328 Write overlay create+unlink ~13 ms/file (~12× tmpfs)
 
-**Root cause: unknown, so plan a measurement, not a fix.** Known so far
+**Original investigation hypothesis (resolved by the linked profile):**
+per-operation SQLite fsyncs dominate; the implemented opt-in mode gives about
+58× on the measured create/unlink workload. The original measurement plan follows.
+Known at planning time
 (read from code): every create and unlink persists a `files` row through
 `persist_files_op`, one SQLite transaction each. The connection uses the
 default journal mode, so each commit costs several fsyncs. Publish paths also

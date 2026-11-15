@@ -577,11 +577,12 @@ struct Args {
     overlay_quota_files: Option<u64>,
 
     /// Overlay database durability: `full` waits for the disk on every create/unlink/rename;
-    /// `relaxed` does not (about 50x faster) and is meant for throwaway overlays: an OS crash or
-    /// power loss can then corrupt the overlay (a killed process cannot), and the next use
-    /// refuses until `overlay fsck --repair`. Requires -w/--overlay-tmpfs/--sandbox and conflicts
+    /// `relaxed` does not (about 58x faster in the measured create/unlink workload) and is meant
+    /// for throwaway overlays: an OS crash or power loss can then corrupt the overlay
+    /// (a killed process cannot), and the next use
+    /// refuses until `overlay fsck --repair`. Requires -w/--overlay-tmpfs/--sandbox; relaxed conflicts
     /// with archive commits (--commit-overlay*, --roll-every); exit 2 otherwise.
-    #[arg(long, value_parser = ["full", "relaxed"], default_value = "full", requires = "overlay_target", conflicts_with = "commit_overlay")]
+    #[arg(long, value_parser = ["full", "relaxed"], default_value = "full", requires = "overlay_target")]
     overlay_durability: String,
 
     #[arg(skip)]
@@ -787,9 +788,14 @@ fn relaxed_durability_has_no_commit(args: &Args) -> Result<(), clap::Error> {
         return Ok(());
     }
     for (given, flag) in [
+        (args.commit_overlay, "--commit-overlay"),
         (args.commit_overlay_on_exit, "--commit-overlay-on-exit"),
         (
-            !matches!(args.commit_overlay_interval.trim(), "" | "0"),
+            overlay_commit::parse_interval(&args.commit_overlay_interval)
+                .map_err(|message| {
+                    clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
+                })?
+                .is_some(),
             "--commit-overlay-interval",
         ),
         (args.roll_every.is_some(), "--roll-every"),
@@ -2671,16 +2677,6 @@ fn main() {
                     eprintln!("error recording read-only rules in overlay metadata: {e}");
                     std::process::exit(1);
                 }
-                // #328: after every setup write, before the first served one.
-                if args.overlay_durability == "relaxed" {
-                    if let Err(e) =
-                        ov.set_durability(ratarmount_compositing::OverlayDurability::Relaxed)
-                    {
-                        eprintln!("error enabling --overlay-durability=relaxed: {e}");
-                        drop(ov);
-                        std::process::exit(1);
-                    }
-                }
                 let ov = Arc::new(ov);
                 bundle.source = Arc::clone(&ov) as Arc<dyn MountSource>;
                 overlay_arc = Some(ov);
@@ -2712,6 +2708,21 @@ fn main() {
         };
         if let Err(e) = recovered {
             eprintln!("error: commit recovery for {}: {e}", member.display());
+            drop(overlay_arc);
+            std::process::exit(1);
+        }
+    }
+
+    // #328: recovery must restamp the base under FULL before unlinking its
+    // archive journal. Only subsequent mount writes may use relaxed durability.
+    if args.overlay_durability == "relaxed" {
+        if let Err(e) = overlay_arc
+            .as_ref()
+            .expect("validated write overlay")
+            .set_durability(ratarmount_compositing::OverlayDurability::Relaxed)
+        {
+            eprintln!("error enabling --overlay-durability=relaxed: {e}");
+            drop(bundle);
             drop(overlay_arc);
             std::process::exit(1);
         }
@@ -8614,6 +8625,39 @@ mod sandbox_cli_tests {
                 )
                 .is_ok(),
                 "{commit:?}"
+            );
+        }
+    }
+
+    /// Regression (#328): explicit FULL must accept offline commits, and a
+    /// disabled interval must not turn a relaxed mount into an archive writer.
+    #[test]
+    fn regression_overlay_durability_full_offline_and_disabled_interval() {
+        let args = parse_args_from([
+            "ratarmount",
+            "--commit-overlay",
+            "-w",
+            "ov",
+            "--overlay-durability=full",
+            "a.tar",
+        ])
+        .unwrap();
+        assert!(args.commit_overlay);
+        for interval in ["0", "00", "0s", "0m", "0h"] {
+            let args = parse_args_from([
+                "ratarmount",
+                "-w",
+                "ov",
+                "--overlay-durability=relaxed",
+                "--commit-overlay-interval",
+                interval,
+                "a.tar",
+                "mnt",
+            ])
+            .unwrap();
+            assert_eq!(
+                overlay_commit::parse_interval(&args.commit_overlay_interval),
+                Ok(None)
             );
         }
     }

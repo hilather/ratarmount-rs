@@ -425,6 +425,24 @@ mod tests {
         });
     }
 
+    /// Regression (#328): a forced seal must not replace an unclean overlay's
+    /// base identity before the seal's later durability check refuses it.
+    #[test]
+    fn regression_relaxed_forced_base_rows_refuse_unclean_record() {
+        let (_tmp, dir, _source) = fixture();
+        plant(&dir, "unknown:42");
+        let before = std::fs::read(dir.join(HIDDEN_DB)).unwrap();
+        let rows = std::collections::BTreeMap::from([
+            ("base_kind".into(), "directory".into()),
+            ("base_url".into(), "/another/base".into()),
+        ]);
+        let error = crate::overlay_meta::record_base_rows_offline(&dir, &rows)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fsck --repair"), "{error}");
+        assert!(std::fs::read(dir.join(HIDDEN_DB)).unwrap() == before);
+    }
+
     /// Regression (#328): `integrity_check` refuses a damaged database (the
     /// `fsck --repair` gate) and accepts an intact one.
     #[test]
@@ -458,6 +476,102 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         let error = integrity_check(&conn).unwrap_err().to_string();
         assert!(error.contains("integrity_check"), "{error}");
+    }
+
+    /// Regression (#328): failed marker persistence must never enable OFF;
+    /// failed clean-close deletion must keep the recovery marker under FULL.
+    #[test]
+    fn regression_relaxed_marker_write_and_clear_failures() {
+        with_boot_id(Some("boot-a"), || {
+            let (_tmp, dir, source) = fixture();
+            let conn = Connection::open(dir.join(HIDDEN_DB)).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER refuse_marker BEFORE INSERT ON meta
+                 WHEN NEW.key='relaxed_durability'
+                 BEGIN SELECT RAISE(ABORT, 'marker write failed'); END;",
+            )
+            .unwrap();
+            drop(conn);
+            let ov = WriteOverlay::new_for_tests(source.clone(), &dir).unwrap();
+            assert!(ov.set_durability(OverlayDurability::Relaxed).is_err());
+            assert_eq!(ov.durability(), OverlayDurability::Full);
+            assert_eq!(ov.synchronous_level_for_test().unwrap(), 2);
+            assert_eq!(ov.meta_value(RELAXED_DURABILITY_KEY).unwrap(), None);
+            drop(ov);
+            let conn = Connection::open(dir.join(HIDDEN_DB)).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER refuse_marker;
+                 CREATE TRIGGER refuse_clear BEFORE DELETE ON meta
+                 WHEN OLD.key='relaxed_durability'
+                 BEGIN SELECT RAISE(ABORT, 'marker clear failed'); END;",
+            )
+            .unwrap();
+            drop(conn);
+            let ov = WriteOverlay::new_for_tests(source, &dir).unwrap();
+            ov.set_durability(OverlayDurability::Relaxed).unwrap();
+            churn(&ov);
+            let expected = marker_value();
+            assert!(ov.set_durability(OverlayDurability::Full).is_err());
+            assert_eq!(ov.synchronous_level_for_test().unwrap(), 2);
+            assert_eq!(
+                ov.meta_value(RELAXED_DURABILITY_KEY).unwrap().as_deref(),
+                Some(expected.as_str())
+            );
+            drop(ov);
+            assert_eq!(marker(&dir).as_deref(), Some(expected.as_str()));
+        });
+    }
+
+    /// Regression (#328): fsck --repair must not clear the marker or repair
+    /// host/row inconsistencies when integrity_check finds a damaged index.
+    #[test]
+    fn regression_relaxed_fsck_corruption_keeps_marker_and_rows() {
+        with_boot_id(Some("boot-a"), || {
+            let (_tmp, dir, _source) = fixture();
+            plant(&dir, "boot-b:42");
+            let conn = Connection::open(dir.join(HIDDEN_DB)).unwrap();
+            // Make an inconsistency that ordinary fsck would repair. Omit an
+            // index update with writable_schema so SQLite stays readable but
+            // integrity_check reports the missing index entry.
+            conn.execute_batch(
+                "CREATE TABLE probe(k INTEGER PRIMARY KEY, v TEXT);
+                 CREATE INDEX probe_v ON probe(v);
+                 INSERT INTO probe VALUES (1,'one');
+                 INSERT INTO files(path,name,mode,deleted) VALUES ('','missing',33188,0);",
+            )
+            .unwrap();
+            let (page, schema): (i64, String) = conn
+                .query_row(
+                    "SELECT rootpage,sql FROM sqlite_master WHERE name='probe_v'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            conn.execute_batch("PRAGMA writable_schema=ON; DELETE FROM sqlite_master WHERE name='probe_v'; PRAGMA writable_schema=OFF;").unwrap();
+            drop(conn);
+            let conn = Connection::open(dir.join(HIDDEN_DB)).unwrap();
+            conn.execute("INSERT INTO probe VALUES (2,'two')", [])
+                .unwrap();
+            conn.execute_batch("PRAGMA writable_schema=ON;").unwrap();
+            conn.execute(
+                "INSERT INTO sqlite_master(type,name,tbl_name,rootpage,sql)
+                 VALUES ('index','probe_v','probe',?1,?2)",
+                params![page, schema],
+            )
+            .unwrap();
+            drop(conn);
+            let before = std::fs::read(dir.join(HIDDEN_DB)).unwrap();
+            let error = crate::overlay_fsck::fsck(&dir, true)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("integrity_check"), "{error}");
+            assert_eq!(marker(&dir).as_deref(), Some("boot-b:42"));
+            assert_eq!(
+                std::fs::read(dir.join(HIDDEN_DB)).unwrap(),
+                before,
+                "the marker, missing-content row and damaged index must remain untouched"
+            );
+        });
     }
 
     #[test]

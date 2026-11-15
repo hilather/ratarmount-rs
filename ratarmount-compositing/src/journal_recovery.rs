@@ -930,6 +930,11 @@ fn decide(
             }
         };
         let Some(meta) = meta else { continue };
+        // #328: even an inode-owned archive journal cannot be recovered using
+        // a record left unclean by relaxed durability. Refuse before recovery
+        // writes, not later when the writable overlay is opened. Force may
+        // override a base mismatch, but cannot validate this database.
+        crate::relaxed_durability::refuse_unclean(Some(&meta)).map_err(io::Error::other)?;
         if is_top && meta.layer_sealed() {
             return Ok(defer("is guarded by a sealed overlay".into(), flag));
         }

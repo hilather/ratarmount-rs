@@ -551,6 +551,8 @@ pub fn seal(cmd: &SealCmd, context: &OverlayRunContext) -> Result<(String, i32),
         }
         let meta = OverlayMeta::read(&args.directory)
             .map_err(|e| super::overlay_open_error(&args.directory, &e))?;
+        ratarmount_compositing::relaxed_durability::refuse_unclean(meta.as_ref())
+            .map_err(|e| format!("seal {}: {e}", args.directory.display()))?;
         let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
         let base = classify_base(args.base.as_ref(), meta.as_ref(), None, context)?;
         if let Some(forced) =

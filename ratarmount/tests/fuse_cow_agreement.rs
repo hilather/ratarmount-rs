@@ -919,7 +919,7 @@ fn churn(mnt: &Path) {
 /// `RATARMOUNT_TEST_BOOT_ID` seam) is refused by the remount, `diff`, `seal`
 /// and `fsck` until `fsck --repair` passes its integrity check.
 #[test]
-fn relaxed_durability_clean_killed_and_rebooted() {
+fn regression_relaxed_durability_clean_killed_and_rebooted() {
     if !available() {
         return;
     }
@@ -1052,6 +1052,80 @@ fn relaxed_durability_clean_killed_and_rebooted() {
         b"new\n"
     );
     mount.unmount();
+}
+
+/// Regression (#328): the forked launcher's exit must keep the marker, while
+/// the serving child's clean exit must flush and clear it before process::exit.
+#[test]
+fn regression_relaxed_durability_daemon_clean_close() {
+    if !available() {
+        return;
+    }
+    struct Mounted(Option<PathBuf>);
+    impl Drop for Mounted {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                let _ = Command::new("fusermount3").arg("-uz").arg(path).status();
+            }
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base.tar");
+    base_tar(&base);
+    let overlay = tmp.path().join("overlay");
+    let mount = tmp.path().join("mnt");
+    fs::create_dir(&mount).unwrap();
+    let mut mounted = Mounted(Some(mount.clone()));
+    let p = Path::new;
+    expect(
+        run(
+            &[
+                p("--passthrough"),
+                p("off"),
+                p("--index-file"),
+                p(":memory:"),
+                p("--overlay-durability=relaxed"),
+                p("-w"),
+                &overlay,
+                &base,
+                &mount,
+            ],
+            &tmp.path().join("cache"),
+        ),
+        0,
+    );
+    assert!(
+        meta_get(&overlay, "relaxed_durability").is_some(),
+        "launcher cleared the child's marker"
+    );
+    churn(&mount);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !Command::new("fusermount3")
+        .arg("-u")
+        .arg(&mount)
+        .status()
+        .unwrap()
+        .success()
+    {
+        assert!(Instant::now() < deadline, "unmount stayed busy");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    mounted.0 = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while meta_get(&overlay, "relaxed_durability").is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "serving child did not clear the marker"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    expect(
+        run(
+            &[p("overlay"), p("fsck"), &overlay],
+            &tmp.path().join("cache"),
+        ),
+        0,
+    );
 }
 
 /// `agree_with` for a layer that is sealed already, as a supervisor finalize

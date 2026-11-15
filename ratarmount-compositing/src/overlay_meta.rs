@@ -1962,7 +1962,10 @@ pub(crate) fn record_base_rows_offline(
     )?;
     conn.busy_timeout(std::time::Duration::ZERO)?;
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let result = apply_comparison_rows(&conn, rows);
+    let result = (|| {
+        crate::relaxed_durability::refuse_unclean(OverlayMeta::from_opened(&conn)?.as_ref())?;
+        apply_comparison_rows(&conn, rows)
+    })();
     match result {
         Ok(()) => conn.execute_batch("COMMIT").map_err(Into::into),
         Err(e) => {

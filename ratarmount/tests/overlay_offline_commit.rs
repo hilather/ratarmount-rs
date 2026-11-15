@@ -661,6 +661,93 @@ fn regression_mount_roll_forward_restamps_then_remount_accepts() {
     }
 }
 
+/// Regression (#328): startup must reject an unclean relaxed overlay before
+/// archive recovery, even with force. Preserve both torn and complete journals.
+#[cfg(unix)]
+#[test]
+fn regression_relaxed_unclean_mount_refuses_before_archive_recovery() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    for complete in [false, true] {
+        let env = Env::new();
+        let archive = regression_238_tar(&env);
+        let overlay = regression_238_overlay(&env, &archive);
+        let db = overlay.join(ratarmount_compositing::HIDDEN_DB);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES ('relaxed_durability','unknown:42')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        if complete {
+            interrupt_complete(&archive);
+        } else {
+            interrupt_append(&archive);
+        }
+        let journal = ratarmount_compress::commit_journal::journal_path(&archive);
+        let before: Vec<_> = [&archive, &db, &journal]
+            .map(|p| fs::read(p).unwrap())
+            .into();
+        for force in [false, true] {
+            for command in ["--no-mount", "--commit-overlay"] {
+                let mut args = vec![command, "-w", s(&overlay), s(&archive)];
+                if force {
+                    args.push("--force-base-mismatch");
+                }
+                let out = env.run(&args);
+                assert!(!out.status.success(), "{}", text(&out));
+                assert!(text(&out).contains("fsck --repair"), "{}", text(&out));
+                for (path, bytes) in [&archive, &db, &journal].into_iter().zip(&before) {
+                    assert!(
+                        fs::read(path).unwrap() == *bytes,
+                        "{} modified",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Regression (#328): deferred recovery must durably restamp the overlay
+/// before removing the archive journal, then enable relaxed serving.
+#[cfg(unix)]
+#[test]
+fn regression_relaxed_deferred_recovery_restamps_under_full() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    let env = Env::new();
+    let archive = regression_238_tar(&env);
+    let overlay = directory_overlay(&env);
+    interrupt_complete(&archive);
+    let journal = ratarmount_compress::commit_journal::journal_path(&archive);
+    use sha2::{Digest, Sha256};
+    let digest = format!("sha256:{:x}", Sha256::digest(fs::read(&archive).unwrap()));
+    let conn = rusqlite::Connection::open(overlay.join(ratarmount_compositing::HIDDEN_DB)).unwrap();
+    // Observe the actual connection doing the restamp, including the recovery
+    // transaction. Setup writes are FULL already; the premature OFF switch
+    // used to make deferred recovery fail this trigger.
+    conn.execute_batch(
+        "CREATE TRIGGER recovery_requires_full BEFORE INSERT ON meta
+         WHEN NEW.key IN ('base_size','base_mtime_ns')
+              AND (SELECT synchronous FROM pragma_synchronous) != 2
+         BEGIN SELECT RAISE(ABORT, 'archive recovery requires FULL'); END;",
+    )
+    .unwrap();
+    drop(conn);
+    env.ok(&[
+        "--no-mount",
+        "-w",
+        s(&overlay),
+        "--force-base-mismatch",
+        "--base-digest",
+        &digest,
+        "--overlay-durability=relaxed",
+        s(&archive),
+    ]);
+    assert!(!journal.exists(), "recovery must finish");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+}
+
 /// Regression (R7-A2): offline `--commit-overlay` recovered a complete journal
 /// at the start of the commit and then ended on an empty plan (or a declined
 /// confirmation) without restamping, so the next commit failed with "changed
