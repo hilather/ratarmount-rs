@@ -1298,9 +1298,18 @@ For these rules:
 `t/agent` that neither the base nor any `--lower` layer has can be removed again
 (`rm -rf t/agent` after `mkdir t/agent`), leaving no tombstone and no entry for
 `t/agent`. Through FUSE, `rmdir` still returns `ENOTEMPTY` for a nonempty
-overlay-created root and `ENOTDIR` for a file. (The base parent `t`, materialized
-on the host by the mkdir, keeps the daemon's umask mode and can show as a
-mode-only change.)
+overlay-created root and `ENOTDIR` for a file. On Unix, the base parent `t`,
+which mkdir materializes on the host, keeps its visible base mode, so it is
+not reported as a change afterwards; the same holds for every parent a
+copy-on-write edit materializes (`lib` for `lib/Foo.pm`), including parents
+provided by a read-only `--lower` layer. The daemon's umask does not change
+these visible modes. Only newly created parents are initialized; an existing
+directory's mode is retained, and initialization is serialized with mounted
+chmod/mkdir operations even without an overlay policy.
+A base directory without owner `rwx` (e.g. `0555` or `0500`) gains them on the
+host for backing storage, while an overlay metadata row preserves its visible
+mode for the mount, diff, seal and pack. Existing chmod overrides take precedence;
+an explicit chmod still counts as a change. Setgid and sticky bits are retained.
 A `t/agent` the base or a lower layer provides stays anchored (EROFS), as do
 rename and reset of either.
 
