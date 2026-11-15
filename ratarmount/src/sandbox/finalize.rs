@@ -68,8 +68,8 @@ pub struct FinalizeTop<'a> {
     pub manifest: &'a Path,
     /// The journal to summarize and the summary to write (overwritten).
     pub journal: Option<(&'a Path, &'a Path)>,
-    /// Test seam: runs before each metadata read after fsck, with its name
-    /// (`"gate"`, then `"report"`).
+    /// Test seam: runs before fsck acquires its transaction (`"fsck"`), then
+    /// before the metadata reads named `"gate"` and `"report"`.
     #[cfg(test)]
     pub before_meta_read: Option<ReadHook>,
 }
@@ -108,10 +108,21 @@ fn meta_error(error: ratarmount_compositing::OverlayError) -> io::Error {
     }
 }
 
+pub(super) fn finalize_io_error(id: &str, error: io::Error) -> ApiError {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        writers_active(format!(
+            "the overlay of attempt {id} is locked or its database is busy ({error}); retry"
+        ))
+    } else {
+        ApiError::new("io", format!("finalize of attempt {id}: {error}"))
+    }
+}
+
 /// Phase 1: fsck, which must be clean. Its own function: the R1c-2 seam for
 /// keeping a first try's `repaired:N` in [`FinalizeProgress`].
-fn check(top: &Path, repair: Repair) -> io::Result<String> {
-    let repair = match repair {
+fn check(request: &mut FinalizeTop<'_>) -> io::Result<String> {
+    let top = request.top;
+    let repair = match request.repair {
         Repair::Always => true,
         // The read that fsck makes: an unsealed, writable top's hot journal
         // (a mount process killed mid-write) is rolled back, as `fsck(top,
@@ -122,7 +133,8 @@ fn check(top: &Path, repair: Repair) -> io::Result<String> {
             // boot once `PRAGMA integrity_check` passes, but a passing check
             // does not bring back lost rows. A supervised attempt that lived
             // through an OS crash is never sealed (or retained): it is
-            // refused here, before anything is written.
+            // refused here before fsck can acknowledge the marker. The
+            // repair transaction repeats this check against its own snapshot.
             if let MarkerState::Unclean(value) = relaxed_durability::marker_state(meta.as_ref()) {
                 return Err(io::Error::other(format!(
                     "{}; this attempt cannot be finalized: destroy it",
@@ -132,7 +144,16 @@ fn check(top: &Path, repair: Repair) -> io::Result<String> {
             !meta.is_some_and(|meta| meta.layer_sealed())
         }
     };
-    let fsck = overlay_fsck::fsck(top, repair)?;
+    #[cfg(test)]
+    if let Some(hook) = request.before_meta_read.as_mut() {
+        hook("fsck");
+    }
+    let mode = if repair && request.repair == Repair::UnlessSealed {
+        overlay_fsck::FsckMode::RepairSameBoot
+    } else {
+        repair.into()
+    };
+    let fsck = overlay_fsck::fsck(top, mode)?;
     if !fsck.is_clean() {
         return Err(io::Error::other(format!("fsck: {}", fsck.result())));
     }
@@ -175,7 +196,7 @@ pub fn finalize_top(
     progress: &mut FinalizeProgress,
 ) -> io::Result<Finalized> {
     let top = request.top;
-    let fsck_result = check(top, request.repair)?;
+    let fsck_result = check(&mut request)?;
     // The base is classified through the factory and gated against what the
     // overlay recorded BEFORE anything is sealed or packed: a base edited
     // during the run fails closed instead of being sealed as if unchanged.
@@ -836,12 +857,8 @@ impl<M: Mounter> Supervisor<M> {
         let finalized = finalized.map_err(|error| {
             if let Some(message) = classify_failed.borrow_mut().take() {
                 ApiError::new("base_open_failed", message)
-            } else if error.kind() == io::ErrorKind::WouldBlock {
-                writers_active(format!(
-                    "the overlay of attempt {id} is locked or its database is busy ({error}); retry"
-                ))
             } else {
-                ApiError::new("io", format!("finalize of attempt {id}: {error}"))
+                finalize_io_error(&id, error)
             }
         })?;
         // Step 7: the sync step, in every finalize.
@@ -899,6 +916,8 @@ impl<M: Mounter> Supervisor<M> {
             )));
         }
         let attempt = self.attempt(id)?.clone();
+        super::inspection::check_offline_durability(&attempt.overlay_dir)
+            .map_err(|error| finalize_io_error(id, error))?;
         let base = self.base(&attempt.base)?.clone();
         let indexes = self.indexes(&base.name);
         let root = attempt.path.parent().expect("attempt root").to_path_buf();

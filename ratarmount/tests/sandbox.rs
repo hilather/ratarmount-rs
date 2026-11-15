@@ -2523,7 +2523,7 @@ fn regression_sandbox_v2_relaxed_attempt_fuse() {
     }
     const KEY: &str = "relaxed_durability";
     const FILES: usize = 200;
-    let daemon = Daemon::start();
+    let mut daemon = Daemon::start();
     daemon.base();
     let mut timings = Vec::new();
     for durability in ["full", "relaxed"] {
@@ -2554,6 +2554,13 @@ fn regression_sandbox_v2_relaxed_attempt_fuse() {
             }
         }
         timings.push((durability, started.elapsed()));
+        let stats = daemon.call(json!({"op": "stats", "id": id}));
+        assert_eq!(stats["files_present"], FILES / 2, "{stats}");
+        let patch = daemon.call(json!({"op": "diff", "id": id, "git": true}));
+        assert!(patch["patch"]
+            .as_str()
+            .unwrap()
+            .contains("diff --git a/f0.txt b/f0.txt"));
         let report = finalize_done(
             &daemon,
             &json!({"version": 2, "op": "finalize", "id": id, "request_id": format!("fin-{durability}")}),
@@ -2565,6 +2572,24 @@ fn regression_sandbox_v2_relaxed_attempt_fuse() {
         let meta = meta_unlocked(&kept);
         assert_eq!(meta.get(KEY), None, "{durability}: {meta:?}");
         assert!(meta.contains_key("sealed_at"), "{meta:?}");
+        // A clean relaxed layer remains valid after restart, including as a
+        // lower of another real FUSE attempt.
+        daemon.restart();
+        assert_eq!(
+            daemon.call(json!({"version": 2, "op": "finalize", "id": id})),
+            report
+        );
+        assert_eq!(
+            daemon.call(json!({"op": "diff", "id": id, "git": true})),
+            patch
+        );
+        let children =
+            daemon.call(json!({"version": 2, "op": "new", "base": "task", "lowers": [kept]}));
+        let child = &children[0];
+        let path = PathBuf::from(child["path"].as_str().unwrap());
+        assert_eq!(fs::read(path.join("f0.txt")).unwrap(), b"0\n");
+        assert!(!path.join("f1.txt").exists());
+        daemon.call(json!({"op": "destroy", "id": child["id"]}));
     }
     eprintln!("create/unlink {FILES} files through FUSE: {timings:?}");
 }

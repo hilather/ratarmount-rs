@@ -764,6 +764,10 @@ impl<M: Mounter> Supervisor<M> {
                         .map_err(|e| ApiError::new("diff_failed", e))?,
                 };
                 let deleted = self.mounter.deleted_paths(&attempt)?;
+                if deleted.is_none() {
+                    super::inspection::check_offline_durability(&attempt.overlay_dir)
+                        .map_err(|e| ApiError::new("diff_failed", e.to_string()))?;
+                }
                 let base = self.base(&attempt.base)?.clone();
                 let indexes = self.indexes(&base.name);
                 // A finalized or retained attempt is read offline, after its
@@ -806,7 +810,12 @@ impl<M: Mounter> Supervisor<M> {
             }
             Operation::Stats { id } => {
                 let (attempt, _) = self.served(&id)?;
-                let stats = if let Some(deleted) = self.mounter.deleted_paths(&attempt)? {
+                let deleted = self.mounter.deleted_paths(&attempt)?;
+                if deleted.is_none() {
+                    super::inspection::check_offline_durability(&attempt.overlay_dir)
+                        .map_err(|e| ApiError::new("stats_failed", e.to_string()))?;
+                }
+                let stats = if let Some(deleted) = deleted {
                     // Named, never a bare io error (Keystone note (1)).
                     let usage = ratarmount_compositing::OverlayUsage::scan(&attempt.overlay_dir)
                         .map_err(|e| {

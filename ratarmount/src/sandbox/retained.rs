@@ -500,6 +500,7 @@ fn restore_entry(dir: &Path, record: &Retained) -> Option<RetainedEntry> {
             return None;
         }
     };
+    ratarmount_compositing::relaxed_durability::refuse_unclean(Some(&meta)).ok()?;
     let prefix = meta.lower_layers().ok()?;
     if !meta.layer_sealed()
         || meta.get("layer_digest") != Some(record.layer_digest.as_str())
@@ -1084,6 +1085,8 @@ impl<M: Mounter> Supervisor<M> {
             ));
         }
         let attempt = entry.attempt.clone();
+        super::inspection::check_offline_durability(&attempt.overlay_dir)
+            .map_err(|error| super::finalize::finalize_io_error(&id, error))?;
         let records = entry.records.clone().unwrap_or_default();
         lowers::recorded_layers(&records).map_err(super::finalize::lower_changed)?;
         let base = self.base(&attempt.base)?.clone();

@@ -194,6 +194,10 @@ layer, syncs it and prints a report (`--pack` adds a bundle). An attempt
 created with `sandbox new --retain` is then kept in the state directory's
 `retained/ID`, where later attempts over TAR or Git bases can stack on it,
 including after a daemon restart restores it.
+Use `sandbox new --overlay-durability relaxed` for disposable attempts that
+can tolerate loss after a machine crash. Finalize refuses a leftover
+foreign/unknown-boot marker; destroy that attempt. Cleanly finalized retained
+layers have full durability. See [relaxed attempts](sandbox.md#relaxed-attempts).
 [Finalize](sandbox.md#finalize) covers its scope (Linux; local TAR, directory
 and Git bases) and the storage it needs.
 

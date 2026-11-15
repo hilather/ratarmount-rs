@@ -3079,8 +3079,9 @@ field; `"relaxed"` is another body for a `request_id`. A relaxed `new` is
 checked by the mount CLI's parser, like a layered or journaled one, before the
 RAM root, any attempt directory or child exists. The mount refuses relaxed
 durability only with archive commits, which the supervisor never passes, so
-the supervisor refuses nothing else: it works with `tmpfs` overlays (where it
-changes nothing that matters), lowers, journals and `retain`.
+it works with lowers, journals and `retain`, subject to their existing
+restrictions (`retain` requires a disk overlay). It also works with `tmpfs`
+overlays, whose contents are lost on reboot regardless of this setting.
 
 What a crash costs here: an attempt's mount clears its marker when it is
 unmounted cleanly, and `finalize` seals only after that unmount. A finalize
@@ -3089,10 +3090,25 @@ its writes reached the kernel) proceeds, and the seal clears the marker. A
 marker of another boot (or an unknown one) means the machine went down while
 the attempt was relaxed: `finalize` answers `io` naming the marker and "destroy
 it" after the stop (the attempt is then unmounted and `finalizing`) but before
-fsck, so nothing in the overlay is written, and it never seals or retains that layer
+fsck repair, and it never seals or retains that layer
 (`overlay fsck --repair` would clear the marker once `PRAGMA integrity_check`
 passes, but that does not bring back lost rows, so finalize does not repair
-it). In practice the supervisor never meets such a top: a restart discards
+it). This refusal is checked again inside fsck's exclusive transaction, so a
+marker that appeared after the initial check cannot be cleared by automated
+repair. Reading an unsealed top may first roll back a hot SQLite journal;
+that recovery does not acknowledge its relaxed crash marker.
+
+`diff` and `stats` also refuse a foreign/unknown-boot marker on the top,
+including through a live child's inspection socket and after it detaches.
+Lower admission checks directory and bundle markers; diff/finalize recheck
+recorded lowers, and composition checks the marker in the same database
+snapshot as the rows. Finalized and retained attempts' fresh finalize calls
+check their top too. Restart leaves a retained top with such a marker reserved
+but unserved, without repairing it. Request-ID replays still return their
+stored answers; use a fresh request ID for a current check. Stats describes
+only the top and does not read its base or lowers.
+
+In ordinary operation a restart discards
 every attempt that is not retained, whatever its durability or boot, so a
 relaxed attempt that lived through an OS crash is removed, never served. A
 retained attempt was finalized with `full` semantics already: its marker was
