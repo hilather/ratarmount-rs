@@ -961,6 +961,9 @@ NUL, empty, `.` or `..` components, reserved overlay bookkeeping names, the
 a virtual folder there, so imported bytes would be hashed and sealed but
 invisible; refused whatever flags the later mount uses), and
 symlink parents in either the lower view or the new overlay are refused.
+This includes deleted lower symlinks: the folder source can still resolve
+descendants through their targets, so importing a symlink-to-directory change
+is refused. Deleted lower regular files can become directory parents.
 Symlink targets are stored as link data, never followed. Paths and symlink
 targets must be UTF-8 because the workspace's mount and overlay APIs use
 strings; non-UTF-8 names are refused, rather than changed silently.
@@ -968,7 +971,17 @@ strings; non-UTF-8 names are refused, rather than changed silently.
 If a hunk fails, the default is to abort and remove the partial overlay.
 `--reject` keeps that file's original lower content and writes only its failed
 hunks to `PATH.rej`, while applying other files. Later sections for an already
-rejected file cannot replace its original content. Import exits 0 on success, 1 when hunks
+rejected file cannot replace its original content. File/directory type
+changes import in Git's section order: `delete x` then `add x/y` replaces the
+file with a directory, and `add x` before the deletions of everything below
+the directory `x` applies those deletions first and removes the emptied tree
+(only that directory; other emptied directories stay). Directory replacement
+is refused if any lower directory in that subtree cannot be listed.
+With `--reject` a failed section anywhere in a type change restores the lower
+`x` and everything below it, undoing earlier sections and restoring pruned
+empty subdirectories.
+A directory replacement also rejects if any child was already rejected.
+The rejected hunks are collected in `x.rej`. Import exits 0 on success, 1 when hunks
 were rejected with `--reject`, and 2 on invalid input or I/O errors. A preexisting
 nonempty destination is left intact.
 

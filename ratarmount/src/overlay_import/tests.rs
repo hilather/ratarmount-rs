@@ -173,6 +173,16 @@ fn roundtrip(case: &str) {
         "latin1" => cow::cow_write(&ov, "/latin", b"caf\xe9, d\xe9j\xe0 vu\n"),
         "quoted" => put(&ov, "/caf\u{e9}\t\"\\.txt", b"quoted\n", 0o644),
         "empty_dir" => ov.mkdir("/empty-dir", 0o755).unwrap(),
+        "file_to_dir" => {
+            ov.unlink("/type").unwrap();
+            ov.mkdir("/type", 0o755).unwrap();
+            put(&ov, "/type/y", b"inside\n", 0o644);
+        }
+        "dir_to_file" => {
+            ov.unlink("/nested/base").unwrap();
+            ov.rmdir("/nested").unwrap();
+            put(&ov, "/nested", b"now a file\n", 0o644);
+        }
         _ => unreachable!(),
     }
     drop(ov);
@@ -225,6 +235,8 @@ roundtrips! {
     regression_import_roundtrip_latin1 => "latin1",
     regression_import_roundtrip_quoted_paths => "quoted",
     regression_import_empty_dirs_are_not_representable => "empty_dir",
+    regression_import_roundtrip_file_replaced_by_directory => "file_to_dir",
+    regression_import_roundtrip_directory_replaced_by_file => "dir_to_file",
 }
 
 /// Regression: exact context may move, but mismatched context is never fuzzed.
@@ -747,5 +759,423 @@ fn regression_import_clears_marker_on_success() {
                 .unwrap()
                 .is_clean()
         );
+    }
+}
+
+const DELETE_TYPE: &[u8] = b"diff --git a/type b/type\ndeleted file mode 100644\n--- a/type\n+++ /dev/null\n@@ -1 +0,0 @@\n-regular\n";
+const ADD_TYPE_Y: &[u8] = b"diff --git a/type/y b/type/y\nnew file mode 100644\n--- /dev/null\n+++ b/type/y\n@@ -0,0 +1 @@\n+inside\n";
+const ADD_NESTED: &[u8] = b"diff --git a/nested b/nested\nnew file mode 100644\n--- /dev/null\n+++ b/nested\n@@ -0,0 +1 @@\n+now a file\n";
+const DELETE_NESTED_BASE: &[u8] = b"diff --git a/nested/base b/nested/base\ndeleted file mode 100644\n--- a/nested/base\n+++ /dev/null\n@@ -1 +0,0 @@\n-keep\n";
+
+fn is_dir(view: &ReadOnlyOverlayLayer, path: &str) -> bool {
+    view.lookup(path, 0)
+        .is_some_and(|fi| fi.mode & S_IFMT == ratarmount_core::S_IFDIR)
+}
+
+fn fsck_clean(dir: &Path) {
+    let report = ratarmount_compositing::overlay_fsck::fsck(dir, false).unwrap();
+    assert!(report.is_clean(), "{report:?}");
+}
+
+/// Regression (#329): deleting file `type` and adding `type/y` failed with
+/// "parent /type is not a directory" because the lower view still had the file.
+#[test]
+fn regression_import_file_replaced_by_directory() {
+    let f = Fixture::new();
+    let args = f.args("file-to-dir");
+    let (_, code) = f.apply(&args, &[DELETE_TYPE, ADD_TYPE_Y].concat()).unwrap();
+    assert_eq!(code, 0);
+    let view = f.view(&args.directory);
+    assert!(is_dir(&view, "/type"));
+    assert!(args.directory.join("type").is_dir());
+    assert_eq!(
+        fs::read(args.directory.join("type/y")).unwrap(),
+        b"inside\n"
+    );
+    fsck_clean(&args.directory);
+}
+
+/// Regression (#329): `add nested` precedes `delete nested/base` in Git's
+/// order; the directory being replaced is emptied and removed first.
+#[test]
+fn regression_import_directory_replaced_by_file() {
+    let f = Fixture::new();
+    let args = f.args("dir-to-file");
+    let (_, code) = f
+        .apply(&args, &[ADD_NESTED, DELETE_NESTED_BASE].concat())
+        .unwrap();
+    assert_eq!(code, 0);
+    let view = f.view(&args.directory);
+    let fi = view.lookup("/nested", 0).unwrap();
+    assert_eq!(fi.mode & S_IFMT, S_IFREG);
+    assert!(view.lookup("/nested/base", 0).is_none());
+    assert_eq!(
+        fs::read(args.directory.join("nested")).unwrap(),
+        b"now a file\n"
+    );
+    fsck_clean(&args.directory);
+    // An add over a directory whose children are not all deleted still fails.
+    let args = f.args("dir-to-file-partial");
+    let error = f.apply(&args, ADD_NESTED).unwrap_err();
+    assert!(error.contains("added file already exists"), "{error}");
+}
+
+/// Regression (#329): a stream that modifies a path and then deletes it reads
+/// the second preimage from the overlay; deletions are not hoisted globally.
+#[test]
+fn regression_import_modify_then_delete_stream_unchanged() {
+    let f = Fixture::new();
+    let args = f.args("modify-delete");
+    let patch = b"--- a/a\n+++ b/a\n@@ -1 +1 @@\n-one\n+ONE\ndiff --git a/a b/a\ndeleted file mode 100644\n--- a/a\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-ONE\n-two\n-three\n";
+    let (_, code) = f.apply(&args, patch).unwrap();
+    assert_eq!(code, 0);
+    assert!(f.view(&args.directory).lookup("/a", 0).is_none());
+}
+
+/// Regression (#329): only a directory replaced by a file is removed; an
+/// import that merely empties a directory keeps it.
+#[test]
+fn regression_import_emptied_directory_is_kept() {
+    let f = Fixture::new();
+    let args = f.args("emptied");
+    let (_, code) = f.apply(&args, DELETE_NESTED_BASE).unwrap();
+    assert_eq!(code, 0);
+    let view = f.view(&args.directory);
+    assert!(is_dir(&view, "/nested"));
+    assert!(view.lookup("/nested/base", 0).is_none());
+}
+
+/// Regression (#329): with --reject, a failed section under a file that this
+/// import turned into a directory restores the lower file (the whole type
+/// change is rejected) and writes its hunks to `type.rej`.
+#[test]
+fn regression_import_type_change_reject_restores_lower() {
+    let f = Fixture::new();
+    let mut args = f.args("type-reject");
+    args.reject = true;
+    let add_z: &[u8] = b"--- /dev/null\n+++ b/type/z\n@@ -0,0 +1 @@\n+zed\n";
+    let bad: &[u8] = b"--- a/type/y\n+++ b/type/y\n@@ -1 +1 @@\n-wrong\n+new\n";
+    let later: &[u8] = b"--- /dev/null\n+++ b/type/w\n@@ -0,0 +1 @@\n+late\n";
+    let (output, code) = f
+        .apply(
+            &args,
+            &[DELETE_TYPE, ADD_TYPE_Y, add_z, bad, later].concat(),
+        )
+        .unwrap();
+    assert_eq!(code, 1, "{output}");
+    let view = f.view(&args.directory);
+    let fi = view.lookup("/type", 0).unwrap();
+    assert_eq!(fi.mode & S_IFMT, S_IFREG);
+    assert_eq!(fs::read(args.directory.join("type")).unwrap(), b"regular\n");
+    for gone in ["/type/y", "/type/z", "/type/w"] {
+        assert!(view.lookup(gone, 0).is_none(), "{gone}");
+    }
+    assert_eq!(
+        fs::read(args.directory.join("type.rej")).unwrap(),
+        b"diff a/type/y b/type/y\t(rejected hunks)\n@@ -1 +1 @@\n-wrong\n+new\n"
+    );
+    let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["rejected"], 1);
+    assert_eq!(json["files"], 0, "nothing below type is kept: {output}");
+    fsck_clean(&args.directory);
+    // The same stream sealed: the restored type change must not make fsck
+    // or seal refuse (that would turn exit 1 into exit 2).
+    let mut args = f.args("type-reject-sealed");
+    args.reject = true;
+    args.no_seal = false;
+    let (output, code) = f
+        .apply(
+            &args,
+            &[DELETE_TYPE, ADD_TYPE_Y, add_z, bad, later].concat(),
+        )
+        .unwrap();
+    assert_eq!(code, 1, "{output}");
+    let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert!(json["layer_digest"].is_string(), "{output}");
+    assert!(
+        ratarmount_compositing::overlay_seal::verify(&args.directory, f.source.clone())
+            .unwrap()
+            .ok
+    );
+}
+
+/// Regression (#329): skipping the parent check for sections of a rejected
+/// file must not let a rename into a symlink parent reach `restore`.
+#[test]
+fn regression_import_reject_still_refuses_symlink_parent() {
+    let f = Fixture::new();
+    let outside = f.temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("file"), b"outside\n").unwrap();
+    let mut args = f.args("reject-link");
+    args.reject = true;
+    let patch = format!(
+        "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-missing\n+x\ndiff --git a/new-link b/new-link\nnew file mode 120000\n--- /dev/null\n+++ b/new-link\n@@ -0,0 +1 @@\n+{}\n\\ No newline at end of file\ndiff --git a/a b/new-link/file\nsimilarity index 50%\nrename from a\nrename to new-link/file\n--- a/a\n+++ b/new-link/file\n@@ -1 +1 @@\n-missing\n+x\n",
+        outside.display()
+    );
+    let error = f.apply(&args, patch.as_bytes()).unwrap_err();
+    assert!(error.contains("symlink parent /new-link"), "{error}");
+    assert_eq!(fs::read(outside.join("file")).unwrap(), b"outside\n");
+}
+
+/// Regression (#329): with --reject, a failing deletion of a child of the
+/// directory being replaced rejects the whole directory -> file change.
+#[test]
+fn regression_import_directory_to_file_reject_keeps_directory() {
+    let f = Fixture::new();
+    let mut args = f.args("dir-reject");
+    args.reject = true;
+    let bad: &[u8] = b"diff --git a/nested/base b/nested/base\ndeleted file mode 100644\n--- a/nested/base\n+++ /dev/null\n@@ -1 +0,0 @@\n-wrong\n";
+    let (_, code) = f.apply(&args, &[ADD_NESTED, bad].concat()).unwrap();
+    assert_eq!(code, 1);
+    let view = f.view(&args.directory);
+    assert!(is_dir(&view, "/nested"));
+    assert!(view.lookup("/nested/base", 0).is_some());
+    let rej = fs::read(args.directory.join("nested.rej")).unwrap();
+    assert!(
+        rej.ends_with(b"@@ -1 +0,0 @@\n-wrong\n"),
+        "{}",
+        String::from_utf8_lossy(&rej)
+    );
+    assert!(
+        rej.windows(b"+now a file\n".len())
+            .any(|w| w == b"+now a file\n"),
+        "{}",
+        String::from_utf8_lossy(&rej)
+    );
+}
+
+/// Regression (#329): lower symlink parents remain refused even after deletion;
+/// folder-backed lower lookups can still follow the link's target.
+#[test]
+fn regression_import_deleted_lower_symlink_parent_is_refused() {
+    let f = Fixture::new();
+    let args = f.args("link-to-dir");
+    let patch = b"diff --git a/link b/link\ndeleted file mode 120000\n--- a/link\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n\\ No newline at end of file\ndiff --git a/link/f b/link/f\nnew file mode 100644\n--- /dev/null\n+++ b/link/f\n@@ -0,0 +1 @@\n+real\n";
+    let error = f.apply(&args, patch).unwrap_err();
+    assert!(error.contains("symlink parent /link"), "{error}");
+    assert!(!args.directory.exists());
+}
+
+/// Regression (#329): a failed first child addition must restore the deleted
+/// lower file even though no replacement directory has been created yet.
+#[test]
+fn regression_import_type_change_reject_before_first_child() {
+    let f = Fixture::new();
+    let mut args = f.args("first-child-reject");
+    args.reject = true;
+    let bad: &[u8] = b"--- /dev/null\n+++ b/type/y\n@@ -1,0 +2 @@\n+inside\n";
+    let (output, code) = f.apply(&args, &[DELETE_TYPE, bad].concat()).unwrap();
+    assert_eq!(code, 1, "{output}");
+    assert_eq!(fs::read(args.directory.join("type")).unwrap(), b"regular\n");
+    assert!(args.directory.join("type.rej").is_file());
+    let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["files"], 0);
+    fsck_clean(&args.directory);
+}
+
+/// Regression (#329): a rejected directory replacement must undo earlier
+/// child edits, not leave a partially changed directory behind.
+#[test]
+fn regression_import_directory_reject_restores_earlier_changes() {
+    let f = Fixture::new();
+    let mut args = f.args("earlier-child-reject");
+    args.reject = true;
+    let modify: &[u8] = b"--- a/nested/base\n+++ b/nested/base\n@@ -1 +1 @@\n-keep\n+changed\n";
+    let (output, code) = f
+        .apply(&args, &[modify, ADD_NESTED, DELETE_NESTED_BASE].concat())
+        .unwrap();
+    assert_eq!(code, 1, "{output}");
+    let view = f.view(&args.directory);
+    let fi = view.lookup("/nested/base", 0).unwrap();
+    assert_eq!(view.read(&fi, 100, 0).unwrap(), b"keep\n");
+    let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["files"], 0);
+    assert!(fs::read(args.directory.join("nested.rej"))
+        .unwrap()
+        .ends_with(b"@@ -1 +0,0 @@\n-keep\n"));
+    fsck_clean(&args.directory);
+}
+
+/// Regression (#329): a later failed hunk at a directory-to-file replacement
+/// restores the original directory and its deleted descendants, then seals.
+#[test]
+fn regression_import_directory_reject_after_replacement() {
+    let f = Fixture::new();
+    let mut args = f.args("late-directory-reject");
+    args.reject = true;
+    args.no_seal = false;
+    let bad: &[u8] = b"--- a/nested\n+++ b/nested\n@@ -1 +1 @@\n-wrong\n+changed\n";
+    let (output, code) = f
+        .apply(&args, &[ADD_NESTED, DELETE_NESTED_BASE, bad].concat())
+        .unwrap();
+    assert_eq!(code, 1, "{output}");
+    let view = f.view(&args.directory);
+    assert!(is_dir(&view, "/nested"));
+    let fi = view.lookup("/nested/base", 0).unwrap();
+    assert_eq!(view.read(&fi, 100, 0).unwrap(), b"keep\n");
+    let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["files"], 0);
+    assert!(json["layer_digest"].is_string());
+    fsck_clean(&args.directory);
+    drop(view);
+    assert!(
+        ratarmount_compositing::overlay_seal::verify(&args.directory, f.source.clone())
+            .unwrap()
+            .ok
+    );
+    ratarmount_compositing::overlay_seal::unseal(&args.directory).unwrap();
+}
+
+/// Regression (#329): hoisted deletions must not discard a child that an
+/// earlier failed section already promised to preserve under --reject.
+#[test]
+fn regression_import_directory_replacement_preserves_rejected_child() {
+    let f = Fixture::new();
+    let mut args = f.args("already-rejected-child");
+    args.reject = true;
+    let bad: &[u8] = b"--- a/nested/base\n+++ b/nested/base\n@@ -1 +1 @@\n-wrong\n+changed\n";
+    let (output, code) = f
+        .apply(&args, &[bad, ADD_NESTED, DELETE_NESTED_BASE].concat())
+        .unwrap();
+    assert_eq!(code, 1, "{output}");
+    let view = f.view(&args.directory);
+    assert!(is_dir(&view, "/nested"));
+    let fi = view.lookup("/nested/base", 0).unwrap();
+    assert_eq!(view.read(&fi, 100, 0).unwrap(), b"keep\n");
+    assert!(args.directory.join("nested.rej").is_file());
+    let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["files"], 0);
+    assert_eq!(json["rejected"], 1);
+    fsck_clean(&args.directory);
+}
+
+/// Regression (#329): restoring a rejected replacement also restores pruned
+/// empty subdirectories and removes children added earlier in the stream.
+#[test]
+fn regression_import_directory_reject_restores_pruned_tree() {
+    use ratarmount_compositing::FolderMountSource;
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base");
+    fs::create_dir_all(base.join("nested/sub/empty")).unwrap();
+    fs::write(base.join("nested/sub/base"), b"keep\n").unwrap();
+    let source = Arc::new(FolderMountSource::new(&base).unwrap());
+    let f = Fixture { temp, base, source };
+    let mut args = f.args("tree-reject");
+    args.reject = true;
+    let add = b"--- /dev/null\n+++ b/nested/added\n@@ -0,0 +1 @@\n+extra\n";
+    let deletes = b"--- a/nested/added\n+++ /dev/null\n@@ -1 +0,0 @@\n-extra\n--- a/nested/sub/base\n+++ /dev/null\n@@ -1 +0,0 @@\n-keep\n";
+    let bad = b"--- a/nested\n+++ b/nested\n@@ -1 +1 @@\n-wrong\n+changed\n";
+    let (output, code) = f
+        .apply(
+            &args,
+            &[
+                add.as_slice(),
+                ADD_NESTED,
+                deletes.as_slice(),
+                bad.as_slice(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+    assert_eq!(code, 1, "{output}");
+    let view = f.view(&args.directory);
+    assert!(is_dir(&view, "/nested/sub/empty"));
+    assert!(view.lookup("/nested/added", 0).is_none());
+    let fi = view.lookup("/nested/sub/base", 0).unwrap();
+    assert_eq!(view.read(&fi, 100, 0).unwrap(), b"keep\n");
+    fsck_clean(&args.directory);
+}
+
+/// Regression (#329): sections suppressed by a restored non-directory must
+/// not read a preimage through it before deciding to skip the section.
+#[test]
+fn regression_import_rejected_symlink_descendant_is_not_read() {
+    use ratarmount_compositing::FolderMountSource;
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&base).unwrap();
+    fs::create_dir(&outside).unwrap();
+    // Any accidental read attempt fails the per-file limit before opening.
+    fs::write(outside.join("large"), vec![b'x'; 8192]).unwrap();
+    std::os::unix::fs::symlink("../outside", base.join("link")).unwrap();
+    let source = Arc::new(FolderMountSource::new(&base).unwrap());
+    let f = Fixture { temp, base, source };
+    let mut args = f.args("reject-link-read");
+    args.reject = true;
+    args.max_patch_bytes = 4096;
+    let patch = b"diff --git a/link b/link\ndeleted file mode 120000\n--- a/link\n+++ /dev/null\n@@ -1 +0,0 @@\n-wrong\n\\ No newline at end of file\ndiff --git a/link/large b/stolen\nsimilarity index 100%\ncopy from link/large\ncopy to stolen\n";
+    let (output, code) = f.apply(&args, patch).unwrap();
+    assert_eq!(code, 1, "{output}");
+    assert_eq!(
+        fs::read_link(args.directory.join("link")).unwrap(),
+        Path::new("../outside")
+    );
+    assert!(!args.directory.join("stolen").exists());
+    fsck_clean(&args.directory);
+}
+
+/// Regression (#329): a failed lower listing is not an empty directory. A
+/// replacement must refuse before it can hide children missing from the list.
+#[test]
+fn regression_import_directory_replacement_refuses_failed_lower_listing() {
+    use ratarmount_compositing::FolderMountSource;
+    struct FailedListing {
+        inner: Arc<dyn MountSource>,
+        path: &'static str,
+    }
+    impl MountSource for FailedListing {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if path == self.path {
+                None
+            } else {
+                self.inner.list(path)
+            }
+        }
+        fn lookup(&self, path: &str, version: i32) -> Option<FileInfo> {
+            self.inner.lookup(path, version)
+        }
+        fn open(
+            &self,
+            fi: &FileInfo,
+            buffering: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.inner.open(fi, buffering)
+        }
+        fn is_immutable(&self) -> bool {
+            self.inner.is_immutable()
+        }
+    }
+    for missing in ["/nested", "/nested/hidden"] {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        fs::create_dir_all(base.join("nested/hidden")).unwrap();
+        fs::write(base.join("nested/base"), b"keep\n").unwrap();
+        fs::write(base.join("nested/hidden/secret"), b"preserve\n").unwrap();
+        let source = Arc::new(FailedListing {
+            inner: Arc::new(FolderMountSource::new(&base).unwrap()),
+            path: missing,
+        });
+        let f = Fixture { temp, base, source };
+        for reject in [false, true] {
+            let mut args = f.args("missing-listing");
+            args.reject = reject;
+            let patch = if missing == "/nested" {
+                ADD_NESTED.to_vec()
+            } else {
+                [ADD_NESTED, DELETE_NESTED_BASE].concat()
+            };
+            let error = f.apply(&args, &patch).unwrap_err();
+            assert!(
+                error.contains("cannot list lower directory"),
+                "{missing}: {error}"
+            );
+            assert!(!args.directory.exists());
+            assert_eq!(
+                fs::read(f.base.join("nested/hidden/secret")).unwrap(),
+                b"preserve\n"
+            );
+        }
     }
 }
