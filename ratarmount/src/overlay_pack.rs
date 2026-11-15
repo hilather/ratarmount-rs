@@ -2500,6 +2500,10 @@ pub(crate) mod tests {
             let base_dir = tmp.path().join("base");
             fs::create_dir(&base_dir).unwrap();
             fs::write(base_dir.join("deleted"), b"old").unwrap();
+            // Layers recreate `deleted` with 0644; fix the base's mode so a
+            // group-writable umask (0002) does not add a mode change.
+            fs::set_permissions(base_dir.join("deleted"), fs::Permissions::from_mode(0o644))
+                .unwrap();
             fs::write(tmp.path().join("outside"), b"secret").unwrap();
             let base: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&base_dir).unwrap());
             let dir = tmp.path().join("overlay");
@@ -4751,8 +4755,11 @@ pub(crate) mod tests {
         assert!(error.contains("lf"), "{error}");
     }
 
-    /// A directory base without `--base-digest` has only a weak identity, so no
-    /// marker is trusted: a same-size edit with the mtime restored is caught.
+    /// Regression: a directory base has no trusted verification marker, so each
+    /// use recomputes the change set. Making the base equal the replacement
+    /// removes its change row and is caught even with size/mtime preserved.
+    /// This does not prove general preimage integrity: a third, different base
+    /// payload leaves the modified row unchanged (canonical rows omit base hashes).
     #[test]
     fn regression_lower_cache_weak_directory_base_always_reverifies() {
         let f = Fixture::new(true);
@@ -4814,7 +4821,7 @@ pub(crate) mod tests {
             &crate::lower_stack_services(),
         )
         .err()
-        .expect("edited base must fail closed");
+        .expect("base edit removing the sealed change row must fail closed");
         assert!(error.contains("deleted"), "{error}");
         // A directory has no computed strong digest, and a supplied
         // `--base-digest` is only a claim: still no marker.
