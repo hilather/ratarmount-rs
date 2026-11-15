@@ -1037,7 +1037,7 @@ ratarmount journal summarize attempt.jsonl --since-mark 'turn 1' --until-mark 't
 
 | Record | Fields / meaning |
 | --- | --- |
-| Header | `journal: 1`, `mount`, `base_digest`, `stack_digest`, `overlay`, `t0`, `clock` |
+| Header | `journal: 1`, `mount`, `base_digest`, `stack_digest`, `overlay`, `t0`, `clock`, `observation` |
 | `open` | Path, access `flags`, caller `pid`/`uid`/`gid`, optional `comm`, source `layer` |
 | `read`, `write` | Per-handle `bytes`, `count`, `ranges`, `first_ts`, `layer`; optional `ranges_truncated` |
 | `create`, `mkdir`, `unlink`, `rmdir`, `symlink`, `truncate`, `chmod` | Successful path mutation and caller |
@@ -1045,9 +1045,13 @@ ratarmount journal summarize attempt.jsonl --since-mark 'turn 1' --until-mark 't
 | `readdir` | First successful directory listing, `entries` count |
 | `denied` | Attempted `what`, path and numeric `errno` |
 | `mark` | UTF-8 `label` identifying a turn boundary |
+| `end` | Last record of a cleanly finished segment: `records` written after the header, `excluded` records suppressed by `--journal-exclude` |
 
 Each mount appends a version-1 header containing `mount`, `base_digest`,
 `stack_digest`, `overlay`, UTC RFC 3339 `t0`, and `clock: "monotonic_ns"`.
+Only one cooperating writer may hold a journal inode at a time. An overlapping
+mount using the same file (including a hard-link alias) fails before appending;
+sequential mounts append separate segments after the earlier writer finishes.
 Subsequent `ts` values are monotonic nanoseconds since that header. Paths are
 mount-relative, without a leading slash; the root is `""`. JSON writers use
 `path_b64` for invalid UTF-8 bytes, although the FUSE frontend currently rejects
@@ -1086,7 +1090,8 @@ the writer and flushes pending records; `--journal-sync` also fsyncs the file.
 Write failures appear in the daemon log and `user.ratarmount.stats`'s `journal_error`; mark
 requests then fail with EIO and unmount reports the failure. Abrupt termination
 can lose buffered records. Summaries tolerate an incomplete final record and
-an incomplete record immediately before a subsequent mount header.
+an incomplete record immediately before a subsequent mount header, and report
+either as incomplete coverage (below).
 
 `summarize` streams the input, keeping a per-path table and mark-to-path sets.
 It reports first read/write timestamps, bytes, read request counts, layer and
@@ -1099,7 +1104,68 @@ errors. Because read records emit at RELEASE, a handle spanning marks is
 assigned to its release bucket; close file handles before marking a turn when
 exact turn attribution matters. Byte-path fallback keys appear as
 `path_b64:BASE64` in the summary. Both `journal` commands exit 0 on success and
-2 on argument, input, or I/O errors.
+2 on argument, input, or I/O errors; incomplete coverage is still exit 0.
+
+### Coverage and completeness
+
+The journal is positive evidence: it lists operations that reached the mount.
+Whether a missing entry means "not touched" or "unknown" depends on coverage,
+which the journal and `summarize` make explicit.
+
+Each header's `observation` records what the segment can show: `reads`
+(`all` or `first`), `exclude` (the `--journal-exclude` globs as given), `sync`,
+and a fixed `not_observed` list of what no journal records: `lookup`,
+`getattr`, `page_cache_reads`, `mmap_reads`, `other_protocols` and
+`outside_mount`. A segment is one mount's records, from its header. The writer
+ends a segment with `{"op":"end","ts":…,"records":N,"excluded":M}` only after
+flushing every record and, with `--journal-sync`, successfully fsyncing those
+records. A flush or fsync failure leaves no `end`. The end marker is written
+directly, without a trailing newline or subsequent flush/fsync: its closing
+brace is the last byte, so a partial write cannot become a valid marker when
+another session appends its separating newline. The marker itself is not
+guaranteed durable across a power loss; losing it makes coverage incomplete.
+A killed mount or a mount still running normally leaves no `end`.
+
+`summarize --json` adds `coverage`:
+
+| Field | Meaning |
+| --- | --- |
+| `complete` | True only if every segment overlapping the selected window recorded valid `observation` settings and ended `clean` with a matching count. The segment holding the `--until-mark` can instead use that mark to establish the FIFO prefix enqueued before it, unless settings, end records or counts contradict completeness. A live journal can therefore be complete for a closed turn |
+| `reasons` | Sorted subset of `missing_end`, `truncated_tail`, `record_count_mismatch`, `pre_coverage_journal` (a header without observation settings), `invalid_observation` (missing or unsupported settings), `invalid_end` (malformed, duplicate or nonterminal end); empty when complete |
+| `windowed` | Whether `--since-mark` or `--until-mark` selected a window |
+| `excluded_globs`, `reads_mode` | Unions of the `observation` settings over the segments in the window |
+| `segments` | One per readable header: `mount`, `t0`, `observation` (`null` before coverage), `ended` (`clean`, `missing_end`, `truncated_tail`, `closed_by_mark`, `invalid_end`), `records` read (excluding header and end), `records_match` and `excluded` from the first end (`null` without it), `in_window`. A torn initial header also makes whole-journal coverage incomplete |
+| `semantics` | Fixed values: `complete: "every_emitted_record_present"`, `read_absence: "unknown"`, `bytes_read: "fuse_callback_bytes"`, `open_absence` (`conclusive` or `unknown`) |
+
+`complete` means the file holds every record the daemon emitted for the
+window. **It is never negative evidence of reads**: page-cache and mmap hits
+produce no READ callback, so a path missing from `files_read` is always
+unknown as a read. `bytes_read` counts bytes returned in FUSE callbacks: cache
+hits can omit application reads, while kernel page filling/readahead can fetch
+more bytes than the application consumes. It is not a bound on application
+read bytes. The strongest negative
+the summary offers is `open_absence: "conclusive"`, set only for a complete,
+unwindowed summary whose every segment's `end` reports `excluded: 0`: then a
+path absent from `paths` had no successful file OPEN through this mount. It
+says nothing about lookups, stats, other export protocols or access outside
+the mount. Segments after the until-mark are read only to judge the window;
+an unreadable record there ends the scan rather than failing the summary.
+
+These conclusions assume an unmodified journal from the trusted writer.
+Counts detect missing records, and malformed, duplicate or nonterminal ends
+cannot certify completeness; they do not authenticate the file. A forged
+header, matching count and end can fabricate coverage. A mark establishes only
+the queue prefix that reached the file, not durable storage or a barrier for
+concurrent callbacks. Read/write records for handles still open at the mark
+are emitted at release (or drained at unmount) and belong to that later bucket.
+`reads: "first"` retains only the first nonempty range per handle; total bytes
+and request counts still include every observed callback. `excluded` counts
+suppressed records, including handle aggregates, rather than individual reads.
+
+`sandbox run` and supervisor `finalize` reports carry `complete` and `reasons`
+in `journal_summary`; the full `coverage` object is in the summary file it
+names. `journal_summary: null` means observation was disabled (no
+`--journal`): nothing was observed, which is not the same as observing zero.
 
 The journal describes operations reaching FUSE. Kernel page-cache hits, mmap
 accesses and accesses through other export protocols do not produce read
@@ -1234,9 +1300,18 @@ For these rules:
 `t/agent` that neither the base nor any `--lower` layer has can be removed again
 (`rm -rf t/agent` after `mkdir t/agent`), leaving no tombstone and no entry for
 `t/agent`. Through FUSE, `rmdir` still returns `ENOTEMPTY` for a nonempty
-overlay-created root and `ENOTDIR` for a file. (The base parent `t`, materialized
-on the host by the mkdir, keeps the daemon's umask mode and can show as a
-mode-only change.)
+overlay-created root and `ENOTDIR` for a file. On Unix, the base parent `t`,
+which mkdir materializes on the host, keeps its visible base mode, so it is
+not reported as a change afterwards; the same holds for every parent a
+copy-on-write edit materializes (`lib` for `lib/Foo.pm`), including parents
+provided by a read-only `--lower` layer. The daemon's umask does not change
+these visible modes. Only newly created parents are initialized; an existing
+directory's mode is retained, and initialization is serialized with mounted
+chmod/mkdir operations even without an overlay policy.
+A base directory without owner `rwx` (e.g. `0555` or `0500`) gains them on the
+host for backing storage, while an overlay metadata row preserves its visible
+mode for the mount, diff, seal and pack. Existing chmod overrides take precedence;
+an explicit chmod still counts as a change. Setgid and sticky bits are retained.
 A `t/agent` the base or a lower layer provides stays anchored (EROFS), as do
 rename and reset of either.
 
@@ -1934,6 +2009,9 @@ a machine failure, so a killed mount also needs `fsck --repair`. A seal never
 carries the marker into a sealed layer. Like every overlay lock claim, a
 daemonized mount holds no kernel lock on its database after its fork (#183).
 
+The sandbox supervisor takes the same option per attempt (protocol version 2
+`new` with `overlay_durability`); see [relaxed attempts](#relaxed-attempts).
+
 Measured with `benchmarks/overlay-create-unlink.sh` on one ext4 disk
 (N=200, REPS=3; see the #328 profile in
 `docs/tasks/plans/issue-328-overlay-create-unlink-profile.md`): about **58×**
@@ -2451,8 +2529,10 @@ batch (see [protocol version 2](#protocol-version-2)). Repeated `--lower PATH`
 [lower stacks](#lower-stacks) and [journals](#journals)); the three journal
 options need `--journal`. Lower paths are sent unchanged: a relative one is
 refused by the daemon, never resolved by the client. `--retain` sends version 2
-too (see [retained attempts](#retained-attempts)). Without these flags, `new`
-sends exactly the version 1 request. `finalize ID [--pack] [--request-id ID]`
+too (see [retained attempts](#retained-attempts)), and so does
+`--overlay-durability relaxed` (see [relaxed attempts](#relaxed-attempts));
+`--overlay-durability full` is the default and sends nothing. Without these
+flags, `new` sends exactly the version 1 request. `finalize ID [--pack] [--request-id ID]`
 (version 2, Linux only) prints the [finalize](#finalize) report, and
 `list --all` sends a version 2 `list` with `all`, which adds served retained
 attempts, including ones restored after a restart; without `--all`, `list`
@@ -2569,7 +2649,8 @@ errors include a bounded excerpt of the failing mount's log when available.
 ### Protocol version 2
 
 Version 2 has the version 1 operations, fields and defaults; `new` also takes
-a `request_id`, `lowers`, a `journal` and `retain`, `list` takes `all`, and
+a `request_id`, `lowers`, a `journal`, `retain` and `overlay_durability`,
+`list` takes `all`, and
 `finalize` exists only in version 2. Field defaults never change within version
 2; later releases only add fields, and a daemon refuses fields it does not know
 with `invalid_request`, so an older daemon fails closed on a newer client.
@@ -2591,11 +2672,14 @@ with `invalid_request`, so an older daemon fails closed on a newer client.
   ASCII letter or digit first, then letters, digits, `.`, `_` or `-`. A
   malformed ID is `invalid_request` and writes nothing. `"request_id": null`
   is refused (`invalid_request`), never read as "no ID". Without a
-  `request_id`, `lowers`, `journal` or `retain`, a version 2 `new` behaves as
-  version 1's.
+  `request_id`, `lowers`, `journal`, `retain` or a relaxed
+  `overlay_durability`, a version 2 `new` behaves as version 1's.
 - **`lowers` and `journal`** (`new` only) stack sealed layers under every
   attempt and record a per-attempt operation journal; see
   [lower stacks](#lower-stacks) and [journals](#journals).
+- **`overlay_durability`** (`new` only) is `"full"` (the default; never
+  serialized, so it hashes as absent) or `"relaxed"`; see
+  [relaxed attempts](#relaxed-attempts).
 - **`finalize` and `retain`** stop, seal and hash an attempt and keep it in
   `retained/ID` (Linux only); see [finalize](#finalize),
   [retained attempts](#retained-attempts) and [durability](#durability).
@@ -2999,7 +3083,7 @@ Nothing is undone, and what completed (the seal, the bundle, the first
 | `bytes_written` | The logical overlay payload size after the stop, as for `sandbox run` |
 | `erofs_denied` | The number of writes the read-only rules refused, from the last read while the mount process served; `null` if it was never read |
 | `manifest_path` | `attempts/ID/manifest.jsonl` |
-| `journal_summary` | `{path,files_read,files_read_then_written,files_written_blind}` of `attempts/ID/journal.summary.json`, or `null` without a journal |
+| `journal_summary` | `{path,files_read,files_read_then_written,files_written_blind,complete,reasons}` of `attempts/ID/journal.summary.json` (see [Coverage and completeness](#coverage-and-completeness)), or `null` without a journal (observation disabled) |
 | `bundle` | `attempts/ID/bundle.tar.zst` with `pack`, else `null` |
 
 **Repeating a finalize.** A finalize of a `finalized` attempt runs the
@@ -3052,6 +3136,62 @@ locked overlay each hold it for up to the smaller of `--timeout` and 10 s. On
 `writers_active`, wait at least
 1 s and back off. `destroy` keeps its own policy: it still unmounts lazily if
 it must and stops the mount process, also for a `finalizing` attempt.
+
+#### Relaxed attempts
+
+```json
+{"version":2,"op":"new","base":"task","count":8,"overlay_durability":"relaxed"}
+```
+
+A version 2 `new` with `overlay_durability: "relaxed"` (CLI `sandbox new
+--overlay-durability relaxed`, Python `new(..., overlay_durability="relaxed")`)
+starts each attempt's mount with `--overlay-durability=relaxed` (see
+[relaxed overlay durability](#relaxed-overlay-durability)): its overlay
+database stops waiting for the disk on every create, unlink and rename (200
+creates plus 100 unlinks through FUSE took about 2.2 s with `full` and 0.1 s
+relaxed on one SSD). Only the string `"full"` or `"relaxed"` is accepted;
+`null`, another spelling or an unknown value is `invalid_request` before
+anything exists. `"full"` is never serialized, so it hashes like an absent
+field; `"relaxed"` is another body for a `request_id`. A relaxed `new` is
+checked by the mount CLI's parser, like a layered or journaled one, before the
+RAM root, any attempt directory or child exists. The mount refuses relaxed
+durability only with archive commits, which the supervisor never passes, so
+it works with lowers, journals and `retain`, subject to their existing
+restrictions (`retain` requires a disk overlay). It also works with `tmpfs`
+overlays, whose contents are lost on reboot regardless of this setting.
+
+What a crash costs here: an attempt's mount clears its marker when it is
+unmounted cleanly, and `finalize` seals only after that unmount. A finalize
+whose top still carries a marker of this boot (its mount process was killed;
+its writes reached the kernel) proceeds, and the seal clears the marker. A
+marker of another boot (or an unknown one) means the machine went down while
+the attempt was relaxed: `finalize` answers `io` naming the marker and "destroy
+it" after the stop (the attempt is then unmounted and `finalizing`) but before
+fsck repair, and it never seals or retains that layer
+(`overlay fsck --repair` would clear the marker once `PRAGMA integrity_check`
+passes, but that does not bring back lost rows, so finalize does not repair
+it). This refusal is checked again inside fsck's exclusive transaction, so a
+marker that appeared after the initial check cannot be cleared by automated
+repair. Reading an unsealed top may first roll back a hot SQLite journal;
+that recovery does not acknowledge its relaxed crash marker.
+
+`diff` and `stats` also refuse a foreign/unknown-boot marker on the top,
+including through a live child's inspection socket and after it detaches.
+Lower admission checks directory and bundle markers; diff/finalize recheck
+recorded lowers, and composition checks the marker in the same database
+snapshot as the rows. Finalized and retained attempts' fresh finalize calls
+check their top too. Restart leaves a retained top with such a marker reserved
+but unserved, without repairing it. Request-ID replays still return their
+stored answers; use a fresh request ID for a current check. Stats describes
+only the top and does not read its base or lowers.
+
+In ordinary operation a restart discards
+every attempt that is not retained, whatever its durability or boot, so a
+relaxed attempt that lived through an OS crash is removed, never served. A
+retained attempt was finalized with `full` semantics already: its marker was
+cleared in a `synchronous=FULL` commit and step S synced its tree before its
+`retained.jsonl` record, so a retained relaxed layer survives a crash like any
+other.
 
 #### Retained attempts
 
@@ -3469,9 +3609,11 @@ journal, and `None` otherwise, including for `list()` results.
 
 `finalize(id, pack=False, request_id=None)` and
 `Attempt.finalize(pack=False, request_id=None)` send protocol version 2 and
-return the [finalize](#finalize) report; `new(..., retain=True)` and
-`list(all=True)` send version 2 too (`retain=False` sends no key, and
-`list(all=False)` is the version 1 request). An `Attempt` the client owns takes
+return the [finalize](#finalize) report; `new(..., retain=True)`,
+`new(..., overlay_durability="relaxed")` and `list(all=True)` send version 2
+too (`retain=False` and `overlay_durability="full"`, the default, send no key,
+and `list(all=False)` is the version 1 request; see
+[relaxed attempts](#relaxed-attempts)). An `Attempt` the client owns takes
 `status`, `path`, `overlay_dir` and, when set, `journal_path` from the report's
 `attempt`, also when `finalize` is called on the client. A finalized attempt
 that was not retained stays owned

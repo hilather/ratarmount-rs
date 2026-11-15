@@ -194,6 +194,10 @@ layer, syncs it and prints a report (`--pack` adds a bundle). An attempt
 created with `sandbox new --retain` is then kept in the state directory's
 `retained/ID`, where later attempts over TAR or Git bases can stack on it,
 including after a daemon restart restores it.
+Use `sandbox new --overlay-durability relaxed` for disposable attempts that
+can tolerate loss after a machine crash. Finalize refuses a leftover
+foreign/unknown-boot marker; destroy that attempt. Cleanly finalized retained
+layers have full durability. See [relaxed attempts](sandbox.md#relaxed-attempts).
 [Finalize](sandbox.md#finalize) covers its scope (Linux; local TAR, directory
 and Git bases) and the storage it needs.
 
@@ -239,6 +243,10 @@ ratarmount journal summarize next-attempt.journal.jsonl --json
 
 The runner needs Linux FUSE and a local Docker/Podman runtime. Its own exit 0
 means the pipeline completed; inspect JSON `exit_code` for the container result.
+Journal summaries include [coverage and completeness](sandbox.md#coverage-and-completeness).
+An incomplete summary cannot establish observed zero; `journal_summary: null`
+means observation was disabled. Missing read records remain inconclusive even
+when coverage is complete.
 For turn boundaries during a journaled mount, use
 `ratarmount journal mark mnt 'turn 1'`. See the
 [offline worked example and reference](sandbox.md) for scratch-fixture setup,

@@ -29,7 +29,8 @@ use clap::{Parser, Subcommand};
 #[cfg(test)]
 use protocol::VERSION;
 use protocol::{
-    BaseOptions, JournalReads, JournalSpec, Op, Operation, OperationV2, Overlay, Request, Response,
+    BaseOptions, JournalReads, JournalSpec, Op, Operation, OperationV2, Overlay, OverlayDurability,
+    Request, Response,
 };
 use std::io::Write;
 #[cfg(test)]
@@ -111,6 +112,9 @@ enum Command {
         /// Keep each attempt in retained/ID once a finalize succeeds (protocol version 2; Linux, TAR, directory and git:/// bases).
         #[arg(long)]
         retain: bool,
+        /// Overlay database durability of each attempt, as the mount's --overlay-durability. relaxed (protocol version 2) stops waiting for the disk on every create, unlink and rename (much faster); an OS crash or power loss can then corrupt the attempt's layer, and finalize refuses it (destroy the attempt). full sends no field.
+        #[arg(long, value_enum, value_name = "MODE")]
+        overlay_durability: Option<OverlayDurability>,
     },
     /// Stop, check, seal and hash an attempt, optionally packing it (protocol version 2; Linux only).
     ///
@@ -193,8 +197,8 @@ pub fn run(args: &SandboxArgs) -> Result<(), String> {
             options: serde_json::from_str::<BaseOptions>(options).map_err(|e| e.to_string())?,
         }
         .into(),
-        // Without --request-id, --lower, --journal and --retain `new` sends
-        // exactly the v1 bytes.
+        // Without --request-id, --lower, --journal, --retain and
+        // `--overlay-durability relaxed`, `new` sends exactly the v1 bytes.
         Command::New {
             base,
             count,
@@ -208,13 +212,20 @@ pub fn run(args: &SandboxArgs) -> Result<(), String> {
             journal_reads,
             journal_sync,
             retain,
+            overlay_durability,
         } => {
+            let overlay_durability = overlay_durability.unwrap_or_default();
             let journal = journal.then(|| JournalSpec {
                 exclude: journal_exclude.clone(),
                 reads: journal_reads.unwrap_or_default(),
                 sync: *journal_sync,
             });
-            if request_id.is_none() && lowers.is_empty() && journal.is_none() && !retain {
+            if request_id.is_none()
+                && lowers.is_empty()
+                && journal.is_none()
+                && !retain
+                && overlay_durability.is_full()
+            {
                 Operation::New {
                     base: base.clone(),
                     count: *count,
@@ -234,6 +245,7 @@ pub fn run(args: &SandboxArgs) -> Result<(), String> {
                     lowers: lowers.clone(),
                     journal,
                     retain: *retain,
+                    overlay_durability,
                 }
                 .into()
             }

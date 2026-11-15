@@ -310,6 +310,9 @@ The complete status against the Python original is in the
    After a machine failure, a leftover relaxed marker requires
    `overlay fsck --repair` before reuse. See
    [Relaxed overlay durability](sandbox.md#relaxed-overlay-durability).
+   The supervisor accepts `sandbox new --overlay-durability relaxed` and
+   refuses to finalize an attempt with a foreign/unknown-boot marker; discard
+   that attempt. See [relaxed attempts](sandbox.md#relaxed-attempts).
 5. **Platforms.** Linux and macOS on Apple silicon. No Intel macOS package (no
    CI runner), no Windows CLI. The library crates compile on Windows.
 6. **Tensor manifests.** Local regular files only; no scheme paths, overlapping

@@ -1393,7 +1393,6 @@ mod tests {
         let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         cow_write(&ov, "/lib/f", b"changed");
         drop(ov);
-        fs::set_permissions(dir.join("lib"), fs::Permissions::from_mode(0o755)).unwrap();
         let opts = ChangeOptions::default();
         let changes = change_set(&dir, base.clone(), &opts).unwrap();
         assert_eq!(changes.len(), 1);
@@ -1419,6 +1418,164 @@ mod tests {
             (changes[1].path.as_slice(), changes[1].status),
             (b"lib".as_slice(), Status::Modified)
         );
+    }
+
+    fn host_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// Regression: #326 residual. Directories materialized only as parents
+    /// (COW of `d/b/c/f`) took the daemon's umask, so every level showed up as
+    /// a mode-only Modified entry. Modes no umask produces (0750, setgid 2775,
+    /// 0700) must be copied exactly at every level.
+    #[test]
+    fn regression_326_materialized_parents_keep_base_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, base) = fixture();
+        let b = tmp.path().join("base");
+        fs::create_dir_all(b.join("d/b/c")).unwrap();
+        fs::write(b.join("d/b/c/f"), b"base").unwrap();
+        for (dir, mode) in [("d", 0o750), ("d/b", 0o2775), ("d/b/c", 0o700)] {
+            fs::set_permissions(b.join(dir), fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(host_mode(&b.join(dir)), mode, "{dir}: fixture mode");
+        }
+        let dir = tmp.path().join("overlay");
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+        cow_write(&ov, "/d/b/c/f", b"changed");
+        drop(ov);
+        for (sub, mode) in [("d", 0o750), ("d/b", 0o2775), ("d/b/c", 0o700)] {
+            assert_eq!(host_mode(&dir.join(sub)), mode, "{sub}: materialized mode");
+        }
+        let opts = ChangeOptions::default();
+        let changes = change_set(&dir, base.clone(), &opts).unwrap();
+        let paths: Vec<_> = changes.iter().map(|c| c.path.as_slice()).collect();
+        assert_eq!(paths, [b"d/b/c/f".as_slice()]);
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+        cow_write(&ov, "/d/b/c/f", b"base");
+        drop(ov);
+        assert!(change_set(&dir, base, &opts).unwrap().is_empty());
+    }
+
+    /// Regression: #326 residual. `mkdir t/agent`, a file in it, then
+    /// `rm -rf t/agent` left `t` (0750 in the base) as a mode-only change
+    /// because creating `t/agent` materialized `t` with the daemon's umask.
+    /// An explicit chmod of `t` must still be a change.
+    #[test]
+    fn regression_326_removed_child_leaves_no_parent_mode_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, base) = fixture();
+        let t = tmp.path().join("base/t");
+        fs::create_dir(&t).unwrap();
+        fs::write(t.join("keep.t"), b"base").unwrap();
+        fs::set_permissions(&t, fs::Permissions::from_mode(0o750)).unwrap();
+        let dir = tmp.path().join("overlay");
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+        ov.mkdir("/t/agent", 0o755).unwrap();
+        put(&ov, "/t/agent/x.t", b"1\n");
+        assert_eq!(host_mode(&dir.join("t")), 0o750);
+        ov.unlink("/t/agent/x.t").unwrap();
+        ov.rmdir("/t/agent").unwrap();
+        drop(ov);
+        let opts = ChangeOptions::default();
+        assert!(change_set(&dir, base.clone(), &opts).unwrap().is_empty());
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+        ov.set_metadata(
+            "/t",
+            &OverlayMetadata {
+                mode: Some(0o755),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(ov);
+        let changes = change_set(&dir, base, &opts).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            (changes[0].path.as_slice(), changes[0].status),
+            (b"t".as_slice(), Status::Modified)
+        );
+        assert_eq!(changes[0].new.as_ref().unwrap().mode & 0o7777, 0o755);
+    }
+
+    /// Regression: #326 residual. A base directory without owner rwx (0555)
+    /// must remain writable as backing storage without becoming a visible
+    /// mode change. Metadata overrides and a read-only lower retain their
+    /// visible modes too, including across reopening the writer.
+    #[test]
+    fn regression_326_write_protected_base_parent_stays_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        for (mode, lower) in [(0o555, false), (0o500, false), (0o550, true)] {
+            let (tmp, base) = fixture();
+            let mut ro = tmp.path().join("base/ro");
+            if !lower {
+                fs::create_dir(&ro).unwrap();
+                fs::write(ro.join("f"), b"base").unwrap();
+                fs::set_permissions(&ro, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            let base: Arc<dyn MountSource> = if lower {
+                let lower_dir = tmp.path().join("lower");
+                ro = lower_dir.join("ro");
+                let ov = WriteOverlay::new_for_tests(base.clone(), &lower_dir).unwrap();
+                ov.mkdir("/ro", 0o755).unwrap();
+                put(&ov, "/ro/f", b"base");
+                ov.set_metadata(
+                    "/ro",
+                    &OverlayMetadata {
+                        mode: Some(0o2550),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                drop(ov);
+                Arc::new(ReadOnlyOverlayLayer::new(base, lower_dir, Immutability::Shared).unwrap())
+            } else {
+                base
+            };
+            let visible = if lower { 0o2550 } else { mode };
+            let dir = tmp.path().join("overlay");
+            let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+            // Existing time-only rows must gain the saved mode, retaining time.
+            ov.set_metadata(
+                "/ro",
+                &OverlayMetadata {
+                    mtime: Some(42.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            put(&ov, "/ro/new", b"x");
+            cow_write(&ov, "/ro/f", b"changed");
+            assert_eq!(ov.lookup("/ro", 0).unwrap().mode & 0o7777, visible);
+            drop(ov);
+            assert_eq!(host_mode(&dir.join("ro")), visible | 0o700);
+            let conn = Connection::open(dir.join(HIDDEN_DB)).unwrap();
+            let saved: (u32, f64) = conn
+                .query_row(
+                    "SELECT mode,mtime FROM overlay_metadata WHERE path='/ro'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(saved, (visible, 42.0));
+            drop(conn);
+            let opts = ChangeOptions::default();
+            let changes = change_set(&dir, base.clone(), &opts).unwrap();
+            assert_eq!(
+                changes
+                    .iter()
+                    .map(|c| c.path.as_slice())
+                    .collect::<Vec<_>>(),
+                [b"ro/f".as_slice(), b"ro/new".as_slice()]
+            );
+            let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+            cow_write(&ov, "/ro/f", b"base");
+            ov.unlink("/ro/new").unwrap();
+            drop(ov);
+            assert!(change_set(&dir, base, &opts).unwrap().is_empty());
+            assert_eq!(host_mode(&ro), visible, "base/lower must be untouched");
+            fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     /// Regression: host walking followed symlinks or exposed staging and bookkeeping entries.

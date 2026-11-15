@@ -2000,8 +2000,12 @@ fn regression_sandbox_v2_finalize_layered_fuse() {
             "files_read": count("files_read"),
             "files_read_then_written": count("files_read_then_written"),
             "files_written_blind": count("files_written_blind"),
+            "complete": summary["coverage"]["complete"],
+            "reasons": summary["coverage"]["reasons"],
         })
     );
+    // The attempt's mount was stopped cleanly before the summary was taken.
+    assert_eq!(summary["coverage"]["complete"], true, "{summary}");
     assert!(
         summary["files_written_blind"]
             .as_array()
@@ -2508,4 +2512,88 @@ fn regression_sandbox_restart_serve_retained_fuse() {
         report
     );
     assert_eq!(daemon.call(json!({"op":"diff","id":id,"git":true})), patch);
+}
+
+/// Regression (#328): a real relaxed supervisor attempt (v2 `new` with
+/// `overlay_durability: relaxed`, retained) records the relaxed marker while
+/// it serves, creates and unlinks files through FUSE, then finalizes: the
+/// clean unmount clears the marker, the layer is sealed and retained, and
+/// only the surviving files are in its change set. A `full` attempt beside it
+/// never records a marker. Timings are printed, never asserted.
+#[test]
+fn regression_sandbox_v2_relaxed_attempt_fuse() {
+    if !prepared_fuse() {
+        return;
+    }
+    const KEY: &str = "relaxed_durability";
+    const FILES: usize = 200;
+    let mut daemon = Daemon::start();
+    daemon.base();
+    let mut timings = Vec::new();
+    for durability in ["full", "relaxed"] {
+        let mut request = json!({
+            "version": 2, "op": "new", "base": "task", "retain": true,
+            "request_id": format!("new-{durability}")
+        });
+        if durability == "relaxed" {
+            request["overlay_durability"] = json!("relaxed");
+        }
+        let attempts = daemon.call(request);
+        let id = attempts[0]["id"].as_str().unwrap().to_owned();
+        let mnt = PathBuf::from(attempts[0]["path"].as_str().unwrap());
+        let overlay = PathBuf::from(attempts[0]["overlay_dir"].as_str().unwrap());
+        let marker = meta_unlocked(&overlay).get(KEY).cloned();
+        if durability == "relaxed" {
+            let marker = marker.expect("a relaxed child records its marker before serving");
+            assert!(marker.contains(':'), "{marker}");
+        } else {
+            assert_eq!(marker, None);
+        }
+        let started = Instant::now();
+        for i in 0..FILES {
+            let path = mnt.join(format!("f{i}.txt"));
+            fs::write(&path, format!("{i}\n")).unwrap();
+            if i % 2 == 1 {
+                fs::remove_file(&path).unwrap();
+            }
+        }
+        timings.push((durability, started.elapsed()));
+        let stats = daemon.call(json!({"op": "stats", "id": id}));
+        assert_eq!(stats["files_present"], FILES / 2, "{stats}");
+        let patch = daemon.call(json!({"op": "diff", "id": id, "git": true}));
+        assert!(patch["patch"]
+            .as_str()
+            .unwrap()
+            .contains("diff --git a/f0.txt b/f0.txt"));
+        let report = finalize_done(
+            &daemon,
+            &json!({"version": 2, "op": "finalize", "id": id, "request_id": format!("fin-{durability}")}),
+            &mnt,
+        );
+        assert_eq!(report["status"], "retained", "{report}");
+        assert_eq!(report["patch_hash"]["files"], FILES / 2, "{report}");
+        let kept = PathBuf::from(report["attempt"]["overlay_dir"].as_str().unwrap());
+        let meta = meta_unlocked(&kept);
+        assert_eq!(meta.get(KEY), None, "{durability}: {meta:?}");
+        assert!(meta.contains_key("sealed_at"), "{meta:?}");
+        // A clean relaxed layer remains valid after restart, including as a
+        // lower of another real FUSE attempt.
+        daemon.restart();
+        assert_eq!(
+            daemon.call(json!({"version": 2, "op": "finalize", "id": id})),
+            report
+        );
+        assert_eq!(
+            daemon.call(json!({"op": "diff", "id": id, "git": true})),
+            patch
+        );
+        let children =
+            daemon.call(json!({"version": 2, "op": "new", "base": "task", "lowers": [kept]}));
+        let child = &children[0];
+        let path = PathBuf::from(child["path"].as_str().unwrap());
+        assert_eq!(fs::read(path.join("f0.txt")).unwrap(), b"0\n");
+        assert!(!path.join("f1.txt").exists());
+        daemon.call(json!({"op": "destroy", "id": child["id"]}));
+    }
+    eprintln!("create/unlink {FILES} files through FUSE: {timings:?}");
 }

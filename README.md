@@ -121,6 +121,8 @@ ratarmount sandbox run --base base.tar.zst --top attempt-07 --image busybox \
 Each attempt gets a private top over the same snapshot and optional sealed
 `--lower` layers. The runner executes a container, cleans up the mount, and
 reports its exit status, strict patch hash, manifest and journal summary as JSON.
+Journal reports include [observation completeness](docs/sandbox.md#coverage-and-completeness);
+missing read records never prove that a file was not read.
 Offline commands import patches, seal and verify layers, compare attempts, and
 pack portable bundles. The supervisor API manages fleets of attempts. Registration
 prepares the shared base/index once; its writable workers use immutable prepared
@@ -313,6 +315,8 @@ the last zstd frame is rewritten. `--overlay-readonly`, `--overlay-quota` and
 `--overlay-durability=relaxed` skips the overlay database's fsyncs (about 58x
 faster in the measured create/unlink workload) for throwaway overlays that an
 OS crash may cost.
+The supervisor accepts the same choice per attempt with
+`sandbox new --overlay-durability relaxed`; see [relaxed attempts](docs/sandbox.md#relaxed-attempts).
 For concurrent attempts over one base, use a separate overlay and mountpoint
 per process with `--no-recreate-index` and one prepared index. This disables
 shared index writes and archive commits while each overlay remains writable.

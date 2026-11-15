@@ -1,6 +1,6 @@
 //! Process and mount operations kept behind a trait for lifecycle tests.
 
-use super::protocol::{ApiError, Attempt, Base, JournalReads, JournalSpec};
+use super::protocol::{ApiError, Attempt, Base, JournalReads, JournalSpec, OverlayDurability};
 use ratarmount_compositing::LowerLayerRecord;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -56,6 +56,8 @@ pub struct SpawnSpec<'a> {
     pub bundle_cache: Option<&'a Path>,
     /// The journal file the supervisor chose, and its options.
     pub journal: Option<(&'a Path, &'a JournalSpec)>,
+    /// `--overlay-durability` (#328); `full` adds no argument.
+    pub durability: OverlayDurability,
 }
 
 pub trait Mounter {
@@ -188,6 +190,9 @@ pub fn mount_args(
         ]);
     }
     args.extend(["-w".into(), attempt.overlay_dir.as_os_str().to_owned()]);
+    if spec.durability == OverlayDurability::Relaxed {
+        args.push("--overlay-durability=relaxed".into());
+    }
     if let Some(quota) = spec.quota {
         args.extend(["--overlay-quota".into(), quota.to_string().into()]);
     }

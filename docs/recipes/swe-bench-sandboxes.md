@@ -172,3 +172,18 @@ def finalize(attempt, request_id, tries=8):
 
 The hidden-tests layer is never routed through the supervisor: grade the
 exported patch with the SWE-bench evaluation harness, as above.
+
+## What ratarmount does not establish
+
+The attempt layer, its digests and the journal are inputs to an evaluation
+record, not the record itself. A
+[capability-gap review](../tasks/plans/swe-capability-gaps-plan.md) maps what a
+trustworthy SWE or CPAN evaluation needs to who provides it:
+
+| Requirement | Owner | What ratarmount provides |
+| --- | --- | --- |
+| Grader isolated from candidate code; hidden tests and the verdict under a separate authority | The verifier or runner | Nothing beyond the exported patch or sealed layer; never grade inside the agent's attempt |
+| Signed, verifiable record of who graded what | The trusted runner (its receipt and signatures) | Stable receipt inputs: `layer_digest`, the base digest in `patch_hash`, and the journal's `complete`/`reasons` |
+| Whole-run observation and negative evidence | Split | Journal coverage (see [Coverage and completeness](../sandbox.md#coverage-and-completeness)). `complete` is never evidence that a file was not read, and `journal_summary: null` means observation was disabled |
+| Per-phase network and leakage policy | The runner's broker, network policy and tool configuration | `sandbox run --network` selects a runtime network mode; it is not an allowlist |
+| Whether a task measures the right behaviour | The benchmark | Nothing |
