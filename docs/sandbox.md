@@ -1035,7 +1035,7 @@ ratarmount journal summarize attempt.jsonl --since-mark 'turn 1' --until-mark 't
 
 | Record | Fields / meaning |
 | --- | --- |
-| Header | `journal: 1`, `mount`, `base_digest`, `stack_digest`, `overlay`, `t0`, `clock` |
+| Header | `journal: 1`, `mount`, `base_digest`, `stack_digest`, `overlay`, `t0`, `clock`, `observation` |
 | `open` | Path, access `flags`, caller `pid`/`uid`/`gid`, optional `comm`, source `layer` |
 | `read`, `write` | Per-handle `bytes`, `count`, `ranges`, `first_ts`, `layer`; optional `ranges_truncated` |
 | `create`, `mkdir`, `unlink`, `rmdir`, `symlink`, `truncate`, `chmod` | Successful path mutation and caller |
@@ -1043,6 +1043,7 @@ ratarmount journal summarize attempt.jsonl --since-mark 'turn 1' --until-mark 't
 | `readdir` | First successful directory listing, `entries` count |
 | `denied` | Attempted `what`, path and numeric `errno` |
 | `mark` | UTF-8 `label` identifying a turn boundary |
+| `end` | Last record of a cleanly finished segment: `records` written after the header, `excluded` records suppressed by `--journal-exclude` |
 
 Each mount appends a version-1 header containing `mount`, `base_digest`,
 `stack_digest`, `overlay`, UTC RFC 3339 `t0`, and `clock: "monotonic_ns"`.
@@ -1084,7 +1085,8 @@ the writer and flushes pending records; `--journal-sync` also fsyncs the file.
 Write failures appear in the daemon log and `user.ratarmount.stats`'s `journal_error`; mark
 requests then fail with EIO and unmount reports the failure. Abrupt termination
 can lose buffered records. Summaries tolerate an incomplete final record and
-an incomplete record immediately before a subsequent mount header.
+an incomplete record immediately before a subsequent mount header, and report
+either as incomplete coverage (below).
 
 `summarize` streams the input, keeping a per-path table and mark-to-path sets.
 It reports first read/write timestamps, bytes, read request counts, layer and
@@ -1097,7 +1099,51 @@ errors. Because read records emit at RELEASE, a handle spanning marks is
 assigned to its release bucket; close file handles before marking a turn when
 exact turn attribution matters. Byte-path fallback keys appear as
 `path_b64:BASE64` in the summary. Both `journal` commands exit 0 on success and
-2 on argument, input, or I/O errors.
+2 on argument, input, or I/O errors; incomplete coverage is still exit 0.
+
+### Coverage and completeness
+
+The journal is positive evidence: it lists operations that reached the mount.
+Whether a missing entry means "not touched" or "unknown" depends on coverage,
+which the journal and `summarize` make explicit.
+
+Each header's `observation` records what the segment can show: `reads`
+(`all` or `first`), `exclude` (the `--journal-exclude` globs as given), `sync`,
+and a fixed `not_observed` list of what no journal records: `lookup`,
+`getattr`, `page_cache_reads`, `mmap_reads`, `other_protocols` and
+`outside_mount`. A segment is one mount's records, from its header. The writer
+ends a segment with `{"op":"end","ts":…,"records":N,"excluded":M}` only after
+writing every record without error, so `end` proves the segment was flushed
+completely. A killed mount, a writer that failed part-way, and a mount still
+running leave no `end`. (With `--journal-sync`, `end` is written before the
+fsync; an fsync failure is reported as a journal error at unmount.)
+
+`summarize --json` adds `coverage`:
+
+| Field | Meaning |
+| --- | --- |
+| `complete` | True only if every segment overlapping the selected window recorded `observation` and ended `clean` with a matching count. For the segment holding the `--until-mark`, the mark itself suffices: marks share the writer's FIFO queue with every other record, so a present until-mark proves everything emitted before it was written. A live journal can therefore be complete for a closed turn |
+| `reasons` | Sorted subset of `missing_end`, `truncated_tail`, `record_count_mismatch`, `pre_coverage_journal` (a header written before `observation` existed); empty when complete |
+| `windowed` | Whether `--since-mark` or `--until-mark` selected a window |
+| `excluded_globs`, `reads_mode` | Unions of the `observation` settings over the segments in the window |
+| `segments` | One per header: `mount`, `t0`, `observation` (`null` before coverage), `ended` (`clean`, `missing_end`, `truncated_tail`, `closed_by_mark`), `records` read, `records_match` and `excluded` from `end` (`null` without it), `in_window` |
+| `semantics` | Fixed values: `complete: "every_emitted_record_present"`, `read_absence: "unknown"`, `bytes_read: "lower_bound"`, `open_absence` (`conclusive` or `unknown`) |
+
+`complete` means the file holds every record the daemon emitted for the
+window. **It is never negative evidence of reads**: page-cache and mmap hits
+produce no READ callback, so a path missing from `files_read` is always
+unknown as a read, and `bytes_read` is a lower bound. The strongest negative
+the summary offers is `open_absence: "conclusive"`, set only for a complete,
+unwindowed summary whose every segment's `end` reports `excluded: 0`: then a
+path absent from `paths` had no successful file OPEN through this mount. It
+says nothing about lookups, stats, other export protocols or access outside
+the mount. Segments after the until-mark are read only to judge the window;
+an unreadable record there ends the scan rather than failing the summary.
+
+`sandbox run` and supervisor `finalize` reports carry `complete` and `reasons`
+in `journal_summary`; the full `coverage` object is in the summary file it
+names. `journal_summary: null` means observation was disabled (no
+`--journal`): nothing was observed, which is not the same as observing zero.
 
 The journal describes operations reaching FUSE. Kernel page-cache hits, mmap
 accesses and accesses through other export protocols do not produce read
@@ -2997,7 +3043,7 @@ Nothing is undone, and what completed (the seal, the bundle, the first
 | `bytes_written` | The logical overlay payload size after the stop, as for `sandbox run` |
 | `erofs_denied` | The number of writes the read-only rules refused, from the last read while the mount process served; `null` if it was never read |
 | `manifest_path` | `attempts/ID/manifest.jsonl` |
-| `journal_summary` | `{path,files_read,files_read_then_written,files_written_blind}` of `attempts/ID/journal.summary.json`, or `null` without a journal |
+| `journal_summary` | `{path,files_read,files_read_then_written,files_written_blind,complete,reasons}` of `attempts/ID/journal.summary.json` (see [Coverage and completeness](#coverage-and-completeness)), or `null` without a journal (observation disabled) |
 | `bundle` | `attempts/ID/bundle.tar.zst` with `pack`, else `null` |
 
 **Repeating a finalize.** A finalize of a `finalized` attempt runs the

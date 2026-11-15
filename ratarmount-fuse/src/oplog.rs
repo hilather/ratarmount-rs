@@ -10,6 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -34,6 +35,26 @@ pub enum Reads {
     All,
     First,
 }
+
+impl Reads {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reads::All => "all",
+            Reads::First => "first",
+        }
+    }
+}
+
+/// What a journal never records, whatever its options (the header's
+/// `observation.not_observed`): absence from these is always unknown.
+pub const NOT_OBSERVED: &[&str] = &[
+    "lookup",
+    "getattr",
+    "page_cache_reads",
+    "mmap_reads",
+    "other_protocols",
+    "outside_mount",
+];
 
 #[derive(Clone, Debug)]
 pub struct JournalOptions {
@@ -132,6 +153,8 @@ pub struct OpLog {
     writer: Mutex<Option<Writer>>,
     failure: Arc<Mutex<Option<String>>>,
     exclude: ReadOnlyGlobs,
+    /// Records suppressed by `--journal-exclude`, reported by the `end` record.
+    excluded: Arc<AtomicU64>,
     reads: Reads,
     path: Option<PathBuf>,
     handles: Mutex<HashMap<u64, Handle>>,
@@ -147,6 +170,7 @@ impl Default for OpLog {
             writer: Mutex::new(None),
             failure: Arc::new(Mutex::new(None)),
             exclude: ReadOnlyGlobs::new(std::iter::empty::<&str>()).expect("empty globs"),
+            excluded: Arc::new(AtomicU64::new(0)),
             reads: Reads::All,
             path: None,
             handles: Mutex::new(HashMap::new()),
@@ -211,17 +235,24 @@ impl OpLog {
             "base_digest": metadata.get("base_digest").map(String::as_str).unwrap_or(""),
             "stack_digest": metadata.get("stack_digest").map(String::as_str).unwrap_or(""),
             "overlay": overlay, "t0": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-            "clock": "monotonic_ns"}),
+            "clock": "monotonic_ns", "observation": observation(options)}),
         )?;
         output.flush()?;
         let (tx, rx) = mpsc::sync_channel(1024);
         let failure = Arc::new(Mutex::new(None));
         let failed = failure.clone();
         let sync = options.sync;
+        let excluded = Arc::new(AtomicU64::new(0));
+        let ended = excluded.clone();
         let join = std::thread::Builder::new()
             .name("ratarmount-oplog".into())
             .spawn(move || {
-                let result = writer_loop(output, rx, sync);
+                let result = writer_loop(output, rx, start, &ended, |file: &File| {
+                    if sync {
+                        file.sync_all()?;
+                    }
+                    Ok(())
+                });
                 if let Err(error) = &result {
                     *failed.lock().unwrap() = Some(error.to_string());
                     log::error!("operation journal writer: {error}");
@@ -233,6 +264,7 @@ impl OpLog {
             writer: Mutex::new(Some(Writer { tx, join })),
             failure,
             exclude,
+            excluded,
             reads: options.reads,
             path: Some(path),
             handles: Mutex::new(HashMap::new()),
@@ -307,12 +339,15 @@ impl OpLog {
                 stats.erofs_denied += 1;
             }
         }
-        if self.path.is_none()
-            || self.exclude.protects(path)
+        if self.path.is_none() {
+            return;
+        }
+        if self.exclude.protects(path)
             || event["to"]
                 .as_str()
                 .is_some_and(|to| self.exclude.protects(to))
         {
+            self.excluded.fetch_add(1, Ordering::Relaxed);
             return;
         }
         if let Err(error) = self.send(event) {
@@ -560,15 +595,34 @@ fn write_line(output: &mut impl Write, record: &Value) -> io::Result<()> {
     output.write_all(b"\n")
 }
 
-fn writer_loop(
-    mut output: BufWriter<File>,
+/// The header's `observation`: the settings that decide what this segment
+/// can show, so a reader can tell "excluded" or "not observed" from "not
+/// touched".
+fn observation(options: &JournalOptions) -> Value {
+    json!({"reads": options.reads.as_str(), "exclude": options.exclude,
+        "sync": options.sync, "not_observed": NOT_OBSERVED})
+}
+
+/// Writes every queued record, then (only if every write succeeded) the
+/// segment's `end` record with the number of records written after the
+/// header and the number `--journal-exclude` suppressed. Any write error
+/// returns before `end`, so its presence proves the segment was flushed
+/// completely.
+fn writer_loop<W: Write>(
+    mut output: BufWriter<W>,
     rx: mpsc::Receiver<Value>,
-    sync: bool,
+    start: Instant,
+    excluded: &AtomicU64,
+    sync: impl FnOnce(&W) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut last_flush = Instant::now();
+    let mut records: u64 = 0;
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(event) => write_line(&mut output, &event)?,
+            Ok(event) => {
+                write_line(&mut output, &event)?;
+                records += 1;
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -577,10 +631,14 @@ fn writer_loop(
             last_flush = Instant::now();
         }
     }
+    let ts = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    write_line(
+        &mut output,
+        &json!({"op": "end", "ts": ts, "records": records,
+            "excluded": excluded.load(Ordering::Relaxed)}),
+    )?;
     output.flush()?;
-    if sync {
-        output.get_ref().sync_all()?;
-    }
+    sync(output.get_ref())?;
     Ok(())
 }
 
@@ -746,8 +804,11 @@ mod tests {
                 .skip(1)
                 .map(|e| e["op"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["open", "read", "write", "rename", "readdir", "mark"]
+            ["open", "read", "write", "rename", "readdir", "mark", "end"]
         );
+        // `.git/**` suppressed the second handle's open, read and write.
+        assert_eq!(events[7]["records"], 6);
+        assert_eq!(events[7]["excluded"], 3);
         assert_eq!(events[1]["flags"], "rw");
         assert_eq!(events[1]["uid"], 7);
         assert_eq!(events[1]["pid"], std::process::id());
@@ -755,7 +816,10 @@ mod tests {
         assert_eq!(events[2]["layer"], "lower:1");
         assert_eq!(events[4]["to"], "src/b");
         assert_eq!(events[5]["entries"], 2);
-        assert!(events.iter().all(|e| !e.to_string().contains(".git")));
+        assert!(events
+            .iter()
+            .skip(1)
+            .all(|e| !e.to_string().contains(".git")));
     }
 
     #[test]
@@ -825,7 +889,8 @@ mod tests {
         assert_eq!(log.stats(None)["erofs_denied"], 2);
         drop(log);
         let events = records(&options.path);
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 6);
+        assert_eq!(events[5]["op"], "end");
         assert_eq!(events[1]["what"], "chmod");
         assert_eq!(events[1]["pid"], 123);
         assert_eq!(events[2]["errno"], libc::EDQUOT);
@@ -876,6 +941,128 @@ mod tests {
             log.record("mkdir", "/a", Caller::default(), None);
         }
         drop(log);
-        assert_eq!(records(&options.path).len(), 4097);
+        let events = records(&options.path);
+        assert_eq!(events.len(), 4098);
+        assert_eq!(events[4097]["records"], 4096);
+    }
+
+    /// Regression (observation coverage): a clean finish ended the segment
+    /// with nothing, so a clean unmount, a killed mount and a writer that
+    /// failed part-way looked the same to a reader. `finish` writes `end`
+    /// last, counting the records after the header and the records
+    /// `--journal-exclude` suppressed; a second session gets its own count.
+    #[test]
+    fn regression_oplog_clean_finish_writes_end_with_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path().join("trace"));
+        for session in 0..2 {
+            let log =
+                OpLog::open(&options, &dir.path().join("mnt"), None, &BTreeMap::new()).unwrap();
+            log.record("mkdir", "/a", Caller::default(), None);
+            log.record("mkdir", "/.git/x", Caller::default(), None);
+            log.record("rename", "/a", Caller::default(), Some("/.git/y"));
+            log.mark(b"turn").unwrap();
+            if session == 1 {
+                log.record("unlink", "/a", Caller::default(), None);
+            }
+            log.finish().unwrap();
+            // Drop after finish must not write a second end.
+            drop(log);
+        }
+        let events = records(&options.path);
+        let ends: Vec<_> = events.iter().filter(|e| e["op"] == "end").collect();
+        assert_eq!(ends.len(), 2);
+        assert_eq!(ends[0]["records"], 2);
+        assert_eq!(ends[0]["excluded"], 2);
+        assert_eq!(ends[1]["records"], 3);
+        assert_eq!(ends[1]["excluded"], 2);
+        assert!(ends[1]["ts"].is_u64());
+        // `end` is the last record of each segment.
+        assert_eq!(events[3]["op"], "end");
+        assert_eq!(events[4]["journal"], 1);
+        assert_eq!(events.last().unwrap()["op"], "end");
+    }
+
+    /// Regression (observation coverage): the header did not record the
+    /// observation settings, so a later reader could not tell "no reads under
+    /// `t/`" from "reads under `t/` were excluded" or reduced to the first.
+    #[test]
+    fn regression_oplog_header_records_observation_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = options(dir.path().join("trace"));
+        options.reads = Reads::First;
+        options.exclude.push("blib/**,t/**".into());
+        options.sync = false;
+        drop(OpLog::open(&options, &dir.path().join("mnt"), None, &BTreeMap::new()).unwrap());
+        assert_eq!(
+            records(&options.path)[0]["observation"],
+            json!({"reads": "first", "exclude": [".git/**", "blib/**,t/**"], "sync": false,
+                "not_observed": ["lookup", "getattr", "page_cache_reads", "mmap_reads",
+                    "other_protocols", "outside_mount"]})
+        );
+    }
+
+    /// A sink that accepts `limit` bytes, then fails every write.
+    struct FailAfter {
+        written: Arc<Mutex<Vec<u8>>>,
+        limit: usize,
+    }
+
+    impl Write for FailAfter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut written = self.written.lock().unwrap();
+            let room = self.limit.saturating_sub(written.len());
+            if room == 0 {
+                return Err(io::Error::other("injected journal write failure"));
+            }
+            let n = room.min(buf.len());
+            written.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Regression (observation coverage): a writer that failed part-way must
+    /// leave no `end`, so the segment reads as incomplete; and a failed sync
+    /// is still an error.
+    #[test]
+    fn regression_oplog_writer_failure_writes_no_end() {
+        for limit in [0, 40, 200, 3000] {
+            let written = Arc::new(Mutex::new(Vec::new()));
+            let output = BufWriter::with_capacity(
+                16,
+                FailAfter {
+                    written: written.clone(),
+                    limit,
+                },
+            );
+            let (tx, rx) = mpsc::sync_channel(1024);
+            for i in 0..100 {
+                tx.send(json!({"op": "mkdir", "path": format!("d{i}"), "ts": i}))
+                    .unwrap();
+            }
+            drop(tx);
+            let error = writer_loop(output, rx, Instant::now(), &AtomicU64::new(0), |_| Ok(()))
+                .unwrap_err();
+            assert_eq!(error.to_string(), "injected journal write failure");
+            let text = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+            assert!(!text.contains("\"op\":\"end\""), "{text}");
+        }
+        // Every write succeeds but the sync fails: an error, never success.
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let output = BufWriter::new(FailAfter {
+            written: written.clone(),
+            limit: usize::MAX,
+        });
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(tx);
+        assert!(
+            writer_loop(output, rx, Instant::now(), &AtomicU64::new(0), |_| Err(
+                io::Error::other("injected sync failure")
+            ))
+            .is_err()
+        );
     }
 }

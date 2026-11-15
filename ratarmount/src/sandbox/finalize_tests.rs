@@ -376,8 +376,16 @@ fn regression_supervisor_finalize_report() {
         report["journal_summary"],
         json!({"path": root.join("journal.summary.json"), "files_read": summary.files_read.len(),
             "files_read_then_written": summary.files_read_then_written.len(),
-            "files_written_blind": summary.files_written_blind.len()})
+            "files_written_blind": summary.files_written_blind.len(),
+            // A header without `observation` and no `end`: a journal written
+            // before observation coverage, never complete.
+            "complete": false, "reasons": ["missing_end", "pre_coverage_journal"]})
     );
+    // The full coverage object is in the summary file.
+    let stored: Value =
+        serde_json::from_slice(&fs::read(root.join("journal.summary.json")).unwrap()).unwrap();
+    assert_eq!(stored["coverage"]["complete"], false);
+    assert_eq!(stored["coverage"]["segments"][0]["ended"], "missing_end");
     assert_eq!(report["manifest_path"], json!(root.join("manifest.jsonl")));
     assert_eq!(report["bundle"], json!(root.join("bundle.tar.zst")));
     for output in ["manifest.jsonl", "journal.summary.json", "bundle.tar.zst"] {

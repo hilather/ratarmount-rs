@@ -315,3 +315,87 @@ fn regression_fuse_journal_header_records_directory_base_digest_kinds() {
         assert!(recorded.starts_with(expected), "{name}: {header}");
     }
 }
+
+fn summarize_json(journal: &Path) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .args(["journal", "summarize"])
+        .arg(journal)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// Regression (observation coverage): a clean unmount, a SIGKILLed mount
+/// and a mount still running all ended their journal segment the same way,
+/// so a reader could not tell "observed nothing more" from "unknown". A
+/// clean unmount now writes `end` and summarizes `complete: true`; a killed
+/// mount appended to the same journal leaves its segment `missing_end` and
+/// the journal `complete: false`.
+#[test]
+fn regression_fuse_journal_coverage_clean_unmount_and_sigkill() {
+    if !available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.tar");
+    fixture(&base);
+    let journal = dir.path().join("trace.jsonl");
+    let mnt = dir.path().join("mnt");
+    let mut mount = Mount::start(&base, &mnt, Some(&journal), None);
+    assert_eq!(fs::read(mnt.join("input")).unwrap().len(), 8192);
+    assert_eq!(fs::read(mnt.join("excluded/input")).unwrap().len(), 8192);
+    mount.stop();
+    let summary = summarize_json(&journal);
+    let coverage = &summary["coverage"];
+    assert_eq!(coverage["complete"], true, "{coverage}");
+    assert_eq!(coverage["reasons"], serde_json::json!([]));
+    let segment = &coverage["segments"][0];
+    assert_eq!(segment["ended"], "clean");
+    assert_eq!(segment["records_match"], true);
+    assert_eq!(segment["observation"]["reads"], "all");
+    assert_eq!(
+        segment["observation"]["exclude"],
+        serde_json::json!(["excluded/**"])
+    );
+    // The excluded read was suppressed, and `end` says so.
+    assert!(segment["excluded"].as_u64().unwrap() >= 1, "{segment}");
+    assert_eq!(
+        coverage["excluded_globs"],
+        serde_json::json!(["excluded/**"])
+    );
+    assert_eq!(coverage["semantics"]["open_absence"], "unknown");
+    assert!(summary["files_read"]
+        .as_array()
+        .unwrap()
+        .contains(&Value::from("input")));
+
+    // A second mount appends a segment and is killed after its read is on disk.
+    let mut killed = Mount::start(&base, &mnt, Some(&journal), None);
+    assert_eq!(fs::read(mnt.join("input")).unwrap().len(), 8192);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let text = fs::read_to_string(&journal).unwrap();
+        let reads = text
+            .lines()
+            .filter(|line| line.contains("\"op\":\"read\""))
+            .count();
+        if reads >= 2 && text.ends_with('\n') {
+            break;
+        }
+        assert!(Instant::now() < deadline, "read record never flushed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    killed.child.kill().unwrap();
+    killed.child.wait().unwrap();
+    // Drop skips the lazy unmount once the child has exited.
+    let _ = Command::new("fusermount3").arg("-uz").arg(&mnt).status();
+    let summary = summarize_json(&journal);
+    let coverage = &summary["coverage"];
+    assert_eq!(coverage["complete"], false, "{coverage}");
+    assert_eq!(coverage["reasons"], serde_json::json!(["missing_end"]));
+    assert_eq!(coverage["segments"][0]["ended"], "clean");
+    assert_eq!(coverage["segments"][1]["ended"], "missing_end");
+    assert!(coverage["segments"][1]["records_match"].is_null());
+}

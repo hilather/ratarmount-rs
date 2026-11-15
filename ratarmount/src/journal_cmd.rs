@@ -72,6 +72,163 @@ pub struct Summary {
     pub files_read_then_written: Vec<String>,
     pub files_written_blind: Vec<String>,
     pub reads_by_mark: BTreeMap<String, BTreeSet<String>>,
+    pub coverage: Coverage,
+}
+
+/// How a segment (one mount's records, from its header) ended.
+pub const ENDED_CLEAN: &str = "clean";
+pub const ENDED_MISSING_END: &str = "missing_end";
+pub const ENDED_TRUNCATED_TAIL: &str = "truncated_tail";
+pub const ENDED_CLOSED_BY_MARK: &str = "closed_by_mark";
+
+/// The closed set of reasons a window is not `complete`.
+pub const REASON_MISSING_END: &str = "missing_end";
+pub const REASON_TRUNCATED_TAIL: &str = "truncated_tail";
+pub const REASON_RECORD_COUNT_MISMATCH: &str = "record_count_mismatch";
+pub const REASON_PRE_COVERAGE_JOURNAL: &str = "pre_coverage_journal";
+
+/// One mount's records: its header and how they ended.
+#[derive(Debug, Serialize)]
+pub struct Segment {
+    pub mount: Value,
+    pub t0: Value,
+    /// The header's observation settings; `null` for a journal written
+    /// before they were recorded.
+    pub observation: Value,
+    pub ended: &'static str,
+    /// Records read after the header, `end` excluded.
+    pub records: u64,
+    /// Whether `end`'s count equals `records`; `null` without `end`.
+    pub records_match: Option<bool>,
+    /// Records `--journal-exclude` suppressed, from `end`; `null` without it.
+    pub excluded: Option<u64>,
+    /// Whether any part of the selected window lies in this segment.
+    pub in_window: bool,
+}
+
+/// What the summary can and cannot show (fixed strings, so a consumer
+/// never has to parse prose).
+#[derive(Debug, Serialize)]
+pub struct Semantics {
+    /// `complete` means the file holds every record the daemon emitted for
+    /// the window; it is never negative evidence of reads.
+    pub complete: &'static str,
+    /// A path missing from `files_read` is always unknown as a read:
+    /// page-cache and mmap hits produce no READ callback.
+    pub read_absence: &'static str,
+    /// `bytes_read` counts only reads that reached the mount.
+    pub bytes_read: &'static str,
+    /// `conclusive` only over a complete, unwindowed window whose segments
+    /// all excluded nothing: then a path absent from `paths` had no
+    /// successful OPEN through this mount. Otherwise `unknown`.
+    pub open_absence: &'static str,
+}
+
+impl Default for Semantics {
+    fn default() -> Self {
+        Self {
+            complete: "every_emitted_record_present",
+            read_absence: "unknown",
+            bytes_read: "lower_bound",
+            open_absence: "unknown",
+        }
+    }
+}
+
+/// The journal's observation coverage for the selected window.
+#[derive(Debug, Default, Serialize)]
+pub struct Coverage {
+    /// True only if every segment overlapping the window recorded its
+    /// observation settings and ended `clean` with a matching count, or, for
+    /// the segment holding the `--until-mark`, that mark is present.
+    pub complete: bool,
+    pub reasons: BTreeSet<&'static str>,
+    /// Whether `--since-mark` or `--until-mark` selected a window.
+    pub windowed: bool,
+    /// Unions over the segments in the window.
+    pub excluded_globs: BTreeSet<String>,
+    pub reads_mode: BTreeSet<String>,
+    pub segments: Vec<Segment>,
+    pub semantics: Semantics,
+}
+
+/// The segment being read.
+struct Open {
+    segment: Segment,
+    end: Option<(Option<u64>, Option<u64>)>,
+    until_here: bool,
+}
+
+impl Open {
+    fn new(header: &Value, in_window: bool) -> Self {
+        let observation = match header.get("observation") {
+            Some(observation @ Value::Object(_)) => observation.clone(),
+            _ => Value::Null,
+        };
+        Self {
+            segment: Segment {
+                mount: header.get("mount").cloned().unwrap_or(Value::Null),
+                t0: header.get("t0").cloned().unwrap_or(Value::Null),
+                observation,
+                ended: ENDED_MISSING_END,
+                records: 0,
+                records_match: None,
+                excluded: None,
+                in_window,
+            },
+            end: None,
+            until_here: false,
+        }
+    }
+
+    fn close(mut self, truncated: bool, coverage: &mut Coverage) {
+        let segment = &mut self.segment;
+        segment.ended = if truncated {
+            ENDED_TRUNCATED_TAIL
+        } else if self.end.is_some() {
+            ENDED_CLEAN
+        } else {
+            ENDED_MISSING_END
+        };
+        if let Some((records, excluded)) = self.end {
+            segment.records_match = Some(records == Some(segment.records));
+            segment.excluded = excluded;
+        }
+        // Marks share the writer's FIFO queue with every other record, so a
+        // present until-mark proves everything emitted before it was written.
+        if self.until_here && segment.ended != ENDED_CLEAN {
+            segment.ended = ENDED_CLOSED_BY_MARK;
+        }
+        if segment.in_window {
+            let reasons = &mut coverage.reasons;
+            if segment.observation.is_null() {
+                reasons.insert(REASON_PRE_COVERAGE_JOURNAL);
+            } else {
+                let observation = &segment.observation;
+                if let Some(reads) = observation["reads"].as_str() {
+                    coverage.reads_mode.insert(reads.into());
+                }
+                for glob in observation["exclude"].as_array().into_iter().flatten() {
+                    if let Some(glob) = glob.as_str() {
+                        coverage.excluded_globs.insert(glob.into());
+                    }
+                }
+            }
+            match segment.ended {
+                ENDED_MISSING_END => {
+                    reasons.insert(REASON_MISSING_END);
+                }
+                ENDED_TRUNCATED_TAIL => {
+                    reasons.insert(REASON_TRUNCATED_TAIL);
+                }
+                _ => {}
+            }
+            if segment.records_match == Some(false) {
+                reasons.insert(REASON_RECORD_COUNT_MISMATCH);
+            }
+        }
+        coverage.segments.push(self.segment);
+    }
 }
 
 pub fn summarize(
@@ -90,9 +247,13 @@ pub fn summarize(
     let mut session = 0;
     let mut opened: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
     let mut header = false;
+    let mut segment: Option<Open> = None;
     // An interrupted append may precede the next mount's header. Only an EOF
     // parse error is deferred; malformed complete records are always errors.
     let mut truncated = false;
+    // After the until-mark the scan continues only to judge its segment; a
+    // record it cannot read there ends the scan instead of failing it.
+    let mut closed = false;
     loop {
         line.clear();
         let bytes = input.read_until(b'\n', &mut line)?;
@@ -109,16 +270,30 @@ pub fn summarize(
                 truncated = true;
                 continue;
             }
-            Err(error) => return Err(invalid(format!("journal line {line_number}: {error}"))),
+            Err(error) => {
+                if closed {
+                    break;
+                }
+                return Err(invalid(format!("journal line {line_number}: {error}")));
+            }
         };
         if let Some(version) = record["journal"].as_u64() {
             if version > JOURNAL_VERSION {
-                return Err(invalid(format!(
+                {
+                    if closed {
+                        break;
+                    }
+                    return Err(invalid(format!(
                     "journal version {version} is newer than supported ({JOURNAL_VERSION}); upgrade ratarmount"
                 )));
+                };
             }
         }
         if record["journal"] == 1 {
+            if let Some(open) = segment.take() {
+                open.close(truncated, &mut summary.coverage);
+            }
+            segment = Some(Open::new(&record, active));
             header = true;
             session += 1;
             truncated = false;
@@ -127,16 +302,35 @@ pub fn summarize(
             continue;
         }
         if truncated {
-            return Err(invalid(format!(
-                "truncated journal record before line {line_number}"
-            )));
+            {
+                if closed {
+                    break;
+                }
+                return Err(invalid(format!(
+                    "truncated journal record before line {line_number}"
+                )));
+            };
         }
-        if !header {
+        let Some(open) = segment.as_mut() else {
             return Err(invalid("missing journal header"));
+        };
+        let op = match record["op"].as_str() {
+            Some(op) => op,
+            None => {
+                if closed {
+                    break;
+                }
+                return Err(invalid("record missing op"));
+            }
+        };
+        if op == "end" {
+            open.end = Some((record["records"].as_u64(), record["excluded"].as_u64()));
+            continue;
         }
-        let op = record["op"]
-            .as_str()
-            .ok_or_else(|| invalid("record missing op"))?;
+        open.segment.records += 1;
+        if closed {
+            continue;
+        }
         if op == "mark" {
             let label = record["label"]
                 .as_str()
@@ -144,9 +338,13 @@ pub fn summarize(
             if !found_since && since == Some(label) {
                 found_since = true;
                 active = true;
+                open.segment.in_window = true;
             } else if active && until == Some(label) {
                 found_until = true;
-                break;
+                open.until_here = true;
+                closed = true;
+                active = false;
+                continue;
             }
             mark = label.into();
             if active {
@@ -231,6 +429,9 @@ pub fn summarize(
     if !header {
         return Err(invalid("missing journal header"));
     }
+    if let Some(open) = segment.take() {
+        open.close(truncated, &mut summary.coverage);
+    }
     if !found_since {
         return Err(invalid(format!("start mark not found: {}", since.unwrap())));
     }
@@ -246,6 +447,18 @@ pub fn summarize(
             (_, Some(_)) => summary.files_written_blind.push(path.clone()),
             _ => {}
         }
+    }
+    let coverage = &mut summary.coverage;
+    coverage.windowed = since.is_some() || until.is_some();
+    coverage.complete = coverage.reasons.is_empty();
+    if coverage.complete
+        && !coverage.windowed
+        && coverage
+            .segments
+            .iter()
+            .all(|segment| segment.excluded == Some(0))
+    {
+        coverage.semantics.open_absence = "conclusive";
     }
     Ok(summary)
 }
@@ -341,6 +554,21 @@ pub fn run(args: &JournalArgs) -> io::Result<()> {
                         output,
                         "Mark {label:?}: {}",
                         paths.iter().cloned().collect::<Vec<_>>().join(", ")
+                    )?;
+                }
+                let coverage = &summary.coverage;
+                if coverage.complete {
+                    writeln!(output, "Coverage: complete")?;
+                } else {
+                    writeln!(
+                        output,
+                        "Coverage: incomplete ({})",
+                        coverage
+                            .reasons
+                            .iter()
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )?;
                 }
             }
@@ -450,6 +678,220 @@ mod tests {
                 .files_read_then_written,
             ["a"]
         );
+    }
+
+    /// A coverage-era header with `reads` and `exclude`.
+    fn header(reads: &str, exclude: &[&str]) -> String {
+        serde_json::json!({"journal": 1, "mount": "/m", "t0": "2026-11-15T00:00:00Z",
+            "clock": "monotonic_ns", "observation": {"reads": reads, "exclude": exclude,
+            "sync": false, "not_observed": ["lookup"]}})
+        .to_string()
+            + "\n"
+    }
+
+    const READ_A: &str =
+        "{\"op\":\"open\",\"path\":\"a\"}\n{\"op\":\"read\",\"path\":\"a\",\"bytes\":1,\"ts\":1}\n";
+
+    fn end(records: u64, excluded: u64) -> String {
+        format!("{{\"op\":\"end\",\"ts\":9,\"records\":{records},\"excluded\":{excluded}}}\n")
+    }
+
+    fn coverage(input: &str, since: Option<&str>, until: Option<&str>) -> serde_json::Value {
+        serde_json::to_value(summarize(input.as_bytes(), since, until).unwrap().coverage).unwrap()
+    }
+
+    /// Regression (observation coverage): `summarize` could not tell a clean
+    /// unmount from a killed mount, a writer that failed part-way, or a
+    /// journal written before observation settings were recorded. The
+    /// `coverage` object judges every segment in the window, with the exact
+    /// JSON shape pinned for a clean journal.
+    #[test]
+    fn regression_journal_coverage_table() {
+        let h = header("all", &["t/**"]);
+        let clean = format!("{h}{READ_A}{}", end(2, 0));
+        assert_eq!(
+            coverage(&clean, None, None),
+            serde_json::json!({"complete": true, "reasons": [], "windowed": false,
+                "excluded_globs": ["t/**"], "reads_mode": ["all"],
+                "segments": [{"mount": "/m", "t0": "2026-11-15T00:00:00Z",
+                    "observation": {"reads": "all", "exclude": ["t/**"], "sync": false,
+                        "not_observed": ["lookup"]},
+                    "ended": "clean", "records": 2, "records_match": true, "excluded": 0,
+                    "in_window": true}],
+                "semantics": {"complete": "every_emitted_record_present",
+                    "read_absence": "unknown", "bytes_read": "lower_bound",
+                    "open_absence": "conclusive"}})
+        );
+        let pre = format!("{{\"journal\":1}}\n{READ_A}{}", end(2, 0));
+        let mixed = format!("{h}{READ_A}{h}{READ_A}{}", end(2, 0));
+        for (case, input, complete, reasons, ended, open_absence) in [
+            // Something was hidden: absence of a path proves nothing.
+            (
+                "excluded",
+                format!("{h}{READ_A}{}", end(2, 1)),
+                true,
+                vec![],
+                vec!["clean"],
+                "unknown",
+            ),
+            (
+                "missing_end",
+                format!("{h}{READ_A}"),
+                false,
+                vec!["missing_end"],
+                vec!["missing_end"],
+                "unknown",
+            ),
+            (
+                "truncated_tail",
+                format!("{h}{READ_A}{{\"op\":\"re"),
+                false,
+                vec!["truncated_tail"],
+                vec!["truncated_tail"],
+                "unknown",
+            ),
+            (
+                "count_mismatch",
+                format!("{h}{READ_A}{}", end(5, 0)),
+                false,
+                vec!["record_count_mismatch"],
+                vec!["clean"],
+                "unknown",
+            ),
+            (
+                "record_after_end",
+                format!("{h}{READ_A}{}{READ_A}", end(2, 0)),
+                false,
+                vec!["record_count_mismatch"],
+                vec!["clean"],
+                "unknown",
+            ),
+            (
+                "pre_coverage",
+                pre,
+                false,
+                vec!["pre_coverage_journal"],
+                vec!["clean"],
+                "unknown",
+            ),
+            (
+                "mixed",
+                mixed,
+                false,
+                vec!["missing_end"],
+                vec!["missing_end", "clean"],
+                "unknown",
+            ),
+            (
+                "truncated_then_clean",
+                format!("{h}{READ_A}{{\"op\":\"read\"\n{h}{READ_A}{}", end(2, 0)),
+                false,
+                vec!["truncated_tail"],
+                vec!["truncated_tail", "clean"],
+                "unknown",
+            ),
+        ] {
+            let coverage = coverage(&input, None, None);
+            assert_eq!(coverage["complete"], complete, "{case}: {coverage}");
+            assert_eq!(coverage["reasons"], serde_json::json!(reasons), "{case}");
+            let got: Vec<_> = coverage["segments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["ended"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(got, ended, "{case}");
+            assert_eq!(
+                coverage["semantics"]["open_absence"], open_absence,
+                "{case}"
+            );
+        }
+        // Unions over the segments: excludes and read modes.
+        let input = format!(
+            "{}{READ_A}{}{}{READ_A}{}",
+            header("all", &["t/**"]),
+            end(2, 0),
+            header("first", &["blib/**"]),
+            end(2, 0)
+        );
+        let coverage = coverage(&input, None, None);
+        assert_eq!(
+            coverage["excluded_globs"],
+            serde_json::json!(["blib/**", "t/**"])
+        );
+        assert_eq!(coverage["reads_mode"], serde_json::json!(["all", "first"]));
+        // `complete: false` is still a successful summary (exit 0).
+        assert!(summarize(format!("{h}{READ_A}").as_bytes(), None, None).is_ok());
+    }
+
+    /// Regression (observation coverage): a window is judged only by the
+    /// segments it overlaps, and a `--until-mark` window on a live journal
+    /// (no `end` yet) is complete once the until-mark is present, because
+    /// marks share the writer's FIFO queue with every other record.
+    #[test]
+    fn regression_journal_coverage_windows() {
+        let h = header("all", &[]);
+        let mark = |label: &str| format!("{{\"op\":\"mark\",\"label\":\"{label}\"}}\n");
+        // A killed first mount, then a clean one holding the since-mark.
+        let input = format!("{h}{READ_A}{h}{}{READ_A}{}", mark("s"), end(3, 0));
+        let since = coverage(&input, Some("s"), None);
+        assert_eq!(since["complete"], true, "{since}");
+        assert_eq!(since["windowed"], true);
+        assert_eq!(since["segments"][0]["in_window"], false);
+        assert_eq!(since["segments"][0]["ended"], "missing_end");
+        assert_eq!(since["segments"][1]["in_window"], true);
+        // Windowed: never conclusive about absent opens.
+        assert_eq!(since["semantics"]["open_absence"], "unknown");
+        // The whole journal is not complete.
+        assert_eq!(coverage(&input, None, None)["complete"], false);
+        // A live journal, closed by its until-mark: complete, even with an
+        // unreadable record after the mark (the scan stops there, as the old
+        // `break` did, so the summary still succeeds).
+        let live = format!("{h}{READ_A}{}{READ_A}", mark("u"));
+        for tail in ["", "{oops}\n", "{\"journal\":2}\n", "{\"no_op\":1}\n"] {
+            let input = format!("{live}{tail}");
+            let until = coverage(&input, None, Some("u"));
+            assert_eq!(until["complete"], true, "{tail}: {until}");
+            assert_eq!(until["segments"][0]["ended"], "closed_by_mark");
+            assert_eq!(
+                until["segments"][0]["records_match"],
+                serde_json::Value::Null
+            );
+            let summary = summarize(input.as_bytes(), None, Some("u")).unwrap();
+            assert_eq!(summary.paths["a"].read_count, 1);
+        }
+        // The until-mark segment ended cleanly: clean, its count is judged.
+        let ended = format!("{live}{}", end(5, 0));
+        let until = coverage(&ended, None, Some("u"));
+        assert_eq!(until["segments"][0]["ended"], "clean");
+        assert_eq!(until["segments"][0]["records_match"], true);
+        // A since-mark in a killed segment and the until-mark in the next:
+        // the killed segment overlaps the window.
+        let input = format!("{h}{}{READ_A}{h}{READ_A}{}", mark("s"), mark("u"));
+        let window = coverage(&input, Some("s"), Some("u"));
+        assert_eq!(window["complete"], false);
+        assert_eq!(window["reasons"], serde_json::json!(["missing_end"]));
+        assert_eq!(window["segments"][1]["ended"], "closed_by_mark");
+        // Segments after the until-mark are outside the window.
+        let input = format!("{h}{}{h}{READ_A}", mark("u"));
+        let window = coverage(&input, None, Some("u"));
+        assert_eq!(window["complete"], true, "{window}");
+        assert_eq!(window["segments"][1]["in_window"], false);
+        // The until-mark proves flushing, not observation settings.
+        let input = format!("{{\"journal\":1}}\n{READ_A}{}", mark("u"));
+        let window = coverage(&input, None, Some("u"));
+        assert_eq!(window["complete"], false);
+        assert_eq!(
+            window["reasons"],
+            serde_json::json!(["pre_coverage_journal"])
+        );
+        // Inside the window, malformed records still fail the summary.
+        assert!(summarize(
+            format!("{h}{{oops}}\n{}", mark("u")).as_bytes(),
+            None,
+            Some("u")
+        )
+        .is_err());
     }
 
     #[test]
