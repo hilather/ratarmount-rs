@@ -1791,11 +1791,16 @@ impl WriteOverlay {
         let hides_base = self.current_base().exists(path);
         let path = normpath(path);
         // The host entry is already gone. Queue instead of returning an error
-        // when older rows are still unsaved or this write fails.
-        self.persist_files_op(PendingFilesOp::Deleted {
-            path: path.clone(),
-            hides_base,
-        })?;
+        // when older rows are still unsaved or this write fails. A name the
+        // lower view lacks needs no tombstone: with no rows of its own there
+        // is nothing to write (#328, see `persist_files_op_unless_redundant`).
+        self.persist_files_op_unless_redundant(
+            PendingFilesOp::Deleted {
+                path: path.clone(),
+                hides_base,
+            },
+            !hides_base,
+        )?;
         if hides_base {
             self.tombstone_remember(&path);
         } else {
@@ -1806,10 +1811,18 @@ impl WriteOverlay {
 
     fn mark_present(&self, path: &str, mode: u32) -> Result<()> {
         let path = normpath(path);
-        self.persist_files_op(PendingFilesOp::Present {
-            path: path.clone(),
-            mode,
-        })?;
+        // Only a regular file the lower view lacks may go without a row
+        // (#328): the commit plan needs the rows of created directories, and
+        // symlinks keep theirs. The host file carries the mode.
+        let overlay_only = mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFREG
+            && !self.current_base().exists(&path);
+        self.persist_files_op_unless_redundant(
+            PendingFilesOp::Present {
+                path: path.clone(),
+                mode,
+            },
+            overlay_only,
+        )?;
         self.tombstone_forget(&path);
         Ok(())
     }
@@ -2957,6 +2970,28 @@ impl WriteOverlay {
     /// sleep lets another writer see an empty queue and commit a later rename
     /// that this retry then marks present again.
     fn persist_files_op(&self, op: PendingFilesOp) -> Result<()> {
+        self.persist_files_op_unless_redundant(op, false)
+    }
+
+    /// [`Self::persist_files_op`], skipping the transaction when `op` would
+    /// change nothing a consumer reads (#328).
+    ///
+    /// `overlay_only` is the caller's claim that the lower view has no entry
+    /// at the path: a `Present` of a regular file, or a `Deleted` with
+    /// `hides_base == false`. Such an op is skipped only when, under the
+    /// `pending_rows` lock, the queue is empty (a queued `Present` or
+    /// `Rename` of the same name would otherwise replay into a row with no
+    /// host entry) and the path has no `files` or `overlay_metadata` row and,
+    /// for `Deleted`, no `xattrs` row other than the reset row `Deleted`
+    /// would write back. Every reader of a row-less host file (lookup,
+    /// listing, commit plan, change set, fsck `unrowed`, seal, pack) takes
+    /// its presence and mode from the host entry. A probe error writes the
+    /// row as before. See docs/tasks/plans/issue-328-option-a.md.
+    fn persist_files_op_unless_redundant(
+        &self,
+        op: PendingFilesOp,
+        overlay_only: bool,
+    ) -> Result<()> {
         if let Err(e) = self.replay_pending_rows() {
             log::warn!(
                 "overlay could not replay earlier files rows: {e}; queueing the next update behind them"
@@ -2970,6 +3005,15 @@ impl WriteOverlay {
         let mut pending_op = Some(op);
         let mut last_err = None;
         let mut queued = self.pending_rows.lock().expect("overlay pending rows");
+        if overlay_only && queued.is_empty() {
+            match self.files_op_is_redundant(pending_op.as_ref().expect("files op")) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => log::warn!(
+                    "overlay could not check existing rows ({e}); writing the files update"
+                ),
+            }
+        }
         for attempt in 1..=attempts {
             if !queued.is_empty() {
                 let op = pending_op.take().expect("files op");
@@ -3026,6 +3070,35 @@ impl WriteOverlay {
         );
         queued.push(op);
         Ok(())
+    }
+
+    /// True when `op` is a `Present` or `Deleted` for a path without rows
+    /// (see [`Self::persist_files_op_unless_redundant`]). Caller holds
+    /// `pending_rows`; this takes `db` (documented lock order).
+    fn files_op_is_redundant(&self, op: &PendingFilesOp) -> Result<bool> {
+        let (path, xattrs_sql) = match op {
+            PendingFilesOp::Present { path, .. } => (path, "0"),
+            PendingFilesOp::Deleted {
+                path,
+                hides_base: false,
+            } => (
+                path,
+                "EXISTS(SELECT 1 FROM xattrs WHERE path=?3 AND name<>'')",
+            ),
+            _ => return Ok(false),
+        };
+        let (folder, name) = Self::split(path);
+        let db = self.db.lock().expect("overlay db");
+        let any: bool = db.query_row(
+            &format!(
+                r#"SELECT EXISTS(SELECT 1 FROM "files" WHERE path=?1 AND name=?2)
+                   OR EXISTS(SELECT 1 FROM overlay_metadata WHERE path=?3)
+                   OR {xattrs_sql}"#
+            ),
+            params![folder, name, path],
+            |r| r.get(0),
+        )?;
+        Ok(!any)
     }
 
     /// Write queued rows, retrying a few times. Empty queue is success.

@@ -921,6 +921,135 @@ fn regression_rmdir_overlay_created_exception_root() {
     agree(root, &overlay, &cache, &[]);
 }
 
+/// Regression (#328): creates and unlinks of names the base lacks write no
+/// `files` rows on a real mount. The files keep their modes in `diff`, a
+/// rename and a create over a tombstoned base member still write rows, and
+/// diff, fsck, seal, verify, pack and unpack agree.
+#[test]
+fn regression_overlay_only_names_write_no_rows() {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _writable = Writable(tmp.path());
+    let root = tmp.path();
+    let cache = root.join("cache");
+    let base = root.join("base.tar");
+    base_tar(&base);
+    let overlay = root.join("overlay");
+    let mnt = root.join("mnt");
+    let mount = Mount::start(&base, &overlay, &mnt);
+    edit(&mnt);
+    churn(&mnt);
+    let mut tool = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(mnt.join("tool.sh"))
+        .unwrap();
+    tool.write_all(b"#!/bin/sh\n").unwrap();
+    drop(tool);
+    fs::rename(mnt.join("churn-1.txt"), mnt.join("renamed.txt")).unwrap();
+    fs::remove_file(mnt.join("docs/keep.txt")).unwrap();
+    fs::write(mnt.join("docs/keep.txt"), b"replaced\n").unwrap();
+    assert_eq!(
+        fs::metadata(mnt.join("tool.sh")).unwrap().mode() & 0o7777,
+        0o700
+    );
+    mount.unmount();
+    let rows = files_rows(&overlay);
+    for (_, name, _) in &rows {
+        assert!(
+            !name.starts_with("churn-") && name != "tool.sh" && name != "new.txt",
+            "{rows:?}"
+        );
+    }
+    for row in [
+        ("/docs", "gone.txt", true),
+        ("/docs", "keep.txt", false),
+        ("", "renamed.txt", false),
+    ] {
+        assert!(
+            rows.contains(&(row.0.into(), row.1.into(), row.2)),
+            "{row:?} in {rows:?}"
+        );
+    }
+    // `diff` without `--hash` exits 1 when there are changes.
+    let patch = expect(run(&[Path::new("diff"), &overlay], &cache), 1);
+    assert!(
+        patch.contains("new file mode 100700"),
+        "tool.sh mode missing from: {patch}"
+    );
+    agree(root, &overlay, &cache, &[]);
+}
+
+/// Regression (#328): a mount SIGKILLed during a create/unlink loop of
+/// overlay-only names leaves a consistent overlay. Before, a kill between the
+/// host unlink and its row transaction left a `files` row without content
+/// (`overlay fsck` exit 1); now such names have no rows to get out of step.
+#[test]
+fn regression_overlay_only_churn_sigkill_leaves_consistent_overlay() {
+    if !available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _writable = Writable(tmp.path());
+    let root = tmp.path();
+    let cache = root.join("cache");
+    let base = root.join("base.tar");
+    base_tar(&base);
+    let overlay = root.join("overlay");
+    for round in 0..3 {
+        let mnt = root.join(format!("mnt-{round}"));
+        let mut mount = Mount::start(&base, &overlay, &mnt);
+        let worker = {
+            let mnt = mnt.clone();
+            std::thread::spawn(move || {
+                for i in 0..100_000 {
+                    if fs::write(mnt.join(format!("k{round}-{i}")), b"x\n").is_err() {
+                        return i;
+                    }
+                    if i > 0 && fs::remove_file(mnt.join(format!("k{round}-{}", i - 1))).is_err() {
+                        return i;
+                    }
+                }
+                100_000
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300 + 100 * round));
+        mount.child.kill().unwrap();
+        mount.child.wait().unwrap();
+        drop(mount);
+        let done = worker.join().unwrap();
+        assert!(done > 0 && done < 100_000, "round {round}: {done} ops");
+        let report = expect(
+            run(
+                &[
+                    Path::new("overlay"),
+                    Path::new("fsck"),
+                    &overlay,
+                    Path::new("--json"),
+                ],
+                &cache,
+            ),
+            0,
+        );
+        let report: Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(report["result"], "ok", "round {round}: {report}");
+    }
+    let mnt = root.join("mnt-final");
+    let mount = Mount::start(&base, &overlay, &mnt);
+    for entry in fs::read_dir(&mnt).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            fs::read(&path).unwrap();
+        }
+    }
+    mount.unmount();
+    agree(root, &overlay, &cache, &[]);
+}
+
 /// C2: an archive base mounted with the hash gate shut leaves the digest
 /// `pending`; `overlay seal` resolves it and every verb agrees.
 #[test]
