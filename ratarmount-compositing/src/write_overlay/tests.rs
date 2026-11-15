@@ -12968,6 +12968,107 @@ fn regression_328_queued_rows_are_not_elided() {
     assert_eq!(report.errors(), 0, "{report:?}");
 }
 
+/// Regression (#328): a failed absence probe must fall back to persistence,
+/// retaining the operation for replay if the database cannot be updated either.
+#[test]
+fn regression_328_probe_error_queues_create_and_unlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let overlay = dir.path().join("ov");
+    let ov = WriteOverlay::new_for_tests(Arc::new(NullBase), &overlay).unwrap();
+    put_overlay_bytes(&ov, "/gone", b"gone");
+    assert_eq!(regression_328_rows(&ov, "/gone"), (0, 0, 0));
+    for create in [true, false] {
+        // A missing table fails the SELECT probe and the normal transaction.
+        ov.db
+            .lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE overlay_metadata RENAME TO saved_metadata")
+            .unwrap();
+        if create {
+            let fd = ov
+                .open_overlay_fd_with_mode("/new", libc::O_CREAT | libc::O_RDWR, 0o751)
+                .unwrap();
+            ov.close_overlay_fd(fd);
+            assert_eq!(ov.pending_row_count(), 2, "Present then ClearDeleted");
+        } else {
+            ov.unlink("/gone").unwrap();
+            assert_eq!(ov.pending_row_count(), 1, "Deleted must not be elided");
+        }
+        ov.db
+            .lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE saved_metadata RENAME TO overlay_metadata")
+            .unwrap();
+        ov.replay_pending_rows().unwrap();
+        assert_eq!(ov.pending_row_count(), 0);
+    }
+    assert_eq!(regression_328_rows(&ov, "/new"), (1, 0, 0));
+    assert_eq!(regression_328_rows(&ov, "/gone"), (0, 0, 1));
+    assert_eq!(ov.lookup("/new", 0).unwrap().mode & 0o7777, 0o751);
+    assert!(ov.lookup("/gone", 0).is_none());
+    drop(ov);
+    assert_eq!(
+        crate::overlay_fsck::fsck(&overlay, false).unwrap().errors(),
+        0
+    );
+}
+
+/// Regression (#328): concurrent creates of the same row-less name and its
+/// unlink must check the base while the commit gate excludes base replacement.
+#[test]
+fn regression_328_concurrent_creates_probe_under_commit_gate() {
+    struct ObservedBase {
+        owner: Mutex<std::sync::Weak<WriteOverlay>>,
+        probes: AtomicU64,
+    }
+    impl MountSource for ObservedBase {
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/new" {
+                let overlay = self.owner.lock().unwrap().upgrade().unwrap();
+                assert!(matches!(
+                    overlay.commit_gate.try_write(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                self.probes.fetch_add(1, Ordering::SeqCst);
+            }
+            None
+        }
+        fn list(&self, _: &str) -> Option<ListResult> {
+            None
+        }
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            unreachable!("empty base has no payload")
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let base = Arc::new(ObservedBase {
+        owner: Mutex::new(std::sync::Weak::new()),
+        probes: AtomicU64::new(0),
+    });
+    let ov = Arc::new(WriteOverlay::new_for_tests(base.clone(), dir.path()).unwrap());
+    *base.owner.lock().unwrap() = Arc::downgrade(&ov);
+    let start = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| {
+                start.wait();
+                let fd = ov.create_file("/new", 0o751).unwrap();
+                ov.close_overlay_fd(fd);
+            });
+        }
+    });
+    assert_eq!(base.probes.load(Ordering::SeqCst), 2);
+    assert_eq!(regression_328_rows(&ov, "/new"), (0, 0, 0));
+    assert_eq!(ov.lookup("/new", 0).unwrap().mode & 0o7777, 0o751);
+    ov.unlink("/new").unwrap();
+    assert_eq!(base.probes.load(Ordering::SeqCst), 3);
+    assert_eq!(regression_328_rows(&ov, "/new"), (0, 0, 0));
+    assert!(!dir.path().join("new").exists());
+}
+
 /// Regression (#328): an overlay whose overlay-only files have no rows and a
 /// copy with the rows the old code wrote agree on everything that reads the
 /// overlay: the change set and canonical hash, the manifest, the layer

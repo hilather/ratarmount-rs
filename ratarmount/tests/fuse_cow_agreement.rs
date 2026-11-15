@@ -984,6 +984,132 @@ fn regression_overlay_only_names_write_no_rows() {
     agree(root, &overlay, &cache, &[]);
 }
 
+/// Regression (#328): a sealed layer with row-less additions must work as a
+/// read-only --lower, including modes, empty files, implicit parents and whiteouts.
+#[test]
+fn regression_overlay_only_sealed_lower_reads_modes_and_whiteouts() {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _writable = Writable(tmp.path());
+    let root = tmp.path();
+    let cache = root.join("cache");
+    let base = root.join("base.tar");
+    base_tar(&base);
+    let overlay = root.join("overlay");
+    let mnt = root.join("writer");
+    let writer = Mount::start(&base, &overlay, &mnt);
+    for (path, mode, bytes) in [
+        ("tool.sh", 0o751, b"#!/bin/sh\n".as_slice()),
+        ("docs/empty", 0o640, b"".as_slice()),
+        ("docs/added", 0o600, b"added\n".as_slice()),
+    ] {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(mnt.join(path))
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+    fs::remove_file(mnt.join("docs/gone.txt")).unwrap();
+    // Rename in both directions across the base/overlay-only boundary.
+    fs::write(mnt.join("replacement"), b"replacement\n").unwrap();
+    fs::rename(mnt.join("replacement"), mnt.join("src/a.c")).unwrap();
+    fs::write(mnt.join("moved"), b"discarded\n").unwrap();
+    fs::rename(mnt.join("src/b.c"), mnt.join("moved")).unwrap();
+    writer.unmount();
+
+    let rows = files_rows(&overlay);
+    for (parent, name) in [
+        ("", "tool.sh"),
+        ("/docs", "empty"),
+        ("/docs", "added"),
+        ("", "docs"),
+    ] {
+        assert!(
+            !rows.iter().any(|(p, n, _)| p == parent && n == name),
+            "{rows:?}"
+        );
+    }
+    assert!(rows.contains(&("/docs".into(), "gone.txt".into(), true)));
+    assert!(rows.contains(&("/src".into(), "a.c".into(), false)));
+    assert!(rows.contains(&("/src".into(), "b.c".into(), true)));
+    assert!(rows.contains(&("".into(), "moved".into(), false)));
+    // This also exercises fsck --repair, seal/verify and bundle round-trip.
+    agree(root, &overlay, &cache, &[]);
+    assert_eq!(
+        files_rows(&overlay),
+        rows,
+        "seal must not invent files rows"
+    );
+    assert_eq!(
+        fs::metadata(overlay.join("tool.sh")).unwrap().mode() & 0o222,
+        0
+    );
+
+    let path = root.join("reader");
+    let reader = Mount::start_with(
+        &base,
+        None,
+        &[std::ffi::OsStr::new("--lower"), overlay.as_os_str()],
+        &[],
+        &path,
+        "Makefile",
+    );
+    for (name, mode, bytes) in [
+        ("tool.sh", 0o751, b"#!/bin/sh\n".as_slice()),
+        ("docs/empty", 0o640, b"".as_slice()),
+        ("docs/added", 0o600, b"added\n".as_slice()),
+    ] {
+        assert_eq!(fs::read(path.join(name)).unwrap(), bytes, "{name}");
+        let metadata = fs::metadata(path.join(name)).unwrap();
+        assert!(metadata.is_file(), "{name}");
+        assert_eq!(metadata.mode() & 0o7777, mode, "{name}");
+        assert_eq!(metadata.len(), bytes.len() as u64, "{name}");
+    }
+    let mut docs: Vec<_> = fs::read_dir(path.join("docs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    docs.sort();
+    assert_eq!(docs, ["added", "empty", "keep.txt"]);
+    for absent in ["docs/gone.txt", "src/b.c", "replacement"] {
+        assert_eq!(
+            fs::metadata(path.join(absent)).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+    assert_eq!(fs::read(path.join("src/a.c")).unwrap(), b"replacement\n");
+    assert_eq!(
+        fs::read(path.join("moved")).unwrap(),
+        b"int b(void) { return 2; }\n"
+    );
+    assert_eq!(
+        fs::write(path.join("tool.sh"), b"denied")
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EROFS)
+    );
+    assert_eq!(
+        fs::remove_file(path.join("tool.sh"))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EROFS)
+    );
+    reader.unmount();
+    assert_eq!(files_rows(&overlay), rows);
+    expect(
+        run(
+            &[Path::new("overlay"), Path::new("verify"), &overlay],
+            &cache,
+        ),
+        0,
+    );
+}
+
 /// Regression (#328): a mount SIGKILLed during a create/unlink loop of
 /// overlay-only names leaves a consistent overlay. Before, a kill between the
 /// host unlink and its row transaction left a `files` row without content

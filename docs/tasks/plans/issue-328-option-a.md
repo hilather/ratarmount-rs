@@ -149,6 +149,16 @@ still cost one transaction each.
   `rename_tx_failure_matches_crash_table` (the stale-row case now gets its
   row from a chmod) and `regression_seal_refuses_mounted_and_inconsistent_overlay`
   (removes a symlink, which keeps its row, instead of a plain file).
+* Review additions: `regression_overlay_only_sealed_lower_reads_modes_and_whiteouts`
+  mounts the sealed directory read-only with `--lower` after the agreement
+  chain, asserts the additions still have no `files` rows, and checks bytes,
+  sizes, original modes, empty files, implicit parents, whiteouts, renames
+  across base names and read-only refusal. `regression_328_probe_error_queues_create_and_unlink`
+  removes an auxiliary table to force the absence probe to fail and checks
+  queue/replay through `open(O_CREAT)` and unlink.
+  `regression_328_concurrent_creates_probe_under_commit_gate` drives two
+  same-name creates and verifies that their base probes and the subsequent
+  unlink probe hold the commit gate against replacement.
 
 ## Residual risks
 
