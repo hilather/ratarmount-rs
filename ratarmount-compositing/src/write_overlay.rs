@@ -1822,12 +1822,70 @@ impl WriteOverlay {
         let real_parent = self.realpath(&parent);
         self.ensure_under_root(&real_parent)?;
         if !real_parent.exists() && self.current_base().is_dir(&parent) {
+            let created = self.missing_host_ancestors(&parent);
             #[expect(
                 clippy::disallowed_methods,
                 reason = r###"internal-read:v1 {"id":"IR-E0008-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_parent","disposition":"output-owner","category":"overlay-directory","reason":"Materialize an archive parent directory inside the checked overlay root before a mutation.","creation":{"policy":"recursive-directory","basis":"Only a missing parent represented as a base directory is materialized; host directory creation keeps existing default/umask behavior."}}"###
             )]
             fs::create_dir_all(&real_parent)?;
+            self.restore_base_dir_modes(&created)?;
         }
+        Ok(())
+    }
+
+    /// Mount paths of `dir` and its ancestors that have no host entry yet,
+    /// shallowest first: the directories `ensure_parent` is about to create.
+    fn missing_host_ancestors(&self, dir: &str) -> Vec<String> {
+        let mut missing = Vec::new();
+        let mut prefix = String::new();
+        for component in dir.split('/').filter(|c| !c.is_empty()) {
+            prefix.push('/');
+            prefix.push_str(component);
+            if fs::symlink_metadata(self.realpath(&prefix)).is_err() {
+                missing.push(prefix.clone());
+            }
+        }
+        missing
+    }
+
+    /// Give directories materialized only as parents their base mode (#326
+    /// residual). `create_dir_all` applies the daemon's umask, so a parent
+    /// such as `lib` (0755 in the base) became 0775 under umask 0002 and every
+    /// change set reported it as a mode-only modification although nothing
+    /// changed it. Only directories this call created are touched; a user's
+    /// earlier chmod of an existing host directory stays. A base directory
+    /// without owner rwx keeps them added (`mode | 0o700`): the overlay must
+    /// still create the child below it, so that directory alone still shows
+    /// as a mode change.
+    fn restore_base_dir_modes(&self, created: &[String]) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let base = self.current_base();
+            for dir in created.iter().rev() {
+                let Some(mut fi) = base.lookup(dir, 0) else {
+                    continue;
+                };
+                self.apply_metadata(dir, &mut fi);
+                if !ratarmount_core::is_dir_mode(fi.mode) {
+                    continue;
+                }
+                let mut mode = fi.mode & 0o7777;
+                if mode & 0o700 != 0o700 {
+                    mode |= 0o700;
+                }
+                let real = self.realpath(dir);
+                self.ensure_under_root(&real)?;
+                set_host_metadata(
+                    &real,
+                    &OverlayMetadata {
+                        mode: Some(mode),
+                        ..Default::default()
+                    },
+                )?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = created;
         Ok(())
     }
 
