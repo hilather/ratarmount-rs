@@ -134,6 +134,21 @@ fn fuse_sandbox_readonly_allow_exceptions() {
             }
             fs::remove_file(&moved).unwrap();
             fs::remove_dir(agent.join("dir")).unwrap();
+            // Regression (#326): `rm -rf t/agent` of the overlay-created
+            // exception root failed with EROFS on the directory itself.
+            fs::write(agent.join("x.t"), b"1\n").unwrap();
+            let rm = std::process::Command::new("rm")
+                .arg("-rf")
+                .arg(&agent)
+                .status()
+                .unwrap();
+            assert!(rm.success(), "rm -rf t/agent: {rm}");
+            assert_eq!(
+                fs::symlink_metadata(&agent).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+            fs::create_dir(&agent).unwrap();
+            fs::remove_dir(&agent).unwrap();
             let status = fs::read_to_string(mnt.join(".ratarmount-control/status")).unwrap();
             let denied: u64 = status
                 .lines()

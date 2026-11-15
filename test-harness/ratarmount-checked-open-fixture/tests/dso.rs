@@ -9,7 +9,8 @@ use std::path::PathBuf;
 const LIB: &str = "ratarmount_checked_open_fixture";
 
 /// The cdylib cargo built for this package: beside the test executable in
-/// `deps/`, or uplifted one directory up.
+/// `deps/`, uplifted one directory up, or (Cargo 1.100 build-dir layout) in a
+/// sibling unit directory of the same package.
 fn fixture_path() -> Option<PathBuf> {
     let name = format!(
         "{}{LIB}{}",
@@ -18,9 +19,48 @@ fn fixture_path() -> Option<PathBuf> {
     );
     let exe = std::env::current_exe().ok()?;
     let deps = exe.parent()?;
-    [deps.join(&name), deps.parent()?.join(&name)]
+    if let Some(found) = [deps.join(&name), deps.parent()?.join(&name)]
         .into_iter()
         .find(|p| p.is_file())
+    {
+        return Some(found);
+    }
+    // Cargo 1.100's build-dir layout gives every unit its own directory,
+    // `build/<package>/<hash>/out/`, so the test executable and the cdylib sit
+    // in sibling `<hash>/out/` directories. Take the newest cdylib there.
+    newest_unit_artifact(deps.parent()?.parent()?, &name)
+}
+
+fn newest_unit_artifact(package_dir: &std::path::Path, name: &str) -> Option<PathBuf> {
+    std::fs::read_dir(package_dir)
+        .ok()?
+        .filter_map(|unit| {
+            let path = unit.ok()?.path().join("out").join(name);
+            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
+}
+
+/// Regression: Cargo 1.100's per-unit build directories put the cdylib in a
+/// sibling `<hash>/out/` directory, not beside the test executable, so the
+/// fixture lookup panicked although the cdylib was built.
+#[test]
+fn regression_fixture_lookup_finds_sibling_unit_cdylib() {
+    let root = tempfile::tempdir().unwrap();
+    let package = root.path().join("build").join("pkg");
+    let name = "libfixture.so";
+    for (unit, body) in [("aaaa", "old"), ("bbbb", "new")] {
+        let out = package.join(unit).join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join(name), body).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::fs::create_dir_all(package.join("cccc").join("out")).unwrap();
+    let found = newest_unit_artifact(&package, name).unwrap();
+    assert_eq!(found, package.join("bbbb").join("out").join(name));
+    assert!(newest_unit_artifact(&package, "libmissing.so").is_none());
 }
 
 type Text = unsafe extern "C" fn(*mut u8, usize) -> usize;

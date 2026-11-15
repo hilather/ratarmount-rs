@@ -966,6 +966,9 @@ NUL, empty, `.` or `..` components, reserved overlay bookkeeping names, the
 a virtual folder there, so imported bytes would be hashed and sealed but
 invisible; refused whatever flags the later mount uses), and
 symlink parents in either the lower view or the new overlay are refused.
+This includes deleted lower symlinks: the folder source can still resolve
+descendants through their targets, so importing a symlink-to-directory change
+is refused. Deleted lower regular files can become directory parents.
 Symlink targets are stored as link data, never followed. Paths and symlink
 targets must be UTF-8 because the workspace's mount and overlay APIs use
 strings; non-UTF-8 names are refused, rather than changed silently.
@@ -973,7 +976,17 @@ strings; non-UTF-8 names are refused, rather than changed silently.
 If a hunk fails, the default is to abort and remove the partial overlay.
 `--reject` keeps that file's original lower content and writes only its failed
 hunks to `PATH.rej`, while applying other files. Later sections for an already
-rejected file cannot replace its original content. Import exits 0 on success, 1 when hunks
+rejected file cannot replace its original content. File/directory type
+changes import in Git's section order: `delete x` then `add x/y` replaces the
+file with a directory, and `add x` before the deletions of everything below
+the directory `x` applies those deletions first and removes the emptied tree
+(only that directory; other emptied directories stay). Directory replacement
+is refused if any lower directory in that subtree cannot be listed.
+With `--reject` a failed section anywhere in a type change restores the lower
+`x` and everything below it, undoing earlier sections and restoring pruned
+empty subdirectories.
+A directory replacement also rejects if any child was already rejected.
+The rejected hunks are collected in `x.rej`. Import exits 0 on success, 1 when hunks
 were rejected with `--reject`, and 2 on invalid input or I/O errors. A preexisting
 nonempty destination is left intact.
 
@@ -1213,7 +1226,17 @@ For these rules:
 | Operation | `t/suite` | `t/agent` | `t/agent/leaf` | `outside` |
 | --- | --- | --- | --- | --- |
 | Create, mkdir, write, truncate, unlink, chmod, setxattr | EROFS | allowed | allowed | allowed |
-| Rename endpoint, rmdir, reset | EROFS | EROFS | allowed | allowed |
+| Rename endpoint, rmdir, reset | EROFS | EROFS¹ | allowed | allowed |
+
+¹ `rmdir` of an exception root is allowed when the overlay created it: an empty
+`t/agent` that neither the base nor any `--lower` layer has can be removed again
+(`rm -rf t/agent` after `mkdir t/agent`), leaving no tombstone and no entry for
+`t/agent`. Through FUSE, `rmdir` still returns `ENOTEMPTY` for a nonempty
+overlay-created root and `ENOTDIR` for a file. (The base parent `t`, materialized
+on the host by the mkdir, keeps the daemon's umask mode and can show as a
+mode-only change.)
+A `t/agent` the base or a lower layer provides stays anchored (EROFS), as do
+rename and reset of either.
 
 The second row also checks possible protected descendants. Exception roots inside
 protected subtrees stay anchored: renaming `t` or `t/agent` is refused; renaming an allowed leaf within
@@ -1223,8 +1246,10 @@ These are policy decisions; normal filesystem errors and directory-rename
 limitations still apply.
 
 A protected path rejects creation, write opens, writes, truncate, COW copy-up,
-unlink, rmdir, mkdir, chmod, timestamp updates, setxattr and symlink creation
-with `EROFS` (read-only filesystem).
+unlink, rmdir, mkdir, chmod, chown (including a same-owner request), timestamp
+updates, setxattr and symlink creation with `EROFS` (read-only filesystem).
+This also applies to unsupported POSIX ACL sets: policy denials take precedence
+over `EOPNOTSUPP` and are counted and journaled once.
 Both rename endpoints are checked. Host parent symlinks are resolved as well,
 so a symlink alias cannot bypass rules for pre-existing overlay content; unlinking
 the alias itself remains allowed. Rename, rmdir and overlay reset also reject
@@ -1713,10 +1738,19 @@ NFSv3/v4 SETATTR, 9P Tsetattr and SFTP SETSTAT also apply mode and time changes.
 SFTP OPEN honors requested creation permissions. The current NFSv3 server dependency
 does not forward MKDIR attributes to the filesystem adapter, so newly created
 NFSv3 directories initially use mode 0755; SETATTR can change it afterwards.
-Ownership changes are refused
-with `EPERM` (the corresponding permission status for SFTP); they neither chown
-host files nor invent stored owners. Use `-o uid=...,gid=...` for presentation
-mapping. chmod on a symlink itself is unsupported. SMB Basic Information has no
+A chown on a writable path to the owner an entry is already shown with (after any
+`-o uid=...,gid=...` mapping) succeeds as a no-op, so ownership-preserving tools
+such as `cp -p` and `sed -i` work, also as root; each ID is
+compared separately. Any other ownership change is refused with `EPERM` (the
+corresponding permission status for SFTP); it neither chowns host files nor
+invents stored owners. Read-only mounts and protected paths still return `EROFS`,
+even for a same-owner request. Detached FUSE inodes compare against their held
+descriptor's presented owner; a read-only descriptor permits the ownership
+no-op but still cannot truncate. Use `-o uid=...,gid=...` for presentation mapping.
+POSIX ACLs are not stored: setting `system.posix_acl_access` or
+`system.posix_acl_default` over FUSE returns `EOPNOTSUPP`, which `cp -p` and
+`sed -i` read as "no ACL support" and fall back to the mode without a
+warning. chmod on a symlink itself is unsupported. SMB Basic Information has no
 Unix mode field; unsupported SET_INFO classes continue to return an error.
 
 ## overlay-stats
@@ -1756,6 +1790,25 @@ octal (`000` through `777`). These presentation options do not change stored own
 credentials; chmod and timestamp updates use the overlay metadata behavior above. SMB and WebDAV expose no Unix uid/gid fields.
 This mapping can avoid Git's “dubious ownership” check when a container uses a
 different user; see [Git mounts](git-mounts.md).
+
+Ratarmount does not pass `default_permissions`, so the kernel forwards every
+chown and chmod to the daemon, including one from a container root without
+`CAP_CHOWN` (`--cap-drop ALL`). A chown succeeds only when it names the owner
+already shown, which is what `cp -p` and `sed -i` request, so `cp -p` works
+whichever owner is presented. Setting a POSIX ACL is different: the kernel
+refuses it with `EPERM` before the daemon sees it unless the caller is the
+presented owner (or has `CAP_FOWNER`), and `sed -i` then warns
+"preserving permissions … Operation not permitted" (the edit still succeeds).
+Present the IDs the container runs as to avoid that: `-o uid=0,gid=0` for a
+root container (`--sandbox` otherwise presents the host caller), or
+`uid: 0, gid: 0` in a supervisor request:
+
+```sh
+ratarmount -f --sandbox -o uid=0,gid=0 -w overlay source.tar mnt/
+docker run --rm --cap-drop ALL --security-opt no-new-privileges \
+  -v "$PWD/mnt:/workspace:rw" -w /workspace debian:stable-slim \
+  sh -c 'cp -p f g && cp -p g f && sed -i s/a/b/ f'
+```
 
 `--sandbox` expands to `-o allow_other,noatime`, caller uid/gid (using
 `SUDO_UID` / `SUDO_GID` when present), and a RAM overlay unless `-w` supplies
