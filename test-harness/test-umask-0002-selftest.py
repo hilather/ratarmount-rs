@@ -10,6 +10,8 @@ import unittest
 
 
 RUNNER = Path(__file__).with_name("test-umask-0002.sh")
+# Every `run ...` line in the runner is one cargo invocation.
+RUNS = sum(1 for line in RUNNER.read_text().splitlines() if line.startswith("run -p "))
 FAKE_CARGO = r'''#!/usr/bin/env python3
 import json
 import os
@@ -69,7 +71,7 @@ class UmaskRunnerTests(unittest.TestCase):
             )
             self.assertTrue(calls.exists(), result.stderr)
             records = [json.loads(line) for line in calls.read_text().splitlines()]
-            self.assertEqual(len(records), 8, result.stdout + result.stderr)
+            self.assertEqual(len(records), RUNS, result.stdout + result.stderr)
             self.assertTrue(all(row["umask"] == "0002" for row in records))
             self.assertTrue(all(row["args"][0] == "test" for row in records))
             self.assertFalse(list(root.glob("ratarmount-umask.*")), "log leaked")

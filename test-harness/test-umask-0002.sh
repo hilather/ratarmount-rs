@@ -50,6 +50,11 @@ run -p ratarmount --test diff "${@}"
 # binds its socket (the check that refused under 0002) before any mount.
 run -p ratarmount --test sandbox "${@}"
 run -p ratarmount --test fuse_cow_agreement regression_supervisor_socket_fixture_starts "${@}"
+# Materialized copy-on-write parents take the base mode (#326 residual, #336).
+run -p ratarmount-compositing --lib regression_cow_lower_view_lists_base_and_build_edits "${@}"
+run -p ratarmount --test overlay_import regression_cow_git_import_hash_roundtrip_base_and_lower "${@}"
+run -p ratarmount --test fuse_cow_agreement supervisor_finalized_layer "${@}"
+run -p ratarmount --test fuse_cow_agreement regression_326 "${@}"
 
 if [ "$status" -ne 0 ]; then
     echo "FAIL: a test failed under umask 0002" >&2
