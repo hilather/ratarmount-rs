@@ -8,7 +8,7 @@
 //! append-time eviction rule; compaction rewrites the live last lines verbatim.
 
 use super::daemon::validate_name;
-use super::protocol::{one, ApiError, OperationV2, Overlay, VERSION_2};
+use super::protocol::{one, ApiError, OperationV2, Overlay, OverlayDurability, VERSION_2};
 pub use super::state_log::Append;
 #[cfg(test)]
 pub use super::state_log::Fault;
@@ -403,6 +403,7 @@ fn defaults(operation: &OperationV2) -> Vec<(&'static str, Value)> {
             ("readonly_globs", json!(Vec::<String>::new())),
             ("lowers", json!(Vec::<String>::new())),
             ("retain", json!(false)),
+            ("overlay_durability", json!(OverlayDurability::Full)),
         ],
         OperationV2::Finalize { .. } => vec![("pack", json!(false))],
         _ => Vec::new(),

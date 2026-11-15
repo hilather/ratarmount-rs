@@ -1066,6 +1066,261 @@ fn regression_326_materialized_parents_keep_base_modes_fuse() {
     agree(root, &overlay, &cache, &[]);
 }
 
+/// Regression (#328): creates and unlinks of names the base lacks write no
+/// `files` rows on a real mount. The files keep their modes in `diff`, a
+/// rename and a create over a tombstoned base member still write rows, and
+/// diff, fsck, seal, verify, pack and unpack agree.
+#[test]
+fn regression_overlay_only_names_write_no_rows() {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _writable = Writable(tmp.path());
+    let root = tmp.path();
+    let cache = root.join("cache");
+    let base = root.join("base.tar");
+    base_tar(&base);
+    let overlay = root.join("overlay");
+    let mnt = root.join("mnt");
+    let mount = Mount::start(&base, &overlay, &mnt);
+    edit(&mnt);
+    churn(&mnt);
+    let mut tool = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(mnt.join("tool.sh"))
+        .unwrap();
+    tool.write_all(b"#!/bin/sh\n").unwrap();
+    drop(tool);
+    fs::rename(mnt.join("churn-1.txt"), mnt.join("renamed.txt")).unwrap();
+    fs::remove_file(mnt.join("docs/keep.txt")).unwrap();
+    fs::write(mnt.join("docs/keep.txt"), b"replaced\n").unwrap();
+    assert_eq!(
+        fs::metadata(mnt.join("tool.sh")).unwrap().mode() & 0o7777,
+        0o700
+    );
+    mount.unmount();
+    let rows = files_rows(&overlay);
+    for (_, name, _) in &rows {
+        assert!(
+            !name.starts_with("churn-") && name != "tool.sh" && name != "new.txt",
+            "{rows:?}"
+        );
+    }
+    for row in [
+        ("/docs", "gone.txt", true),
+        ("/docs", "keep.txt", false),
+        ("", "renamed.txt", false),
+    ] {
+        assert!(
+            rows.contains(&(row.0.into(), row.1.into(), row.2)),
+            "{row:?} in {rows:?}"
+        );
+    }
+    // `diff` without `--hash` exits 1 when there are changes.
+    let patch = expect(run(&[Path::new("diff"), &overlay], &cache), 1);
+    assert!(
+        patch.contains("new file mode 100700"),
+        "tool.sh mode missing from: {patch}"
+    );
+    agree(root, &overlay, &cache, &[]);
+}
+
+/// Regression (#328): a sealed layer with row-less additions must work as a
+/// read-only --lower, including modes, empty files, implicit parents and whiteouts.
+#[test]
+fn regression_overlay_only_sealed_lower_reads_modes_and_whiteouts() {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _writable = Writable(tmp.path());
+    let root = tmp.path();
+    let cache = root.join("cache");
+    let base = root.join("base.tar");
+    base_tar(&base);
+    let overlay = root.join("overlay");
+    let mnt = root.join("writer");
+    let writer = Mount::start(&base, &overlay, &mnt);
+    for (path, mode, bytes) in [
+        ("tool.sh", 0o751, b"#!/bin/sh\n".as_slice()),
+        ("docs/empty", 0o640, b"".as_slice()),
+        ("docs/added", 0o600, b"added\n".as_slice()),
+    ] {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(mnt.join(path))
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+    fs::remove_file(mnt.join("docs/gone.txt")).unwrap();
+    // Rename in both directions across the base/overlay-only boundary.
+    fs::write(mnt.join("replacement"), b"replacement\n").unwrap();
+    fs::rename(mnt.join("replacement"), mnt.join("src/a.c")).unwrap();
+    fs::write(mnt.join("moved"), b"discarded\n").unwrap();
+    fs::rename(mnt.join("src/b.c"), mnt.join("moved")).unwrap();
+    writer.unmount();
+
+    let rows = files_rows(&overlay);
+    for (parent, name) in [
+        ("", "tool.sh"),
+        ("/docs", "empty"),
+        ("/docs", "added"),
+        ("", "docs"),
+    ] {
+        assert!(
+            !rows.iter().any(|(p, n, _)| p == parent && n == name),
+            "{rows:?}"
+        );
+    }
+    assert!(rows.contains(&("/docs".into(), "gone.txt".into(), true)));
+    assert!(rows.contains(&("/src".into(), "a.c".into(), false)));
+    assert!(rows.contains(&("/src".into(), "b.c".into(), true)));
+    assert!(rows.contains(&("".into(), "moved".into(), false)));
+    // This also exercises fsck --repair, seal/verify and bundle round-trip.
+    agree(root, &overlay, &cache, &[]);
+    assert_eq!(
+        files_rows(&overlay),
+        rows,
+        "seal must not invent files rows"
+    );
+    assert_eq!(
+        fs::metadata(overlay.join("tool.sh")).unwrap().mode() & 0o222,
+        0
+    );
+
+    let path = root.join("reader");
+    let reader = Mount::start_with(
+        &base,
+        None,
+        &[std::ffi::OsStr::new("--lower"), overlay.as_os_str()],
+        &[],
+        &path,
+        "Makefile",
+    );
+    for (name, mode, bytes) in [
+        ("tool.sh", 0o751, b"#!/bin/sh\n".as_slice()),
+        ("docs/empty", 0o640, b"".as_slice()),
+        ("docs/added", 0o600, b"added\n".as_slice()),
+    ] {
+        assert_eq!(fs::read(path.join(name)).unwrap(), bytes, "{name}");
+        let metadata = fs::metadata(path.join(name)).unwrap();
+        assert!(metadata.is_file(), "{name}");
+        assert_eq!(metadata.mode() & 0o7777, mode, "{name}");
+        assert_eq!(metadata.len(), bytes.len() as u64, "{name}");
+    }
+    let mut docs: Vec<_> = fs::read_dir(path.join("docs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    docs.sort();
+    assert_eq!(docs, ["added", "empty", "keep.txt"]);
+    for absent in ["docs/gone.txt", "src/b.c", "replacement"] {
+        assert_eq!(
+            fs::metadata(path.join(absent)).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+    assert_eq!(fs::read(path.join("src/a.c")).unwrap(), b"replacement\n");
+    assert_eq!(
+        fs::read(path.join("moved")).unwrap(),
+        b"int b(void) { return 2; }\n"
+    );
+    assert_eq!(
+        fs::write(path.join("tool.sh"), b"denied")
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EROFS)
+    );
+    assert_eq!(
+        fs::remove_file(path.join("tool.sh"))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EROFS)
+    );
+    reader.unmount();
+    assert_eq!(files_rows(&overlay), rows);
+    expect(
+        run(
+            &[Path::new("overlay"), Path::new("verify"), &overlay],
+            &cache,
+        ),
+        0,
+    );
+}
+
+/// Regression (#328): a mount SIGKILLed during a create/unlink loop of
+/// overlay-only names leaves a consistent overlay. Before, a kill between the
+/// host unlink and its row transaction left a `files` row without content
+/// (`overlay fsck` exit 1); now such names have no rows to get out of step.
+#[test]
+fn regression_overlay_only_churn_sigkill_leaves_consistent_overlay() {
+    if !available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _writable = Writable(tmp.path());
+    let root = tmp.path();
+    let cache = root.join("cache");
+    let base = root.join("base.tar");
+    base_tar(&base);
+    let overlay = root.join("overlay");
+    for round in 0..3 {
+        let mnt = root.join(format!("mnt-{round}"));
+        let mut mount = Mount::start(&base, &overlay, &mnt);
+        let worker = {
+            let mnt = mnt.clone();
+            std::thread::spawn(move || {
+                for i in 0..100_000 {
+                    if fs::write(mnt.join(format!("k{round}-{i}")), b"x\n").is_err() {
+                        return i;
+                    }
+                    if i > 0 && fs::remove_file(mnt.join(format!("k{round}-{}", i - 1))).is_err() {
+                        return i;
+                    }
+                }
+                100_000
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300 + 100 * round));
+        mount.child.kill().unwrap();
+        mount.child.wait().unwrap();
+        drop(mount);
+        let done = worker.join().unwrap();
+        assert!(done > 0 && done < 100_000, "round {round}: {done} ops");
+        let report = expect(
+            run(
+                &[
+                    Path::new("overlay"),
+                    Path::new("fsck"),
+                    &overlay,
+                    Path::new("--json"),
+                ],
+                &cache,
+            ),
+            0,
+        );
+        let report: Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(report["result"], "ok", "round {round}: {report}");
+    }
+    let mnt = root.join("mnt-final");
+    let mount = Mount::start(&base, &overlay, &mnt);
+    for entry in fs::read_dir(&mnt).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            fs::read(&path).unwrap();
+        }
+    }
+    mount.unmount();
+    agree(root, &overlay, &cache, &[]);
+}
+
 /// C2: an archive base mounted with the hash gate shut leaves the digest
 /// `pending`; `overlay seal` resolves it and every verb agrees.
 #[test]
@@ -1269,8 +1524,71 @@ fn regression_relaxed_durability_clean_killed_and_rebooted() {
     mount.unmount();
 }
 
+/// The pids (of this uid, not this process) whose argv has `mnt` as one
+/// exact argument: a daemonized mount's serving child.
+fn serving_pids(mnt: &Path) -> Vec<u32> {
+    let want = mnt.as_os_str().as_encoded_bytes();
+    let me = unsafe { libc::getuid() };
+    let own = std::process::id();
+    let mut out = Vec::new();
+    for entry in fs::read_dir("/proc").unwrap().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == own || entry.metadata().map(|m| m.uid()).ok() != Some(me) {
+            continue;
+        }
+        let Ok(cmd) = fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if cmd.split(|b| *b == 0).any(|arg| arg == want) {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+/// `pid` has exited (no `/proc/PID`, a zombie, or a reused pid whose argv no
+/// longer names `mnt`).
+fn serving_child_gone(pid: u32, mnt: &Path) -> bool {
+    let zombie = fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| state == "Z")
+    });
+    zombie || !serving_pids(mnt).contains(&pid)
+}
+
+/// `meta_get` that never rolls back a hot `-journal` (a hot journal or a lock
+/// is retried until `deadline`): safe while a daemonized mount, which holds no
+/// kernel lock on its database (#183), may be writing.
+fn meta_get_no_recovery(overlay: &Path, key: &str, deadline: Instant) -> Option<String> {
+    loop {
+        match ratarmount_compositing::OverlayMeta::read_no_recovery(overlay) {
+            Ok(meta) => return meta.unwrap().get(key).map(str::to_string),
+            Err(error) => assert!(
+                Instant::now() < deadline,
+                "overlay metadata stayed unreadable: {error}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Regression (#328): the forked launcher's exit must keep the marker, while
 /// the serving child's clean exit must flush and clear it before process::exit.
+///
+/// Regression (flaky under CPU load): the test polled `OverlayMeta::read`
+/// right after `fusermount3 -u`, while the serving child was committing the
+/// marker's deletion. A daemonized mount holds no kernel lock on its database
+/// (#183), so the poll took the child's live `-journal` for a hot one and
+/// rolled the deletion back; the child exited believing it had committed, and
+/// the marker stayed. Nothing that may roll back a journal touches the
+/// database until the serving child has exited.
 #[test]
 fn regression_relaxed_durability_daemon_clean_close() {
     if !available() {
@@ -1310,9 +1628,19 @@ fn regression_relaxed_durability_daemon_clean_close() {
         0,
     );
     assert!(
-        meta_get(&overlay, "relaxed_durability").is_some(),
+        meta_get_no_recovery(
+            &overlay,
+            "relaxed_durability",
+            Instant::now() + Duration::from_secs(10)
+        )
+        .is_some(),
         "launcher cleared the child's marker"
     );
+    // The launcher has exited (`run` waited for it): only the child names `mount`.
+    let child = match serving_pids(&mount)[..] {
+        [pid] => pid,
+        ref pids => panic!("expected one serving child for the mount, found {pids:?}"),
+    };
     churn(&mount);
     let deadline = Instant::now() + Duration::from_secs(10);
     while !Command::new("fusermount3")
@@ -1327,13 +1655,18 @@ fn regression_relaxed_durability_daemon_clean_close() {
     }
     mounted.0 = None;
     let deadline = Instant::now() + Duration::from_secs(10);
-    while meta_get(&overlay, "relaxed_durability").is_some() {
+    while !serving_child_gone(child, &mount) {
         assert!(
             Instant::now() < deadline,
-            "serving child did not clear the marker"
+            "serving child {child} did not exit after the unmount"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert_eq!(
+        meta_get(&overlay, "relaxed_durability"),
+        None,
+        "serving child did not clear the marker"
+    );
     expect(
         run(
             &[p("overlay"), p("fsck"), &overlay],

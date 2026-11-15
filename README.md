@@ -315,6 +315,8 @@ the last zstd frame is rewritten. `--overlay-readonly`, `--overlay-quota` and
 `--overlay-durability=relaxed` skips the overlay database's fsyncs (about 58x
 faster in the measured create/unlink workload) for throwaway overlays that an
 OS crash may cost.
+The supervisor accepts the same choice per attempt with
+`sandbox new --overlay-durability relaxed`; see [relaxed attempts](docs/sandbox.md#relaxed-attempts).
 For concurrent attempts over one base, use a separate overlay and mountpoint
 per process with `--no-recreate-index` and one prepared index. This disables
 shared index writes and archive commits while each overlay remains writable.
