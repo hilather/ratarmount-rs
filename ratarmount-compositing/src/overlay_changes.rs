@@ -1499,24 +1499,83 @@ mod tests {
     }
 
     /// Regression: #326 residual. A base directory without owner rwx (0555)
-    /// must not become unwritable for the overlay: the materialized parent
-    /// keeps the base's other bits and gains owner rwx so the child can be
-    /// created (documented residual: that directory shows as a mode change).
+    /// must remain writable as backing storage without becoming a visible
+    /// mode change. Metadata overrides and a read-only lower retain their
+    /// visible modes too, including across reopening the writer.
     #[test]
     fn regression_326_write_protected_base_parent_stays_writable() {
         use std::os::unix::fs::PermissionsExt;
-        let (tmp, base) = fixture();
-        let ro = tmp.path().join("base/ro");
-        fs::create_dir(&ro).unwrap();
-        fs::write(ro.join("f"), b"base").unwrap();
-        fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
-        let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
-        put(&ov, "/ro/new", b"x");
-        cow_write(&ov, "/ro/f", b"changed");
-        drop(ov);
-        assert_eq!(host_mode(&dir.join("ro")), 0o755);
-        fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
+        for (mode, lower) in [(0o555, false), (0o500, false), (0o550, true)] {
+            let (tmp, base) = fixture();
+            let mut ro = tmp.path().join("base/ro");
+            if !lower {
+                fs::create_dir(&ro).unwrap();
+                fs::write(ro.join("f"), b"base").unwrap();
+                fs::set_permissions(&ro, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            let base: Arc<dyn MountSource> = if lower {
+                let lower_dir = tmp.path().join("lower");
+                ro = lower_dir.join("ro");
+                let ov = WriteOverlay::new_for_tests(base.clone(), &lower_dir).unwrap();
+                ov.mkdir("/ro", 0o755).unwrap();
+                put(&ov, "/ro/f", b"base");
+                ov.set_metadata(
+                    "/ro",
+                    &OverlayMetadata {
+                        mode: Some(0o2550),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                drop(ov);
+                Arc::new(ReadOnlyOverlayLayer::new(base, lower_dir, Immutability::Shared).unwrap())
+            } else {
+                base
+            };
+            let visible = if lower { 0o2550 } else { mode };
+            let dir = tmp.path().join("overlay");
+            let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+            // Existing time-only rows must gain the saved mode, retaining time.
+            ov.set_metadata(
+                "/ro",
+                &OverlayMetadata {
+                    mtime: Some(42.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            put(&ov, "/ro/new", b"x");
+            cow_write(&ov, "/ro/f", b"changed");
+            assert_eq!(ov.lookup("/ro", 0).unwrap().mode & 0o7777, visible);
+            drop(ov);
+            assert_eq!(host_mode(&dir.join("ro")), visible | 0o700);
+            let conn = Connection::open(dir.join(HIDDEN_DB)).unwrap();
+            let saved: (u32, f64) = conn
+                .query_row(
+                    "SELECT mode,mtime FROM overlay_metadata WHERE path='/ro'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(saved, (visible, 42.0));
+            drop(conn);
+            let opts = ChangeOptions::default();
+            let changes = change_set(&dir, base.clone(), &opts).unwrap();
+            assert_eq!(
+                changes
+                    .iter()
+                    .map(|c| c.path.as_slice())
+                    .collect::<Vec<_>>(),
+                [b"ro/f".as_slice(), b"ro/new".as_slice()]
+            );
+            let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+            cow_write(&ov, "/ro/f", b"base");
+            ov.unlink("/ro/new").unwrap();
+            drop(ov);
+            assert!(change_set(&dir, base, &opts).unwrap().is_empty());
+            assert_eq!(host_mode(&ro), visible, "base/lower must be untouched");
+            fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     /// Regression: host walking followed symlinks or exposed staging and bookkeeping entries.

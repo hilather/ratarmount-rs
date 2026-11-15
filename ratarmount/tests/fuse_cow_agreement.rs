@@ -947,7 +947,8 @@ fn regression_rmdir_overlay_created_exception_root() {
 /// removing `t/agent` (and a COW edit of `src/a.c`) materialized the base
 /// parents `t` (0755) and `src` (0750) with the umask (0775), so
 /// `diff --manifest` listed them as mode-only changes versus a re-import of
-/// the attempt's patch. Only `src/a.c` may remain, and every verb agrees.
+/// the attempt's patch. Restrictive parents and existing metadata overrides
+/// retain their visible modes; diff, fsck, seal and pack agree.
 #[test]
 fn regression_326_materialized_parents_keep_base_modes_fuse() {
     if !available() {
@@ -960,7 +961,17 @@ fn regression_326_materialized_parents_keep_base_modes_fuse() {
     let base = base_dir(root);
     fs::create_dir(base.join("t")).unwrap();
     fs::write(base.join("t/keep.t"), b"keep\n").unwrap();
-    for (dir, mode) in [("t", 0o755), ("src", 0o750), ("docs", 0o2755)] {
+    for dir in ["ro", "private"] {
+        fs::create_dir(base.join(dir)).unwrap();
+        fs::write(base.join(dir).join("f"), b"base\n").unwrap();
+    }
+    for (dir, mode) in [
+        ("t", 0o755),
+        ("src", 0o750),
+        ("docs", 0o2755),
+        ("ro", 0o555),
+        ("private", 0o750),
+    ] {
         fs::set_permissions(base.join(dir), fs::Permissions::from_mode(mode)).unwrap();
     }
     let rules = [
@@ -1011,12 +1022,27 @@ fn regression_326_materialized_parents_keep_base_modes_fuse() {
     );
     fs::write(mnt.join("src/a.c"), b"int a(void) { return 10; }\n").unwrap();
     fs::write(mnt.join("docs/new.txt"), b"new\n").unwrap();
-    for (dir, mode) in [("t", 0o755), ("src", 0o750), ("docs", 0o2755)] {
+    fs::set_permissions(mnt.join("private"), fs::Permissions::from_mode(0o500)).unwrap();
+    fs::write(mnt.join("ro/f"), b"changed\n").unwrap();
+    fs::write(mnt.join("private/f"), b"changed\n").unwrap();
+    for (dir, mode) in [
+        ("t", 0o755),
+        ("src", 0o750),
+        ("docs", 0o2755),
+        ("ro", 0o555),
+        ("private", 0o500),
+    ] {
         let seen = fs::metadata(mnt.join(dir)).unwrap().permissions().mode() & 0o7777;
         assert_eq!(seen, mode, "{dir}: mode seen through the mount");
     }
     mount.unmount();
-    for (dir, mode) in [("t", 0o755), ("src", 0o750), ("docs", 0o2755)] {
+    for (dir, mode) in [
+        ("t", 0o755),
+        ("src", 0o750),
+        ("docs", 0o2755),
+        ("ro", 0o755),
+        ("private", 0o700),
+    ] {
         let host = fs::metadata(overlay.join(dir))
             .unwrap()
             .permissions()
@@ -1032,7 +1058,11 @@ fn regression_326_materialized_parents_keep_base_modes_fuse() {
             row["path"].as_str().unwrap().to_string()
         })
         .collect();
-    assert_eq!(paths, ["docs/new.txt", "src/a.c"], "{manifest}");
+    assert_eq!(
+        paths,
+        ["docs/new.txt", "private", "private/f", "ro/f", "src/a.c"],
+        "{manifest}"
+    );
     agree(root, &overlay, &cache, &[]);
 }
 

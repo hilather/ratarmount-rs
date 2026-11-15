@@ -19,6 +19,163 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 #[cfg(unix)]
+fn parent_mode_fixture(policy: bool) -> (tempfile::TempDir, Arc<WriteOverlay>) {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    fs::create_dir_all(base.join("d/b")).unwrap();
+    fs::write(base.join("d/b/f"), b"base").unwrap();
+    fs::set_permissions(base.join("d"), fs::Permissions::from_mode(0o750)).unwrap();
+    fs::set_permissions(base.join("d/b"), fs::Permissions::from_mode(0o1755)).unwrap();
+    let base = Arc::new(crate::FolderMountSource::new(base).unwrap());
+    let mut ov = WriteOverlay::new_for_tests(base, tmp.path().join("overlay")).unwrap();
+    if policy {
+        ov.set_policy(Some(Arc::new(CountingPolicy::new(u64::MAX))));
+    }
+    (tmp, Arc::new(ov))
+}
+
+/// Regression: a host mkdir between the absence check and parent creation
+/// was mistaken for our own creation, overwriting its explicit mode.
+#[cfg(unix)]
+#[test]
+fn regression_326_parent_mkdir_race_preserves_winner_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    for policy in [false, true] {
+        let (_tmp, ov) = parent_mode_fixture(policy);
+        let d = ov.root.join("d");
+        *ov.parent_before_create_hook.lock().unwrap() = Some(Box::new(move || {
+            fs::create_dir(&d).unwrap();
+            fs::set_permissions(&d, fs::Permissions::from_mode(0o711)).unwrap();
+        }));
+        ov.ensure_modifiable("/d/b/f").unwrap();
+        assert_eq!(
+            metadata_mode(&fs::metadata(ov.root.join("d")).unwrap()) & 0o7777,
+            0o711
+        );
+        assert_eq!(
+            metadata_mode(&fs::metadata(ov.root.join("d/b")).unwrap()) & 0o7777,
+            0o1755
+        );
+        assert_eq!(fs::read(ov.root.join("d/b/f")).unwrap(), b"base");
+    }
+}
+
+/// Regression: a competing chmod could finish between the base-mode lookup
+/// and initialization, leaving the host mode different from the recorded mode.
+#[cfg(unix)]
+#[test]
+fn regression_326_parent_initialization_serializes_chmod_without_policy() {
+    use std::sync::mpsc;
+    for policy in [false, true] {
+        let (_tmp, ov) = parent_mode_fixture(policy);
+        let (start_tx, start_rx) = mpsc::channel();
+        let (begun_tx, begun_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let other = ov.clone();
+        let worker = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            begun_tx.send(()).unwrap();
+            other
+                .set_metadata(
+                    "/d",
+                    &OverlayMetadata {
+                        mode: Some(0o711),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let _ = done_tx.send(());
+        });
+        *ov.parent_before_mode_hook.lock().unwrap() = Some(Box::new(move || {
+            start_tx.send(()).unwrap();
+            begun_rx.recv().unwrap();
+            assert!(
+                matches!(
+                    done_rx.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "chmod finished before parent initialization"
+            );
+        }));
+        ov.ensure_modifiable("/d/b/f").unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            metadata_mode(&fs::metadata(ov.root.join("d")).unwrap()) & 0o7777,
+            0o711
+        );
+        assert_eq!(ov.lookup("/d", 0).unwrap().mode & 0o7777, 0o711);
+    }
+}
+
+/// Regression: create_dir_all followed a symlink installed after validation
+/// and created directories outside the overlay before chmod's check refused.
+#[cfg(unix)]
+#[test]
+fn regression_326_parent_creation_race_refuses_symlink_before_descending() {
+    use std::os::unix::fs::symlink;
+    for policy in [false, true] {
+        for entry in ["outside", "inside", "file"] {
+            let (tmp, ov) = parent_mode_fixture(policy);
+            let outside = tmp.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            let before = fs::metadata(&outside).unwrap().permissions();
+            let target = if entry == "outside" {
+                outside.clone()
+            } else {
+                ov.root.join("target")
+            };
+            if entry == "inside" {
+                fs::create_dir(&target).unwrap();
+            }
+            let d = ov.root.join("d");
+            let file = entry == "file";
+            *ov.parent_before_create_hook.lock().unwrap() = Some(Box::new(move || {
+                if file {
+                    fs::write(d, b"winner").unwrap();
+                } else {
+                    symlink(target, d).unwrap();
+                }
+            }));
+            assert!(
+                ov.ensure_modifiable("/d/b/f").is_err(),
+                "{entry}, policy={policy}"
+            );
+            assert!(!outside.join("b").exists());
+            assert!(!ov.root.join("target/b").exists());
+            assert_eq!(fs::metadata(&outside).unwrap().permissions(), before);
+            if file {
+                assert_eq!(fs::read(ov.root.join("d")).unwrap(), b"winner");
+            }
+        }
+    }
+}
+
+/// Regression: walking parents component by component must still accept an
+/// existing confined intermediate alias and leave its target mode unchanged.
+#[cfg(unix)]
+#[test]
+fn regression_326_parent_modes_through_existing_confined_alias() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    for policy in [false, true] {
+        let (_tmp, ov) = parent_mode_fixture(policy);
+        fs::create_dir(ov.root.join("target")).unwrap();
+        fs::set_permissions(ov.root.join("target"), fs::Permissions::from_mode(0o711)).unwrap();
+        symlink("target", ov.root.join("d")).unwrap();
+        ov.ensure_modifiable("/d/b/f").unwrap();
+        assert_eq!(
+            metadata_mode(&fs::metadata(ov.root.join("target")).unwrap()) & 0o7777,
+            0o711
+        );
+        assert_eq!(
+            metadata_mode(&fs::metadata(ov.root.join("target/b")).unwrap()) & 0o7777,
+            0o1755
+        );
+        assert_eq!(fs::read(ov.root.join("target/b/f")).unwrap(), b"base");
+    }
+}
+
+#[cfg(unix)]
 fn regression_240_overlay_lock_held(root: &Path) -> bool {
     use std::os::fd::AsRawFd;
 
