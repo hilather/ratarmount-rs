@@ -1563,32 +1563,17 @@ fn serving_child_gone(pid: u32, mnt: &Path) -> bool {
     zombie || !serving_pids(mnt).contains(&pid)
 }
 
-/// `meta_get` that never rolls back a hot `-journal` (a hot journal or a lock
-/// is retried until `deadline`): safe while a daemonized mount, which holds no
-/// kernel lock on its database (#183), may be writing.
-fn meta_get_no_recovery(overlay: &Path, key: &str, deadline: Instant) -> Option<String> {
-    loop {
-        match ratarmount_compositing::OverlayMeta::read_no_recovery(overlay) {
-            Ok(meta) => return meta.unwrap().get(key).map(str::to_string),
-            Err(error) => assert!(
-                Instant::now() < deadline,
-                "overlay metadata stayed unreadable: {error}"
-            ),
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// Regression (#328): the forked launcher's exit must keep the marker, while
-/// the serving child's clean exit must flush and clear it before process::exit.
+/// Regression (#328): the serving child's clean exit must flush and clear the
+/// marker before process::exit.
 ///
-/// Regression (flaky under CPU load): the test polled `OverlayMeta::read`
-/// right after `fusermount3 -u`, while the serving child was committing the
-/// marker's deletion. A daemonized mount holds no kernel lock on its database
-/// (#183), so the poll took the child's live `-journal` for a hot one and
-/// rolled the deletion back; the child exited believing it had committed, and
-/// the marker stayed. Nothing that may roll back a journal touches the
-/// database until the serving child has exited.
+/// Regression (flaky under CPU load, then #183): the test polled
+/// `OverlayMeta::read` right after `fusermount3 -u`, while the serving child
+/// was committing the marker's deletion. Before #183 a daemonized mount held
+/// no kernel lock on its database, so the poll took the child's live
+/// `-journal` for a hot one and rolled the deletion back. Now the launcher
+/// never opens the overlay and the serving child holds its database
+/// exclusively: a read while it serves is refused as "in use". The final read
+/// and fsck still wait for the serving child to exit.
 #[test]
 fn regression_relaxed_durability_daemon_clean_close() {
     if !available() {
@@ -1627,14 +1612,16 @@ fn regression_relaxed_durability_daemon_clean_close() {
         ),
         0,
     );
+    let in_use = |overlay: &Path| match ratarmount_compositing::OverlayMeta::read(overlay) {
+        Ok(_) => false,
+        Err(e) => {
+            assert!(e.to_string().contains("in use"), "{e}");
+            true
+        }
+    };
     assert!(
-        meta_get_no_recovery(
-            &overlay,
-            "relaxed_durability",
-            Instant::now() + Duration::from_secs(10)
-        )
-        .is_some(),
-        "launcher cleared the child's marker"
+        in_use(&overlay),
+        "the serving child holds the overlay database"
     );
     // The launcher has exited (`run` waited for it): only the child names `mount`.
     let child = match serving_pids(&mount)[..] {
@@ -1654,6 +1641,7 @@ fn regression_relaxed_durability_daemon_clean_close() {
         std::thread::sleep(Duration::from_millis(100));
     }
     mounted.0 = None;
+    // The child still finishes (and holds the database) after the unmount.
     let deadline = Instant::now() + Duration::from_secs(10);
     while !serving_child_gone(child, &mount) {
         assert!(
@@ -1662,6 +1650,10 @@ fn regression_relaxed_durability_daemon_clean_close() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert!(
+        !in_use(&overlay),
+        "the database is free once the serving child exited"
+    );
     assert_eq!(
         meta_get(&overlay, "relaxed_durability"),
         None,
