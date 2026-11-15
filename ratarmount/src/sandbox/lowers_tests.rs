@@ -325,6 +325,38 @@ fn refused(supervisor: &mut Supervisor<Fake>, fake: &Fake, request: &Value, name
     message
 }
 
+/// Regression: bundle preflight accepted a crash marker in meta.json and
+/// reached child creation instead of rejecting the lower before setup.
+#[test]
+fn regression_supervisor_relaxed_lower_bundle_marker() {
+    use ratarmount_compositing::relaxed_durability::RELAXED_DURABILITY_KEY;
+    let world = World::new();
+    let layer = world.layer("layer", &[], Identity::Strong(X), &[("a", "a\n")]);
+    let bundle = world.bundle(&layer, &[], "layer.tar.zst");
+    let mut metadata =
+        crate::overlay_pack::bundle_meta(&bundle, Limits::resolve(None, None).unwrap()).unwrap();
+    let mut setup = setup(&world);
+    for (i, marker) in ["other-boot:42", "unknown:42"].into_iter().enumerate() {
+        metadata.insert(RELAXED_DURABILITY_KEY.into(), marker.into());
+        let damaged = world.path(&format!("damaged-{i}.tar.zst"));
+        crate::overlay_pack::tests::retar_with(
+            &bundle,
+            &damaged,
+            "meta.json",
+            &serde_json::to_vec(&metadata).unwrap(),
+        );
+        let before = fs::read(&damaged).unwrap();
+        let message = refused(
+            &mut setup.supervisor,
+            &setup.fake,
+            &layered(1, &[&damaged]),
+            damaged.to_str().unwrap(),
+        );
+        assert!(message.contains(marker), "{message}");
+        assert_eq!(fs::read(&damaged).unwrap(), before);
+    }
+}
+
 /// Accepted with `count` 2: each child got the canonical `lowers`, in order,
 /// and its re-check recorded what it took (`digests`); then destroyed.
 fn accepted(setup: &mut Setup, lowers: &[&Path], digests: &[String]) {

@@ -1,6 +1,7 @@
 //! Private read-only child channel: SQLite intentionally permits only its owner.
 
 use super::protocol::{Attempt, MAX_RESPONSE};
+use ratarmount_compositing::relaxed_durability;
 use ratarmount_compositing::{LowerLayerRecord, OverlayQuota, WriteOverlay};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -63,6 +64,29 @@ pub struct Status {
     pub erofs_denied: u64,
 }
 
+/// Keep the successful private-channel reply as an array. A refusal carries
+/// its reason instead of returning tombstones from an unclean database.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+enum DeletedPaths {
+    Paths(Vec<String>),
+    Refused { error: String },
+}
+
+/// Detached attempts can be inspected directly, without recovering or
+/// changing their database. Live attempts use the owner's connection below.
+pub(super) fn check_offline_durability(dir: &Path) -> io::Result<()> {
+    let meta = ratarmount_compositing::OverlayMeta::read_no_recovery(dir).map_err(|error| {
+        let kind = if error.is_locked() {
+            io::ErrorKind::WouldBlock
+        } else {
+            io::ErrorKind::Other
+        };
+        io::Error::new(kind, format!("overlay {}: {error}", dir.display()))
+    })?;
+    relaxed_durability::refuse_unclean(meta.as_ref()).map_err(io::Error::other)
+}
+
 /// Serves `deleted_paths`, `lower_layers` and `status` for the mount's
 /// overlay. `quota` is the mount's quota and policy handle, when it has one.
 pub(crate) fn start(
@@ -115,10 +139,23 @@ pub(crate) fn start(
                         break;
                     };
                     let reply = if command == "deleted_paths\n" {
-                        let mut deleted: Vec<_> =
-                            overlay.load_tombstone_paths().into_iter().collect();
-                        deleted.sort();
-                        serde_json::to_vec(&deleted).ok()
+                        let checked = overlay
+                            .meta_value(relaxed_durability::RELAXED_DURABILITY_KEY)
+                            .and_then(|marker| {
+                                relaxed_durability::refuse_unclean_marker(marker.as_deref())
+                            });
+                        let reply = match checked {
+                            Ok(()) => {
+                                let mut deleted: Vec<_> =
+                                    overlay.load_tombstone_paths().into_iter().collect();
+                                deleted.sort();
+                                DeletedPaths::Paths(deleted)
+                            }
+                            Err(error) => DeletedPaths::Refused {
+                                error: error.to_string(),
+                            },
+                        };
+                        serde_json::to_vec(&reply).ok()
                     } else if command == "status\n" {
                         let erofs_denied = quota.as_ref().map_or(0, |q| q.usage().erofs_denied);
                         serde_json::to_vec(&Status { erofs_denied }).ok()
@@ -152,7 +189,10 @@ pub(crate) fn start(
 }
 
 pub fn deleted_paths(attempt: &Attempt) -> io::Result<Vec<String>> {
-    request(attempt, b"deleted_paths\n", Duration::from_secs(5))
+    match request(attempt, b"deleted_paths\n", Duration::from_secs(5))? {
+        DeletedPaths::Paths(paths) => Ok(paths),
+        DeletedPaths::Refused { error } => Err(io::Error::other(error)),
+    }
 }
 
 /// The child's recorded `lower_layers` (`[]` when it has none), within

@@ -19,6 +19,163 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 #[cfg(unix)]
+fn parent_mode_fixture(policy: bool) -> (tempfile::TempDir, Arc<WriteOverlay>) {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    fs::create_dir_all(base.join("d/b")).unwrap();
+    fs::write(base.join("d/b/f"), b"base").unwrap();
+    fs::set_permissions(base.join("d"), fs::Permissions::from_mode(0o750)).unwrap();
+    fs::set_permissions(base.join("d/b"), fs::Permissions::from_mode(0o1755)).unwrap();
+    let base = Arc::new(crate::FolderMountSource::new(base).unwrap());
+    let mut ov = WriteOverlay::new_for_tests(base, tmp.path().join("overlay")).unwrap();
+    if policy {
+        ov.set_policy(Some(Arc::new(CountingPolicy::new(u64::MAX))));
+    }
+    (tmp, Arc::new(ov))
+}
+
+/// Regression: a host mkdir between the absence check and parent creation
+/// was mistaken for our own creation, overwriting its explicit mode.
+#[cfg(unix)]
+#[test]
+fn regression_326_parent_mkdir_race_preserves_winner_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    for policy in [false, true] {
+        let (_tmp, ov) = parent_mode_fixture(policy);
+        let d = ov.root.join("d");
+        *ov.parent_before_create_hook.lock().unwrap() = Some(Box::new(move || {
+            fs::create_dir(&d).unwrap();
+            fs::set_permissions(&d, fs::Permissions::from_mode(0o711)).unwrap();
+        }));
+        ov.ensure_modifiable("/d/b/f").unwrap();
+        assert_eq!(
+            metadata_mode(&fs::metadata(ov.root.join("d")).unwrap()) & 0o7777,
+            0o711
+        );
+        assert_eq!(
+            metadata_mode(&fs::metadata(ov.root.join("d/b")).unwrap()) & 0o7777,
+            0o1755
+        );
+        assert_eq!(fs::read(ov.root.join("d/b/f")).unwrap(), b"base");
+    }
+}
+
+/// Regression: a competing chmod could finish between the base-mode lookup
+/// and initialization, leaving the host mode different from the recorded mode.
+#[cfg(unix)]
+#[test]
+fn regression_326_parent_initialization_serializes_chmod_without_policy() {
+    use std::sync::mpsc;
+    for policy in [false, true] {
+        let (_tmp, ov) = parent_mode_fixture(policy);
+        let (start_tx, start_rx) = mpsc::channel();
+        let (begun_tx, begun_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let other = ov.clone();
+        let worker = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            begun_tx.send(()).unwrap();
+            other
+                .set_metadata(
+                    "/d",
+                    &OverlayMetadata {
+                        mode: Some(0o711),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let _ = done_tx.send(());
+        });
+        *ov.parent_before_mode_hook.lock().unwrap() = Some(Box::new(move || {
+            start_tx.send(()).unwrap();
+            begun_rx.recv().unwrap();
+            assert!(
+                matches!(
+                    done_rx.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "chmod finished before parent initialization"
+            );
+        }));
+        ov.ensure_modifiable("/d/b/f").unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            metadata_mode(&fs::metadata(ov.root.join("d")).unwrap()) & 0o7777,
+            0o711
+        );
+        assert_eq!(ov.lookup("/d", 0).unwrap().mode & 0o7777, 0o711);
+    }
+}
+
+/// Regression: create_dir_all followed a symlink installed after validation
+/// and created directories outside the overlay before chmod's check refused.
+#[cfg(unix)]
+#[test]
+fn regression_326_parent_creation_race_refuses_symlink_before_descending() {
+    use std::os::unix::fs::symlink;
+    for policy in [false, true] {
+        for entry in ["outside", "inside", "file"] {
+            let (tmp, ov) = parent_mode_fixture(policy);
+            let outside = tmp.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            let before = fs::metadata(&outside).unwrap().permissions();
+            let target = if entry == "outside" {
+                outside.clone()
+            } else {
+                ov.root.join("target")
+            };
+            if entry == "inside" {
+                fs::create_dir(&target).unwrap();
+            }
+            let d = ov.root.join("d");
+            let file = entry == "file";
+            *ov.parent_before_create_hook.lock().unwrap() = Some(Box::new(move || {
+                if file {
+                    fs::write(d, b"winner").unwrap();
+                } else {
+                    symlink(target, d).unwrap();
+                }
+            }));
+            assert!(
+                ov.ensure_modifiable("/d/b/f").is_err(),
+                "{entry}, policy={policy}"
+            );
+            assert!(!outside.join("b").exists());
+            assert!(!ov.root.join("target/b").exists());
+            assert_eq!(fs::metadata(&outside).unwrap().permissions(), before);
+            if file {
+                assert_eq!(fs::read(ov.root.join("d")).unwrap(), b"winner");
+            }
+        }
+    }
+}
+
+/// Regression: walking parents component by component must still accept an
+/// existing confined intermediate alias and leave its target mode unchanged.
+#[cfg(unix)]
+#[test]
+fn regression_326_parent_modes_through_existing_confined_alias() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    for policy in [false, true] {
+        let (_tmp, ov) = parent_mode_fixture(policy);
+        fs::create_dir(ov.root.join("target")).unwrap();
+        fs::set_permissions(ov.root.join("target"), fs::Permissions::from_mode(0o711)).unwrap();
+        symlink("target", ov.root.join("d")).unwrap();
+        ov.ensure_modifiable("/d/b/f").unwrap();
+        assert_eq!(
+            metadata_mode(&fs::metadata(ov.root.join("target")).unwrap()) & 0o7777,
+            0o711
+        );
+        assert_eq!(
+            metadata_mode(&fs::metadata(ov.root.join("target/b")).unwrap()) & 0o7777,
+            0o1755
+        );
+        assert_eq!(fs::read(ov.root.join("target/b/f")).unwrap(), b"base");
+    }
+}
+
+#[cfg(unix)]
 fn regression_240_overlay_lock_held(root: &Path) -> bool {
     use std::os::fd::AsRawFd;
 
@@ -11146,7 +11303,8 @@ fn rename_tx_failure_matches_crash_table() {
         );
         assert!(is_overlay_fi(&probe.lookup("/dst", 0).unwrap()));
         assert_eq!(deleted_flag(&probe, "/src"), None);
-        assert_eq!(deleted_flag(&probe, "/dst"), Some(0));
+        // #328: the overlay-only create of `/dst` wrote no row.
+        assert_eq!(deleted_flag(&probe, "/dst"), None);
         Err(OverlayError::Msg("injected rename tx failure".into()))
     })));
     ov.rename_parked("/src", "/dst")
@@ -11170,7 +11328,8 @@ fn rename_tx_failure_matches_crash_table() {
     assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"archive-src");
     assert!(is_overlay_fi(&ov.lookup("/dst", 0).unwrap()));
 
-    // Overlay-only `from`: lookup is None and a stale deleted=0 row remains.
+    // Overlay-only `from` with a row (a chmod wrote one; since #328 a plain
+    // create writes none): lookup is None and a stale deleted=0 row remains.
     let dir = tempfile::tempdir().unwrap();
     let overlay = dir.path().join("ov");
     let ov = Arc::new(
@@ -11178,6 +11337,15 @@ fn rename_tx_failure_matches_crash_table() {
     );
     put_overlay_bytes(&ov, "/dst", b"old-dest");
     put_overlay_bytes(&ov, "/src", b"new-src");
+    ov.set_metadata(
+        "/src",
+        &OverlayMetadata {
+            mode: Some(0o640),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(deleted_flag(&ov, "/src"), Some(0));
     let probe = Arc::downgrade(&ov);
     let host = overlay.clone();
     // Same budget as the archive-from case: Drop's replay must also fail.
@@ -12186,8 +12354,11 @@ fn park_open_emfile_leaves_names_unchanged() {
     for code in [libc::EMFILE, libc::ENFILE] {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
-            .unwrap();
+        // `/victim` is a base name, so its copy-up has a row that a wrongly
+        // run delete would turn into a tombstone (#328: overlay-only names
+        // have none).
+        let base = Arc::new(MemBase::with(&[("/victim", b"archived")])) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         put_overlay_bytes(&ov, "/dst", b"keep-dst");
         put_overlay_bytes(&ov, "/src", b"keep-src");
         ov.set_park_open_hook(Some(Box::new(move || {
@@ -12745,5 +12916,529 @@ fn regression_254_all_tar_offsetheaders_implied_versions() {
         }
         base.history = vec![tar_fi_at(1024), tar_fi_at(0)];
         assert_eq!(all_tar_offsetheaders(&base, "/entry").unwrap(), [0, 1024]);
+    }
+}
+
+/// `(files, overlay_metadata, xattrs)` row counts for `path` (#328).
+fn regression_328_rows(ov: &WriteOverlay, path: &str) -> (i64, i64, i64) {
+    let (folder, name) = WriteOverlay::split(path);
+    let path = normpath(path);
+    let db = ov.db.lock().unwrap();
+    let count = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> i64 {
+        db.query_row(sql, p, |r| r.get(0)).unwrap()
+    };
+    (
+        count(
+            r#"SELECT count(*) FROM "files" WHERE path=?1 AND name=?2"#,
+            &[&folder, &name],
+        ),
+        count(
+            "SELECT count(*) FROM overlay_metadata WHERE path=?1",
+            &[&path],
+        ),
+        count("SELECT count(*) FROM xattrs WHERE path=?1", &[&path]),
+    )
+}
+
+/// Regression (#328): create and unlink of a regular file the lower view
+/// lacks cost one durable SQLite transaction each. They now write no rows:
+/// the file is still listed, read and served with the mode it was created
+/// with; unlink, unlink-then-recreate and rename behave as before; a rename
+/// (and later unlink of the destination) still writes its rows, and mkdir
+/// and symlinks keep theirs.
+#[test]
+fn regression_328_overlay_only_create_unlink_write_no_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let overlay = dir.path().join("ov");
+    let base = Arc::new(MemBase::with(&[("/base", b"archived")])) as Arc<dyn MountSource>;
+    let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
+
+    let fd = ov.create_file("/new", 0o751).unwrap();
+    assert_eq!(unsafe { libc::write(fd, b"hello".as_ptr().cast(), 5) }, 5);
+    ov.close_overlay_fd(fd);
+    assert_eq!(regression_328_rows(&ov, "/new"), (0, 0, 0));
+    let fi = ov.lookup("/new", 0).expect("listed without a row");
+    assert_eq!(fi.mode & ratarmount_core::S_IFMT, ratarmount_core::S_IFREG);
+    assert_eq!(fi.mode & 0o7777, 0o751);
+    assert_eq!(fi.size, 5);
+    let names = match ov.list("/").unwrap() {
+        ListResult::Infos(m) => m.into_keys().collect::<Vec<_>>(),
+        ListResult::Names(n) => n,
+    };
+    assert!(names.iter().any(|n| n == "new"), "{names:?}");
+    let mut body = Vec::new();
+    ov.open(&fi, 0).unwrap().read_to_end(&mut body).unwrap();
+    assert_eq!(body, b"hello");
+
+    // Unlink: no tombstone and no `xattrs` reset row for a name the base lacks.
+    ov.unlink("/new").unwrap();
+    assert_eq!(regression_328_rows(&ov, "/new"), (0, 0, 0));
+    assert!(ov.lookup("/new", 0).is_none());
+    assert!(!ov.is_deleted("/new"));
+    // Unlink then recreate.
+    put_overlay_bytes(&ov, "/new", b"again");
+    assert_eq!(regression_328_rows(&ov, "/new"), (0, 0, 0));
+    assert_eq!(fs::read(overlay.join("new")).unwrap(), b"again");
+
+    // A rename of a row-less file still records the destination.
+    ov.rename("/new", "/moved").unwrap();
+    assert_eq!(deleted_flag(&ov, "/moved"), Some(0));
+    assert_eq!(deleted_flag(&ov, "/new"), None);
+    assert!(ov.lookup("/new", 0).is_none());
+    assert_eq!(ov.lookup("/moved", 0).unwrap().mode & 0o7777, 0o644);
+    // ... and its unlink removes that row.
+    ov.unlink("/moved").unwrap();
+    assert_eq!(deleted_flag(&ov, "/moved"), None);
+    assert!(ov.lookup("/moved", 0).is_none());
+
+    // mkdir, files under it, rmdir of the emptied directory.
+    ov.mkdir("/d", 0o750).unwrap();
+    assert_eq!(deleted_flag(&ov, "/d"), Some(0), "mkdir keeps its row");
+    put_overlay_bytes(&ov, "/d/inner", b"x");
+    assert_eq!(regression_328_rows(&ov, "/d/inner"), (0, 0, 0));
+    ov.unlink("/d/inner").unwrap();
+    ov.rmdir("/d").unwrap();
+    assert_eq!(regression_328_rows(&ov, "/d"), (0, 0, 1), "rmdir as before");
+    assert!(ov.lookup("/d", 0).is_none());
+    // Symlinks keep their row.
+    ov.create_symlink("/link", "target").unwrap();
+    assert_eq!(deleted_flag(&ov, "/link"), Some(0));
+    assert_eq!(ov.pending_row_count(), 0);
+}
+
+/// Regression (#328): the elision never applies to a name the lower view
+/// has, nor to a name with rows of its own. A base delete still tombstones,
+/// a create over the tombstone still clears it, an O_TRUNC re-create after a
+/// chmod still drops the metadata row, and an unlink of a file with user
+/// xattrs still clears them (a re-create sees none).
+#[test]
+fn regression_328_base_names_and_existing_rows_still_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let overlay = dir.path().join("ov");
+    let base = Arc::new(MemBase::with(&[("/a", b"archived"), ("/b", b"archived")]))
+        as Arc<dyn MountSource>;
+    let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
+
+    ov.unlink("/a").unwrap();
+    assert_eq!(deleted_flag(&ov, "/a"), Some(1));
+    assert!(ov.is_deleted("/a"));
+    put_overlay_bytes(&ov, "/a", b"replacement");
+    assert_eq!(deleted_flag(&ov, "/a"), Some(0), "create over a tombstone");
+    assert!(!ov.is_deleted("/a"));
+    assert_eq!(fs::read(overlay.join("a")).unwrap(), b"replacement");
+    // A copy-up of a base name is not touched either: unlink tombstones again.
+    ov.unlink("/a").unwrap();
+    assert_eq!(deleted_flag(&ov, "/a"), Some(1));
+
+    // A base name without a tombstone: the create is still recorded.
+    put_overlay_bytes(&ov, "/b", b"over the base");
+    assert_eq!(deleted_flag(&ov, "/b"), Some(0), "create over a base name");
+
+    put_overlay_bytes(&ov, "/c", b"c");
+    ov.set_metadata(
+        "/c",
+        &OverlayMetadata {
+            mode: Some(0o600),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(regression_328_rows(&ov, "/c"), (1, 1, 0));
+    let fd = ov.create_file("/c", 0o640).unwrap();
+    ov.close_overlay_fd(fd);
+    assert_eq!(
+        regression_328_rows(&ov, "/c"),
+        (1, 0, 0),
+        "Present still drops the metadata row"
+    );
+    assert_eq!(ov.lookup("/c", 0).unwrap().mode & 0o7777, 0o640);
+
+    // A metadata row without a `files` row: `overlay unseal` leaves the
+    // modes seal pinned. The re-create must still drop it.
+    put_overlay_bytes(&ov, "/p", b"p");
+    ov.db
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO overlay_metadata(path,mode) VALUES ('/p',420)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(regression_328_rows(&ov, "/p"), (0, 1, 0));
+    let fd = ov.create_file("/p", 0o600).unwrap();
+    ov.close_overlay_fd(fd);
+    assert_eq!(regression_328_rows(&ov, "/p"), (1, 0, 0));
+    assert_eq!(ov.lookup("/p", 0).unwrap().mode & 0o7777, 0o600);
+
+    put_overlay_bytes(&ov, "/x", b"x");
+    ov.set_xattr("/x", "user.k", b"v", 0).unwrap();
+    ov.unlink("/x").unwrap();
+    let (files, metadata, _) = regression_328_rows(&ov, "/x");
+    assert_eq!((files, metadata), (0, 0));
+    let named: i64 = ov
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM xattrs WHERE path='/x' AND name<>''",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(named, 0, "unlink cleared the user xattr");
+    put_overlay_bytes(&ov, "/x", b"x2");
+    assert!(ov.xattrs_for_path("/x").unwrap().is_empty());
+}
+
+/// Regression (#328, #88): an elidable op is never skipped while older rows
+/// are queued. A queued rename to `/b` followed by an unlink of `/b` must
+/// queue the delete behind it; skipping it would replay into a present row
+/// with no host file (fsck `missing_content`).
+#[test]
+fn regression_328_queued_rows_are_not_elided() {
+    let dir = tempfile::tempdir().unwrap();
+    let overlay = dir.path().join("ov");
+    let ov =
+        WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+    put_overlay_bytes(&ov, "/a", b"a");
+    // Three direct rename attempts, then three replay attempts in the unlink.
+    ov.set_rename_tx_failures(6);
+    ov.rename("/a", "/b").unwrap();
+    assert_eq!(ov.pending_row_count(), 1);
+    ov.unlink("/b").unwrap();
+    assert_eq!(ov.pending_row_count(), 2, "unlink queued behind the rename");
+    // Likewise a create while rows are queued: appended, not skipped.
+    ov.set_rename_tx_failures(3);
+    put_overlay_bytes(&ov, "/c", b"c");
+    assert_eq!(ov.pending_row_count(), 3);
+    ov.replay_pending_rows().unwrap();
+    assert_eq!(ov.pending_row_count(), 0);
+    assert_eq!(
+        deleted_flag(&ov, "/b"),
+        None,
+        "rename row removed by replay"
+    );
+    assert_eq!(deleted_flag(&ov, "/a"), None);
+    assert_eq!(deleted_flag(&ov, "/c"), Some(0));
+    drop(ov);
+    let report = crate::overlay_fsck::fsck(&overlay, false).unwrap();
+    assert_eq!(report.errors(), 0, "{report:?}");
+}
+
+/// Regression (#328): a failed absence probe must fall back to persistence,
+/// retaining the operation for replay if the database cannot be updated either.
+#[test]
+fn regression_328_probe_error_queues_create_and_unlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let overlay = dir.path().join("ov");
+    let ov = WriteOverlay::new_for_tests(Arc::new(NullBase), &overlay).unwrap();
+    put_overlay_bytes(&ov, "/gone", b"gone");
+    assert_eq!(regression_328_rows(&ov, "/gone"), (0, 0, 0));
+    for create in [true, false] {
+        // A missing table fails the SELECT probe and the normal transaction.
+        ov.db
+            .lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE overlay_metadata RENAME TO saved_metadata")
+            .unwrap();
+        if create {
+            let fd = ov
+                .open_overlay_fd_with_mode("/new", libc::O_CREAT | libc::O_RDWR, 0o751)
+                .unwrap();
+            ov.close_overlay_fd(fd);
+            assert_eq!(ov.pending_row_count(), 2, "Present then ClearDeleted");
+        } else {
+            ov.unlink("/gone").unwrap();
+            assert_eq!(ov.pending_row_count(), 1, "Deleted must not be elided");
+        }
+        ov.db
+            .lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE saved_metadata RENAME TO overlay_metadata")
+            .unwrap();
+        ov.replay_pending_rows().unwrap();
+        assert_eq!(ov.pending_row_count(), 0);
+    }
+    assert_eq!(regression_328_rows(&ov, "/new"), (1, 0, 0));
+    assert_eq!(regression_328_rows(&ov, "/gone"), (0, 0, 1));
+    assert_eq!(ov.lookup("/new", 0).unwrap().mode & 0o7777, 0o751);
+    assert!(ov.lookup("/gone", 0).is_none());
+    drop(ov);
+    assert_eq!(
+        crate::overlay_fsck::fsck(&overlay, false).unwrap().errors(),
+        0
+    );
+}
+
+/// Regression (#328): concurrent creates of the same row-less name and its
+/// unlink must check the base while the commit gate excludes base replacement.
+#[test]
+fn regression_328_concurrent_creates_probe_under_commit_gate() {
+    struct ObservedBase {
+        owner: Mutex<std::sync::Weak<WriteOverlay>>,
+        probes: AtomicU64,
+    }
+    impl MountSource for ObservedBase {
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/new" {
+                let overlay = self.owner.lock().unwrap().upgrade().unwrap();
+                assert!(matches!(
+                    overlay.commit_gate.try_write(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                self.probes.fetch_add(1, Ordering::SeqCst);
+            }
+            None
+        }
+        fn list(&self, _: &str) -> Option<ListResult> {
+            None
+        }
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            unreachable!("empty base has no payload")
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let base = Arc::new(ObservedBase {
+        owner: Mutex::new(std::sync::Weak::new()),
+        probes: AtomicU64::new(0),
+    });
+    let ov = Arc::new(WriteOverlay::new_for_tests(base.clone(), dir.path()).unwrap());
+    *base.owner.lock().unwrap() = Arc::downgrade(&ov);
+    let start = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| {
+                start.wait();
+                let fd = ov.create_file("/new", 0o751).unwrap();
+                ov.close_overlay_fd(fd);
+            });
+        }
+    });
+    assert_eq!(base.probes.load(Ordering::SeqCst), 2);
+    assert_eq!(regression_328_rows(&ov, "/new"), (0, 0, 0));
+    assert_eq!(ov.lookup("/new", 0).unwrap().mode & 0o7777, 0o751);
+    ov.unlink("/new").unwrap();
+    assert_eq!(base.probes.load(Ordering::SeqCst), 3);
+    assert_eq!(regression_328_rows(&ov, "/new"), (0, 0, 0));
+    assert!(!dir.path().join("new").exists());
+}
+
+/// Regression (#328): an overlay whose overlay-only files have no rows and a
+/// copy with the rows the old code wrote agree on everything that reads the
+/// overlay: the change set and canonical hash, the manifest, the layer
+/// digest a seal records, fsck (clean; only `unrowed` differs) and the
+/// commit plan. A crash before a row was written left that row-less state.
+#[test]
+fn regression_328_rowless_and_rowed_overlays_agree() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    let dir = tempfile::tempdir().unwrap();
+    let base_dir = dir.path().join("base");
+    fs::create_dir_all(base_dir.join("sub")).unwrap();
+    fs::write(base_dir.join("kept"), b"kept\n").unwrap();
+    fs::write(base_dir.join("sub/gone"), b"gone\n").unwrap();
+    let base =
+        || Arc::new(crate::FolderMountSource::new(&base_dir).unwrap()) as Arc<dyn MountSource>;
+    let rowless = dir.path().join("rowless");
+    {
+        let ov = WriteOverlay::new_for_tests(base(), &rowless).unwrap();
+        let fd = ov.create_file("/new.sh", 0o751).unwrap();
+        ov.close_overlay_fd(fd);
+        fs::write(rowless.join("new.sh"), b"#!/bin/sh\n").unwrap();
+        put_overlay_bytes(&ov, "/sub/added", b"added\n");
+        put_overlay_bytes(&ov, "/tmp-gone", b"temp\n");
+        ov.unlink("/tmp-gone").unwrap();
+        ov.unlink("/sub/gone").unwrap();
+        ov.mkdir("/empty", 0o700).unwrap();
+        for path in ["/new.sh", "/sub/added", "/tmp-gone"] {
+            assert_eq!(regression_328_rows(&ov, path), (0, 0, 0), "{path}");
+        }
+    }
+    let rowed = dir.path().join("rowed");
+    let st = StdCommand::new("cp")
+        .arg("-a")
+        .arg(&rowless)
+        .arg(&rowed)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    {
+        // What the old `Present` and `Deleted` transactions left behind.
+        let conn = Connection::open(rowed.join(HIDDEN_DB)).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO "files"(path,name,mode,deleted) VALUES ('','new.sh',33257,0);
+               INSERT INTO "files"(path,name,mode,deleted) VALUES ('/sub','added',33188,0);
+               INSERT INTO xattrs(path,name,value) VALUES ('/tmp-gone','',NULL);"#,
+        )
+        .unwrap();
+    }
+    let opts = crate::overlay_changes::ChangeOptions::default();
+    let changes = |top: &Path| crate::overlay_changes::change_set(top, base(), &opts).unwrap();
+    let (a, b) = (changes(&rowless), changes(&rowed));
+    let hash = |c: &[crate::overlay_changes::Change]| {
+        crate::overlay_changes::canonical_hash(c, &opts).unwrap()
+    };
+    assert_eq!(hash(&a), hash(&b));
+    let manifest = |c: &[crate::overlay_changes::Change]| {
+        let mut out = Vec::new();
+        crate::overlay_changes::write_manifest(c, &mut out).unwrap();
+        out
+    };
+    assert_eq!(manifest(&a), manifest(&b));
+    let text = String::from_utf8(manifest(&a)).unwrap();
+    assert!(
+        text.contains("new.sh") && text.contains("sub/added"),
+        "{text}"
+    );
+    assert!(!text.contains("tmp-gone"), "{text}");
+    assert_eq!(
+        crate::overlay_seal::current_layer_digest(&rowless, base()).unwrap(),
+        crate::overlay_seal::current_layer_digest(&rowed, base()).unwrap()
+    );
+    let (fa, fb) = (
+        crate::overlay_fsck::fsck(&rowless, false).unwrap(),
+        crate::overlay_fsck::fsck(&rowed, false).unwrap(),
+    );
+    assert_eq!((fa.errors(), fb.errors()), (0, 0), "{fa:?} {fb:?}");
+    assert_eq!(fa.unrowed, fb.unrowed + 2, "{fa:?} {fb:?}");
+    let (pa, pb) = (
+        collect_overlay_commit_plan(&rowless).unwrap(),
+        collect_overlay_commit_plan(&rowed).unwrap(),
+    );
+    assert_eq!(pa.appends_nul, pb.appends_nul);
+    assert_eq!(pa.deletions_nul, pb.deletions_nul);
+    assert_eq!(pa.deleted_paths, pb.deleted_paths);
+    assert_eq!(pa.append_entries, pb.append_entries);
+    assert_eq!(format!("{:?}", pa.metadata), format!("{:?}", pb.metadata));
+    assert!(pa.append_entries.contains(&("empty".to_string(), true)));
+    assert!(pa.xattrs.is_empty(), "{:?}", pa.xattrs);
+    // The old reset row named a path that is not a member.
+    assert_eq!(pb.xattrs.keys().collect::<Vec<_>>(), ["tmp-gone"]);
+    for top in [&rowless, &rowed] {
+        crate::overlay_seal::seal_impl(top, None, base()).unwrap();
+        assert!(crate::overlay_seal::verify(top, base()).unwrap().ok);
+        crate::overlay_seal::unseal(top).unwrap();
+    }
+}
+
+/// Regression (#328): an offline `--commit-overlay` writes a row-less
+/// overlay-only file with the mode it was created with and leaves out one
+/// that was created and unlinked.
+#[test]
+fn regression_328_rowless_file_commits_with_host_mode() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("data");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("old.txt"), b"old\n").unwrap();
+    let tar = dir.path().join("a.tar");
+    let st = StdCommand::new("tar")
+        .arg("-cf")
+        .arg(&tar)
+        .arg("-C")
+        .arg(&src)
+        .arg("old.txt")
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let overlay = dir.path().join("ov");
+    {
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
+        let fd = ov.create_file("/tool.sh", 0o751).unwrap();
+        assert_eq!(unsafe { libc::write(fd, b"run\n".as_ptr().cast(), 4) }, 4);
+        ov.close_overlay_fd(fd);
+        put_overlay_bytes(&ov, "/scratch", b"tmp");
+        ov.unlink("/scratch").unwrap();
+        assert_eq!(regression_328_rows(&ov, "/tool.sh"), (0, 0, 0));
+    }
+    let opts = CommitOverlayOptions {
+        yes: true,
+        ..Default::default()
+    };
+    match commit_overlay(&overlay, &tar, &opts) {
+        Ok(_) => {}
+        Err(e) if soft_skip_gnu_tar_commit(&e) => {
+            eprintln!("skip: {e}");
+            return;
+        }
+        Err(e) => panic!("commit_overlay: {e}"),
+    }
+    let list = StdCommand::new("tar")
+        .arg("-tvf")
+        .arg(&tar)
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let text = String::from_utf8_lossy(&list.stdout);
+    let tool = text
+        .lines()
+        .find(|l| l.ends_with(" tool.sh"))
+        .unwrap_or_else(|| panic!("tool.sh missing: {text}"));
+    assert!(tool.starts_with("-rwxr-x--x "), "{tool}");
+    assert!(text.lines().any(|l| l.ends_with(" old.txt")), "{text}");
+    assert!(!text.contains("scratch"), "{text}");
+    let body = StdCommand::new("tar")
+        .arg("-xOf")
+        .arg(&tar)
+        .arg("tool.sh")
+        .output()
+        .unwrap();
+    assert_eq!(body.stdout, b"run\n");
+}
+
+/// Regression (#328): live and interval commits publish a row-less
+/// overlay-only file with its create mode and leave out one created and
+/// unlinked. After the base swap the name is a base name: unlink tombstones
+/// it and a re-create writes a row again.
+#[test]
+fn regression_328_rowless_file_live_and_interval_commit() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for idle in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        fs::write(&archive, pack_tar(&[ustar_file("old", b"original")])).unwrap();
+        let overlay = dir.path().join("overlay");
+        let mut ov = overlay_with_base(open_uncompressed_tar_base(&archive, false), &overlay);
+        ov.set_commit_mode(CommitMode::Append);
+        let fd = ov.create_file("/tool.sh", 0o751).unwrap();
+        assert_eq!(unsafe { libc::write(fd, b"run\n".as_ptr().cast(), 4) }, 4);
+        ov.close_overlay_fd(fd);
+        // `close_overlay_fd` releases the write pin an interval commit checks.
+        let fd = ov.create_file("/scratch", 0o644).unwrap();
+        ov.close_overlay_fd(fd);
+        ov.unlink("/scratch").unwrap();
+        assert_eq!(regression_328_rows(&ov, "/tool.sh"), (0, 0, 0));
+        assert_eq!(regression_328_rows(&ov, "/scratch"), (0, 0, 0));
+        let reopen = |path: &Path| Ok(open_uncompressed_tar_base(path, false));
+        let committed = if idle {
+            ov.commit_live_idle(&archive, Duration::ZERO, reopen)
+        } else {
+            ov.commit_live(&archive, reopen)
+        };
+        assert!(committed.unwrap(), "idle={idle}");
+        assert!(!overlay.join("tool.sh").exists(), "idle={idle}");
+        let list = StdCommand::new("tar")
+            .arg("-tvf")
+            .arg(&archive)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&list.stdout);
+        let tool = text
+            .lines()
+            .find(|l| l.ends_with(" tool.sh"))
+            .unwrap_or_else(|| panic!("idle={idle}: tool.sh missing: {text}"));
+        assert!(tool.starts_with("-rwxr-x--x "), "idle={idle}: {tool}");
+        assert!(!text.contains("scratch"), "idle={idle}: {text}");
+        let fi = ov.lookup("/tool.sh", 0).expect("served from the new base");
+        assert_eq!(fi.mode & 0o7777, 0o751, "idle={idle}");
+
+        ov.unlink("/tool.sh").unwrap();
+        assert_eq!(deleted_flag(&ov, "/tool.sh"), Some(1), "idle={idle}");
+        assert!(ov.lookup("/tool.sh", 0).is_none());
+        put_overlay_bytes(&ov, "/tool.sh", b"again");
+        assert_eq!(deleted_flag(&ov, "/tool.sh"), Some(0), "idle={idle}");
     }
 }

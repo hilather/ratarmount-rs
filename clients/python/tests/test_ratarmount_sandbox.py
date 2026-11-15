@@ -505,3 +505,34 @@ def test_regression_list_all_includes_retained(daemon):
         pass
     client.close()
     assert [r["id"] for r in requests if r["op"] == "destroy"] == ["1"]
+
+
+def test_regression_overlay_durability_sends_v2_only_when_relaxed(daemon):
+    """Regression (#328): new(overlay_durability="relaxed") sends protocol v2
+    with the key; "full" (the default) and an omitted keyword keep the v1
+    bytes, or send no key in a v2 request; another value is sent as given
+    (the daemon refuses it)."""
+    client, requests, _ = daemon
+    v1 = (b'{"version": 1, "op": "new", "base": "task", "count": 1, "overlay": "disk", '
+          b'"quota": null, "readonly_globs": []}\n')
+    client.new("task")
+    assert requests.raw[-1] == v1
+    client.new("task", overlay_durability="full")
+    assert requests.raw[-1] == v1
+    client.new("task", overlay_durability="relaxed")
+    assert requests.raw[-1] == (
+        b'{"version": 2, "op": "new", "base": "task", "count": 1, "overlay": "disk", '
+        b'"quota": null, "readonly_globs": [], "overlay_durability": "relaxed"}\n')
+    client.new("task", request_id="d", retain=True, overlay_durability="relaxed")
+    assert requests.raw[-1] == (
+        b'{"version": 2, "op": "new", "base": "task", "count": 1, "overlay": "disk", '
+        b'"quota": null, "readonly_globs": [], "request_id": "d", "retain": true, '
+        b'"overlay_durability": "relaxed"}\n')
+    client.new("task", request_id="e", overlay_durability="full")
+    assert requests.raw[-1] == (
+        b'{"version": 2, "op": "new", "base": "task", "count": 1, "overlay": "disk", '
+        b'"quota": null, "readonly_globs": [], "request_id": "e"}\n')
+    client.new("task", overlay_durability="off")
+    assert json.loads(requests.raw[-1]) == dict(
+        version=2, op="new", base="task", count=1, overlay="disk", quota=None,
+        readonly_globs=[], overlay_durability="off")
