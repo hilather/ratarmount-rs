@@ -1287,6 +1287,9 @@ struct SandboxDaemon {
 
 impl SandboxDaemon {
     fn start(root: &Path) -> Self {
+        // The daemon refuses a socket parent that others can write to; under a
+        // group-writable umask (0002) a default temporary directory is one.
+        fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let socket = root.join("api.sock");
         let log = root.join("daemon.log");
         let child = Command::new(env!("CARGO_BIN_EXE_ratarmount"))

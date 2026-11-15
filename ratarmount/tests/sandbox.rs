@@ -34,7 +34,12 @@ impl Daemon {
 
     /// `start` with `env` added to the daemon's environment.
     fn start_with_env(env: Vec<(&'static str, OsString)>) -> Self {
-        let root = tempfile::tempdir().unwrap();
+        // The daemon refuses a socket parent that others can write to; under a
+        // group-writable umask (0002) a default temporary directory is one.
+        let root = tempfile::Builder::new()
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .tempdir()
+            .unwrap();
         let socket = root.path().join("api.sock");
         let child = Self::spawn(root.path(), &socket, &env);
         let mut daemon = Self {

@@ -1259,6 +1259,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join("base")).unwrap();
         fs::write(tmp.path().join("base/a"), b"old\n").unwrap();
+        // Rowed edits create `/a` with 0644; fix the base's mode so a
+        // group-writable umask (0002) does not add a mode change.
+        fs::set_permissions(
+            tmp.path().join("base/a"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
         let base = Arc::new(FolderMountSource::new(tmp.path().join("base")).unwrap());
         (tmp, base)
     }

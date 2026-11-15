@@ -2500,6 +2500,10 @@ pub(crate) mod tests {
             let base_dir = tmp.path().join("base");
             fs::create_dir(&base_dir).unwrap();
             fs::write(base_dir.join("deleted"), b"old").unwrap();
+            // Layers recreate `deleted` with 0644; fix the base's mode so a
+            // group-writable umask (0002) does not add a mode change.
+            fs::set_permissions(base_dir.join("deleted"), fs::Permissions::from_mode(0o644))
+                .unwrap();
             fs::write(tmp.path().join("outside"), b"secret").unwrap();
             let base: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&base_dir).unwrap());
             let dir = tmp.path().join("overlay");

@@ -362,15 +362,25 @@ mod tests {
     /// still shared the released lock's open file description.
     #[test]
     fn regression_synthetic_cache_reclaims_only_abandoned_owned_staging_and_unheld_locks() {
-        let temp = tempfile::tempdir().unwrap();
+        // `Directory::root` refuses a group-writable cache root, which a default
+        // temporary directory is under umask 0002.
+        let temp = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let root = Directory::root(&temp.path().canonicalize().unwrap()).unwrap();
         root.0.lock().unwrap();
         let now = SystemTime::now();
         let old = now - STAGING_MAX_AGE - Duration::from_secs(60);
         for name in [".building-old", ".building-current", "completed-entry"] {
             let path = temp.path().join(name);
+            // As `staging` and `create_file` make them (0700 and 0600): reclaim
+            // skips a tree holding a group-writable entry, which a default
+            // directory or file is under umask 0002.
             fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             fs::write(path.join("payload"), b"data").unwrap();
+            fs::set_permissions(path.join("payload"), fs::Permissions::from_mode(0o600)).unwrap();
             if name != ".building-current" {
                 File::open(path).unwrap().set_modified(old).unwrap();
             }
@@ -380,6 +390,9 @@ mod tests {
         symlink(outside.path(), temp.path().join(".building-symlink")).unwrap();
         for name in ["stale.lock", "held.lock", "recent.lock"] {
             let file = File::create(temp.path().join(name)).unwrap();
+            // Reclaim only removes private files; under umask 0002 a new file is 0664.
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .unwrap();
             if name != "recent.lock" {
                 file.set_modified(old).unwrap();
             }
