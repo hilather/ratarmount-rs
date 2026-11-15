@@ -2933,6 +2933,29 @@ mod tests {
 
 #[cfg(test)]
 mod torrent_dispatch_tests {
+    /// Regression: the feature-dependent boolean rewrite must keep magnet prefix detection exact.
+    #[test]
+    fn regression_torrent_magnet_prefix() {
+        for input in [
+            "magnet:",
+            "MAGNET:?xt=urn:btih:0123456789012345678901234567890123456789",
+            "mAgNeT://example/a.torrent",
+        ] {
+            assert!(super::is_torrent_input(input), "{input}");
+        }
+        for input in [
+            "",
+            "magnet",
+            "magnetx:",
+            "prefix-magnet:",
+            " magnet:",
+            "magneté:",
+            "🧲🧲",
+        ] {
+            assert!(!super::is_torrent_input(input), "{input}");
+        }
+    }
+
     /// Regression: a minimal remote library returned a generic unsupported-scheme error.
     #[cfg(not(feature = "bittorrent"))]
     #[test]
@@ -2957,8 +2980,18 @@ mod torrent_dispatch_tests {
         assert!(!super::is_torrent_input(mount.to_str().unwrap()));
         assert!(!super::is_remote_url(mount.to_str().unwrap()));
         assert!(!super::is_torrent_input("missing.torrent"));
-        for input in [file.to_str().unwrap(), "https://example/a.torrent?token=x"] {
-            assert_eq!(super::is_torrent_input(input), cfg!(feature = "bittorrent"));
+        let file_url = url::Url::from_file_path(&file).unwrap();
+        for input in [
+            file.to_str().unwrap(),
+            file_url.as_str(),
+            "https://example/a.torrent?token=x",
+            "http://example/a.TORRENT#fragment",
+        ] {
+            assert_eq!(
+                super::is_torrent_input(input),
+                cfg!(feature = "bittorrent"),
+                "{input}"
+            );
         }
         assert_eq!(
             super::remote_url_scheme("https://example/a.torrent").as_deref(),
@@ -2971,12 +3004,17 @@ mod torrent_dispatch_tests {
         assert!(super::is_torrent_input(
             "magnet:?xt=urn:btih:0123456789012345678901234567890123456789"
         ));
+        let mount_url = url::Url::from_file_path(&mount).unwrap();
+        let missing_url = url::Url::from_file_path(dir.path().join("missing.torrent")).unwrap();
         for input in [
+            mount_url.as_str(),
+            missing_url.as_str(),
             "a.torrent.tar",
             "a.torrent/child",
             "a.txt",
             "https://example/a.tar?name=a.torrent",
             "s3://bucket/a.torrent",
+            "https://[invalid/a.torrent",
         ] {
             assert!(!super::is_torrent_input(input), "{input}");
         }

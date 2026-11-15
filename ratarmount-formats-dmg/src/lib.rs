@@ -397,6 +397,70 @@ mod tests {
 
     const FAT_BYTES: usize = 256 * 1024;
 
+    /// Regression: Clippy's boolean rewrite must preserve each signature and its partition offset.
+    #[test]
+    fn regression_hfs_apfs_probe_signatures() {
+        for partition_offset in [0, 4096] {
+            for (offset, signature) in [
+                (32, b"NXSB".as_slice()),
+                (1024, b"H+".as_slice()),
+                (1024, b"HX".as_slice()),
+                (1024, b"BD".as_slice()),
+            ] {
+                let start = partition_offset + offset;
+                let mut bytes = vec![0; start + signature.len()];
+                bytes[start..].copy_from_slice(signature);
+                let mut reader = Cursor::new(bytes);
+                reader.set_position(reader.get_ref().len() as u64);
+                assert!(looks_like_hfs_or_apfs(&mut reader, partition_offset as u64));
+                assert!(!looks_like_hfs_or_apfs(
+                    &mut reader,
+                    partition_offset as u64 + 1
+                ));
+                reader.get_mut().pop();
+                assert!(!looks_like_hfs_or_apfs(
+                    &mut reader,
+                    partition_offset as u64
+                ));
+            }
+        }
+        let mut reader = Cursor::new(vec![0; 2048]);
+        assert!(!looks_like_hfs_or_apfs(&mut reader, 0));
+        assert!(!looks_like_hfs_or_apfs(&mut reader, u64::MAX));
+    }
+
+    /// Regression: probe I/O failures remain false, and a failed seek must not trigger a read.
+    #[test]
+    fn regression_hfs_apfs_probe_io_errors() {
+        struct FailingReader {
+            fail_seek: bool,
+            reads: usize,
+        }
+        impl Seek for FailingReader {
+            fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
+                if self.fail_seek {
+                    Err(io::Error::other("seek failed"))
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                Err(io::Error::other("read failed"))
+            }
+        }
+        for fail_seek in [false, true] {
+            let mut reader = FailingReader {
+                fail_seek,
+                reads: 0,
+            };
+            assert!(!looks_like_hfs_or_apfs(&mut reader, 0));
+            assert_eq!(reader.reads, if fail_seek { 0 } else { 2 });
+        }
+    }
+
     fn fat_volume(name: &str, payload: &[u8]) -> Vec<u8> {
         let mut storage = vec![0u8; FAT_BYTES];
         {
