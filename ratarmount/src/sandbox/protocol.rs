@@ -99,6 +99,38 @@ impl<'de> Deserialize<'de> for JournalReads {
     }
 }
 
+/// What an attempt's overlay database waits for (#328): the child's
+/// `--overlay-durability`. `relaxed` stops waiting for the disk on every
+/// create, unlink and rename; an OS crash can then corrupt the layer, and
+/// finalize refuses such a layer (destroy the attempt).
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayDurability {
+    #[default]
+    Full,
+    Relaxed,
+}
+
+impl OverlayDurability {
+    pub fn is_full(&self) -> bool {
+        *self == Self::Full
+    }
+}
+
+/// Only the strings `"full"` and `"relaxed"`, as [`JournalReads`].
+impl<'de> Deserialize<'de> for OverlayDurability {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "full" => Ok(Self::Full),
+            "relaxed" => Ok(Self::Relaxed),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["full", "relaxed"],
+            )),
+        }
+    }
+}
+
 /// The per-attempt operation journal of a v2 `new` (§5.6). Every member is
 /// always serialized, so `journal: {}` never hashes like an absent journal.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -112,7 +144,7 @@ pub struct JournalSpec {
 }
 
 /// Version 2: the v1 operations, where `new` also takes a `request_id`,
-/// `lowers`, a `journal` and `retain`, and `list` takes `all`; plus
+/// `lowers`, a `journal`, `retain` and `overlay_durability`, and `list` takes `all`; plus
 /// `finalize`. Fields and defaults are v1's, and they never change within
 /// version 2; later releases only add fields,
 /// which an older daemon refuses as unknown. Only `new` and `finalize` take a
@@ -160,6 +192,10 @@ pub enum OperationV2 {
         /// (R1c-1 §5.6). Linux only, TAR, directory and `git:///` bases only.
         #[serde(default, skip_serializing_if = "is_false")]
         retain: bool,
+        /// The attempts' `--overlay-durability` (#328). Absent is `full`,
+        /// which is never serialized: R1a's bytes and hashes are unchanged.
+        #[serde(default, skip_serializing_if = "OverlayDurability::is_full")]
+        overlay_durability: OverlayDurability,
     },
     List {
         #[serde(default)]
@@ -209,7 +245,7 @@ fn is_false(value: &bool) -> bool {
 
 impl OperationV2 {
     /// The same v1 operation; a `request_id` is not part of it. A `new` with
-    /// `lowers`, a `journal` or `retain`, a `list` with `all` and `finalize`
+    /// `lowers`, a `journal`, `retain` or relaxed durability, a `list` with `all` and `finalize`
     /// have no v1 form: the supervisor never converts one (§5.1).
     pub fn into_v1(self) -> Operation {
         match self {
@@ -232,11 +268,15 @@ impl OperationV2 {
                 lowers,
                 journal,
                 retain,
+                overlay_durability,
             } => {
                 // `Supervisor::handle` takes every v2 `new` before this.
                 assert!(
-                    lowers.is_empty() && journal.is_none() && !retain,
-                    "a layered, journaled or retained new has no v1 form"
+                    lowers.is_empty()
+                        && journal.is_none()
+                        && !retain
+                        && overlay_durability.is_full(),
+                    "a layered, journaled, retained or relaxed new has no v1 form"
                 );
                 Operation::New {
                     base,

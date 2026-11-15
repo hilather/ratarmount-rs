@@ -661,6 +661,7 @@ impl<M: Mounter> Supervisor<M> {
                 lowers,
                 journal,
                 retain,
+                overlay_durability,
             }) => {
                 return self
                     .new_attempts(
@@ -672,6 +673,7 @@ impl<M: Mounter> Supervisor<M> {
                         &lowers,
                         journal.as_ref(),
                         retain,
+                        overlay_durability,
                         None,
                     )
                     .map(|(_, result)| result)
@@ -731,6 +733,7 @@ impl<M: Mounter> Supervisor<M> {
                     &[],
                     None,
                     false,
+                    OverlayDurability::Full,
                     None,
                 )
                 .map(|(_, result)| result)
@@ -761,6 +764,10 @@ impl<M: Mounter> Supervisor<M> {
                         .map_err(|e| ApiError::new("diff_failed", e))?,
                 };
                 let deleted = self.mounter.deleted_paths(&attempt)?;
+                if deleted.is_none() {
+                    super::inspection::check_offline_durability(&attempt.overlay_dir)
+                        .map_err(|e| ApiError::new("diff_failed", e.to_string()))?;
+                }
                 let base = self.base(&attempt.base)?.clone();
                 let indexes = self.indexes(&base.name);
                 // A finalized or retained attempt is read offline, after its
@@ -803,7 +810,12 @@ impl<M: Mounter> Supervisor<M> {
             }
             Operation::Stats { id } => {
                 let (attempt, _) = self.served(&id)?;
-                let stats = if let Some(deleted) = self.mounter.deleted_paths(&attempt)? {
+                let deleted = self.mounter.deleted_paths(&attempt)?;
+                if deleted.is_none() {
+                    super::inspection::check_offline_durability(&attempt.overlay_dir)
+                        .map_err(|e| ApiError::new("stats_failed", e.to_string()))?;
+                }
+                let stats = if let Some(deleted) = deleted {
                     // Named, never a bare io error (Keystone note (1)).
                     let usage = ratarmount_compositing::OverlayUsage::scan(&attempt.overlay_dir)
                         .map_err(|e| {
@@ -874,6 +886,7 @@ impl<M: Mounter> Supervisor<M> {
             lowers,
             journal,
             retain,
+            overlay_durability,
         } = &operation
         else {
             unreachable!("only a v2 new with a request_id is routed here");
@@ -910,6 +923,7 @@ impl<M: Mounter> Supervisor<M> {
             lowers,
             journal.as_ref(),
             *retain,
+            *overlay_durability,
             Some((id, &hash)),
         );
         self.requests.finish(id, &hash, outcome)
@@ -1009,6 +1023,7 @@ impl<M: Mounter> Supervisor<M> {
         lowers: &[String],
         journal: Option<&JournalSpec>,
         retain: bool,
+        durability: OverlayDurability,
         request: Option<(&str, &str)>,
     ) -> requests::Outcome {
         if retain {
@@ -1068,7 +1083,9 @@ impl<M: Mounter> Supervisor<M> {
             None
         };
         let lower_paths: Vec<PathBuf> = layered.iter().map(|lower| lower.path.clone()).collect();
-        if !layered.is_empty() || journal.is_some() {
+        // A relaxed attempt's flag goes through the parser too: before the
+        // RAM root, any attempt directory or child.
+        if !layered.is_empty() || journal.is_some() || !durability.is_full() {
             // The parser takes these, but no argv can carry them: spawning
             // the child would fail only once its attempt exists.
             let unspawnable = journal.and_then(|spec| {
@@ -1102,6 +1119,7 @@ impl<M: Mounter> Supervisor<M> {
                     lowers: &lower_paths,
                     bundle_cache: bundle_cache.as_deref(),
                     journal: journal.map(|spec| (probe, spec)),
+                    durability,
                 },
             )?;
         }
@@ -1199,6 +1217,7 @@ impl<M: Mounter> Supervisor<M> {
                         lowers: &lower_paths,
                         bundle_cache: bundle_cache.as_deref(),
                         journal: journal.map(|spec| (journal_path.as_path(), spec)),
+                        durability,
                     },
                 )?;
             }

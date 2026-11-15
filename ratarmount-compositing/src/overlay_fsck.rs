@@ -157,11 +157,35 @@ fn overlay_error(error: OverlayError) -> io::Error {
     }
 }
 
+/// Whether fsck may repair rows and acknowledge a relaxed machine crash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsckMode {
+    Check,
+    Repair,
+    /// Automated finalize may repair ordinary inconsistencies, but must
+    /// never acknowledge a foreign or unknown boot's relaxed marker.
+    RepairSameBoot,
+}
+
+impl From<bool> for FsckMode {
+    fn from(repair: bool) -> Self {
+        if repair {
+            Self::Repair
+        } else {
+            Self::Check
+        }
+    }
+}
+
 /// Check with one directory walk and one `files` scan. Repair holds a SQLite
 /// exclusive transaction throughout; host removals use no-follow parent FDs.
 /// Sealed overlays are checked read-only, without updating their metadata.
 /// A missing/unreadable database is an error and is never created.
-pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
+/// Boolean callers retain the explicit CLI repair policy; automated callers
+/// use [`FsckMode::RepairSameBoot`] to refuse relaxed crash recovery.
+pub fn fsck(dir: &Path, mode: impl Into<FsckMode>) -> io::Result<FsckReport> {
+    let mode = mode.into();
+    let repair = mode != FsckMode::Check;
     let meta = OverlayMeta::read(dir).map_err(overlay_error)?;
     let sealed = meta.as_ref().is_some_and(OverlayMeta::layer_sealed);
     if repair && sealed {
@@ -214,6 +238,15 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
             crate::relaxed_durability::classify(Some(value)),
             crate::relaxed_durability::MarkerState::Unclean(_)
         );
+        if unclean && mode == FsckMode::RepairSameBoot {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}; this attempt cannot be finalized: destroy it",
+                    crate::relaxed_durability::unclean_message(value)
+                ),
+            ));
+        }
         if repair {
             crate::relaxed_durability::integrity_check(&conn).map_err(overlay_error)?;
             crate::relaxed_durability::clear_marker(&conn).map_err(overlay_error)?;

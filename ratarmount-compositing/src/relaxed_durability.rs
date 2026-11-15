@@ -172,7 +172,13 @@ pub fn unclean_message(value: &str) -> String {
 
 /// Refuse an overlay whose relaxed mount did not survive a reboot.
 pub fn refuse_unclean(meta: Option<&OverlayMeta>) -> Result<()> {
-    match marker_state(meta) {
+    refuse_unclean_marker(meta.and_then(|meta| meta.get(RELAXED_DURABILITY_KEY)))
+}
+
+/// Refuse a marker read through an existing owner connection or from bundle
+/// metadata, without opening a second connection to a live overlay.
+pub fn refuse_unclean_marker(value: Option<&str>) -> Result<()> {
+    match classify(value) {
         MarkerState::Unclean(value) => Err(OverlayError::Msg(unclean_message(&value))),
         MarkerState::Absent | MarkerState::SameBoot(_) => Ok(()),
     }
@@ -423,6 +429,61 @@ mod tests {
             assert!(meta.layer_sealed());
             assert_eq!(meta.get(RELAXED_DURABILITY_KEY), None);
         });
+    }
+
+    /// Regression: read-only composition bypassed the crash marker, including
+    /// immutable lowers used by supervised diff, seal and pack.
+    #[test]
+    fn regression_relaxed_read_layers_refuse_unclean_markers() {
+        use crate::{Immutability, ReadOnlyOverlayLayer};
+        with_boot_id(Some("boot-a"), || {
+            let (_tmp, dir, source) = fixture();
+            for value in ["boot-a:42", "boot-b:42", "unknown:42"] {
+                plant(&dir, value);
+                let before = std::fs::read(dir.join(HIDDEN_DB)).unwrap();
+                for mode in [Immutability::Shared, Immutability::Immutable] {
+                    let result = ReadOnlyOverlayLayer::new(source.clone(), &dir, mode);
+                    if value == "boot-a:42" {
+                        assert!(result.is_ok());
+                    } else {
+                        let error = result.err().expect("unclean layer refused").to_string();
+                        assert!(error.contains(value), "{error}");
+                    }
+                }
+                assert_eq!(std::fs::read(dir.join(HIDDEN_DB)).unwrap(), before);
+            }
+        });
+    }
+
+    /// Regression: automated repair cleared an unknown/foreign boot marker
+    /// that appeared after the supervisor's initial read. Only explicit
+    /// repair may acknowledge it, even when SQLite integrity_check passes.
+    #[test]
+    fn regression_relaxed_finalize_repair_requires_current_boot() {
+        use crate::overlay_fsck::{fsck, FsckMode};
+        for boot in [Some("boot-a"), None] {
+            with_boot_id(boot, || {
+                let (_tmp, dir, _) = fixture();
+                for value in ["boot-a:42", "boot-b:42", "unknown:42"] {
+                    plant(&dir, value);
+                    let before = std::fs::read(dir.join(HIDDEN_DB)).unwrap();
+                    let result = fsck(&dir, FsckMode::RepairSameBoot);
+                    if boot.is_some() && value == "boot-a:42" {
+                        assert!(result.unwrap().is_clean());
+                        assert_eq!(marker(&dir), None);
+                    } else {
+                        let error = result.unwrap_err().to_string();
+                        assert!(
+                            error.contains(value) && error.contains("destroy it"),
+                            "{error}"
+                        );
+                        assert_eq!(std::fs::read(dir.join(HIDDEN_DB)).unwrap(), before);
+                        assert!(fsck(&dir, true).unwrap().is_clean());
+                        assert_eq!(marker(&dir), None);
+                    }
+                }
+            });
+        }
     }
 
     /// Regression (#328): a forced seal must not replace an unclean overlay's

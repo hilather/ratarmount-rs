@@ -446,6 +446,13 @@ fn base_digest_of_kind(kind: &str, digest: &str) -> bool {
 fn check_stack(lowers: &[Lower]) -> Result<(), ApiError> {
     for (i, lower) in lowers.iter().enumerate() {
         let name = lower.path.display();
+        ratarmount_compositing::relaxed_durability::refuse_unclean_marker(
+            lower
+                .meta
+                .get(ratarmount_compositing::relaxed_durability::RELAXED_DURABILITY_KEY)
+                .map(String::as_str),
+        )
+        .map_err(|error| invalid(excerpt(&format!("lower {name}: {error}"), MESSAGE_BYTES)))?;
         for marker in ["stack_mismatch_forced_at", "base_mismatch_forced_at"] {
             if lower.meta.contains_key(marker) {
                 return Err(invalid(format!(
@@ -609,6 +616,8 @@ pub fn recorded_layers(
         .iter()
         .map(|record| {
             let meta = OverlayMeta::read_no_recovery(&record.path)
+                .map_err(|e| format!("lower {}: {e}", record.path.display()))?;
+            ratarmount_compositing::relaxed_durability::refuse_unclean(meta.as_ref())
                 .map_err(|e| format!("lower {}: {e}", record.path.display()))?;
             let unchanged = meta.as_ref().is_some_and(|meta| {
                 meta.layer_sealed()
