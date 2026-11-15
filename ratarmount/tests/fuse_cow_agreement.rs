@@ -89,6 +89,19 @@ impl Mount {
         path: &Path,
         ready: &str,
     ) -> Self {
+        Self::start_umask(base, overlay, flags, env, path, ready, None)
+    }
+
+    /// `start_with`, with the daemon's umask set to `umask` when given.
+    fn start_umask(
+        base: &Path,
+        overlay: Option<&Path>,
+        flags: &[&std::ffi::OsStr],
+        env: &[(&str, &Path)],
+        path: &Path,
+        ready: &str,
+        umask: Option<libc::mode_t>,
+    ) -> Self {
         fs::create_dir(path).unwrap();
         let private = path.parent().unwrap().join("mount-home");
         fs::create_dir_all(&private).unwrap();
@@ -102,6 +115,16 @@ impl Mount {
             .args(flags);
         if let Some(overlay) = overlay {
             cmd.arg("-w").arg(overlay);
+        }
+        if let Some(mask) = umask {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: umask(2) is async-signal-safe and touches no memory.
+            unsafe {
+                cmd.pre_exec(move || {
+                    libc::umask(mask);
+                    Ok(())
+                });
+            }
         }
         let child = cmd
             .arg(base)
@@ -904,8 +927,7 @@ fn regression_rmdir_overlay_created_exception_root() {
     );
 
     // No manifest row for the removed root (the issue's manifest difference).
-    // The materialized parent `bin` may differ in mode when the umask does not
-    // match the base's directory mode; that is pre-existing and not #326.
+    // The materialized parent `bin` carries the base's mode (#326 residual).
     let manifest = expect(
         run(
             &[Path::new("diff"), &overlay, Path::new("--manifest")],
@@ -916,8 +938,131 @@ fn regression_rmdir_overlay_created_exception_root() {
     for line in manifest.lines() {
         let row: Value = serde_json::from_str(line).unwrap();
         let path = row["path"].as_str().expect("UTF-8 fixture path");
-        assert!(!path.starts_with("bin/agent"), "{manifest}");
+        assert!(!path.starts_with("bin"), "{manifest}");
     }
+    agree(root, &overlay, &cache, &[]);
+}
+
+/// Regression: #326 residual. With the daemon under umask 0002, creating and
+/// removing `t/agent` (and a COW edit of `src/a.c`) materialized the base
+/// parents `t` (0755) and `src` (0750) with the umask (0775), so
+/// `diff --manifest` listed them as mode-only changes versus a re-import of
+/// the attempt's patch. Restrictive parents and existing metadata overrides
+/// retain their visible modes; diff, fsck, seal and pack agree.
+#[test]
+fn regression_326_materialized_parents_keep_base_modes_fuse() {
+    if !available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _writable = Writable(tmp.path());
+    let root = tmp.path();
+    let cache = root.join("cache");
+    let base = base_dir(root);
+    fs::create_dir(base.join("t")).unwrap();
+    fs::write(base.join("t/keep.t"), b"keep\n").unwrap();
+    for dir in ["ro", "private"] {
+        fs::create_dir(base.join(dir)).unwrap();
+        fs::write(base.join(dir).join("f"), b"base\n").unwrap();
+    }
+    for (dir, mode) in [
+        ("t", 0o755),
+        ("src", 0o750),
+        ("docs", 0o2755),
+        ("ro", 0o555),
+        ("private", 0o750),
+    ] {
+        fs::set_permissions(base.join(dir), fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let rules = [
+        std::ffi::OsStr::new("--overlay-readonly"),
+        std::ffi::OsStr::new("t/**"),
+        std::ffi::OsStr::new("--overlay-allow"),
+        std::ffi::OsStr::new("t/agent/**"),
+    ];
+    let overlay = root.join("overlay");
+    let mnt = root.join("mnt");
+    let mount = Mount::start_umask(
+        &base,
+        Some(&overlay),
+        &rules,
+        &[],
+        &mnt,
+        "Makefile",
+        Some(0o002),
+    );
+    let script = "mkdir -p t/agent && echo 1 > t/agent/x.t && rm -rf t/agent";
+    let status = Command::new("sh")
+        .args(["-c", script])
+        .current_dir(&mnt)
+        .status()
+        .unwrap();
+    assert!(status.success(), "{script}: {status}");
+    mount.unmount();
+    let manifest = |cache: &Path| {
+        expect(
+            run(
+                &[Path::new("diff"), &overlay, Path::new("--manifest")],
+                cache,
+            ),
+            0,
+        )
+    };
+    // The #326 flow alone leaves no change at all.
+    assert_eq!(manifest(&cache), "", "after the #326 flow");
+    let mnt = root.join("mnt2");
+    let mount = Mount::start_umask(
+        &base,
+        Some(&overlay),
+        &rules,
+        &[],
+        &mnt,
+        "Makefile",
+        Some(0o002),
+    );
+    fs::write(mnt.join("src/a.c"), b"int a(void) { return 10; }\n").unwrap();
+    fs::write(mnt.join("docs/new.txt"), b"new\n").unwrap();
+    fs::set_permissions(mnt.join("private"), fs::Permissions::from_mode(0o500)).unwrap();
+    fs::write(mnt.join("ro/f"), b"changed\n").unwrap();
+    fs::write(mnt.join("private/f"), b"changed\n").unwrap();
+    for (dir, mode) in [
+        ("t", 0o755),
+        ("src", 0o750),
+        ("docs", 0o2755),
+        ("ro", 0o555),
+        ("private", 0o500),
+    ] {
+        let seen = fs::metadata(mnt.join(dir)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(seen, mode, "{dir}: mode seen through the mount");
+    }
+    mount.unmount();
+    for (dir, mode) in [
+        ("t", 0o755),
+        ("src", 0o750),
+        ("docs", 0o2755),
+        ("ro", 0o755),
+        ("private", 0o700),
+    ] {
+        let host = fs::metadata(overlay.join(dir))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(host, mode, "{dir}: materialized host mode");
+    }
+    let manifest = manifest(&cache);
+    let paths: Vec<String> = manifest
+        .lines()
+        .map(|line| {
+            let row: Value = serde_json::from_str(line).unwrap();
+            row["path"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert_eq!(
+        paths,
+        ["docs/new.txt", "private", "private/f", "ro/f", "src/a.c"],
+        "{manifest}"
+    );
     agree(root, &overlay, &cache, &[]);
 }
 

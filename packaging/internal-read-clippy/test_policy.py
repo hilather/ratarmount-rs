@@ -3,6 +3,7 @@
 import copy
 import importlib.util
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -307,6 +308,36 @@ class Contract(unittest.TestCase):
                  "policy.py", "dispatch.py"]
         self.assertEqual(approved["policy"]["configuration"],
                          policy.digest(b"".join((here / f).read_bytes() for f in files)))
+
+    def test_regression_326_parent_creation_review_matches_source(self):
+        """Regression: parent creation's approval still claimed default/umask modes.
+
+        This checks the reviewed source/reason/leaf change without the pinned
+        compiler driver; production identity/fulfillment still requires CI.
+        """
+        source = (policy.ROOT / "ratarmount-compositing/src/write_overlay.rs").read_text()
+        found = re.findall(
+            r'(internal-read:v1 \{"id":"IR-E0008-M01"[^\n]+?)"###\s*\)\]\s*'
+            r'(let created = fs::create_dir\(&real\);)', source)
+        self.assertEqual(len(found), 1)
+        reason, _ = found[0]
+        approved = json.loads((Path(__file__).parent / "manifest.json").read_text())
+        entries = [e for e in approved["entries"]
+                   if e.get("metadata", {}).get("id") == "IR-E0008-M01"]
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["reason"], reason)
+        metadata = policy.metadata_reason(reason)
+        self.assertEqual(entry["metadata"], metadata)
+        self.assertEqual(entry["item"], metadata["item"])
+        self.assertEqual(metadata["creation"]["policy"], "exclusive-directory")
+        self.assertIn("visible mode preserved in overlay metadata", metadata["creation"]["basis"])
+        self.assertEqual(entry["configured_path"], "std::fs::create_dir")
+        self.assertEqual(entry["resolved"], "std::fs::create_dir")
+        self.assertEqual(entry["rule_reason"], "inventory-op:fs::create_dir")
+        # proc_macro2::TokenStream::to_string(), the driver's normalized leaf.
+        self.assertEqual(entry["leaf_digest"],
+                         policy.digest(b"let created = fs :: create_dir (& real) ;"))
 
 
 if __name__ == "__main__":

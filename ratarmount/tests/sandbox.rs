@@ -2005,8 +2005,12 @@ fn regression_sandbox_v2_finalize_layered_fuse() {
             "files_read": count("files_read"),
             "files_read_then_written": count("files_read_then_written"),
             "files_written_blind": count("files_written_blind"),
+            "complete": summary["coverage"]["complete"],
+            "reasons": summary["coverage"]["reasons"],
         })
     );
+    // The attempt's mount was stopped cleanly before the summary was taken.
+    assert_eq!(summary["coverage"]["complete"], true, "{summary}");
     assert!(
         summary["files_written_blind"]
             .as_array()

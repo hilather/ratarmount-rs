@@ -833,6 +833,8 @@ impl Drop for CowReservation<'_> {
 /// Union of a read-only base with a writable overlay folder + deletion DB.
 pub struct WriteOverlay {
     policy: Option<Arc<dyn OverlayPolicy>>,
+    /// Also serializes directory initialization and metadata without a policy.
+    /// Unpoliced payload I/O must not hold this gate (a FIFO open can block).
     policy_gate: Mutex<()>,
     #[cfg(unix)]
     policy_fds: Mutex<PolicyFds>,
@@ -844,6 +846,10 @@ pub struct WriteOverlay {
     /// metadata and the file fsync, before `persist_noclobber`.
     #[cfg(test)]
     cow_before_persist_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    parent_before_create_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(all(test, unix))]
+    parent_before_mode_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     base: Arc<dyn MountSource>,
     /// The classified base this overlay was opened with (`None` for the
     /// legacy constructors). A commit re-points it at the archive it wrote.
@@ -995,6 +1001,14 @@ impl WriteOverlay {
         self.policy
             .as_ref()
             .map(|_| self.policy_gate.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Directory mutations already hold policy_lock when configured. Supply
+    /// the same exclusion without a policy, only for directory/metadata work.
+    fn parent_lock(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        self.policy
+            .is_none()
+            .then(|| self.policy_gate.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Reserved control name (only while the control folder is served).
@@ -1509,6 +1523,10 @@ impl WriteOverlay {
             cow_before_read_hook: Mutex::new(None),
             #[cfg(test)]
             cow_before_persist_hook: Mutex::new(None),
+            #[cfg(test)]
+            parent_before_create_hook: Mutex::new(None),
+            #[cfg(all(test, unix))]
+            parent_before_mode_hook: Mutex::new(None),
             base,
             identity: Mutex::new(identity.cloned()),
             force_base_mismatch: info.is_some_and(|info| info.force_base_mismatch),
@@ -1815,19 +1833,96 @@ impl WriteOverlay {
     }
 
     fn ensure_parent(&self, path: &str) -> Result<()> {
+        let _parents = self.parent_lock();
         let (parent, _) = Self::split(path);
         if parent.is_empty() || parent == "/" {
             return Ok(());
         }
         let real_parent = self.realpath(&parent);
         self.ensure_under_root(&real_parent)?;
-        if !real_parent.exists() && self.current_base().is_dir(&parent) {
+        if real_parent.exists() || !self.current_base().is_dir(&parent) {
+            return Ok(());
+        }
+        let mut prefix = String::new();
+        for component in parent.split('/').filter(|c| !c.is_empty()) {
+            prefix.push('/');
+            prefix.push_str(component);
+            let real = self.realpath(&prefix);
+            match fs::symlink_metadata(&real) {
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            self.ensure_under_root(&real)?;
+            #[cfg(test)]
+            {
+                let hook = self.parent_before_create_hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
             #[expect(
                 clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0008-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_parent","disposition":"output-owner","category":"overlay-directory","reason":"Materialize an archive parent directory inside the checked overlay root before a mutation.","creation":{"policy":"recursive-directory","basis":"Only a missing parent represented as a base directory is materialized; host directory creation keeps existing default/umask behavior."}}"###
+                reason = r###"internal-read:v1 {"id":"IR-E0008-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_parent","disposition":"output-owner","category":"overlay-directory","reason":"Materialize an archive parent directory inside the checked overlay root before a mutation.","creation":{"policy":"exclusive-directory","basis":"Create checked ancestors one at a time; only successful mkdir calls initialize the base mode under the mutation gate. Host owner rwx is retained, with the visible mode preserved in overlay metadata when needed."}}"###
             )]
-            fs::create_dir_all(&real_parent)?;
+            let created = fs::create_dir(&real);
+            match created {
+                Ok(()) => self.restore_base_dir_mode(&prefix)?,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    // Another host writer owns this entry, including its mode.
+                    self.ensure_under_root(&real)?;
+                    if !fs::metadata(&real)?.is_dir() {
+                        return Err(e.into());
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
+        Ok(())
+    }
+
+    /// Initialize a newly created parent while holding the mutation gate.
+    /// Restore each level before creating its children (including setgid).
+    /// Host owner rwx is needed for backing storage; preserve a more restrictive
+    /// visible mode using the same metadata overrides as chmod and sealing.
+    fn restore_base_dir_mode(&self, dir: &str) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let base = self.current_base();
+            let Some(mut fi) = base.lookup(dir, 0) else {
+                return Ok(());
+            };
+            self.apply_metadata(dir, &mut fi);
+            if !ratarmount_core::is_dir_mode(fi.mode) {
+                return Ok(());
+            }
+            let mode = fi.mode & 0o7777;
+            #[cfg(test)]
+            {
+                let hook = self.parent_before_mode_hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            let real = self.realpath(dir);
+            self.ensure_under_root(&real)?;
+            if mode & 0o700 != 0o700 {
+                self.db.lock().expect("overlay db").execute(
+                    "INSERT INTO overlay_metadata(path,mode) VALUES (?1,?2)
+                     ON CONFLICT(path) DO UPDATE SET mode=COALESCE(overlay_metadata.mode,excluded.mode)",
+                    params![dir, mode],
+                )?;
+            }
+            set_host_metadata(
+                &real,
+                &OverlayMetadata {
+                    mode: Some(mode | 0o700),
+                    ..Default::default()
+                },
+            )?;
+        }
+        #[cfg(not(unix))]
+        let _ = dir;
         Ok(())
     }
 
@@ -1889,6 +1984,12 @@ impl WriteOverlay {
         self.apply_metadata(path, &mut fi);
         self.remember_base_xattrs(path, self.current_base().as_ref(), &fi)?;
         if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
+            let _parents = self.parent_lock();
+            self.ensure_under_root(&real)?;
+            if fs::symlink_metadata(&real).is_ok() {
+                return Ok(());
+            }
+            self.apply_metadata(path, &mut fi);
             #[expect(
                 clippy::disallowed_methods,
                 reason = r###"internal-read:v1 {"id":"IR-E0009-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_modifiable_inner","disposition":"output-owner","category":"overlay-directory","reason":"Materialize a base directory during copy-on-write and then apply the archived directory metadata.","creation":{"policy":"recursive-directory","basis":"The path passes overlay confinement checks; set_host_metadata restores the base directory metadata after creation."}}"###
@@ -2576,6 +2677,7 @@ impl WriteOverlay {
         let _policy = self.policy_lock();
         self.check_mutation(OverlayMutation::Mkdir, &[path])?;
         self.ensure_parent(path)?;
+        let _parents = self.parent_lock();
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
         #[expect(
@@ -2648,6 +2750,7 @@ impl WriteOverlay {
         }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
+        let _parents = self.parent_lock();
         self.check_rmdir_policy(path)?;
         self.refuse_sealed_delete(path)?;
         let real = self.realpath(path);
@@ -3472,6 +3575,7 @@ impl WriteOverlay {
     pub fn set_metadata(&self, path: &str, attrs: &OverlayMetadata) -> Result<()> {
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
+        let _parents = self.parent_lock();
         let path = normpath(path);
         self.check_mutation(OverlayMutation::Write, &[&path])?;
         if is_overlay_internal_path(&path) {
@@ -3549,6 +3653,7 @@ impl WriteOverlay {
         use std::os::unix::fs::PermissionsExt;
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
+        let _parents = self.parent_lock();
         self.check_mutation(OverlayMutation::Write, &[path])?;
         validate_metadata(attrs)?;
         if let Some(mode) = attrs.mode {
