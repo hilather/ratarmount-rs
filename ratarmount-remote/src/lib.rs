@@ -514,17 +514,18 @@ pub fn remote_url_scheme(s: &str) -> Option<String> {
 
 /// Torrent metainfo is a lazy remote tree even when the metainfo file is local.
 pub fn is_torrent_input(s: &str) -> bool {
-    if s.get(..7)
-        .is_some_and(|p| p.eq_ignore_ascii_case("magnet:"))
-    {
-        return true;
-    }
+    let magnet = s
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("magnet:"));
     #[cfg(not(feature = "bittorrent"))]
     {
-        false
+        magnet
     }
     #[cfg(feature = "bittorrent")]
     {
+        if magnet {
+            return true;
+        }
         if s.contains("://") {
             return Url::parse(s).is_ok_and(|u| {
                 u.path().to_ascii_lowercase().ends_with(".torrent")

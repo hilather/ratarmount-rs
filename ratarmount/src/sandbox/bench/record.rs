@@ -95,7 +95,8 @@ pub(super) fn host_identity(result: io::Result<libc::utsname>) -> io::Result<Hos
     let value = result.map_err(|e| io::Error::other(format!("uname failed: {e}")))?;
     // Bound each field even for malformed input; nodename is deliberately omitted.
     let text = |name, p: &[libc::c_char]| -> io::Result<String> {
-        let bytes: Vec<u8> = p.iter().map(|&c| c as u8).collect();
+        // `c_char` is `i8` on x86_64 and `u8` on aarch64; reinterpret the byte either way.
+        let bytes: Vec<u8> = p.iter().map(|&c| c.to_ne_bytes()[0]).collect();
         CStr::from_bytes_until_nul(&bytes)
             .map(|s| s.to_string_lossy().into_owned())
             .map_err(|_| io::Error::other(format!("uname field {name} missing NUL terminator")))

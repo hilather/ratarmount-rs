@@ -157,15 +157,11 @@ fn looks_like_hfs_or_apfs<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         return true;
     }
     let mut sig = [0u8; 2];
-    if reader
+    reader
         .seek(SeekFrom::Start(partition_offset.saturating_add(1024)))
         .is_ok()
         && reader.read_exact(&mut sig).is_ok()
         && (sig == *b"H+" || sig == *b"HX" || sig == *b"BD")
-    {
-        return true;
-    }
-    false
 }
 
 fn try_fs_at(disk: DmgDisk, label: &Path, offset: u64) -> Option<Arc<dyn MountSource>> {
