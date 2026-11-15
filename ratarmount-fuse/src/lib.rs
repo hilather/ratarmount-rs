@@ -2569,6 +2569,23 @@ impl RatarmountFs {
             return self.setattr_detached(ino, size, fh, attrs);
         }
         let path = self.path_for_ino(ino).ok_or(ENOENT)?;
+        let filtered;
+        let attrs = if self.overlay.is_some() && (attrs.uid.is_some() || attrs.gid.is_some()) {
+            // A chown to the owner already presented is a no-op (#327).
+            let presented = self
+                .file_info_for_ino(ino)
+                .or_else(|| self.source.lookup(&path, 0))
+                .unwrap_or_else(ratarmount_core::create_root_file_info);
+            filtered = without_presented_owner(
+                self.attribute_mapping,
+                presented.uid,
+                presented.gid,
+                attrs,
+            );
+            &filtered
+        } else {
+            attrs
+        };
         if size.is_some() || !attrs.is_empty() {
             self.overlay
                 .as_ref()
@@ -2616,6 +2633,18 @@ let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             if acc != libc::O_WRONLY && acc != libc::O_RDWR {
                 return Err(EACCES);
             }
+            let filtered;
+            let attrs = if attrs.uid.is_some() || attrs.gid.is_some() {
+                let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
+                if unsafe { libc::fstat(fd, &mut st) } != 0 {
+                    return Err(EIO);
+                }
+                filtered =
+                    without_presented_owner(self.attribute_mapping, st.st_uid, st.st_gid, attrs);
+                &filtered
+            } else {
+                attrs
+            };
             if !attrs.is_empty() {
                 self.overlay
                     .as_ref()
@@ -2649,6 +2678,38 @@ let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
                 self.mapped_attr(file_attr_from_stat(ino, &st)),
             ))
         })
+    }
+
+    /// `SETXATTR` body after the name is decoded.
+    fn setxattr_entry(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<(), i32> {
+        if let Some(result) = self.root_control(ino, name, value) {
+            return result;
+        }
+        let overlay = self.overlay.as_ref().ok_or(EROFS)?;
+        // POSIX ACLs are not stored. EOPNOTSUPP is what coreutils and sed read
+        // as "no ACL support" and fall back to chmod quietly; EPERM made
+        // `sed -i` warn "preserving permissions ... Operation not permitted" (#327).
+        if name.starts_with("system.posix_acl_") {
+            return Err(libc::EOPNOTSUPP);
+        }
+        let path = self.path_for_ino(ino).ok_or(EACCES)?;
+        // macFUSE passes the native CREATE=2/REPLACE=4 bits; the storage API
+        // uses the Linux CREATE=1/REPLACE=2 encoding on every platform.
+        #[cfg(target_os = "macos")]
+        let flags = match flags {
+            0 => 0,
+            libc::XATTR_CREATE => 1,
+            libc::XATTR_REPLACE => 2,
+            _ => return Err(EINVAL),
+        };
+        overlay
+            .set_xattr(&path, name, value, flags)
+            .map_err(|e| match &e {
+                ratarmount_compositing::OverlayError::Io(e) => {
+                    e.raw_os_error().unwrap_or_else(|| io_to_errno(e))
+                }
+                _ => EIO,
+            })
     }
 
     fn snapshot_xattrs(&self, fi: Option<&FileInfo>) -> BTreeMap<String, Vec<u8>> {
@@ -2774,6 +2835,21 @@ fn mode_to_kind(mode: u32) -> FileType {
 /// carry `inf`/`1e999` mtimes (PAX headers parse as f64); `SystemTime` addition
 /// with a saturated `u64::MAX` seconds would panic, killing the daemon.
 const FAR_FUTURE_SECS: u64 = u32::MAX as u64;
+
+/// `attrs` without the uid/gid that equal the presented owner of the entry.
+fn without_presented_owner(
+    mapping: AttributeMapping,
+    raw_uid: u32,
+    raw_gid: u32,
+    attrs: &OverlayMetadata,
+) -> OverlayMetadata {
+    let (uid, gid) = mapping.drop_presented_owner(raw_uid, raw_gid, attrs.uid, attrs.gid);
+    OverlayMetadata {
+        uid,
+        gid,
+        ..attrs.clone()
+    }
+}
 
 fn setattr_time(time: fuser::TimeOrNow, now: SystemTime) -> f64 {
     let time = match time {
@@ -3647,28 +3723,7 @@ impl Filesystem for RatarmountFs {
                     return Err(EINVAL);
                 }
                 let name = name.to_str().ok_or(EILSEQ)?;
-                if let Some(result) = self.root_control(ino.0, name, value) {
-                    return result;
-                }
-                let overlay = self.overlay.as_ref().ok_or(EROFS)?;
-                let path = self.path_for_ino(ino.0).ok_or(EACCES)?;
-                // macFUSE passes the native CREATE=2/REPLACE=4 bits; the storage API
-                // uses the Linux CREATE=1/REPLACE=2 encoding on every platform.
-                #[cfg(target_os = "macos")]
-                let flags = match flags {
-                    0 => 0,
-                    libc::XATTR_CREATE => 1,
-                    libc::XATTR_REPLACE => 2,
-                    _ => return Err(EINVAL),
-                };
-                overlay
-                    .set_xattr(&path, name, value, flags)
-                    .map_err(|e| match &e {
-                        ratarmount_compositing::OverlayError::Io(e) => {
-                            e.raw_os_error().unwrap_or_else(|| io_to_errno(e))
-                        }
-                        _ => EIO,
-                    })
+                self.setxattr_entry(ino.0, name, value, flags)
             });
         match result {
             Ok(()) => reply.ok(),
@@ -9099,6 +9154,141 @@ mod sandbox_attr_tests {
         assert_eq!(u32::from(attr.perm), metadata.mode() & 0o7777 & !0o027);
         let raw = overlay.lookup("/created", 0).unwrap();
         assert_eq!((raw.uid, raw.gid), (metadata.uid(), metadata.gid()));
+    }
+
+    fn owner_fs(
+        mapping: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        RatarmountFs,
+        u64,
+        (u32, u32),
+    ) {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("member"), b"base").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let source = Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+        let overlay = Arc::new(crate::test_overlay::new_overlay(source, directory.path()).unwrap());
+        let fs = RatarmountFs::new(overlay.clone(), Some(overlay))
+            .with_attribute_mapping(AttributeMapping::parse(mapping).unwrap());
+        let (ino, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("member")).unwrap();
+        let raw = unsafe { (libc::geteuid(), libc::getegid()) };
+        (base, directory, fs, ino, raw)
+    }
+
+    fn chown(fs: &RatarmountFs, ino: u64, uid: Option<u32>, gid: Option<u32>) -> Result<(), i32> {
+        fs.setattr_metadata_entry(
+            ino,
+            None,
+            None,
+            &OverlayMetadata {
+                uid,
+                gid,
+                ..Default::default()
+            },
+        )
+        .map(|_| ())
+    }
+
+    /// Regression: `cp -p` / `sed -i` into a write mount failed with EPERM
+    /// because a chown to the owner already shown was refused (#327).
+    #[test]
+    fn regression_fuse_setattr_same_owner_chown_is_noop() {
+        // Unmapped: the presented owner is the stored one.
+        let (_b, _d, fs, ino, (uid, gid)) = owner_fs("");
+        assert_eq!(chown(&fs, ino, Some(uid), Some(gid)), Ok(()));
+        assert_eq!(chown(&fs, ino, Some(uid), None), Ok(()));
+        assert_eq!(chown(&fs, ino, None, Some(gid)), Ok(()));
+        assert_eq!(
+            chown(&fs, ino, Some(uid.wrapping_add(1)), None),
+            Err(libc::EPERM)
+        );
+        assert_eq!(
+            chown(&fs, ino, None, Some(gid.wrapping_add(1))),
+            Err(libc::EPERM)
+        );
+        // A same-owner chown combined with chmod still applies the mode.
+        let (_, attr) = fs
+            .setattr_metadata_entry(
+                ino,
+                None,
+                None,
+                &OverlayMetadata {
+                    mode: Some(0o700),
+                    uid: Some(uid),
+                    gid: Some(gid),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(attr.perm, 0o700);
+
+        // Mapped: compare with the presented owner, not the stored one.
+        let (_b, _d, fs, ino, (uid, gid)) = owner_fs("uid=12345,gid=23456");
+        assert_eq!(chown(&fs, ino, Some(12345), Some(23456)), Ok(()));
+        assert_eq!(chown(&fs, ino, Some(12345), None), Ok(()));
+        assert_eq!(chown(&fs, ino, None, Some(23456)), Ok(()));
+        if (uid, gid) != (12345, 23456) {
+            assert_eq!(chown(&fs, ino, Some(uid), Some(gid)), Err(libc::EPERM));
+        }
+        assert_eq!(chown(&fs, ino, None, Some(23457)), Err(libc::EPERM));
+        let (_b, _d, fs, ino, _) = owner_fs("uid=0,gid=0");
+        assert_eq!(chown(&fs, ino, Some(0), Some(0)), Ok(()));
+        assert_eq!(chown(&fs, ino, Some(1), Some(0)), Err(libc::EPERM));
+    }
+
+    /// Regression: a detached (renamed-over) inode's same-owner fchown is a
+    /// no-op compared with its mapped descriptor owner (#327).
+    #[test]
+    fn regression_fuse_setattr_same_owner_chown_detached() {
+        let (_b, _d, fs, _, (uid, gid)) = owner_fs("gid=23456");
+        let ov = fs.overlay.clone().unwrap();
+        for name in ["/dst", "/src"] {
+            let fd = ov.create_file(name, 0o644).unwrap();
+            ov.close_overlay_fd(fd);
+        }
+        let (dst, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("dst")).unwrap();
+        fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("src")).unwrap();
+        let (fh, _) = fs.open_inode(dst, libc::O_RDWR).unwrap();
+        fs.rename_paths(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "dst", 0)
+            .unwrap();
+        let set = |uid, gid| {
+            fs.setattr_metadata_entry(
+                dst,
+                None,
+                Some(fh),
+                &OverlayMetadata {
+                    uid,
+                    gid,
+                    ..Default::default()
+                },
+            )
+            .map(|_| ())
+        };
+        assert_eq!(set(Some(uid), Some(23456)), Ok(()));
+        assert_eq!(set(Some(uid.wrapping_add(1)), None), Err(libc::EPERM));
+        if gid != 23456 {
+            assert_eq!(set(None, Some(gid)), Err(libc::EPERM));
+        }
+    }
+
+    /// Regression: `sed -i` warned "preserving permissions ... Operation not
+    /// permitted" because a POSIX ACL copy got EPERM; it must be EOPNOTSUPP (#327).
+    #[test]
+    fn regression_fuse_posix_acl_set_is_unsupported() {
+        let (_b, _d, fs, ino, _) = owner_fs("");
+        for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+            assert_eq!(
+                fs.setxattr_entry(ino, name, b"\x02\0\0\0", 0),
+                Err(libc::EOPNOTSUPP)
+            );
+        }
+        assert_eq!(fs.setxattr_entry(ino, "user.note", b"v", 0), Ok(()));
+        assert_eq!(
+            fs.setxattr_entry(ino, "trusted.x", b"v", 0),
+            Err(libc::EPERM)
+        );
     }
 
     /// Regression: allow_other must explain the fuse.conf line before fusermount fails.

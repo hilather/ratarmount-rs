@@ -330,6 +330,20 @@ impl RatarmountSftp {
         attrs: &ratarmount_compositing::OverlayMetadata,
     ) -> Result<(), i32> {
         let ov = self.overlay()?;
+        let filtered;
+        let attrs = if attrs.uid.is_some() || attrs.gid.is_some() {
+            // A chown to the owner already presented is a no-op (#327).
+            let mut out = attrs.clone();
+            if let Ok(fi) = self.file_info_at(path) {
+                (out.uid, out.gid) = self
+                    .attribute_mapping
+                    .drop_presented_owner(fi.uid, fi.gid, attrs.uid, attrs.gid);
+            }
+            filtered = out;
+            &filtered
+        } else {
+            attrs
+        };
         let path = self.realpath(path);
         ov.set_attributes(&path, size, attrs).map_err(|e| {
             let e = overlay_to_io(e);
@@ -436,6 +450,46 @@ mod tests {
 
     use ratarmount_core::{create_root_file_info, ListResult, S_IFREG};
     use ratarmount_export_core::fill_read;
+
+    /// Regression: `cp -p` over SFTP failed because a SETSTAT to the owner
+    /// already presented was refused with EPERM (#327).
+    #[test]
+    fn regression_sftp_setstat_same_owner_chown_is_noop() {
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        for (mapping, shown) in [("", (uid, gid)), ("uid=12345,gid=23456", (12345, 23456))] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::write(base.path().join("member"), b"base").unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let source =
+                Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+            let ov = Arc::new(crate::test_overlay::new_overlay(source, directory.path()).unwrap());
+            let fs = RatarmountSftp::with_overlay(ov.clone(), 0, 8, Some(ov))
+                .with_attribute_mapping(ratarmount_core::AttributeMapping::parse(mapping).unwrap());
+            let chown = |uid: Option<u32>, gid: Option<u32>| {
+                fs.setstat_metadata(
+                    "/member",
+                    &ratarmount_compositing::OverlayMetadata {
+                        uid,
+                        gid,
+                        ..Default::default()
+                    },
+                )
+            };
+            assert_eq!(chown(Some(shown.0), Some(shown.1)), Ok(()), "{mapping}");
+            assert_eq!(chown(Some(shown.0), None), Ok(()), "{mapping}");
+            assert_eq!(chown(None, Some(shown.1)), Ok(()), "{mapping}");
+            assert_eq!(
+                chown(Some(shown.0.wrapping_add(1)), None),
+                Err(libc::EPERM),
+                "{mapping}"
+            );
+            assert_eq!(
+                chown(None, Some(shown.1.wrapping_add(1))),
+                Err(libc::EPERM),
+                "{mapping}"
+            );
+        }
+    }
 
     /// Regression: SFTP SETSTAT mode and times must not be silently discarded.
     #[test]

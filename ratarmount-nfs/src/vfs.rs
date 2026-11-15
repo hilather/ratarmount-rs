@@ -412,7 +412,7 @@ impl RatarmountNfs {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        let attrs = OverlayMetadata {
+        let mut attrs = OverlayMetadata {
             mode: match setattr.mode {
                 set_mode3::mode(v) => Some(v),
                 _ => None,
@@ -440,6 +440,14 @@ impl RatarmountNfs {
                 }
             },
         };
+        if attrs.uid.is_some() || attrs.gid.is_some() {
+            // A chown to the owner already presented is a no-op (#327).
+            if let Ok(fi) = self.file_info_for_id(id) {
+                (attrs.uid, attrs.gid) = self
+                    .attribute_mapping
+                    .drop_presented_owner(fi.uid, fi.gid, attrs.uid, attrs.gid);
+            }
+        }
         if !attrs.is_empty() || matches!(setattr.size, set_size3::size(_)) {
             ov.set_attributes(
                 &path,
@@ -1941,5 +1949,45 @@ mod sandbox_attr_tests {
         }
         let attr = mapped.getattr_sync(1).unwrap();
         assert_eq!((attr.uid, attr.gid), (12345, 23456));
+    }
+
+    /// Regression: `cp -p` over NFS failed because a SETATTR to the owner
+    /// already presented was refused with EPERM (#327).
+    #[test]
+    fn regression_nfs_setattr_same_owner_chown_is_noop() {
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        for (mapping, shown) in [("", (uid, gid)), ("uid=12345,gid=23456", (12345, 23456))] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::write(base.path().join("member"), b"base").unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let source =
+                Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+            let ov = Arc::new(crate::test_overlay::new_overlay(source, directory.path()).unwrap());
+            let nfs = RatarmountNfs::with_overlay(ov.clone(), 0, Some(ov))
+                .with_attribute_mapping(AttributeMapping::parse(mapping).unwrap());
+            let id = nfs
+                .lookup_sync(1, &nfsserve::nfs::nfsstring(b"member".to_vec()))
+                .unwrap();
+            let chown = |uid: Option<u32>, gid: Option<u32>| {
+                nfs.setattr_sync(
+                    id,
+                    sattr3 {
+                        uid: uid.map_or(set_uid3::Void, set_uid3::uid),
+                        gid: gid.map_or(set_gid3::Void, set_gid3::gid),
+                        ..Default::default()
+                    },
+                )
+            };
+            let attr = chown(Some(shown.0), Some(shown.1)).unwrap();
+            assert_eq!((attr.uid, attr.gid), shown, "{mapping}");
+            assert!(chown(Some(shown.0), None).is_ok(), "{mapping}");
+            assert!(chown(None, Some(shown.1)).is_ok(), "{mapping}");
+            assert_eq!(
+                chown(Some(shown.0.wrapping_add(1)), None).unwrap_err() as u32,
+                nfsstat3::NFS3ERR_PERM as u32,
+                "{mapping}"
+            );
+            assert!(chown(None, Some(shown.1.wrapping_add(1))).is_err());
+        }
     }
 }

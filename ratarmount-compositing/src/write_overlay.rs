@@ -342,7 +342,8 @@ CREATE TABLE IF NOT EXISTS meta (
 "#;
 
 /// Optional metadata changes. Missing times mean UTIME_OMIT; frontends resolve
-/// UTIME_NOW once per request. Ownership changes are refused with EPERM.
+/// UTIME_NOW once per request. Ownership changes are refused with EPERM;
+/// frontends drop a uid/gid equal to the presented owner first (#327).
 #[derive(Clone, Debug, Default)]
 pub struct OverlayMetadata {
     pub mode: Option<u32>,

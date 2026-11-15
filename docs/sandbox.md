@@ -1705,10 +1705,16 @@ NFSv3/v4 SETATTR, 9P Tsetattr and SFTP SETSTAT also apply mode and time changes.
 SFTP OPEN honors requested creation permissions. The current NFSv3 server dependency
 does not forward MKDIR attributes to the filesystem adapter, so newly created
 NFSv3 directories initially use mode 0755; SETATTR can change it afterwards.
-Ownership changes are refused
-with `EPERM` (the corresponding permission status for SFTP); they neither chown
-host files nor invent stored owners. Use `-o uid=...,gid=...` for presentation
-mapping. chmod on a symlink itself is unsupported. SMB Basic Information has no
+A chown to the owner an entry is already shown with (after any
+`-o uid=...,gid=...` mapping) succeeds as a no-op, so ownership-preserving tools
+such as `cp -p` and `sed -i` work, also as root; each ID is
+compared separately. Any other ownership change is refused with `EPERM` (the
+corresponding permission status for SFTP); it neither chowns host files nor
+invents stored owners. Use `-o uid=...,gid=...` for presentation mapping.
+POSIX ACLs are not stored: setting `system.posix_acl_access` or
+`system.posix_acl_default` over FUSE returns `EOPNOTSUPP`, which `cp -p` and
+`sed -i` read as "no ACL support" and fall back to the mode without a
+warning. chmod on a symlink itself is unsupported. SMB Basic Information has no
 Unix mode field; unsupported SET_INFO classes continue to return an error.
 
 ## overlay-stats
@@ -1748,6 +1754,25 @@ octal (`000` through `777`). These presentation options do not change stored own
 credentials; chmod and timestamp updates use the overlay metadata behavior above. SMB and WebDAV expose no Unix uid/gid fields.
 This mapping can avoid Git's “dubious ownership” check when a container uses a
 different user; see [Git mounts](git-mounts.md).
+
+Ratarmount does not pass `default_permissions`, so the kernel forwards every
+chown and chmod to the daemon, including one from a container root without
+`CAP_CHOWN` (`--cap-drop ALL`). A chown succeeds only when it names the owner
+already shown, which is what `cp -p` and `sed -i` request, so `cp -p` works
+whichever owner is presented. Setting a POSIX ACL is different: the kernel
+refuses it with `EPERM` before the daemon sees it unless the caller is the
+presented owner (or has `CAP_FOWNER`), and `sed -i` then warns
+"preserving permissions … Operation not permitted" (the edit still succeeds).
+Present the IDs the container runs as to avoid that: `-o uid=0,gid=0` for a
+root container (`--sandbox` otherwise presents the host caller), or
+`uid: 0, gid: 0` in a supervisor request:
+
+```sh
+ratarmount -f --sandbox -o uid=0,gid=0 -w overlay source.tar mnt/
+docker run --rm --cap-drop ALL --security-opt no-new-privileges \
+  -v "$PWD/mnt:/workspace:rw" -w /workspace debian:stable-slim \
+  sh -c 'cp -p f g && cp -p g f && sed -i s/a/b/ f'
+```
 
 `--sandbox` expands to `-o allow_other,noatime`, caller uid/gid (using
 `SUDO_UID` / `SUDO_GID` when present), and a RAM overlay unless `-w` supplies

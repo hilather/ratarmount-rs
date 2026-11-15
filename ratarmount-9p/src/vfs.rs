@@ -366,6 +366,20 @@ impl Ratarmount9p {
     pub fn setattr(&self, id: u64, size: Option<u64>, attrs: &OverlayMetadata) -> Result<(), i32> {
         let ov = self.overlay()?;
         let path = self.path_for_id(id)?;
+        let filtered;
+        let attrs = if attrs.uid.is_some() || attrs.gid.is_some() {
+            // A chown to the owner already presented is a no-op (#327).
+            let mut out = attrs.clone();
+            if let Ok(fi) = self.file_info(id) {
+                (out.uid, out.gid) = self
+                    .attribute_mapping
+                    .drop_presented_owner(fi.uid, fi.gid, attrs.uid, attrs.gid);
+            }
+            filtered = out;
+            &filtered
+        } else {
+            attrs
+        };
         ov.set_attributes(&path, size, attrs).map_err(|e| {
             let e = overlay_to_io(e);
             e.raw_os_error().unwrap_or_else(|| io_to_errno(&e))
@@ -831,5 +845,47 @@ mod sandbox_attr_tests {
             .with_attribute_mapping(AttributeMapping::parse("uid=12345,gid=23456").unwrap());
         let attr = fs.getattr(root_id()).unwrap();
         assert_eq!((attr.uid, attr.gid), (12345, 23456));
+    }
+
+    /// Regression: `cp -p` over 9P failed because a Tsetattr to the owner
+    /// already presented was refused with EPERM (#327).
+    #[test]
+    fn regression_9p_setattr_same_owner_chown_is_noop() {
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        for (mapping, shown) in [("", (uid, gid)), ("uid=12345,gid=23456", (12345, 23456))] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::write(base.path().join("member"), b"base").unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let source =
+                Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+            let ov = Arc::new(crate::test_overlay::new_overlay(source, directory.path()).unwrap());
+            let fs = Ratarmount9p::with_overlay(ov.clone(), 0, 8, Some(ov))
+                .with_attribute_mapping(AttributeMapping::parse(mapping).unwrap());
+            let (id, _) = fs.lookup_child(root_id(), "member").unwrap();
+            let chown = |uid: Option<u32>, gid: Option<u32>| {
+                fs.setattr(
+                    id,
+                    None,
+                    &OverlayMetadata {
+                        uid,
+                        gid,
+                        ..Default::default()
+                    },
+                )
+            };
+            assert_eq!(chown(Some(shown.0), Some(shown.1)), Ok(()), "{mapping}");
+            assert_eq!(chown(Some(shown.0), None), Ok(()), "{mapping}");
+            assert_eq!(chown(None, Some(shown.1)), Ok(()), "{mapping}");
+            assert_eq!(
+                chown(Some(shown.0.wrapping_add(1)), None),
+                Err(libc::EPERM),
+                "{mapping}"
+            );
+            assert_eq!(
+                chown(None, Some(shown.1.wrapping_add(1))),
+                Err(libc::EPERM),
+                "{mapping}"
+            );
+        }
     }
 }

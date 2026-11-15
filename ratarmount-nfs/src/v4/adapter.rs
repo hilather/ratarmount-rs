@@ -376,13 +376,24 @@ impl RatarmountNfs4 {
             embednfs::SetTime::ServerNow => now,
             embednfs::SetTime::Client(t) => t.seconds as f64 + t.nanos as f64 / 1e9,
         };
-        let metadata = OverlayMetadata {
+        let mut metadata = OverlayMetadata {
             mode: attrs.mode,
             uid: attrs.uid,
             gid: attrs.gid,
             atime: attrs.atime.as_ref().map(time),
             mtime: attrs.mtime.as_ref().map(time),
         };
+        if metadata.uid.is_some() || metadata.gid.is_some() {
+            // A chown to the owner already presented is a no-op (#327).
+            if let Ok(fi) = self.file_info_for_id(id) {
+                (metadata.uid, metadata.gid) = self.attribute_mapping.drop_presented_owner(
+                    fi.uid,
+                    fi.gid,
+                    metadata.uid,
+                    metadata.gid,
+                );
+            }
+        }
         if !metadata.is_empty() || attrs.size.is_some() {
             ov.set_attributes(&path, attrs.size, &metadata)
                 .map_err(|e| match &e {
@@ -1611,6 +1622,43 @@ mod tests {
 #[cfg(test)]
 mod sandbox_attr_tests {
     use super::*;
+
+    /// Regression: `cp -p` over NFSv4 failed because a SETATTR to the owner
+    /// already presented was refused with EPERM (#327).
+    #[test]
+    fn regression_nfs4_setattr_same_owner_chown_is_noop() {
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        for (mapping, shown) in [("", (uid, gid)), ("uid=12345,gid=23456", (12345, 23456))] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::write(base.path().join("member"), b"base").unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let source =
+                Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+            let ov = Arc::new(crate::test_overlay::new_overlay(source, directory.path()).unwrap());
+            let nfs = RatarmountNfs4::with_overlay(ov.clone(), 0, Some(ov))
+                .with_attribute_mapping(AttributeMapping::parse(mapping).unwrap());
+            let id = nfs.lookup_sync(1, "member").unwrap();
+            let chown = |uid: Option<u32>, gid: Option<u32>| {
+                nfs.setattr_sync(
+                    id,
+                    &SetAttrs {
+                        uid,
+                        gid,
+                        ..SetAttrs::default()
+                    },
+                )
+            };
+            assert!(chown(Some(shown.0), Some(shown.1)).is_ok(), "{mapping}");
+            assert!(chown(Some(shown.0), None).is_ok(), "{mapping}");
+            assert!(chown(None, Some(shown.1)).is_ok(), "{mapping}");
+            assert_eq!(
+                chown(Some(shown.0.wrapping_add(1)), None).unwrap_err(),
+                FsError::PermissionDenied,
+                "{mapping}"
+            );
+            assert!(chown(None, Some(shown.1.wrapping_add(1))).is_err());
+        }
+    }
 
     /// Regression: NFS attributes must report mapped owners and mode for every Unix type.
     #[test]
