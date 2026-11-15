@@ -15,6 +15,15 @@ use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, Us
 #[path = "diff/cow.rs"]
 mod cow;
 
+/// Write a base file with mode 0644 whatever the umask: these tests compare it
+/// with overlay files created or set to 0644, so a group-writable umask (0002)
+/// would add a mode change to the expected diff.
+fn write_base_file(path: &Path, data: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(path, data).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+}
+
 fn run(overlay: &Path, base: Option<&Path>, flags: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
     cmd.arg("diff").arg(overlay);
@@ -30,7 +39,7 @@ fn regression_cow_diff_name_manifest_hash_and_between() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("base");
     fs::create_dir(&base).unwrap();
-    fs::write(base.join("f"), b"base\n").unwrap();
+    write_base_file(&base.join("f"), b"base\n");
     let source = Arc::new(FolderMountSource::new(&base).unwrap());
     let dir = tmp.path().join("cow");
     let ov = token::new_overlay(source.clone(), &dir).unwrap();
@@ -94,7 +103,7 @@ fn regression_diff_exit_codes_and_clean_stdout() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("base");
     fs::create_dir(&base).unwrap();
-    fs::write(base.join("a"), b"before\n").unwrap();
+    write_base_file(&base.join("a"), b"before\n");
     let overlay_dir = tmp.path().join("overlay");
     let overlay = token::new_overlay(
         Arc::new(FolderMountSource::new(&base).unwrap()),

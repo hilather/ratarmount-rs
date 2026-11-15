@@ -362,15 +362,25 @@ mod tests {
     /// still shared the released lock's open file description.
     #[test]
     fn regression_synthetic_cache_reclaims_only_abandoned_owned_staging_and_unheld_locks() {
-        let temp = tempfile::tempdir().unwrap();
+        // `Directory::root` refuses a group-writable cache root, which a default
+        // temporary directory is under umask 0002.
+        let temp = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let root = Directory::root(&temp.path().canonicalize().unwrap()).unwrap();
         root.0.lock().unwrap();
         let now = SystemTime::now();
         let old = now - STAGING_MAX_AGE - Duration::from_secs(60);
         for name in [".building-old", ".building-current", "completed-entry"] {
             let path = temp.path().join(name);
+            // As `staging` and `create_file` make them (0700 and 0600): reclaim
+            // skips a tree holding a group-writable entry, which a default
+            // directory or file is under umask 0002.
             fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             fs::write(path.join("payload"), b"data").unwrap();
+            fs::set_permissions(path.join("payload"), fs::Permissions::from_mode(0o600)).unwrap();
             if name != ".building-current" {
                 File::open(path).unwrap().set_modified(old).unwrap();
             }
@@ -380,6 +390,9 @@ mod tests {
         symlink(outside.path(), temp.path().join(".building-symlink")).unwrap();
         for name in ["stale.lock", "held.lock", "recent.lock"] {
             let file = File::create(temp.path().join(name)).unwrap();
+            // Reclaim only removes private files; under umask 0002 a new file is 0664.
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .unwrap();
             if name != "recent.lock" {
                 file.set_modified(old).unwrap();
             }
@@ -409,5 +422,54 @@ mod tests {
         root.reclaim(now).unwrap();
         assert!(!temp.path().join("held.lock").exists());
         drop(child_copy);
+    }
+
+    /// Regression: private success fixtures must not hide reclamation of
+    /// group/world-writable staging directories, payloads or legacy locks.
+    #[test]
+    fn regression_synthetic_cache_reclaim_refuses_writable_entries() {
+        let temp = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let path = temp.path().canonicalize().unwrap();
+        for mode in [0o770, 0o707] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(Directory::root(&path).is_err());
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = Directory::root(&path).unwrap();
+        root.0.lock().unwrap();
+        let now = SystemTime::now();
+        let old = now - STAGING_MAX_AGE - Duration::from_secs(60);
+        for writable in [0o020, 0o002] {
+            for unsafe_directory in [true, false] {
+                let stage = path.join(format!(".building-{writable}-{unsafe_directory}"));
+                fs::create_dir(&stage).unwrap();
+                fs::set_permissions(
+                    &stage,
+                    fs::Permissions::from_mode(0o700 | if unsafe_directory { writable } else { 0 }),
+                )
+                .unwrap();
+                let payload = stage.join("payload");
+                fs::write(&payload, b"keep").unwrap();
+                fs::set_permissions(
+                    &payload,
+                    fs::Permissions::from_mode(0o600 | if unsafe_directory { 0 } else { writable }),
+                )
+                .unwrap();
+                File::open(&stage).unwrap().set_modified(old).unwrap();
+                root.reclaim(now).unwrap();
+                assert_eq!(fs::read(&payload).unwrap(), b"keep");
+            }
+            let lock = path.join(format!("unsafe-{writable}.lock"));
+            let file = File::create(&lock).unwrap();
+            file.set_permissions(fs::Permissions::from_mode(0o600 | writable))
+                .unwrap();
+            file.set_modified(old).unwrap();
+            drop(file);
+            root.reclaim(now).unwrap();
+            assert!(lock.exists());
+        }
     }
 }

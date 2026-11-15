@@ -1765,6 +1765,9 @@ struct SandboxDaemon {
 
 impl SandboxDaemon {
     fn start(root: &Path) -> Self {
+        // The daemon refuses a socket parent that others can write to; under a
+        // group-writable umask (0002) a default temporary directory is one.
+        fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let socket = root.join("api.sock");
         let log = root.join("daemon.log");
         let child = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
@@ -1841,6 +1844,16 @@ impl Drop for SandboxDaemon {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Regression: the agreement fixture's socket parent was group-writable under
+/// umask 0002. Exercise startup without the separate implicit-COW-parent bug.
+#[test]
+fn regression_supervisor_socket_fixture_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = SandboxDaemon::start(tmp.path());
+    let attempts = daemon.call(json!({"version": 1, "op": "list"}));
+    assert_eq!(attempts, json!([]));
 }
 
 /// Regression (R1c-1 F4): a layer the real supervisor finalized (its own
