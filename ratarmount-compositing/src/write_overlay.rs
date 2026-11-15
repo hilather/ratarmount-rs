@@ -765,6 +765,13 @@ pub enum OverlayMutation {
 /// existing overlay. External host writes are outside this interface.
 pub trait OverlayPolicy: Send + Sync {
     fn check_mutation(&self, op: OverlayMutation, paths: &[&str]) -> io::Result<()>;
+    /// Authorize removing the directory `path`. `exists_in_lower` says whether
+    /// the composed lower view (base plus any `--lower` layers) has `path`;
+    /// a policy may allow removing a directory the overlay itself created.
+    /// Wrappers must forward this method, not `check_mutation(Rmdir)`.
+    fn check_rmdir(&self, path: &str, _exists_in_lower: bool) -> io::Result<()> {
+        self.check_mutation(OverlayMutation::Rmdir, &[path])
+    }
     fn check_write(&self, path: &str, offset: u64, len: u64, current_size: u64) -> io::Result<()>;
     fn bytes_changed(&self, _path: &str, _added: u64, _removed: u64) {}
     fn file_created(&self, _path: &str) {}
@@ -1006,6 +1013,18 @@ impl WriteOverlay {
             let paths: Vec<String> = paths.iter().map(|p| normpath(p)).collect();
             let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
             policy.check_mutation(op, &refs)?;
+        }
+        Ok(())
+    }
+
+    fn check_rmdir_policy(&self, path: &str) -> io::Result<()> {
+        self.refuse_control_path(path)?;
+        if let Some(policy) = &self.policy {
+            let path = normpath(path);
+            // Same source as `mark_deleted`'s `hides_base`: the composed
+            // lower view, so a root a sealed `--lower` provides stays anchored.
+            let exists_in_lower = self.current_base().exists(&path);
+            policy.check_rmdir(&path, exists_in_lower)?;
         }
         Ok(())
     }
@@ -2609,7 +2628,7 @@ impl WriteOverlay {
         }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
-        self.check_mutation(OverlayMutation::Rmdir, &[path])?;
+        self.check_rmdir_policy(path)?;
         self.refuse_sealed_delete(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
