@@ -21,12 +21,16 @@ import time
 # baseline, 'disk' is `-w DIR`, 'tmpfs' is `--overlay-tmpfs`. The rules variants
 # protect everything but `work/`, as a sandbox does; the workload runs in `work/`.
 RULES = ['--overlay-readonly', '**', '--overlay-allow', 'work/**']
+# `--overlay-durability=relaxed` (#328): the overlay database skips its fsyncs.
+RELAXED = ['--overlay-durability=relaxed']
 VARIANTS = {
     'baseline-tmpfs': (None, []),
     'baseline-disk': (None, []),
     'disk': ('disk', []),
     'disk-journal': ('disk', ['journal']),
     'disk-rules': ('disk', RULES),
+    'disk-relaxed': ('disk', RELAXED),
+    'disk-relaxed-rules': ('disk', RELAXED + RULES),
     'tmpfs': ('tmpfs', []),
     'tmpfs-journal': ('tmpfs', ['journal']),
     'tmpfs-rules': ('tmpfs', RULES),
@@ -109,6 +113,8 @@ if '--self-test' in sys.argv:
     assert cmd == ['/b', '-f', '--passthrough', 'off', '-w', '/r/overlay-x', '--journal', '/r/journal-x.jsonl',
                    '--overlay-readonly', '**', '--overlay-allow', 'work/**', '/r/a.tar', '/r/m'], cmd
     assert command('/b', 'tmpfs', [], root, root / 'a.tar', root / 'm', 'y')[4] == '--overlay-tmpfs'
+    relaxed = command('/b', *VARIANTS['disk-relaxed'], root, root / 'a.tar', root / 'm', 'z')
+    assert relaxed[4:7] == ['-w', '/r/overlay-z', '--overlay-durability=relaxed'], relaxed
     assert selected('') == list(VARIANTS) and selected('disk,tmpfs') == ['disk', 'tmpfs']
     line = summary('disk', 2, [(0.002, 0.004), (0.004, 0.008), (0.1, 0.1)])
     assert 'create_ms_per_op=   2.000' in line and 'unlink_ms_per_op=   4.000' in line, line

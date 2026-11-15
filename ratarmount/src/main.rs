@@ -576,6 +576,14 @@ struct Args {
     #[arg(long, requires = "overlay_target", conflicts_with = "commit_overlay")]
     overlay_quota_files: Option<u64>,
 
+    /// Overlay database durability: `full` waits for the disk on every create/unlink/rename;
+    /// `relaxed` does not (about 50x faster) and is meant for throwaway overlays: an OS crash or
+    /// power loss can then corrupt the overlay (a killed process cannot), and the next use
+    /// refuses until `overlay fsck --repair`. Requires -w/--overlay-tmpfs/--sandbox and conflicts
+    /// with archive commits (--commit-overlay*, --roll-every); exit 2 otherwise.
+    #[arg(long, value_parser = ["full", "relaxed"], default_value = "full", requires = "overlay_target", conflicts_with = "commit_overlay")]
+    overlay_durability: String,
+
     #[arg(skip)]
     overlay_stats: Option<overlay_stats::StatsArgs>,
 
@@ -771,6 +779,34 @@ fn base_flag_needs_target_or_lower(args: &Args) -> Result<(), clap::Error> {
     Ok(())
 }
 
+/// `--overlay-durability=relaxed` is for throwaway overlays: it never feeds
+/// an archive commit (#328). Clap's `conflicts_with` would also refuse an
+/// explicit `full`, so the value is checked here.
+fn relaxed_durability_has_no_commit(args: &Args) -> Result<(), clap::Error> {
+    if args.overlay_durability != "relaxed" {
+        return Ok(());
+    }
+    for (given, flag) in [
+        (args.commit_overlay_on_exit, "--commit-overlay-on-exit"),
+        (
+            !matches!(args.commit_overlay_interval.trim(), "" | "0"),
+            "--commit-overlay-interval",
+        ),
+        (args.roll_every.is_some(), "--roll-every"),
+    ] {
+        if given {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!(
+                    "--overlay-durability=relaxed cannot be used with {flag}: a relaxed overlay \
+                     is throwaway and is never committed into an archive\n"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Parse `--parallel-nested`: non-negative integer or `auto` (→ 0).
 fn parse_parallel_nested(s: &str) -> Result<u32, String> {
     let t = s.trim();
@@ -952,6 +988,7 @@ where
         ));
     }
     base_flag_needs_target_or_lower(&args)?;
+    relaxed_durability_has_no_commit(&args)?;
     expand_sandbox(&mut args, caller_ids())
         .map_err(|message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message))?;
     ratarmount_compositing::ReadOnlyGlobs::new(&args.journal_exclude)
@@ -2633,6 +2670,16 @@ fn main() {
                 ) {
                     eprintln!("error recording read-only rules in overlay metadata: {e}");
                     std::process::exit(1);
+                }
+                // #328: after every setup write, before the first served one.
+                if args.overlay_durability == "relaxed" {
+                    if let Err(e) =
+                        ov.set_durability(ratarmount_compositing::OverlayDurability::Relaxed)
+                    {
+                        eprintln!("error enabling --overlay-durability=relaxed: {e}");
+                        drop(ov);
+                        std::process::exit(1);
+                    }
                 }
                 let ov = Arc::new(ov);
                 bundle.source = Arc::clone(&ov) as Arc<dyn MountSource>;
@@ -8485,6 +8532,90 @@ mod sandbox_cli_tests {
             "a.tar"
         ])
         .is_err());
+    }
+    /// Regression (#328): `--overlay-durability` must not steal the archive or
+    /// mount point, needs a write-overlay target (clap exit 2 without one),
+    /// conflicts with `--commit-overlay`, and accepts only `full` / `relaxed`.
+    #[test]
+    fn regression_overlay_durability_clap() {
+        for target in [vec!["-w", "ov"], vec!["--overlay-tmpfs"], vec!["--sandbox"]] {
+            for form in [
+                vec!["--overlay-durability", "relaxed"],
+                vec!["--overlay-durability=relaxed"],
+            ] {
+                let args = parse_args_from(
+                    ["ratarmount"]
+                        .into_iter()
+                        .chain(target.clone())
+                        .chain(form)
+                        .chain(["a.tar", "mnt"]),
+                )
+                .unwrap();
+                assert_eq!(args.overlay_durability, "relaxed");
+                assert_eq!(args.paths, [PathBuf::from("a.tar"), PathBuf::from("mnt")]);
+            }
+        }
+        let args = parse_args_from(["ratarmount", "-w", "ov", "a.tar", "mnt"]).unwrap();
+        assert_eq!(args.overlay_durability, "full");
+        let args = parse_args_from(["ratarmount", "a.tar", "mnt"]).unwrap();
+        assert_eq!(args.overlay_durability, "full");
+        for value in ["full", "relaxed"] {
+            let error = parse_args_from(["ratarmount", "--overlay-durability", value, "a.tar"])
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{error}"
+            );
+            assert_eq!(error.exit_code(), 2);
+        }
+        assert!(parse_args_from([
+            "ratarmount",
+            "--commit-overlay",
+            "-w",
+            "ov",
+            "--overlay-durability=relaxed",
+            "a.tar"
+        ])
+        .is_err());
+        let error = parse_args_from([
+            "ratarmount",
+            "-w",
+            "ov",
+            "--overlay-durability=off",
+            "a.tar",
+        ])
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        // A relaxed overlay is throwaway: it never feeds an archive commit.
+        for commit in [
+            vec!["--commit-overlay-on-exit"],
+            vec!["--commit-overlay-interval", "60"],
+            vec!["--roll-every", "1h"],
+        ] {
+            let error = parse_args_from(
+                ["ratarmount", "-w", "ov", "--overlay-durability=relaxed"]
+                    .into_iter()
+                    .chain(commit.clone())
+                    .chain(["a.tar", "mnt"]),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{commit:?}: {error}"
+            );
+            assert!(
+                parse_args_from(
+                    ["ratarmount", "-w", "ov", "--overlay-durability=full"]
+                        .into_iter()
+                        .chain(commit.clone())
+                        .chain(["a.tar", "mnt"]),
+                )
+                .is_ok(),
+                "{commit:?}"
+            );
+        }
     }
     /// Regression: a single allow value must not consume the archive positional,
     /// and exceptions require read-only rules and a writable overlay target.

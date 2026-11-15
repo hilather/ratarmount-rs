@@ -292,6 +292,13 @@ database, not just lose recent transactions. The mode must therefore:
 small risk of power-loss corruption in rollback mode. B1 has the same kind
 of risk for a much larger gain. Not worth a mode of its own.
 
+**Implemented** as `--overlay-durability=relaxed` (synchronous=OFF behind a
+boot-ID marker; no COW directory-fsync change; relaxed refuses archive
+commits instead of switching them back to FULL). Measured N=200, REPS=3 on
+ext4: `-w` 7.04 / 6.55 ms per create / unlink, relaxed 0.155 / 0.078,
+`--overlay-tmpfs` 0.111 / 0.065. See docs/sandbox.md, "Relaxed overlay
+durability".
+
 ### Out of scope
 
 WAL (#239). Group commit across FUSE requests: it conflicts with

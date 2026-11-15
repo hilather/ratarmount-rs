@@ -914,6 +914,10 @@ pub struct WriteOverlay {
     /// Set for the duration of remote on-exit so the interval thread cannot start
     /// another PUT while on-exit is waiting.
     interval_suppressed: AtomicBool,
+    /// `--overlay-durability=relaxed` is active on `db` (#328): the marker row
+    /// is recorded and `synchronous=OFF`. Cleared, under `synchronous=FULL`,
+    /// when the overlay drops.
+    relaxed: AtomicBool,
     /// Test-only: after the host rename, before one tombstone attempt (#88).
     /// `Err` fails that attempt. Later attempts still run. The rename returns
     /// success either way, and the in-memory tombstones match the completed
@@ -1380,6 +1384,21 @@ impl WriteOverlay {
                     "overlay is sealed; mount it with --lower, or `overlay unseal`".into(),
                 ));
             }
+            // #328: a relaxed mount that did not survive a reboot leaves a
+            // database that may be corrupt; one of this boot (a killed
+            // process) is intact, and its marker is cleared below.
+            let relaxed_marker = crate::relaxed_durability::read_marker(&transaction)?;
+            if let crate::relaxed_durability::MarkerState::Unclean(value) =
+                crate::relaxed_durability::classify(relaxed_marker.as_deref())
+            {
+                return Err(OverlayError::Msg(format!(
+                    "{}; then retry the writable mount",
+                    crate::relaxed_durability::unclean_message(&value)
+                )));
+            }
+            if relaxed_marker.is_some() {
+                crate::relaxed_durability::clear_marker(&transaction)?;
+            }
             crate::overlay_meta::initialize(
                 &transaction,
                 had_files,
@@ -1501,6 +1520,7 @@ impl WriteOverlay {
             spool: Mutex::new(None),
             persist_count: AtomicU64::new(0),
             interval_suppressed: AtomicBool::new(false),
+            relaxed: AtomicBool::new(false),
             #[cfg(test)]
             rename_before_tx_hook: Mutex::new(None),
             #[cfg(test)]
@@ -3317,6 +3337,69 @@ impl WriteOverlay {
     pub fn record_base_digest(&self, pending: &crate::PendingBase, digest: &str) -> Result<bool> {
         let db = self.db.lock().expect("overlay db");
         crate::overlay_meta::record_base_digest_required(&db, pending, digest, true)
+    }
+
+    /// Switch the mount's overlay connection between `synchronous=FULL` and
+    /// the opt-in `synchronous=OFF` (#328, `--overlay-durability`). Relaxed
+    /// first commits the `relaxed_durability` marker under `FULL`, so it is on
+    /// disk before any unsynced write; `Full` (and dropping the overlay)
+    /// restores `FULL` and deletes the marker in a commit whose fsync also
+    /// flushes every earlier relaxed write. No other connection changes.
+    pub fn set_durability(&self, durability: crate::OverlayDurability) -> Result<()> {
+        match durability {
+            crate::OverlayDurability::Full => self.restore_full_durability(),
+            crate::OverlayDurability::Relaxed => {
+                let db = self.db.lock().expect("overlay db");
+                db.execute_batch("PRAGMA synchronous = FULL;")?;
+                db.execute_batch(crate::overlay_meta::META_SCHEMA)?;
+                crate::overlay_meta::OverlayMeta::set(
+                    &db,
+                    crate::relaxed_durability::RELAXED_DURABILITY_KEY,
+                    &crate::relaxed_durability::marker_value(),
+                )?;
+                db.execute_batch("PRAGMA synchronous = OFF;")?;
+                self.relaxed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+    }
+
+    /// The overlay connection's current durability.
+    pub fn durability(&self) -> crate::OverlayDurability {
+        if self.relaxed.load(Ordering::SeqCst) {
+            crate::OverlayDurability::Relaxed
+        } else {
+            crate::OverlayDurability::Full
+        }
+    }
+
+    fn restore_full_durability(&self) -> Result<()> {
+        if !self.relaxed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
+        db.execute_batch("PRAGMA synchronous = FULL;")?;
+        crate::relaxed_durability::clear_marker(&db)?;
+        self.relaxed.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Clean close of a relaxed overlay. A failure leaves the marker, which
+    /// the next open of this boot accepts and clears.
+    fn finish_relaxed_durability(&self) {
+        if let Err(error) = self.restore_full_durability() {
+            log::warn!(
+                "could not clear the relaxed-durability marker of overlay {}: {error}",
+                self.root.display()
+            );
+        }
+    }
+
+    /// Test-only: the overlay connection's `PRAGMA synchronous` level.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn synchronous_level_for_test(&self) -> Result<i64> {
+        let db = self.db.lock().expect("overlay db");
+        crate::relaxed_durability::synchronous_level(&db)
     }
 
     /// Record one overlay-level `meta` key (for example `readonly_rules`).
@@ -5183,6 +5266,8 @@ impl Drop for WriteOverlay {
         // Recover poisoned locks. A panic here aborts the process.
         // `std::process::exit` skips this; callers drop the overlay first.
         self.replay_pending_on_drop();
+        // After the replay: its writes are covered by the FULL commit below.
+        self.finish_relaxed_durability();
     }
 }
 
@@ -7502,16 +7587,15 @@ fn ensure_overlay_unsealed_required(
     marked: bool,
     display_path: &Path,
 ) -> Result<()> {
-    if crate::OverlayMeta::read_no_recovery_required(write_overlay, marked)?
-        .as_ref()
-        .is_some_and(crate::OverlayMeta::layer_sealed)
-    {
+    let meta = crate::OverlayMeta::read_no_recovery_required(write_overlay, marked)?;
+    if meta.as_ref().is_some_and(crate::OverlayMeta::layer_sealed) {
         return Err(OverlayError::Msg(format!(
             "overlay {} is sealed; mount it with --lower, or `overlay unseal`",
             display_path.display()
         )));
     }
-    Ok(())
+    // #328: never commit a relaxed overlay that did not survive a reboot.
+    crate::relaxed_durability::refuse_unclean(meta.as_ref())
 }
 
 /// What [`commit_overlay_raw_dir`] did.

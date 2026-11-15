@@ -180,8 +180,8 @@ ZIP. Live commits (on exit or on an interval) support uncompressed TAR and
 `.tar.zst`, rewriting only the last zstd frame. Everything about overlays,
 including the safety rules and what happens on a crash, is in
 [Writing into archives](write-overlay.md). Policies for untrusted writers
-(`--overlay-readonly`, `--overlay-quota`, `--sandbox`) are in
-[Sandboxes](sandbox.md).
+(`--overlay-readonly`, `--overlay-quota`, `--sandbox`) and fast throwaway
+overlays (`--overlay-durability=relaxed`) are in [Sandboxes](sandbox.md).
 
 ### Agent attempts and grading
 

@@ -64,6 +64,10 @@ pub struct RunArgs {
     allow: Vec<String>,
     #[arg(long, value_parser = ratarmount_compositing::parse_overlay_size)]
     quota: Option<u64>,
+    /// Overlay database durability of the mount (`relaxed`: no fsyncs; an OS crash can
+    /// corrupt --top, see the mount's `--overlay-durability`).
+    #[arg(long, value_parser = ["full", "relaxed"], default_value = "full")]
+    overlay_durability: String,
     #[arg(long)]
     timeout: Option<u64>,
     #[arg(long, value_parser = ["docker", "podman"])]
@@ -1016,6 +1020,10 @@ fn mount_argv(args: &RunArgs, top: &Path, mount: &Path, journal: &Path) -> Vec<O
     if args.journal {
         argv.extend(["--journal".into(), journal.into()]);
     }
+    // Only when chosen: a `full` run keeps its historical argv (#328).
+    if args.overlay_durability == "relaxed" {
+        argv.push("--overlay-durability=relaxed".into());
+    }
     // Before `--`: after it clap would read the flag as a positional input.
     match &args.base_digest {
         Some(ratarmount_compositing::BaseDigestRequest::Supplied(digest)) => {
@@ -1475,6 +1483,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Regression (#328): `--overlay-durability relaxed` reaches the mount
+    /// before `--`, and the default leaves the historical argv unchanged.
+    #[test]
+    fn regression_run_mount_argv_passes_overlay_durability() {
+        let full = mount_argv(
+            &args(&[]),
+            Path::new("/top"),
+            Path::new("/mnt"),
+            Path::new("/j"),
+        );
+        assert!(!full
+            .iter()
+            .any(|a| a.to_string_lossy().contains("durability")));
+        let explicit = mount_argv(
+            &args(&["--overlay-durability", "full"]),
+            Path::new("/top"),
+            Path::new("/mnt"),
+            Path::new("/j"),
+        );
+        assert_eq!(explicit, full);
+        let relaxed = mount_argv(
+            &args(&["--overlay-durability", "relaxed"]),
+            Path::new("/top"),
+            Path::new("/mnt"),
+            Path::new("/j"),
+        );
+        let separator = relaxed.iter().position(|a| a == "--").unwrap();
+        let at = relaxed
+            .iter()
+            .position(|a| a == "--overlay-durability=relaxed")
+            .unwrap();
+        assert!(at < separator);
+        assert_eq!(&relaxed[separator + 1..], ["/base", "/mnt"]);
+        assert_eq!(relaxed.len(), full.len() + 1);
     }
 
     /// Regression: a `--top` inside a directory `--base` would be hashed as base content.

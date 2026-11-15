@@ -12017,6 +12017,32 @@
       "rule_reason": "inventory-op:tempfile"
     },
     {
+      "configured_path": "std::fs::read_to_string",
+      "item": "ratarmount_compositing::relaxed_durability::read_boot_id",
+      "leaf_digest": "bd94827bdc110d9e028100b5a6153d4f1f39c079761668b566cefb180856388b",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "kernel-or-process-introspection",
+        "creation": {
+          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-E0148-M01",
+        "item": "ratarmount_compositing::relaxed_durability::read_boot_id",
+        "reason": "/proc or mount-table introspection"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0148-M01\",\"item\":\"ratarmount_compositing::relaxed_durability::read_boot_id\",\"disposition\":\"out-of-family\",\"category\":\"kernel-or-process-introspection\",\"reason\":\"/proc or mount-table introspection\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
+      "resolved": "std::fs::read_to_string",
+      "rule_reason": "inventory-op:fs::read_to_string"
+    },
+    {
       "configured_path": "std::fs::OpenOptions",
       "item": "ratarmount_compositing::write_overlay",
       "leaf_digest": "4a4d8cc591a7c9e8d619df113a57c54e05c5a168a1f7696161ea7c6123bd7cdc",
