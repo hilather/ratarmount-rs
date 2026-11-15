@@ -212,7 +212,7 @@ fn import(
         let mut written: BTreeSet<String> = BTreeSet::new();
         let mut rejected: BTreeSet<String> = BTreeSet::new();
         let mut rejects: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        // Deletions applied early because they empty a directory that an
+        // Deletions applied or rejected early as part of a directory that an
         // earlier section replaces with a file (#329).
         let mut hoisted = BTreeSet::new();
         for (index, patch) in patches.iter().enumerate() {
@@ -230,11 +230,20 @@ fn import(
             for path in patch.old.iter().chain(&patch.new) {
                 // Only a path below a rejected (restored) file skips the check:
                 // that file is its lower self again and nothing is written below it.
-                if !rejected_root(&rejected, path).is_some_and(|root| root != path) {
-                    check_parents(&overlay, path)?;
+                if !below_rejected_file(&overlay, &rejected, path) {
+                    check_parents(&overlay, stack.view.as_ref(), path)?;
                 }
             }
             let original = match &patch.old {
+                Some(path) if below_rejected_file(&overlay, &rejected, path) => None,
+                Some(path)
+                    if rejected.contains(path)
+                        && overlay
+                            .lookup(&format!("/{path}"), 0)
+                            .is_some_and(|fi| fi.mode & S_IFMT == S_IFDIR) =>
+                {
+                    None
+                }
                 Some(path) => read_entry(&overlay, path, args.max_patch_bytes)?,
                 None => None,
             };
@@ -260,12 +269,18 @@ fn import(
                     // as a whole, with everything written below it.
                     let root = type_change_root(&overlay, stack.view.as_ref(), path)
                         .unwrap_or_else(|| path.clone());
-                    restore(&overlay, stack.view.as_ref(), &root, args.max_patch_bytes)?;
+                    restore(
+                        &overlay,
+                        stack.view.as_ref(),
+                        &root,
+                        &written,
+                        args.max_patch_bytes,
+                    )?;
                     written.retain(|w| !at_or_under(w, &root));
-                    rejected.insert(root);
+                    mark_rejected(&mut rejected, &mut rejects, root);
                 }
                 let name = reject_name(&rejected, patch.path());
-                check_parents(&overlay, &name)?;
+                check_parents(&overlay, stack.view.as_ref(), &name)?;
                 let reject = rejects.entry(name).or_insert_with(|| {
                     format!(
                         "diff a/{} b/{}\t(rejected hunks)\n",
@@ -292,18 +307,34 @@ fn import(
                     .is_some_and(|fi| fi.mode & S_IFMT == S_IFDIR)
                 {
                     // Directory -> file: Git emits `add x` before `delete x/...`.
-                    match replace_directory(&overlay, patches, index, path, args.max_patch_bytes)? {
+                    match replace_directory(
+                        &overlay,
+                        stack.view.as_ref(),
+                        patches,
+                        index,
+                        path,
+                        &rejected,
+                        args.max_patch_bytes,
+                    )? {
                         Replace::Removed(done) => {
                             for (j, child) in done {
                                 hoisted.insert(j);
                                 written.insert(child);
                             }
                         }
-                        Replace::Failed(_) if args.reject => {
+                        Replace::Failed { deletions, .. } if args.reject => {
                             // Keep the lower directory; the whole type change
                             // is rejected and later sections below it are
                             // skipped (their failed hunks join this .rej).
-                            rejected.insert(path.to_string());
+                            restore(
+                                &overlay,
+                                stack.view.as_ref(),
+                                path,
+                                &written,
+                                args.max_patch_bytes,
+                            )?;
+                            written.retain(|w| !at_or_under(w, path));
+                            mark_rejected(&mut rejected, &mut rejects, path.to_string());
                             let reject = rejects
                                 .entry(reject_name(&rejected, path))
                                 .or_insert_with(|| {
@@ -313,9 +344,17 @@ fn import(
                             for hunk in &patch.hunks {
                                 reject.extend_from_slice(&hunk.raw);
                             }
+                            // Keep the dry-run failures: restoring an earlier
+                            // edit may make a formerly failing deletion match.
+                            for (j, failed) in deletions {
+                                hoisted.insert(j);
+                                for i in failed {
+                                    reject.extend_from_slice(&patches[j].hunks[i].raw);
+                                }
+                            }
                             continue;
                         }
-                        Replace::Failed(message) => return Err(message),
+                        Replace::Failed { message, .. } => return Err(message),
                         Replace::NotCovered => {}
                     }
                 }
@@ -358,7 +397,7 @@ fn import(
             }
         }
         for (name, reject) in rejects {
-            check_parents(&overlay, &name)?;
+            check_parents(&overlay, stack.view.as_ref(), &name)?;
             write_entry(&overlay, &name, &reject, S_IFREG | 0o644, time)?;
         }
         finish_import(&overlay)?;
@@ -425,12 +464,22 @@ fn finish_import(overlay: &WriteOverlay) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Parents are judged in the merged view, which applies this import's
-/// tombstones: a lower file or symlink the patch already deleted is no
-/// obstacle (#329), one it has not deleted is still visible and refused.
-fn check_parents(overlay: &WriteOverlay, path: &str) -> Result<(), String> {
+/// A deleted lower regular file can become a directory. Lower symlinks must
+/// still be refused: folder-backed lookups can follow them even after the
+/// merged view has hidden the symlink, exposing entries outside the base.
+fn check_parents(
+    overlay: &WriteOverlay,
+    lower: &dyn MountSource,
+    path: &str,
+) -> Result<(), String> {
     for (i, _) in path.match_indices('/') {
         let parent = format!("/{}", &path[..i]);
+        if lower
+            .lookup(&parent, 0)
+            .is_some_and(|fi| fi.mode & S_IFMT == S_IFLNK)
+        {
+            return Err(format!("{path}: symlink parent {parent} is refused"));
+        }
         if let Some(fi) = overlay.lookup(&parent, 0) {
             if fi.mode & S_IFMT == S_IFLNK {
                 return Err(format!("{path}: symlink parent {parent} is refused"));
@@ -456,6 +505,40 @@ fn rejected_root<'a>(rejected: &'a BTreeSet<String>, path: &str) -> Option<&'a S
         .find_map(|p| rejected.get(p))
 }
 
+fn below_rejected_file(overlay: &WriteOverlay, rejected: &BTreeSet<String>, path: &str) -> bool {
+    rejected_root(rejected, path).is_some_and(|root| {
+        root != path
+            && overlay
+                .lookup(&format!("/{root}"), 0)
+                .is_some_and(|fi| fi.mode & S_IFMT != S_IFDIR)
+    })
+}
+
+/// A rejected parent subsumes earlier child rejections and their reject files.
+fn mark_rejected(
+    rejected: &mut BTreeSet<String>,
+    rejects: &mut BTreeMap<String, Vec<u8>>,
+    root: String,
+) {
+    let name = format!("{root}.rej");
+    let children: Vec<_> = rejects
+        .keys()
+        .filter(|key| {
+            *key != &name
+                && key
+                    .strip_suffix(".rej")
+                    .is_some_and(|path| at_or_under(path, &root))
+        })
+        .cloned()
+        .collect();
+    for child in children {
+        let bytes = rejects.remove(&child).unwrap();
+        rejects.entry(name.clone()).or_default().extend(bytes);
+    }
+    rejected.retain(|path| !at_or_under(path, &root));
+    rejected.insert(root);
+}
+
 /// Failed hunks below a rejected type change go to the restored path's `.rej`.
 fn reject_name(rejected: &BTreeSet<String>, path: &str) -> String {
     format!(
@@ -465,20 +548,21 @@ fn reject_name(rejected: &BTreeSet<String>, path: &str) -> String {
 }
 
 /// The topmost proper ancestor of `path` that is a non-directory in the lower
-/// view but a directory in the overlay: a file this import replaced.
+/// view but deleted or a directory in the overlay: a file this import replaced,
+/// including a failed first child addition before mkdir has run.
 fn type_change_root(overlay: &WriteOverlay, lower: &dyn MountSource, path: &str) -> Option<String> {
     path.match_indices('/').find_map(|(i, _)| {
         let full = format!("/{}", &path[..i]);
         let is_dir = |fi: FileInfo| fi.mode & S_IFMT == S_IFDIR;
-        (overlay.lookup(&full, 0).is_some_and(is_dir)
+        ((overlay.is_deleted(&full) || overlay.lookup(&full, 0).is_some_and(is_dir))
             && lower.lookup(&full, 0).is_some_and(|fi| !is_dir(fi)))
         .then(|| path[..i].to_string())
     })
 }
 
-/// Children of `dir` (no leading slash) in the merged view, with their modes.
-fn children(overlay: &WriteOverlay, dir: &str) -> Vec<(String, u32)> {
-    let names = match overlay.list(&format!("/{dir}")) {
+/// Children of `dir` (no leading slash) in a view, with their modes.
+fn children(source: &dyn MountSource, dir: &str) -> Vec<(String, u32)> {
+    let names = match source.list(&format!("/{dir}")) {
         Some(ListResult::Infos(map)) => map.into_keys().collect(),
         Some(ListResult::Names(names)) => names,
         None => Vec::new(),
@@ -487,7 +571,7 @@ fn children(overlay: &WriteOverlay, dir: &str) -> Vec<(String, u32)> {
         .into_iter()
         .filter_map(|name| {
             let child = format!("{dir}/{name}");
-            let fi = overlay.lookup(&format!("/{child}"), 0)?;
+            let fi = source.lookup(&format!("/{child}"), 0)?;
             Some((child, fi.mode))
         })
         .collect()
@@ -513,7 +597,11 @@ enum Replace {
     /// The deletions `(section index, path)` ran and the directory is gone.
     Removed(Vec<(usize, String)>),
     /// A covering deletion would fail; nothing was changed.
-    Failed(String),
+    Failed {
+        message: String,
+        /// Every covering deletion and its failed hunk indices, before restore.
+        deletions: Vec<(usize, Vec<usize>)>,
+    },
     /// Later sections do not delete everything below the directory.
     NotCovered,
 }
@@ -524,9 +612,11 @@ enum Replace {
 /// and remove the emptied directory tree. Only this directory is pruned.
 fn replace_directory(
     overlay: &WriteOverlay,
+    lower: &dyn MountSource,
     patches: &[parse::FilePatch],
     index: usize,
     dir: &str,
+    rejected: &BTreeSet<String>,
     limit: u64,
 ) -> Result<Replace, String> {
     let mut deletions = BTreeMap::new();
@@ -551,6 +641,13 @@ fn replace_directory(
     let mut files = Vec::new();
     let mut pending = vec![dir.to_string()];
     while let Some(d) = pending.pop() {
+        // WriteOverlay::list can return an empty merged listing when the
+        // lower directory exists but its listing failed. That is not proof
+        // that the patch deletes all children: pruning it would hide data.
+        let full = format!("/{d}");
+        if lower.is_dir(&full) && lower.list(&full).is_none() {
+            return Err(format!("{d}: cannot list lower directory for replacement"));
+        }
         for (child, mode) in children(overlay, &d) {
             if mode & S_IFMT == S_IFDIR {
                 pending.push(child);
@@ -562,7 +659,15 @@ fn replace_directory(
     if files.len() != deletions.len() || files.iter().any(|f| !deletions.contains_key(f)) {
         return Ok(Replace::NotCovered);
     }
+    if rejected.iter().any(|path| at_or_under(path, dir)) {
+        return Ok(Replace::Failed {
+            message: format!("{dir}: directory contains a rejected path"),
+            deletions: Vec::new(),
+        });
+    }
     // Dry-run every deletion before changing anything.
+    let mut checked = Vec::new();
+    let mut failure = None;
     for (path, &j) in &deletions {
         let later = &patches[j];
         let Some((_, bytes)) = read_entry(overlay, path, limit)? else {
@@ -570,14 +675,22 @@ fn replace_directory(
         };
         let (content, failed) = apply_hunks(&bytes, &later.hunks, limit)?;
         if let Some(first) = failed.first() {
-            return Ok(Replace::Failed(format!(
-                "{path}: hunk #{} failed (exact context not found)",
-                first + 1
-            )));
-        }
-        if !later.literal.as_deref().unwrap_or(&content).is_empty() {
+            failure.get_or_insert_with(|| {
+                format!(
+                    "{path}: hunk #{} failed (exact context not found)",
+                    first + 1
+                )
+            });
+        } else if !later.literal.as_deref().unwrap_or(&content).is_empty() {
             return Err(format!("{path}: deletion leaves content"));
         }
+        checked.push((j, failed));
+    }
+    if let Some(message) = failure {
+        return Ok(Replace::Failed {
+            message,
+            deletions: checked,
+        });
     }
     for path in deletions.keys() {
         overlay
@@ -685,15 +798,53 @@ fn restore(
     overlay: &WriteOverlay,
     lower: &dyn MountSource,
     path: &str,
+    written: &BTreeSet<String>,
     limit: u64,
 ) -> Result<(), String> {
     let full = format!("/{path}");
+    let original = lower.lookup(&full, 0);
+    if let Some(fi) = original.filter(|fi| fi.mode & S_IFMT == S_IFDIR) {
+        if overlay
+            .lookup(&full, 0)
+            .is_some_and(|fi| fi.mode & S_IFMT != S_IFDIR)
+        {
+            overlay.unlink(&full).map_err(|e| format!("{path}: {e}"))?;
+        }
+        overlay
+            .mkdir(&full, 0o755)
+            .map_err(|e| format!("{path}: {e}"))?;
+        // Restore affected children, including implicit parents of written
+        // paths. Unchanged lower files need no copying or preimage reads.
+        let prefix = format!("{path}/");
+        let mut affected: BTreeSet<_> = written
+            .iter()
+            .filter_map(|p| p.strip_prefix(&prefix))
+            .map(|rest| format!("{prefix}{}", rest.split('/').next().unwrap()))
+            .collect();
+        // Replacing a directory prunes empty subdirectories too; these have
+        // no file section and therefore are absent from `written`.
+        for (child, mode) in children(lower, path) {
+            if mode & S_IFMT == S_IFDIR && overlay.lookup(&format!("/{child}"), 0).is_none() {
+                affected.insert(child);
+            }
+        }
+        for child in affected {
+            restore(overlay, lower, &child, written, limit)?;
+        }
+        return overlay
+            .set_metadata(
+                &full,
+                &OverlayMetadata {
+                    mode: Some(fi.mode & 0o7777),
+                    mtime: Some(fi.mtime),
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| format!("{path}: {e}"));
+    }
     if overlay
         .lookup(&full, 0)
         .is_some_and(|fi| fi.mode & S_IFMT == S_IFDIR)
-        && lower
-            .lookup(&full, 0)
-            .is_some_and(|fi| fi.mode & S_IFMT != S_IFDIR)
     {
         remove_tree(overlay, path)?;
     }

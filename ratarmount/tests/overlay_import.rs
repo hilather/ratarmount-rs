@@ -490,3 +490,43 @@ fn regression_import_file_directory_type_change_cli() {
     );
     assert_eq!(names.stdout, b"T\td\nD\td/y\nT\tx\nA\tx/y\n");
 }
+
+/// Regression (#329): deleting a lower directory symlink must not let later
+/// copy sections read its target through the folder source's path lookup.
+#[test]
+fn regression_import_deleted_lower_symlink_cannot_copy_outside() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    let outside = root.path().join("outside");
+    fs::create_dir(&base).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("secret"), b"outside secret\n").unwrap();
+    std::os::unix::fs::symlink("../outside", base.join("link")).unwrap();
+    let delete = b"diff --git a/link b/link\ndeleted file mode 120000\n--- a/link\n+++ /dev/null\n@@ -1 +0,0 @@\n-../outside\n\\ No newline at end of file\n";
+    let copy = b"diff --git a/link/secret b/stolen\nsimilarity index 100%\ncopy from link/secret\ncopy to stolen\n";
+    for reject in [false, true] {
+        let dest = root.path().join(format!("overlay-{reject}"));
+        let output = import(
+            &base,
+            &dest,
+            &[delete.as_slice(), copy.as_slice()].concat(),
+            if reject {
+                &["--reject", "--no-seal"]
+            } else {
+                &["--no-seal"]
+            },
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("symlink parent /link"));
+        assert!(!dest.exists());
+    }
+    assert_eq!(
+        fs::read(outside.join("secret")).unwrap(),
+        b"outside secret\n"
+    );
+}
