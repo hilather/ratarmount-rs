@@ -3643,6 +3643,30 @@ impl WriteOverlay {
         }
     }
 
+    /// [`Self::test_hold_open_transaction`] on its own thread, for a serving
+    /// mount (#183): the thread waits until the test creates the ready file's
+    /// path plus `.go` (once the mount is up: requests that need the
+    /// database wait while the transaction is held), then holds it. No-op in
+    /// release builds and without the seam's variable.
+    pub fn spawn_test_hold_open_transaction(self: &Arc<Self>) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(ready) = std::env::var_os("RATARMOUNT_TEST_JOURNAL_HOLD") {
+            let overlay = Arc::clone(self);
+            let mut go = ready;
+            go.push(".go");
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                while !Path::new(&go).exists() {
+                    if std::time::Instant::now() > deadline {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                overlay.test_hold_open_transaction();
+            });
+        }
+    }
+
     /// Change metadata through the same policy gate as data writes. Archive-only
     /// members retain their original read cookie and never copy payload data.
     pub fn set_metadata(&self, path: &str, attrs: &OverlayMetadata) -> Result<()> {

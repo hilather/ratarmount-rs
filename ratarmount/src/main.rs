@@ -11,7 +11,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{ArgAction, Parser};
-use nix::unistd::{fork, setsid, ForkResult};
 pub(crate) use ratarmount_compositing::lower_stack::MountLowerStack;
 use ratarmount_compositing::{
     maybe_wrap_payload_cache, CommitOverlayOptions, ControlFolderMountSource, ControlFolderOptions,
@@ -41,6 +40,7 @@ mod quiet_print;
 mod base_digest;
 mod base_identity;
 mod corpus;
+mod daemon;
 mod diff;
 mod export_index;
 mod find;
@@ -713,7 +713,7 @@ struct Args {
     #[arg(short = 'd', long = "debug", default_value_t = 1)]
     debug: u8,
 
-    /// Redirect log output to this file (after mount setup; useful without -f)
+    /// Write diagnostic logs to this file (also after daemonizing)
     #[arg(long = "log-file")]
     log_file: Option<PathBuf>,
 
@@ -1759,26 +1759,10 @@ fn main() {
         std::process::exit(2);
     }
 
-    let write_style = resolve_color_style(args.color, args.no_color);
-    init_logger(args.debug, args.log_file.as_deref(), write_style);
-    if args.sandbox {
-        log::info!(
-            "sandbox: -o {} overlay={} quota={:?} passthrough={:?}",
-            args.fuse,
-            if args.overlay_tmpfs.is_some() {
-                "tmpfs".into()
-            } else {
-                args.write_overlay
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default()
-            },
-            args.overlay_quota,
-            args.passthrough
-        );
-    }
-    if args.overlay_tmpfs.is_some() && args.overlay_quota.is_none() {
-        eprintln!("warning: --overlay-tmpfs has no size cap; RAM usage is unbounded (set --overlay-tmpfs=SIZE or --overlay-quota)");
+    // These modes return before mount planning and never fork.
+    let offline = args.repack_seekable || args.unmount || args.commit_overlay;
+    if offline {
+        init_startup_logging(&args);
     }
 
     if args.repack_seekable {
@@ -2038,6 +2022,18 @@ fn main() {
             std::process::exit(1);
         }
     }
+
+    // A daemonized FUSE mount forks here, before it opens any database it
+    // must keep locked while it serves (#183): fcntl locks are not inherited
+    // by a fork child. The child does the rest of startup with this
+    // process's stdio and detaches right before serving; this process only
+    // relays its status and waits for the mount. Exactly the runs that reach
+    // a daemonized `run_*` branch (a guarded FUSE mount without `-f`).
+    if let Some((_, plan)) = guard.as_ref().filter(|_| !args.foreground) {
+        daemon::fork_launcher(&plan.mp);
+    }
+    // The serving process alone opens the log, as well as every database.
+    init_startup_logging(&args);
 
     // Classify every local member's commit journal against the records that
     // vote on it BEFORE any recovery write; members a record does not own wait
@@ -3079,7 +3075,6 @@ fn main() {
                     readahead,
                     nfs_opts,
                     args.foreground,
-                    args.log_file.is_some(),
                     live_commit_archive,
                     args.commit_overlay_on_exit,
                     commit_interval,
@@ -3102,7 +3097,6 @@ fn main() {
             Some(nfs_opts),
             plan,
             args.foreground,
-            args.log_file.is_some(),
             live_commit_archive,
             args.commit_overlay_on_exit,
             commit_interval,
@@ -3126,7 +3120,6 @@ fn main() {
             None,
             plan,
             args.foreground,
-            args.log_file.is_some(),
             live_commit_archive,
             args.commit_overlay_on_exit,
             commit_interval,
@@ -3147,7 +3140,6 @@ fn main() {
         activity,
         readahead,
         args.foreground,
-        args.log_file.is_some(),
         live_commit_archive,
         args.commit_overlay_on_exit,
         commit_interval,
@@ -3723,9 +3715,8 @@ fn spawn_interval_if(
 /// [`overlay_commit::request_shutdown`]. `commit` (on-exit persist) runs
 /// while this process still holds the overlay.
 ///
-/// The forked parent must not call this. The child owns the SQLite
-/// connection; dropping here would replay into that connection. The parent's
-/// `process::exit` skips Drop on purpose.
+/// A daemonized mount's launcher never opens the overlay (it forks before
+/// any database is opened, #183), so only the serving process calls this.
 fn finish_overlay_serve(
     overlay: Option<Arc<WriteOverlay>>,
     source: Option<Arc<dyn MountSource>>,
@@ -3762,7 +3753,6 @@ fn run_exports(
     mut nfs_opts: Option<ratarmount_nfs::NfsOptions>,
     mut plan: ExportPlan,
     foreground: bool,
-    has_log_file: bool,
     live_archive: Option<PathBuf>,
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
@@ -3903,86 +3893,62 @@ fn run_exports(
                 finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
                 std::process::exit(1);
             }
-            match unsafe { fork() } {
-                Ok(ForkResult::Parent { child }) => {
-                    relinquish_temp_overlay();
-                    // The child owns the overlay database. Dropping it here
-                    // would replay pending rows into the child's connection.
-                    // process::exit skips Drop on purpose. The interval thread
-                    // starts in the child, not in this process.
-                    if !wait_until_mounted(&mp, Duration::from_secs(30)) {
-                        eprintln!(
-                            "error: timed out waiting for mount at {} (child pid {child})",
-                            mp.display()
-                        );
-                        let _ = unmount(&mp);
-                        std::process::exit(1);
-                    }
-                    std::process::exit(0);
-                }
-                Ok(ForkResult::Child) => {
-                    let _ = setsid();
-                    if !has_log_file {
-                        let _ = redirect_stdio_to_null();
-                    }
-                    overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-                    let control = control.map(ControlListener::serve);
-                    let interval = spawn_interval_if(
-                        &overlay_arc,
-                        &live_archive,
-                        commit_interval,
-                        Some(nfs_stop.clone()),
-                        &open_opts,
-                    );
-                    let BoundExports {
-                        handles,
-                        source,
-                        overlay: overlay_arc,
-                        interval,
-                    } = spawn_export_threads_or_exit(
-                        source,
-                        nfs_opts,
-                        plan,
-                        overlay_arc,
-                        interval,
-                        exit_with_code,
-                    );
-                    let mount_err = mount_blocking(
-                        source,
-                        &mp,
-                        true,
-                        writable,
-                        overlay_arc.clone(),
-                        fuse_opts,
-                        readahead,
-                        passthrough,
-                        open_opts.direct_io,
-                        activity,
-                    );
-                    wait_control_reply(&control);
-                    nfs_stop.request_stop();
-                    export_stop.request_stop();
-                    join_export_handles(handles);
-                    finish_overlay_serve(overlay_arc, None, interval, commit_exit);
-                    if let Err(e) = mount_err {
-                        #[expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-B0024-M01","item":"ratarmount::run_exports","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                        )]
-                        let _ = std::fs::write(
-                            "/tmp/ratarmount-rs-fuse-error.log",
-                            format!("mount error: {e}\n"),
-                        );
-                        std::process::exit(1);
-                    }
-                    std::process::exit(0);
-                }
-                Err(e) => {
-                    eprintln!("error: fork failed: {e}");
-                    finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
-                    std::process::exit(1);
-                }
+            // Forked in `main` before any database was opened (#183).
+            daemon::detach();
+            if let Some(ov) = &overlay_arc {
+                ov.spawn_test_hold_open_transaction();
             }
+            overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+            let control = control.map(ControlListener::serve);
+            let interval = spawn_interval_if(
+                &overlay_arc,
+                &live_archive,
+                commit_interval,
+                Some(nfs_stop.clone()),
+                &open_opts,
+            );
+            let BoundExports {
+                handles,
+                source,
+                overlay: overlay_arc,
+                interval,
+            } = spawn_export_threads_or_exit(
+                source,
+                nfs_opts,
+                plan,
+                overlay_arc,
+                interval,
+                exit_with_code,
+            );
+            let mount_err = mount_blocking(
+                source,
+                &mp,
+                true,
+                writable,
+                overlay_arc.clone(),
+                fuse_opts,
+                readahead,
+                passthrough,
+                open_opts.direct_io,
+                activity,
+            );
+            wait_control_reply(&control);
+            nfs_stop.request_stop();
+            export_stop.request_stop();
+            join_export_handles(handles);
+            finish_overlay_serve(overlay_arc, None, interval, commit_exit);
+            if let Err(e) = mount_err {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0024-M01","item":"ratarmount::run_exports","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )]
+                let _ = std::fs::write(
+                    "/tmp/ratarmount-rs-fuse-error.log",
+                    format!("mount error: {e}\n"),
+                );
+                std::process::exit(1);
+            }
+            std::process::exit(0);
         }
     }
 }
@@ -4074,7 +4040,6 @@ fn run_fuse_and_nfs(
     readahead: u64,
     mut nfs_opts: ratarmount_nfs::NfsOptions,
     foreground: bool,
-    has_log_file: bool,
     live_archive: Option<PathBuf>,
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
@@ -4136,96 +4101,73 @@ fn run_fuse_and_nfs(
         return;
     }
 
-    // Daemonize: probe NFS bind in the parent so a dead port is not silent.
+    // Probe NFS before detaching so a dead port is not silent.
     // No client has been served. Drop the overlay before exit anyway.
     if let Err(e) = std::net::TcpListener::bind(nfs_opts.bind) {
         eprintln!("error: cannot bind NFS on {}: {e}", nfs_opts.bind);
         finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
         std::process::exit(1);
     }
-    match unsafe { fork() } {
-        Ok(ForkResult::Parent { child }) => {
-            relinquish_temp_overlay();
-            // The child owns the overlay database. Dropping it here would
-            // replay pending rows into the child's connection. process::exit
-            // skips Drop on purpose. The interval thread starts in the child.
-            if !wait_until_mounted(&mp, Duration::from_secs(30)) {
-                eprintln!(
-                    "error: timed out waiting for mount at {} (child pid {child})",
-                    mp.display()
-                );
-                let _ = unmount(&mp);
-                std::process::exit(1);
-            }
-            std::process::exit(0);
-        }
-        Ok(ForkResult::Child) => {
-            let _ = setsid();
-            if !has_log_file {
-                let _ = redirect_stdio_to_null();
-            }
-            let stop = ratarmount_nfs::NfsStop::new();
-            nfs_opts.stop = Some(stop.clone());
-            overlay_commit::spawn_signal_nfs_stop(stop.clone());
-            overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-            let control = control.map(ControlListener::serve);
-            let interval = spawn_interval_if(
-                &overlay_arc,
-                &live_archive,
-                commit_interval,
-                Some(stop.clone()),
-                &open_opts,
-            );
-            let handle = match spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
-                Ok(h) => h,
-                Err(e) => {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0025-M01","item":"ratarmount::run_fuse_and_nfs","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                    )]
-                    let _ = std::fs::write(
-                        "/tmp/ratarmount-rs-nfs-error.log",
-                        format!("NFS bind error: {e}\n"),
-                    );
-                    finish_overlay_serve(overlay_arc, Some(source), interval, |_| {});
-                    std::process::exit(1);
-                }
-            };
-            let mount_err = mount_blocking(
-                source,
-                &mp,
-                true,
-                writable,
-                overlay_arc.clone(),
-                fuse_opts,
-                readahead,
-                passthrough,
-                open_opts.direct_io,
-                activity,
-            );
-            wait_control_reply(&control);
-            stop.request_stop();
-            let _ = handle.join();
-            finish_overlay_serve(overlay_arc, None, interval, commit_exit);
-            if let Err(e) = mount_err {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0026-M01","item":"ratarmount::run_fuse_and_nfs","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                )]
-                let _ = std::fs::write(
-                    "/tmp/ratarmount-rs-fuse-error.log",
-                    format!("mount error: {e}\n"),
-                );
-                std::process::exit(1);
-            }
-            std::process::exit(0);
-        }
+    // Forked in `main` before any database was opened (#183).
+    daemon::detach();
+    if let Some(ov) = &overlay_arc {
+        ov.spawn_test_hold_open_transaction();
+    }
+    let stop = ratarmount_nfs::NfsStop::new();
+    nfs_opts.stop = Some(stop.clone());
+    overlay_commit::spawn_signal_nfs_stop(stop.clone());
+    overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+    let control = control.map(ControlListener::serve);
+    let interval = spawn_interval_if(
+        &overlay_arc,
+        &live_archive,
+        commit_interval,
+        Some(stop.clone()),
+        &open_opts,
+    );
+    let handle = match spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
+        Ok(h) => h,
         Err(e) => {
-            eprintln!("error: fork failed: {e}");
-            finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0025-M01","item":"ratarmount::run_fuse_and_nfs","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let _ = std::fs::write(
+                "/tmp/ratarmount-rs-nfs-error.log",
+                format!("NFS bind error: {e}\n"),
+            );
+            finish_overlay_serve(overlay_arc, Some(source), interval, |_| {});
             std::process::exit(1);
         }
+    };
+    let mount_err = mount_blocking(
+        source,
+        &mp,
+        true,
+        writable,
+        overlay_arc.clone(),
+        fuse_opts,
+        readahead,
+        passthrough,
+        open_opts.direct_io,
+        activity,
+    );
+    wait_control_reply(&control);
+    stop.request_stop();
+    let _ = handle.join();
+    finish_overlay_serve(overlay_arc, None, interval, commit_exit);
+    if let Err(e) = mount_err {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0026-M01","item":"ratarmount::run_fuse_and_nfs","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
+        let _ = std::fs::write(
+            "/tmp/ratarmount-rs-fuse-error.log",
+            format!("mount error: {e}\n"),
+        );
+        std::process::exit(1);
     }
+    std::process::exit(0);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4239,7 +4181,6 @@ fn run_fuse_only(
     activity: ratarmount_fuse::oplog::MountActivity,
     readahead: u64,
     foreground: bool,
-    has_log_file: bool,
     live_archive: Option<PathBuf>,
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
@@ -4287,69 +4228,46 @@ fn run_fuse_only(
         return;
     }
 
-    match unsafe { fork() } {
-        Ok(ForkResult::Parent { child }) => {
-            relinquish_temp_overlay();
-            // The child owns the overlay database. Dropping it here would
-            // replay pending rows into the child's connection. process::exit
-            // skips Drop on purpose. The interval thread starts in the child.
-            if !wait_until_mounted(&mp, Duration::from_secs(30)) {
-                eprintln!(
-                    "error: timed out waiting for mount at {} (child pid {child})",
-                    mp.display()
-                );
-                let _ = unmount(&mp);
-                std::process::exit(1);
-            }
-            std::process::exit(0);
-        }
-        Ok(ForkResult::Child) => {
-            let _ = setsid();
-            if !has_log_file {
-                let _ = redirect_stdio_to_null();
-            }
-            overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-            let control = control.map(ControlListener::serve);
-            let interval = spawn_interval_if(
-                &overlay_arc,
-                &live_archive,
-                commit_interval,
-                None,
-                &open_opts,
-            );
-            let mount_err = mount_blocking(
-                source,
-                &mp,
-                true,
-                writable,
-                overlay_arc.clone(),
-                fuse_opts,
-                readahead,
-                passthrough,
-                open_opts.direct_io,
-                activity,
-            );
-            wait_control_reply(&control);
-            finish_overlay_serve(overlay_arc, None, interval, commit_exit);
-            if let Err(e) = mount_err {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0027-M01","item":"ratarmount::run_fuse_only","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                )]
-                let _ = std::fs::write(
-                    "/tmp/ratarmount-rs-fuse-error.log",
-                    format!("mount error: {e}\n"),
-                );
-                std::process::exit(1);
-            }
-            std::process::exit(0);
-        }
-        Err(e) => {
-            eprintln!("error: fork failed: {e}");
-            finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
-            std::process::exit(1);
-        }
+    // Forked in `main` before any database was opened (#183).
+    daemon::detach();
+    if let Some(ov) = &overlay_arc {
+        ov.spawn_test_hold_open_transaction();
     }
+    overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+    let control = control.map(ControlListener::serve);
+    let interval = spawn_interval_if(
+        &overlay_arc,
+        &live_archive,
+        commit_interval,
+        None,
+        &open_opts,
+    );
+    let mount_err = mount_blocking(
+        source,
+        &mp,
+        true,
+        writable,
+        overlay_arc.clone(),
+        fuse_opts,
+        readahead,
+        passthrough,
+        open_opts.direct_io,
+        activity,
+    );
+    wait_control_reply(&control);
+    finish_overlay_serve(overlay_arc, None, interval, commit_exit);
+    if let Err(e) = mount_err {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0027-M01","item":"ratarmount::run_fuse_only","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
+        let _ = std::fs::write(
+            "/tmp/ratarmount-rs-fuse-error.log",
+            format!("mount error: {e}\n"),
+        );
+        std::process::exit(1);
+    }
+    std::process::exit(0);
 }
 
 /// Resolve log color style from CLI flags and environment.
@@ -4383,6 +4301,30 @@ fn resolve_color_style(force_color: bool, force_no_color: bool) -> env_logger::W
         return env_logger::WriteStyle::Always;
     }
     env_logger::WriteStyle::Auto
+}
+
+fn init_startup_logging(args: &Args) {
+    let write_style = resolve_color_style(args.color, args.no_color);
+    init_logger(args.debug, args.log_file.as_deref(), write_style);
+    if args.sandbox {
+        log::info!(
+            "sandbox: -o {} overlay={} quota={:?} passthrough={:?}",
+            args.fuse,
+            if args.overlay_tmpfs.is_some() {
+                "tmpfs".into()
+            } else {
+                args.write_overlay
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            },
+            args.overlay_quota,
+            args.passthrough
+        );
+    }
+    if args.overlay_tmpfs.is_some() && args.overlay_quota.is_none() {
+        eprintln!("warning: --overlay-tmpfs has no size cap; RAM usage is unbounded (set --overlay-tmpfs=SIZE or --overlay-quota)");
+    }
 }
 
 fn init_logger(debug: u8, log_file: Option<&Path>, write_style: env_logger::WriteStyle) {
@@ -4686,8 +4628,9 @@ fn remove_registered_control_socket() {
 }
 
 /// A bound control socket that is not yet served. Binding (and printing the path) happens
-/// before any fork so errors reach the user; [`ControlListener::serve`] runs in the process
-/// that serves the mount, because a thread started before `fork` does not exist in the child.
+/// before the serving process detaches from the caller's stdio, so errors reach the user;
+/// [`ControlListener::serve`] runs once serving starts. A daemonized mount forks before any
+/// of this (`daemon::fork_launcher`), so the socket carries the serving process's pid.
 struct ControlListener {
     listener: UnixListener,
     sock: PathBuf,
@@ -4907,17 +4850,6 @@ fn control_reply(
 #[cfg(test)]
 fn no_unmount(_: &Path) -> std::io::Result<()> {
     Ok(())
-}
-
-fn wait_until_mounted(path: &Path, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if is_fuse_mount(path) {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    false
 }
 
 /// True when `path` appears to be a live FUSE (or FUSE-T) mount.
@@ -8831,6 +8763,7 @@ mod sandbox_cli_tests {
 #[cfg(test)]
 mod sandbox_preset_tests {
     use super::*;
+    use nix::unistd::{fork, ForkResult};
 
     /// Regression: sandbox defaults must respect explicit overlay, ownership and passthrough settings.
     #[test]

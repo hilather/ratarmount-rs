@@ -96,8 +96,9 @@ fn regression_docs_state_failed_replacement_and_locator_rules() {
 fn regression_docs_scope_lock_claims_and_platform_matrix() {
     let text = read("docs/sandbox.md");
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Every "in use" lock claim is scoped to a foreground mount (#183).
-    const SCOPE: &str = "(a foreground `-f` mount; a daemonized mount holds no lock, #183)";
+    // Every "in use" lock claim covers a daemonized mount too, until its
+    // serving process exits (#183).
+    const SCOPE: &str = "(foreground or daemonized, until the serving process exits; #183)";
     for claim in [
         "A mounted overlay's exclusive database lock is reported as \"in use\"",
         "may fail with “in use” if another mount holds the database",
@@ -107,7 +108,7 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
     ] {
         assert!(
             flat.contains(&format!("{claim} {SCOPE}")),
-            "docs/sandbox.md lock claim not scoped to #183: {claim}"
+            "docs/sandbox.md lock claim lost its #183 scope: {claim}"
         );
     }
     for sentence in [
@@ -129,13 +130,17 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
         "docs/python.md lost the #154 paragraph"
     );
     for sentence in [
-        "A daemonized ratarmount (the default without `-f`, for a FUSE mount and for an export server alike) currently holds no kernel lock on its overlay database at all",
-        "(#183). Until that is fixed, run with `-f` when another process may open the same overlay.",
+        "so it holds the overlay database's exclusive lock and the index's shared lock for its whole life (#183)",
+        "is refused with \"in use\" and changes nothing; a reader can no longer roll back the mount's in-flight journal. Wait for the serving process to exit (or retry on \"in use\") before running them right after an unmount",
         "| Platform / host | Installation | Checked open |",
         "opening one database file through both at once in one process is unsupported (#154",
     ] {
-        assert!(text.contains(sentence), "docs/sandbox.md lost: {sentence}");
+        assert!(flat.contains(sentence), "docs/sandbox.md lost: {sentence}");
     }
+    assert!(
+        !flat.contains("currently holds no kernel lock"),
+        "docs/sandbox.md still says a daemonized mount holds no lock (#183)"
+    );
     assert!(
         !text.contains("swapped away and back at its path during its own open"),
         "docs/sandbox.md still lists the swap-back exclusion the checked open closed"
@@ -143,6 +148,34 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
     let changelog = read("CHANGELOG.md");
     assert!(changelog
         .contains("still holds no kernel lock on its overlay database after it forks (#183)"));
+    assert!(changelog.contains("now forks before it opens any database"));
+}
+
+/// Regression: unmount recipes ran offline verbs before the server released
+/// its lock, and a bare BEGIN IMMEDIATE probe could itself hold a reservation.
+#[test]
+fn regression_docs_daemon_wait() {
+    let sandbox = read("docs/sandbox.md");
+    for required in [
+        "wait \"$attempt_pid\"",
+        "BEGIN IMMEDIATE; ROLLBACK;",
+        "CLI exit codes alone do not",
+        "zero busy timeout",
+        "`pgrep -f MOUNTPOINT` is not a",
+    ] {
+        assert!(
+            sandbox.contains(required),
+            "missing daemon wait guidance: {required}"
+        );
+    }
+    for path in ["docs/provenance.md", "docs/getting-started.md"] {
+        assert!(
+            read(path).contains("wait \"$mount_pid\""),
+            "{path}: offline access precedes server exit"
+        );
+    }
+    assert!(read("docs/mount-options-parity.md")
+        .contains("daemonized mounts detach standard streams while continuing to log"));
 }
 
 /// Regression: required-session wording and offline no-recovery rules survive reconciliation.

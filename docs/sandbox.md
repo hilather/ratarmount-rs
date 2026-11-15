@@ -112,7 +112,7 @@ JSON-encoded `lower_layers`), plus the numeric `overlay-stats` fields
 the overlay directory, so its permissions determine `files_dir_writable`.
 Success exits 0. Missing or damaged databases fail without being created or
 repaired. A mounted overlay's exclusive database lock is reported as "in use"
-(a foreground `-f` mount; a daemonized mount holds no lock, #183).
+(foreground or daemonized, until the serving process exits; #183).
 
 | Key | Meaning |
 |---|---|
@@ -547,7 +547,7 @@ ratarmount --lower prepared --overlay-tmpfs=2G source.tar scratch/
 Lower layers must have `sealed_at` metadata. `--allow-unsealed-lower` also accepts
 unsealed and legacy overlays; these open read-only without SQLite's immutable
 option and may fail with “in use” if another mount holds the database
-(a foreground `-f` mount; a daemonized mount holds no lock, #183). They use
+(foreground or daemonized, until the serving process exits; #183). They use
 a construction-time row snapshot, so stop writers before using them. Sealed
 lowers use immutable SQLite and can be shared by concurrent mounts.
 
@@ -599,7 +599,7 @@ metadata for such an overlay without inventing a base identity; keep supplying
 BASE to verify it.
 
 Seal refuses a database held by another mount (“in use by another ratarmount
-process”) (a foreground `-f` mount; a daemonized mount holds no lock, #183).
+process”) (foreground or daemonized, until the serving process exits; #183).
 It runs fsck without repair under a writer reservation and refuses
 inconsistencies with an `overlay fsck --repair` hint. The digest is the canonical
 SHA-256 change hash against the composed lower view, with exact bytes, modes,
@@ -740,7 +740,7 @@ mount-relative parent, not a host absolute path.
 Unsealed checks record `fsck_at` and `fsck_result` (`ok`, `errors:N`, or
 `repaired:N`). Sealed overlays can be checked without modifying any metadata;
 `--repair` is refused. A database locked by a mount returns “in use”
-(a foreground `-f` mount; a daemonized mount holds no lock, #183). Repairs
+(foreground or daemonized, until the serving process exits; #183). Repairs
 hold an exclusive SQLite transaction, but host changes and SQLite are not one
 atomic transaction: stop direct host writers and rerun after an interrupted
 repair. A consistency check does not verify content hashes.
@@ -771,8 +771,8 @@ base and a note goes to stderr. Repeat `--lower DIR` in bottom-to-top order, or
 omit it to use `meta.lower_layers`. Sealed lowers open immutable; other lowers
 open read-only. `--strict` refuses any unsealed top or lower. Without it, unsealed
 and legacy overlays produce warnings. Stop writers before comparing: offline
-diff refuses a database locked by a mount (a foreground `-f` mount; a
-daemonized mount holds no lock, #183), and files/SQLite are separate stores.
+diff refuses a database locked by a mount (foreground or daemonized, until the
+serving process exits; #183), and files/SQLite are separate stores.
 
 Choose one output mode (default `--patch`):
 
@@ -1703,11 +1703,14 @@ Docker daemon with the `busybox` image.
 ## Branching an episode
 
 A harness can fork an attempt at
-turn *k* by stopping writers, unmounting, and sealing that attempt. Then each
+turn *k* by stopping writers, unmounting, waiting for its serving process to
+exit, and sealing that attempt. Run the original attempt with `-f` in the
+background and save its PID as `attempt_pid`. Then each
 branch gets its own writable top over the same ordered lower stack:
 
 ```sh
 fusermount3 -u attempt-mnt
+wait "$attempt_pid"  # the server has flushed and released its overlay lock
 ratarmount overlay fsck attempt-k --repair
 ratarmount overlay seal attempt-k
 ratarmount --lower prepared --lower attempt-k -w branch-a source.tar branch-a-mnt/
@@ -2006,8 +2009,9 @@ rolls back a hot `-journal` on the first open before the marker can be read,
 and the rollback journal itself was not synced while relaxed. Without a
 readable boot ID (macOS, masked `/proc`), every leftover marker is treated as
 a machine failure, so a killed mount also needs `fsck --repair`. A seal never
-carries the marker into a sealed layer. Like every overlay lock claim, a
-daemonized mount holds no kernel lock on its database after its fork (#183).
+carries the marker into a sealed layer. A daemonized mount's serving process
+holds the database lock until it has flushed and cleared the marker and exited
+(#183); a verb run in that window is refused as "in use".
 
 The sandbox supervisor takes the same option per attempt (protocol version 2
 `new` with `overlay_durability`); see [relaxed attempts](#relaxed-attempts).
@@ -2131,17 +2135,46 @@ reads and the macOS park share the tested helper but have no test of their
 own. Pack payload append has a direct registered-alias refusal/lock regression.
 
 These protections keep the SQLite locks of a process that holds the database
-for its whole life: a foreground mount or export server (`-f`; `sandbox run`
-and the sandbox supervisor run ratarmount that way), or a library or Python
-user. A daemonized ratarmount (the default without `-f`, for a FUSE mount and
-for an export server alike) currently holds no kernel lock on its overlay
-database at all: the database is opened and locked before the fork, POSIX
-locks are not inherited by the child, and the parent's exit releases them
-(#183). Until that is fixed, run with `-f` when another process may open the
-same overlay. Without the lock, another process that opens the database
-(`overlay info`, `fsck`, `diff`, a library read) can take the mount's
-in-flight `-journal` for a hot one and roll back a write the mount believes
-it committed.
+for its whole life: a mount or export server, foreground (`-f`; `sandbox run`
+and the sandbox supervisor run ratarmount that way) or daemonized, or a library
+or Python user. POSIX locks are not inherited by a `fork()` child, so a
+daemonized FUSE mount (the default without `-f`) forks before opening any
+database or log and before starting worker threads. The launcher holds no
+database lock; it relays the
+serving process's exit status while that process starts (startup errors and
+their exit statuses are unchanged) and then waits for the mount. The serving
+process recovers journals, opens the base and its index and opens the overlay
+database itself, so it holds the overlay database's exclusive lock and the
+index's shared lock for its whole life (#183). No lock is handed over between
+processes, so there is no window in which another process could take one.
+Before this, the database was locked before the fork and the launcher's exit
+released the lock: any process could write the live database, or take the
+serving process's live rollback journal for a hot one and roll back a write
+the server then believed committed.
+
+`fusermount3 -u` and `ratarmount -u` return when the kernel has detached the
+mount, before the serving process has finished: it still joins its threads,
+replays queued rows, runs an on-exit commit and clears the relaxed-durability
+marker under its lock. A verb that opens the overlay in that window (`overlay
+fsck`, `seal`, `info`, `diff`, `pack`) is refused with "in use" and changes
+nothing; a reader can no longer roll back the mount's in-flight journal. Wait
+for the serving process to exit (or retry on "in use") before running them
+right after an unmount. For scripts, run the mount with `-f` in the background,
+save `$!`, wait for mount readiness, and `wait "$mount_pid"` after unmounting;
+see the [checkpoint recipe](recipes/scripts/checkpoint-archives.sh). This also
+lets the script check the server's exit status. `pgrep -f MOUNTPOINT` is not a
+reliable completion check: the path is a regular expression and can match the
+calling shell or unrelated processes.
+
+For a daemon whose PID is unavailable, retry only a refusal whose diagnostic
+contains "in use", with a bounded timeout; CLI exit codes alone do not
+distinguish that refusal from other errors. A separate SQLite connection can
+instead probe `BEGIN IMMEDIATE; ROLLBACK;` against the existing
+`.ratarmount.overlay.sqlite` (open read/write without creating it, and use a
+zero busy timeout). Retry `SQLITE_BUSY`, stop on other errors, and close the
+connection after each attempt. Always roll back a successful probe so the
+probe itself does not keep the next operation out. Stop competing writers
+first: a successful probe does not reserve access for a later command.
 
 
 A required-record observation is a **one-way session latch**. Once an overlay
