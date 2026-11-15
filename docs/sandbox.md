@@ -2124,7 +2124,10 @@ for an export server alike) currently holds no kernel lock on its overlay
 database at all: the database is opened and locked before the fork, POSIX
 locks are not inherited by the child, and the parent's exit releases them
 (#183). Until that is fixed, run with `-f` when another process may open the
-same overlay.
+same overlay. Without the lock, another process that opens the database
+(`overlay info`, `fsck`, `diff`, a library read) can take the mount's
+in-flight `-journal` for a hot one and roll back a write the mount believes
+it committed.
 
 
 A required-record observation is a **one-way session latch**. Once an overlay
