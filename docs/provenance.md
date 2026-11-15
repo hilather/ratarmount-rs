@@ -4,11 +4,14 @@ On a writable FUSE mount, attach provenance without copying an archive member's
 payload into the overlay:
 
 ```sh
-ratarmount -w edits traces.tar.zst mnt
+ratarmount -f -w edits traces.tar.zst mnt &
+mount_pid=$!
+# Wait for mount readiness before editing (see the checkpoint recipe).
 setfattr -n user.teacher -v glm-5.3-flash mnt/trace.jsonl
 setfattr -n user.train_ok -v false mnt/trace.jsonl
 getfattr -d mnt/trace.jsonl
 fusermount3 -u mnt
+wait "$mount_pid"  # flush queued writes and release the overlay lock
 ratarmount --commit-overlay --yes -w edits --commit-manifest traces.tar.zst
 ratarmount find --xattr train_ok=false traces.tar.zst
 ```

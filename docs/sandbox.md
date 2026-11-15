@@ -1703,11 +1703,14 @@ Docker daemon with the `busybox` image.
 ## Branching an episode
 
 A harness can fork an attempt at
-turn *k* by stopping writers, unmounting, and sealing that attempt. Then each
+turn *k* by stopping writers, unmounting, waiting for its serving process to
+exit, and sealing that attempt. Run the original attempt with `-f` in the
+background and save its PID as `attempt_pid`. Then each
 branch gets its own writable top over the same ordered lower stack:
 
 ```sh
 fusermount3 -u attempt-mnt
+wait "$attempt_pid"  # the server has flushed and released its overlay lock
 ratarmount overlay fsck attempt-k --repair
 ratarmount overlay seal attempt-k
 ratarmount --lower prepared --lower attempt-k -w branch-a source.tar branch-a-mnt/
@@ -2135,8 +2138,9 @@ These protections keep the SQLite locks of a process that holds the database
 for its whole life: a mount or export server, foreground (`-f`; `sandbox run`
 and the sandbox supervisor run ratarmount that way) or daemonized, or a library
 or Python user. POSIX locks are not inherited by a `fork()` child, so a
-daemonized FUSE mount (the default without `-f`) forks before it opens
-anything: the launcher opens no database and holds no lock; it relays the
+daemonized FUSE mount (the default without `-f`) forks before opening any
+database or log and before starting worker threads. The launcher holds no
+database lock; it relays the
 serving process's exit status while that process starts (startup errors and
 their exit statuses are unchanged) and then waits for the mount. The serving
 process recovers journals, opens the base and its index and opens the overlay
@@ -2155,10 +2159,22 @@ marker under its lock. A verb that opens the overlay in that window (`overlay
 fsck`, `seal`, `info`, `diff`, `pack`) is refused with "in use" and changes
 nothing; a reader can no longer roll back the mount's in-flight journal. Wait
 for the serving process to exit (or retry on "in use") before running them
-right after an unmount: for example poll until no process serving that mount
-point is left (`pgrep -f MOUNTPOINT`), or until `BEGIN IMMEDIATE` on
-`.ratarmount.overlay.sqlite` is no longer busy. A foreground `-f` mount's own
-exit marks the same point.
+right after an unmount. For scripts, run the mount with `-f` in the background,
+save `$!`, wait for mount readiness, and `wait "$mount_pid"` after unmounting;
+see the [checkpoint recipe](recipes/scripts/checkpoint-archives.sh). This also
+lets the script check the server's exit status. `pgrep -f MOUNTPOINT` is not a
+reliable completion check: the path is a regular expression and can match the
+calling shell or unrelated processes.
+
+For a daemon whose PID is unavailable, retry only a refusal whose diagnostic
+contains "in use", with a bounded timeout; CLI exit codes alone do not
+distinguish that refusal from other errors. A separate SQLite connection can
+instead probe `BEGIN IMMEDIATE; ROLLBACK;` against the existing
+`.ratarmount.overlay.sqlite` (open read/write without creating it, and use a
+zero busy timeout). Retry `SQLITE_BUSY`, stop on other errors, and close the
+connection after each attempt. Always roll back a successful probe so the
+probe itself does not keep the next operation out. Stop competing writers
+first: a successful probe does not reserve access for a later command.
 
 
 A required-record observation is a **one-way session latch**. Once an overlay

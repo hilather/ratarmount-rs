@@ -5,6 +5,7 @@
 //! life: another process could write the live database, or roll back the
 //! serving process's live `-journal` as if it were hot. The launcher now forks
 //! before it opens anything, and the serving process takes every lock itself.
+#![cfg(target_os = "linux")]
 
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -207,11 +208,10 @@ fn check_daemon_holds_locks(name: &str, args: &[&str]) {
         "{name}: BEGIN IMMEDIATE from another process must be busy: {busy:?}"
     );
     let index = tmp.path().join("base.tar.index.sqlite");
-    if index.exists() {
-        let (index_pid, _) = lock_holder(&index)
-            .unwrap_or_else(|| panic!("{name}: the serving process holds no index lock"));
-        assert_eq!(index_pid, pid, "{name}: index lock held by the server");
-    }
+    assert!(index.is_file(), "{name}: the persistent index must exist");
+    let (index_pid, _) = lock_holder(&index)
+        .unwrap_or_else(|| panic!("{name}: the serving process holds no index lock"));
+    assert_eq!(index_pid, pid, "{name}: index lock held by the server");
     // The mount still serves.
     assert_eq!(fs::read(mnt.join("a.txt")).unwrap(), b"base\n");
     daemon.unmount();
@@ -249,7 +249,9 @@ fn regression_183_reader_cannot_roll_back_live_journal() {
     let mnt = tmp.path().join("mnt");
     let ready = tmp.path().join("ready");
     let mut daemon = Daemon::start(
-        &["--index-file", ":memory:"],
+        // The on-exit commit needs the same DB mutex as the held transaction,
+        // keeping the server alive after kernel unmount.
+        &["--index-file", ":memory:", "--commit-overlay-on-exit"],
         &overlay,
         &base,
         &mnt,
@@ -288,6 +290,25 @@ fn regression_183_reader_cannot_roll_back_live_journal() {
         "live journal untouched"
     );
     let (pid, _) = lock_holder(&db).expect("the serving process holds the lock");
+    // Kernel detach is not the server's exit. Its held write still blocks
+    // inspection and repair even when there is no longer a FUSE mount.
+    daemon.unmount();
+    assert!(alive(pid), "the held transaction must block on-exit commit");
+    for verb in ["info", "fsck", "seal"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+            .args(["overlay", verb])
+            .arg(&overlay)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{verb} accepted a finishing server");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("in use"),
+            "{verb}: {out:?}"
+        );
+    }
+    assert!(is_busy(&begin_immediate(&db)));
+    assert_eq!(fs::read(&db).unwrap(), db_before);
+    assert_eq!(fs::read(&journal).unwrap(), journal_before);
     // End the server mid-transaction; its journal is hot now and the
     // rollback is the reader's to do. The startup writes it committed stay.
     nix::sys::signal::kill(
@@ -296,7 +317,6 @@ fn regression_183_reader_cannot_roll_back_live_journal() {
     )
     .unwrap();
     wait_exit(pid);
-    daemon.unmount();
     let meta = ratarmount_compositing::OverlayMeta::read(&overlay)
         .unwrap()
         .expect("overlay record");
@@ -310,4 +330,139 @@ fn regression_183_reader_cannot_roll_back_live_journal() {
     let mut again = Daemon::start(&["--index-file", ":memory:"], &overlay, &base, &mnt2, &[]);
     assert_eq!(fs::read(mnt2.join("new.txt")).unwrap(), b"new\n");
     again.unmount();
+}
+
+/// Regression: --log-file kept the daemon's stdout/stderr pipes open, so a
+/// caller capturing output waited for the entire mount lifetime. The logger
+/// must keep writing through its own descriptor after stdio is detached.
+#[test]
+fn regression_183_log_file_detaches_stdio() {
+    if !available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base.tar");
+    base_tar(&base);
+    for args in [
+        vec![],
+        vec!["--nfs", "--nfs-bind", "127.0.0.1:0"],
+        vec!["--http", "--http-bind", "127.0.0.1:0"],
+    ] {
+        let mnt = tmp.path().join("mnt");
+        fs::create_dir_all(&mnt).unwrap();
+        let mut cleanup = Daemon {
+            mnt: mnt.clone(),
+            mounted: true,
+        };
+        let log = tmp.path().join("mount.log");
+        let launcher = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+            .args(&args)
+            .args(["-d", "3", "--log-file"])
+            .arg(&log)
+            .arg(&base)
+            .arg(&mnt)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let output = std::thread::spawn(move || {
+            let result = launcher.wait_with_output().unwrap();
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(Duration::from_secs(10));
+        if result.is_err() {
+            // Release inherited pipes on the old code before failing.
+            cleanup.unmount();
+        }
+        output.join().unwrap();
+        let out = result.expect("launcher output stayed open until unmount with --log-file");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(fs::read(mnt.join("a.txt")).unwrap(), b"base\n");
+        cleanup.unmount();
+        // finish_overlay_serve logs after detach, so this is stronger than
+        // merely observing log output produced during startup.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !fs::read_to_string(&log).unwrap().contains("memory_budget") {
+            assert!(
+                Instant::now() < deadline,
+                "daemon stopped logging after detach"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        fs::remove_file(log).unwrap();
+    }
+}
+
+/// Regression: logging was initialized in the launcher, despite the promise
+/// to fork before opening startup files. Park the server at a password FIFO
+/// and inspect the launcher's descriptors and threads, then interrupt startup.
+#[test]
+fn regression_183_launcher_opens_no_startup_files_and_relays_signals() {
+    if !available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base.tar");
+    base_tar(&base);
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    let fifo = tmp.path().join("passwords");
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    let log = tmp.path().join("startup.log");
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .arg("--log-file")
+        .arg(&log)
+        .arg("--password-file")
+        .arg(&fifo)
+        .args(["--http", "--http-bind", "127.0.0.1:0"])
+        .arg("-w")
+        .arg(tmp.path().join("overlay"))
+        .arg(&base)
+        .arg(&mnt)
+        .spawn()
+        .unwrap();
+    let pid = launcher.id();
+    let children_path = format!("/proc/{pid}/task/{pid}/children");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let child = loop {
+        let children = fs::read_to_string(&children_path).unwrap_or_default();
+        if let Some(child) = children
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<i32>().ok())
+        {
+            if log.exists() {
+                break child;
+            }
+        }
+        if Instant::now() >= deadline {
+            launcher.kill().unwrap();
+            launcher.wait().unwrap();
+            panic!("startup never reached the password FIFO");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let descriptors: Vec<_> = fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .map(|fd| fs::read_link(fd.unwrap().path()).unwrap())
+        .collect();
+    let threads = fs::read_dir(format!("/proc/{pid}/task")).unwrap().count();
+    // Collect before asserting so even the regressed launcher is stopped.
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let status = launcher.wait().unwrap();
+    wait_exit(child);
+    assert_eq!(status.code(), Some(128 + libc::SIGTERM));
+    assert_eq!(threads, 1, "launcher started threads before fork");
+    assert!(
+        !descriptors.contains(&log),
+        "launcher retained the log file: {descriptors:?}"
+    );
+    assert!(!tmp.path().join("overlay").exists());
+    assert!(!tmp.path().join("base.tar.index.sqlite").exists());
 }

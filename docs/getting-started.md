@@ -208,9 +208,12 @@ then be shared across independent writable attempts:
 ratarmount snapshot repo@HEAD base.tar.zst --with-index --json
 ratarmount overlay import --no-seal prepared.patch prepared base.tar.zst
 ratarmount overlay seal prepared
-ratarmount --lower prepared -w attempt base.tar.zst mnt/
+ratarmount -f --lower prepared -w attempt base.tar.zst mnt/ &
+mount_pid=$!
+# Wait for mount readiness before editing (see the checkpoint recipe).
 # Run the agent and its edits through mnt/ before unmounting.
 ratarmount -u mnt/
+wait "$mount_pid"  # flush queued writes and release the overlay lock
 ratarmount overlay fsck attempt --repair
 ratarmount overlay seal attempt
 ratarmount overlay info attempt --json
@@ -294,6 +297,12 @@ in `/etc/fuse.conf` and mount with `-o allow_other`. `-o uid=,gid=,umask=`
 present the tree with different ownership without changing the archive.
 
 ## Stopping a mount
+
+Unmounting detaches the kernel mount before the server finishes flushing its
+overlay. Before offline `overlay fsck`, `seal`, `info`, `diff`, or `pack`, wait
+for the serving process to exit. Scripts can run `-f` in the background and
+wait for its saved PID after unmounting; a daemonized overlay otherwise reports
+"in use" until shutdown finishes. See the [shutdown and retry guidance](sandbox.md#hard-links-of-the-overlay-database).
 
 `ratarmount -u mnt/` retries `fusermount3 -u` for about a second while the mount
 is busy; desktop watchers (gvfsd-trash, gvfs-udisks2-volume-monitor) probe every

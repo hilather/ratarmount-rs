@@ -151,6 +151,33 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
     assert!(changelog.contains("now forks before it opens any database"));
 }
 
+/// Regression: unmount recipes ran offline verbs before the server released
+/// its lock, and a bare BEGIN IMMEDIATE probe could itself hold a reservation.
+#[test]
+fn regression_docs_daemon_wait() {
+    let sandbox = read("docs/sandbox.md");
+    for required in [
+        "wait \"$attempt_pid\"",
+        "BEGIN IMMEDIATE; ROLLBACK;",
+        "CLI exit codes alone do not",
+        "zero busy timeout",
+        "`pgrep -f MOUNTPOINT` is not a",
+    ] {
+        assert!(
+            sandbox.contains(required),
+            "missing daemon wait guidance: {required}"
+        );
+    }
+    for path in ["docs/provenance.md", "docs/getting-started.md"] {
+        assert!(
+            read(path).contains("wait \"$mount_pid\""),
+            "{path}: offline access precedes server exit"
+        );
+    }
+    assert!(read("docs/mount-options-parity.md")
+        .contains("daemonized mounts detach standard streams while continuing to log"));
+}
+
 /// Regression: required-session wording and offline no-recovery rules survive reconciliation.
 #[test]
 fn regression_docs_required_record_latch_and_offline_no_recovery() {

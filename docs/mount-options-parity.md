@@ -122,7 +122,7 @@ the [N-worker recipe and compatibility limits](sandbox.md#prepare-once-n-writabl
 | `-g` / `--gs` / `--gzip-seek-point-spacing` (Python `-gs`) | yes | yes | `[x]` MiB uncompressed checkpoint spacing; **default 16**; denser **1–4** for random-heavy mounts (higher open time / RSS) — see note below |
 | `--readahead BYTES` | no (issue [#180](https://github.com/mxmlnkn/ratarmount/issues/180)) | **added** | `[x]` sequential FUSE window per open (`0`=off; `K`/`M`/`G`; max 64 MiB/handle; auto 1 MiB when flag omitted and rapidgzip preferred **or** any input looks like gzip `.gz`/`.tgz`/`.tar.gz`/`.gzip`; explicit `--readahead 0`/`N` overrides) |
 | `-d` / `--debug` | yes | yes | `[x]` |
-| `--log-file` | yes | yes | `[x]` |
+| `--log-file` | yes | yes (the serving process opens the diagnostic log; daemonized mounts detach standard streams while continuing to log) | `[x]` |
 | `--color` / `--no-color` | yes | **added** (logging style) | `~` |
 | `--oss-attributions` | yes | **added** (short list) | `~` |
 | Multi-source union (positional) | yes | yes + folder cache | `[x]` |

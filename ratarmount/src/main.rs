@@ -713,7 +713,7 @@ struct Args {
     #[arg(short = 'd', long = "debug", default_value_t = 1)]
     debug: u8,
 
-    /// Redirect log output to this file (after mount setup; useful without -f)
+    /// Write diagnostic logs to this file (also after daemonizing)
     #[arg(long = "log-file")]
     log_file: Option<PathBuf>,
 
@@ -1759,26 +1759,10 @@ fn main() {
         std::process::exit(2);
     }
 
-    let write_style = resolve_color_style(args.color, args.no_color);
-    init_logger(args.debug, args.log_file.as_deref(), write_style);
-    if args.sandbox {
-        log::info!(
-            "sandbox: -o {} overlay={} quota={:?} passthrough={:?}",
-            args.fuse,
-            if args.overlay_tmpfs.is_some() {
-                "tmpfs".into()
-            } else {
-                args.write_overlay
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default()
-            },
-            args.overlay_quota,
-            args.passthrough
-        );
-    }
-    if args.overlay_tmpfs.is_some() && args.overlay_quota.is_none() {
-        eprintln!("warning: --overlay-tmpfs has no size cap; RAM usage is unbounded (set --overlay-tmpfs=SIZE or --overlay-quota)");
+    // These modes return before mount planning and never fork.
+    let offline = args.repack_seekable || args.unmount || args.commit_overlay;
+    if offline {
+        init_startup_logging(&args);
     }
 
     if args.repack_seekable {
@@ -2048,6 +2032,8 @@ fn main() {
     if let Some((_, plan)) = guard.as_ref().filter(|_| !args.foreground) {
         daemon::fork_launcher(&plan.mp);
     }
+    // The serving process alone opens the log, as well as every database.
+    init_startup_logging(&args);
 
     // Classify every local member's commit journal against the records that
     // vote on it BEFORE any recovery write; members a record does not own wait
@@ -3089,7 +3075,6 @@ fn main() {
                     readahead,
                     nfs_opts,
                     args.foreground,
-                    args.log_file.is_some(),
                     live_commit_archive,
                     args.commit_overlay_on_exit,
                     commit_interval,
@@ -3112,7 +3097,6 @@ fn main() {
             Some(nfs_opts),
             plan,
             args.foreground,
-            args.log_file.is_some(),
             live_commit_archive,
             args.commit_overlay_on_exit,
             commit_interval,
@@ -3136,7 +3120,6 @@ fn main() {
             None,
             plan,
             args.foreground,
-            args.log_file.is_some(),
             live_commit_archive,
             args.commit_overlay_on_exit,
             commit_interval,
@@ -3157,7 +3140,6 @@ fn main() {
         activity,
         readahead,
         args.foreground,
-        args.log_file.is_some(),
         live_commit_archive,
         args.commit_overlay_on_exit,
         commit_interval,
@@ -3771,7 +3753,6 @@ fn run_exports(
     mut nfs_opts: Option<ratarmount_nfs::NfsOptions>,
     mut plan: ExportPlan,
     foreground: bool,
-    has_log_file: bool,
     live_archive: Option<PathBuf>,
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
@@ -3913,7 +3894,7 @@ fn run_exports(
                 std::process::exit(1);
             }
             // Forked in `main` before any database was opened (#183).
-            daemon::detach(has_log_file);
+            daemon::detach();
             if let Some(ov) = &overlay_arc {
                 ov.spawn_test_hold_open_transaction();
             }
@@ -4059,7 +4040,6 @@ fn run_fuse_and_nfs(
     readahead: u64,
     mut nfs_opts: ratarmount_nfs::NfsOptions,
     foreground: bool,
-    has_log_file: bool,
     live_archive: Option<PathBuf>,
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
@@ -4121,7 +4101,7 @@ fn run_fuse_and_nfs(
         return;
     }
 
-    // Daemonize: probe NFS bind in the parent so a dead port is not silent.
+    // Probe NFS before detaching so a dead port is not silent.
     // No client has been served. Drop the overlay before exit anyway.
     if let Err(e) = std::net::TcpListener::bind(nfs_opts.bind) {
         eprintln!("error: cannot bind NFS on {}: {e}", nfs_opts.bind);
@@ -4129,7 +4109,7 @@ fn run_fuse_and_nfs(
         std::process::exit(1);
     }
     // Forked in `main` before any database was opened (#183).
-    daemon::detach(has_log_file);
+    daemon::detach();
     if let Some(ov) = &overlay_arc {
         ov.spawn_test_hold_open_transaction();
     }
@@ -4201,7 +4181,6 @@ fn run_fuse_only(
     activity: ratarmount_fuse::oplog::MountActivity,
     readahead: u64,
     foreground: bool,
-    has_log_file: bool,
     live_archive: Option<PathBuf>,
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
@@ -4250,7 +4229,7 @@ fn run_fuse_only(
     }
 
     // Forked in `main` before any database was opened (#183).
-    daemon::detach(has_log_file);
+    daemon::detach();
     if let Some(ov) = &overlay_arc {
         ov.spawn_test_hold_open_transaction();
     }
@@ -4322,6 +4301,30 @@ fn resolve_color_style(force_color: bool, force_no_color: bool) -> env_logger::W
         return env_logger::WriteStyle::Always;
     }
     env_logger::WriteStyle::Auto
+}
+
+fn init_startup_logging(args: &Args) {
+    let write_style = resolve_color_style(args.color, args.no_color);
+    init_logger(args.debug, args.log_file.as_deref(), write_style);
+    if args.sandbox {
+        log::info!(
+            "sandbox: -o {} overlay={} quota={:?} passthrough={:?}",
+            args.fuse,
+            if args.overlay_tmpfs.is_some() {
+                "tmpfs".into()
+            } else {
+                args.write_overlay
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            },
+            args.overlay_quota,
+            args.passthrough
+        );
+    }
+    if args.overlay_tmpfs.is_some() && args.overlay_quota.is_none() {
+        eprintln!("warning: --overlay-tmpfs has no size cap; RAM usage is unbounded (set --overlay-tmpfs=SIZE or --overlay-quota)");
+    }
 }
 
 fn init_logger(debug: u8, log_file: Option<&Path>, write_style: env_logger::WriteStyle) {
