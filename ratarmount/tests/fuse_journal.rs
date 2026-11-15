@@ -18,9 +18,22 @@ struct Mount {
 
 impl Mount {
     fn start(base: &Path, mount: &Path, journal: Option<&Path>, overlay: Option<&Path>) -> Self {
+        Self::start_with_io(base, mount, journal, overlay, true)
+    }
+
+    fn start_with_io(
+        base: &Path,
+        mount: &Path,
+        journal: Option<&Path>,
+        overlay: Option<&Path>,
+        direct_io: bool,
+    ) -> Self {
         fs::create_dir_all(mount).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
-        command.args(["-f", "--direct-io"]);
+        command.arg("-f");
+        if direct_io {
+            command.arg("--direct-io");
+        }
         if let Some(journal) = journal {
             command
                 .args(["--journal-sync", "--journal-exclude", "excluded/**"])
@@ -325,6 +338,39 @@ fn summarize_json(journal: &Path) -> Value {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// Regression: kernel page filling/readahead can fetch more bytes than the
+/// application reads. Journal bytes are callback bytes, not a lower bound on
+/// application consumption; cache hits can also make them smaller.
+#[test]
+fn regression_fuse_journal_coverage_cached_read_bytes() {
+    use std::io::Read;
+    if !available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.tar");
+    fixture(&base);
+    let journal = dir.path().join("trace.jsonl");
+    let mnt = dir.path().join("mnt");
+    let mut mount = Mount::start_with_io(&base, &mnt, Some(&journal), None, false);
+    let mut file = fs::File::open(mnt.join("input")).unwrap();
+    let mut byte = [0];
+    file.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [b'x']);
+    drop(file);
+    mount.stop();
+    let summary = summarize_json(&journal);
+    assert_eq!(summary["coverage"]["complete"], true);
+    assert!(
+        summary["paths"]["input"]["bytes_read"].as_u64().unwrap() > 1,
+        "{summary}"
+    );
+    assert_eq!(
+        summary["coverage"]["semantics"]["bytes_read"],
+        "fuse_callback_bytes"
+    );
 }
 
 /// Regression (observation coverage): a clean unmount, a SIGKILLed mount

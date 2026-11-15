@@ -220,6 +220,15 @@ impl OpLog {
                 "journal must be a regular file",
             ));
         }
+        // Segments are sequential. An overlapping writer's end/count could
+        // otherwise certify this writer's unfinished segment in a mark window.
+        file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "operation journal is already in use",
+            ),
+            std::fs::TryLockError::Error(error) => error,
+        })?;
         let mut output = BufWriter::new(file);
         // Separate sessions in an append-only file, even after a killed writer.
         if output.get_ref().metadata()?.len() != 0 {
@@ -324,6 +333,8 @@ impl OpLog {
         if let Some(tx) = tx {
             tx.send(event)
                 .map_err(|_| io::Error::other("operation journal writer stopped"))?;
+        } else if self.path.is_some() {
+            return Err(io::Error::other("operation journal writer stopped"));
         }
         Ok(())
     }
@@ -603,11 +614,11 @@ fn observation(options: &JournalOptions) -> Value {
         "sync": options.sync, "not_observed": NOT_OBSERVED})
 }
 
-/// Writes every queued record, then (only if every write succeeded) the
-/// segment's `end` record with the number of records written after the
-/// header and the number `--journal-exclude` suppressed. Any write error
-/// returns before `end`, so its presence proves the segment was flushed
-/// completely.
+/// Flush (and optionally sync) every queued record before publishing `end`.
+/// No fallible finalization follows publication. The end has no trailing
+/// newline: its closing brace must be the last byte written, so a partial
+/// write cannot become a valid end when the next session appends a newline.
+/// The marker itself is not fsynced; losing it leaves coverage unknown.
 fn writer_loop<W: Write>(
     mut output: BufWriter<W>,
     rx: mpsc::Receiver<Value>,
@@ -631,15 +642,14 @@ fn writer_loop<W: Write>(
             last_flush = Instant::now();
         }
     }
-    let ts = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-    write_line(
-        &mut output,
-        &json!({"op": "end", "ts": ts, "records": records,
-            "excluded": excluded.load(Ordering::Relaxed)}),
-    )?;
     output.flush()?;
     sync(output.get_ref())?;
-    Ok(())
+    let ts = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    let end = serde_json::to_vec(&json!({"op": "end", "ts": ts, "records": records,
+        "excluded": excluded.load(Ordering::Relaxed)}))?;
+    // Bypass BufWriter so Drop cannot retry a failed marker publication.
+    let (mut sink, _) = output.into_parts();
+    sink.write_all(&end)
 }
 
 /// Resolve existing ancestors, including symlinks, before checking containment.
@@ -983,6 +993,93 @@ mod tests {
         assert_eq!(events.last().unwrap()["op"], "end");
     }
 
+    /// Regression: two live writers could interleave headers and ends, letting
+    /// one writer's end certify the other's incomplete mark window. Lock the
+    /// acquired inode before any append, including when reached by an alias.
+    #[test]
+    fn regression_oplog_overlapping_sessions_refused_before_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace");
+        let options = options(path.clone());
+        let mount = dir.path().join("mnt");
+        let first = OpLog::open(&options, &mount, None, &BTreeMap::new()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let alias = path.with_extension("alias");
+        std::fs::hard_link(&path, &alias).unwrap();
+        for path in [&path, &alias] {
+            let mut options = options.clone();
+            options.path = path.clone();
+            let error = OpLog::open(&options, &mount, None, &BTreeMap::new())
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
+        first.finish().unwrap();
+        let second = OpLog::open(&options, &mount, None, &BTreeMap::new()).unwrap();
+        second.finish().unwrap();
+        let events = records(&path);
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0]["journal"], 1);
+        assert_eq!(events[1]["op"], "end");
+        assert_eq!(events[2]["journal"], 1);
+        assert_eq!(events[3]["op"], "end");
+    }
+
+    /// Regression: shutdown must drain unreleased handles before `end`, even
+    /// with `reads=first` and excludes. A concurrent mark must either be in
+    /// the end's count or fail; a closed writer used to acknowledge lost marks.
+    #[test]
+    fn regression_oplog_finish_drains_handles_and_concurrent_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = options(dir.path().join("trace"));
+        options.reads = Reads::First;
+        let log = OpLog::open(&options, &dir.path().join("mnt"), None, &BTreeMap::new()).unwrap();
+        for (fh, path) in [(1, "/file"), (2, "/.git/file")] {
+            log.opened(fh, path, libc::O_RDWR, Caller::default(), "base".into());
+            log.io(fh, 0, 3, false);
+            log.io(fh, 10, 7, false);
+            log.io(fh, 0, 5, true);
+        }
+        log.mark(b"before").unwrap();
+        let accepted = std::thread::scope(|scope| {
+            let barrier = Arc::new(std::sync::Barrier::new(9));
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let log = &log;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        (0..128).filter(|_| log.mark(b"racing").is_ok()).count()
+                    })
+                })
+                .collect();
+            barrier.wait();
+            log.finish().unwrap();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .sum::<usize>()
+                + 1
+        });
+        assert_eq!(log.mark(b"after"), Err(libc::EIO));
+        log.finish().unwrap();
+        let events = records(&options.path);
+        assert_eq!(
+            events.iter().filter(|e| e["op"] == "mark").count(),
+            accepted
+        );
+        let end = events.last().unwrap();
+        assert_eq!(end["op"], "end");
+        assert_eq!(end["records"], accepted + 3); // open, read, write
+        assert_eq!(end["excluded"], 3);
+        let read = events.iter().find(|e| e["op"] == "read").unwrap();
+        assert_eq!(read["bytes"], 10);
+        assert_eq!(read["count"], 2);
+        assert_eq!(read["ranges"], json!([[0, 3]]));
+        assert_eq!(events.iter().filter(|e| e["op"] == "end").count(), 1);
+    }
+
     /// Regression (observation coverage): the header did not record the
     /// observation settings, so a later reader could not tell "no reads under
     /// `t/`" from "reads under `t/` were excluded" or reduced to the first.
@@ -1064,5 +1161,68 @@ mod tests {
             ))
             .is_err()
         );
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "sync failure published end"
+        );
+    }
+
+    /// Regression: a final flush error or a partial end write could leave a
+    /// parseable `end`, certifying a writer that actually failed. Appending
+    /// another session must not repair a failed end into a valid certificate.
+    #[test]
+    fn regression_oplog_end_publication_failures() {
+        struct FlushFailure(Vec<u8>);
+        impl Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("injected flush failure"))
+            }
+        }
+        let mut sink = FlushFailure(Vec::new());
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(json!({"op": "mkdir", "path": "a"})).unwrap();
+        drop(tx);
+        assert!(writer_loop(
+            BufWriter::new(&mut sink),
+            rx,
+            Instant::now(),
+            &AtomicU64::new(0),
+            |_| Ok(())
+        )
+        .is_err());
+        assert!(!String::from_utf8(sink.0)
+            .unwrap()
+            .contains("\"op\":\"end\""));
+
+        let mut succeeded = false;
+        for limit in 0..256 {
+            let written = Arc::new(Mutex::new(Vec::new()));
+            let output = BufWriter::new(FailAfter {
+                written: written.clone(),
+                limit,
+            });
+            let (tx, rx) = mpsc::sync_channel(1);
+            drop(tx);
+            let result = writer_loop(output, rx, Instant::now(), &AtomicU64::new(0), |_| Ok(()));
+            let mut bytes = written.lock().unwrap().clone();
+            // This is how the next OpLog::open separates a killed writer's tail.
+            bytes.extend_from_slice(b"\n{\"journal\":1}\n");
+            let ends = bytes
+                .split(|b| *b == b'\n')
+                .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+                .filter(|record| record["op"] == "end")
+                .count();
+            if result.is_ok() {
+                assert_eq!(ends, 1);
+                succeeded = true;
+                break;
+            }
+            assert_eq!(ends, 0, "failed at byte {limit}, but left a valid end");
+        }
+        assert!(succeeded);
     }
 }

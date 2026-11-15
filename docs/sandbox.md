@@ -1047,6 +1047,9 @@ ratarmount journal summarize attempt.jsonl --since-mark 'turn 1' --until-mark 't
 
 Each mount appends a version-1 header containing `mount`, `base_digest`,
 `stack_digest`, `overlay`, UTC RFC 3339 `t0`, and `clock: "monotonic_ns"`.
+Only one cooperating writer may hold a journal inode at a time. An overlapping
+mount using the same file (including a hard-link alias) fails before appending;
+sequential mounts append separate segments after the earlier writer finishes.
 Subsequent `ts` values are monotonic nanoseconds since that header. Paths are
 mount-relative, without a leading slash; the root is `""`. JSON writers use
 `path_b64` for invalid UTF-8 bytes, although the FUSE frontend currently rejects
@@ -1113,32 +1116,49 @@ and a fixed `not_observed` list of what no journal records: `lookup`,
 `getattr`, `page_cache_reads`, `mmap_reads`, `other_protocols` and
 `outside_mount`. A segment is one mount's records, from its header. The writer
 ends a segment with `{"op":"end","ts":…,"records":N,"excluded":M}` only after
-writing every record without error, so `end` proves the segment was flushed
-completely. A killed mount, a writer that failed part-way, and a mount still
-running leave no `end`. (With `--journal-sync`, `end` is written before the
-fsync; an fsync failure is reported as a journal error at unmount.)
+flushing every record and, with `--journal-sync`, successfully fsyncing those
+records. A flush or fsync failure leaves no `end`. The end marker is written
+directly, without a trailing newline or subsequent flush/fsync: its closing
+brace is the last byte, so a partial write cannot become a valid marker when
+another session appends its separating newline. The marker itself is not
+guaranteed durable across a power loss; losing it makes coverage incomplete.
+A killed mount or a mount still running normally leaves no `end`.
 
 `summarize --json` adds `coverage`:
 
 | Field | Meaning |
 | --- | --- |
-| `complete` | True only if every segment overlapping the selected window recorded `observation` and ended `clean` with a matching count. For the segment holding the `--until-mark`, the mark itself suffices: marks share the writer's FIFO queue with every other record, so a present until-mark proves everything emitted before it was written. A live journal can therefore be complete for a closed turn |
-| `reasons` | Sorted subset of `missing_end`, `truncated_tail`, `record_count_mismatch`, `pre_coverage_journal` (a header written before `observation` existed); empty when complete |
+| `complete` | True only if every segment overlapping the selected window recorded valid `observation` settings and ended `clean` with a matching count. The segment holding the `--until-mark` can instead use that mark to establish the FIFO prefix enqueued before it, unless settings, end records or counts contradict completeness. A live journal can therefore be complete for a closed turn |
+| `reasons` | Sorted subset of `missing_end`, `truncated_tail`, `record_count_mismatch`, `pre_coverage_journal` (a header without observation settings), `invalid_observation` (missing or unsupported settings), `invalid_end` (malformed, duplicate or nonterminal end); empty when complete |
 | `windowed` | Whether `--since-mark` or `--until-mark` selected a window |
 | `excluded_globs`, `reads_mode` | Unions of the `observation` settings over the segments in the window |
-| `segments` | One per header: `mount`, `t0`, `observation` (`null` before coverage), `ended` (`clean`, `missing_end`, `truncated_tail`, `closed_by_mark`), `records` read, `records_match` and `excluded` from `end` (`null` without it), `in_window` |
-| `semantics` | Fixed values: `complete: "every_emitted_record_present"`, `read_absence: "unknown"`, `bytes_read: "lower_bound"`, `open_absence` (`conclusive` or `unknown`) |
+| `segments` | One per readable header: `mount`, `t0`, `observation` (`null` before coverage), `ended` (`clean`, `missing_end`, `truncated_tail`, `closed_by_mark`, `invalid_end`), `records` read (excluding header and end), `records_match` and `excluded` from the first end (`null` without it), `in_window`. A torn initial header also makes whole-journal coverage incomplete |
+| `semantics` | Fixed values: `complete: "every_emitted_record_present"`, `read_absence: "unknown"`, `bytes_read: "fuse_callback_bytes"`, `open_absence` (`conclusive` or `unknown`) |
 
 `complete` means the file holds every record the daemon emitted for the
 window. **It is never negative evidence of reads**: page-cache and mmap hits
 produce no READ callback, so a path missing from `files_read` is always
-unknown as a read, and `bytes_read` is a lower bound. The strongest negative
+unknown as a read. `bytes_read` counts bytes returned in FUSE callbacks: cache
+hits can omit application reads, while kernel page filling/readahead can fetch
+more bytes than the application consumes. It is not a bound on application
+read bytes. The strongest negative
 the summary offers is `open_absence: "conclusive"`, set only for a complete,
 unwindowed summary whose every segment's `end` reports `excluded: 0`: then a
 path absent from `paths` had no successful file OPEN through this mount. It
 says nothing about lookups, stats, other export protocols or access outside
 the mount. Segments after the until-mark are read only to judge the window;
 an unreadable record there ends the scan rather than failing the summary.
+
+These conclusions assume an unmodified journal from the trusted writer.
+Counts detect missing records, and malformed, duplicate or nonterminal ends
+cannot certify completeness; they do not authenticate the file. A forged
+header, matching count and end can fabricate coverage. A mark establishes only
+the queue prefix that reached the file, not durable storage or a barrier for
+concurrent callbacks. Read/write records for handles still open at the mark
+are emitted at release (or drained at unmount) and belong to that later bucket.
+`reads: "first"` retains only the first nonempty range per handle; total bytes
+and request counts still include every observed callback. `excluded` counts
+suppressed records, including handle aggregates, rather than individual reads.
 
 `sandbox run` and supervisor `finalize` reports carry `complete` and `reasons`
 in `journal_summary`; the full `coverage` object is in the summary file it

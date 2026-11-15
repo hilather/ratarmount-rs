@@ -49,7 +49,7 @@ const RECORD_BYTES: u64 = 4 << 20;
 /// `failed` line (4,096 kept IDs twice and an escaped 8 KiB `mount.log`
 /// excerpt) is about 185 KB. R1b's lower re-check messages are cut to the
 /// same 8 KiB (`lowers::MESSAGE_BYTES`). A finalize `done` line stores the
-/// report, whose `journal_summary` coverage (`complete` and at most the four
+/// report, whose `journal_summary` coverage (`complete` and at most the six
 /// fixed `reasons`) adds under 200 bytes; `retained::widest_report` pins it.
 pub const LINE_BOUND: u64 = RECORD_BYTES + (512 << 10);
 /// The answer to a retry of a request cut off by a restart (§5.3).

@@ -80,12 +80,26 @@ pub const ENDED_CLEAN: &str = "clean";
 pub const ENDED_MISSING_END: &str = "missing_end";
 pub const ENDED_TRUNCATED_TAIL: &str = "truncated_tail";
 pub const ENDED_CLOSED_BY_MARK: &str = "closed_by_mark";
+pub const ENDED_INVALID_END: &str = "invalid_end";
 
 /// The closed set of reasons a window is not `complete`.
 pub const REASON_MISSING_END: &str = "missing_end";
 pub const REASON_TRUNCATED_TAIL: &str = "truncated_tail";
 pub const REASON_RECORD_COUNT_MISMATCH: &str = "record_count_mismatch";
 pub const REASON_PRE_COVERAGE_JOURNAL: &str = "pre_coverage_journal";
+pub const REASON_INVALID_OBSERVATION: &str = "invalid_observation";
+pub const REASON_INVALID_END: &str = "invalid_end";
+
+/// Shared with the report-size estimate: adding a reason must widen that
+/// estimate too. Reasons are fixed strings, never unbounded input text.
+pub const COVERAGE_REASONS: &[&str] = &[
+    REASON_MISSING_END,
+    REASON_TRUNCATED_TAIL,
+    REASON_RECORD_COUNT_MISMATCH,
+    REASON_PRE_COVERAGE_JOURNAL,
+    REASON_INVALID_OBSERVATION,
+    REASON_INVALID_END,
+];
 
 /// One mount's records: its header and how they ended.
 #[derive(Debug, Serialize)]
@@ -116,7 +130,8 @@ pub struct Semantics {
     /// A path missing from `files_read` is always unknown as a read:
     /// page-cache and mmap hits produce no READ callback.
     pub read_absence: &'static str,
-    /// `bytes_read` counts only reads that reached the mount.
+    /// `bytes_read` counts FUSE callback bytes. Cache hits can omit application
+    /// reads; page filling/readahead can fetch bytes the application never uses.
     pub bytes_read: &'static str,
     /// `conclusive` only over a complete, unwindowed window whose segments
     /// all excluded nothing: then a path absent from `paths` had no
@@ -129,7 +144,7 @@ impl Default for Semantics {
         Self {
             complete: "every_emitted_record_present",
             read_absence: "unknown",
-            bytes_read: "lower_bound",
+            bytes_read: "fuse_callback_bytes",
             open_absence: "unknown",
         }
     }
@@ -157,14 +172,27 @@ struct Open {
     segment: Segment,
     end: Option<(Option<u64>, Option<u64>)>,
     until_here: bool,
+    invalid_end: bool,
+}
+
+fn valid_observation(observation: &Value) -> bool {
+    matches!(observation["reads"].as_str(), Some("all" | "first"))
+        && observation["exclude"]
+            .as_array()
+            .is_some_and(|globs| globs.iter().all(Value::is_string))
+        && observation["sync"].is_boolean()
+        && observation["not_observed"].as_array().is_some_and(|items| {
+            let expected = ratarmount_fuse::oplog::NOT_OBSERVED;
+            items.len() == expected.len()
+                && expected
+                    .iter()
+                    .all(|name| items.iter().any(|item| item.as_str() == Some(name)))
+        })
 }
 
 impl Open {
     fn new(header: &Value, in_window: bool) -> Self {
-        let observation = match header.get("observation") {
-            Some(observation @ Value::Object(_)) => observation.clone(),
-            _ => Value::Null,
-        };
+        let observation = header.get("observation").cloned().unwrap_or(Value::Null);
         Self {
             segment: Segment {
                 mount: header.get("mount").cloned().unwrap_or(Value::Null),
@@ -178,6 +206,7 @@ impl Open {
             },
             end: None,
             until_here: false,
+            invalid_end: false,
         }
     }
 
@@ -185,6 +214,8 @@ impl Open {
         let segment = &mut self.segment;
         segment.ended = if truncated {
             ENDED_TRUNCATED_TAIL
+        } else if self.invalid_end {
+            ENDED_INVALID_END
         } else if self.end.is_some() {
             ENDED_CLEAN
         } else {
@@ -194,9 +225,9 @@ impl Open {
             segment.records_match = Some(records == Some(segment.records));
             segment.excluded = excluded;
         }
-        // Marks share the writer's FIFO queue with every other record, so a
-        // present until-mark proves everything emitted before it was written.
-        if self.until_here && segment.ended != ENDED_CLEAN {
+        // A present until-mark establishes the FIFO prefix enqueued before
+        // the mark. Concurrent callbacks and unreleased handles may emit later.
+        if self.until_here && matches!(segment.ended, ENDED_MISSING_END | ENDED_TRUNCATED_TAIL) {
             segment.ended = ENDED_CLOSED_BY_MARK;
         }
         if segment.in_window {
@@ -205,6 +236,9 @@ impl Open {
                 reasons.insert(REASON_PRE_COVERAGE_JOURNAL);
             } else {
                 let observation = &segment.observation;
+                if !valid_observation(observation) {
+                    reasons.insert(REASON_INVALID_OBSERVATION);
+                }
                 if let Some(reads) = observation["reads"].as_str() {
                     coverage.reads_mode.insert(reads.into());
                 }
@@ -225,6 +259,9 @@ impl Open {
             }
             if segment.records_match == Some(false) {
                 reasons.insert(REASON_RECORD_COUNT_MISMATCH);
+            }
+            if self.invalid_end {
+                reasons.insert(REASON_INVALID_END);
             }
         }
         coverage.segments.push(self.segment);
@@ -256,7 +293,11 @@ pub fn summarize(
     let mut closed = false;
     loop {
         line.clear();
-        let bytes = input.read_until(b'\n', &mut line)?;
+        let bytes = match input.read_until(b'\n', &mut line) {
+            Ok(bytes) => bytes,
+            Err(_) if closed => break,
+            Err(error) => return Err(error),
+        };
         if bytes == 0 {
             break;
         }
@@ -279,19 +320,21 @@ pub fn summarize(
         };
         if let Some(version) = record["journal"].as_u64() {
             if version > JOURNAL_VERSION {
-                {
-                    if closed {
-                        break;
-                    }
-                    return Err(invalid(format!(
+                if closed {
+                    break;
+                }
+                return Err(invalid(format!(
                     "journal version {version} is newer than supported ({JOURNAL_VERSION}); upgrade ratarmount"
                 )));
-                };
             }
         }
         if record["journal"] == 1 {
             if let Some(open) = segment.take() {
                 open.close(truncated, &mut summary.coverage);
+            } else if truncated && active {
+                // A torn first header is still evidence of an interrupted
+                // session; the next header must not erase that uncertainty.
+                summary.coverage.reasons.insert(REASON_TRUNCATED_TAIL);
             }
             segment = Some(Open::new(&record, active));
             header = true;
@@ -302,14 +345,12 @@ pub fn summarize(
             continue;
         }
         if truncated {
-            {
-                if closed {
-                    break;
-                }
-                return Err(invalid(format!(
-                    "truncated journal record before line {line_number}"
-                )));
-            };
+            if closed {
+                break;
+            }
+            return Err(invalid(format!(
+                "truncated journal record before line {line_number}"
+            )));
         }
         let Some(open) = segment.as_mut() else {
             return Err(invalid("missing journal header"));
@@ -323,8 +364,16 @@ pub fn summarize(
                 return Err(invalid("record missing op"));
             }
         };
+        // `end` must be unique and terminal. Never let a replacement marker
+        // repair a count mismatch or erase a previous excluded count.
+        if open.end.is_some() {
+            open.invalid_end = true;
+        }
         if op == "end" {
-            open.end = Some((record["records"].as_u64(), record["excluded"].as_u64()));
+            let records = record["records"].as_u64();
+            let excluded = record["excluded"].as_u64();
+            open.invalid_end |= records.is_none() || excluded.is_none() || !record["ts"].is_u64();
+            open.end.get_or_insert((records, excluded));
             continue;
         }
         open.segment.records += 1;
@@ -684,7 +733,7 @@ mod tests {
     fn header(reads: &str, exclude: &[&str]) -> String {
         serde_json::json!({"journal": 1, "mount": "/m", "t0": "2026-11-15T00:00:00Z",
             "clock": "monotonic_ns", "observation": {"reads": reads, "exclude": exclude,
-            "sync": false, "not_observed": ["lookup"]}})
+            "sync": false, "not_observed": ratarmount_fuse::oplog::NOT_OBSERVED}})
         .to_string()
             + "\n"
     }
@@ -698,6 +747,117 @@ mod tests {
 
     fn coverage(input: &str, since: Option<&str>, until: Option<&str>) -> serde_json::Value {
         serde_json::to_value(summarize(input.as_bytes(), since, until).unwrap().coverage).unwrap()
+    }
+
+    /// Regression: duplicate/nonterminal/malformed ends and incomplete or
+    /// unknown observation settings certified an untrustworthy segment.
+    #[test]
+    fn regression_journal_coverage_invalid_certificates() {
+        let h = header("all", &[]);
+        for (case, input, reason) in [
+            (
+                "duplicate end",
+                format!("{h}{}{}", end(0, 0), end(0, 0)),
+                "invalid_end",
+            ),
+            (
+                "replaced end",
+                format!("{h}{}{READ_A}{}", end(0, 0), end(2, 0)),
+                "invalid_end",
+            ),
+            (
+                "early end with forged total",
+                format!("{h}{}{READ_A}", end(2, 0)),
+                "invalid_end",
+            ),
+            (
+                "missing excluded",
+                format!("{h}{{\"op\":\"end\",\"ts\":9,\"records\":0}}\n"),
+                "invalid_end",
+            ),
+            (
+                "missing timestamp",
+                format!("{h}{{\"op\":\"end\",\"records\":0,\"excluded\":0}}\n"),
+                "invalid_end",
+            ),
+        ] {
+            for until in [None, Some("u")] {
+                let input = if until.is_some() {
+                    // A mark after an end must not rescue an invalid segment.
+                    format!("{input}{{\"op\":\"mark\",\"label\":\"u\"}}\n")
+                } else {
+                    input.clone()
+                };
+                let got = coverage(&input, None, until);
+                assert_eq!(got["complete"], false, "{case}: {got}");
+                assert!(
+                    got["reasons"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&Value::from(reason)),
+                    "{case}: {got}"
+                );
+                assert_eq!(got["semantics"]["open_absence"], "unknown");
+            }
+        }
+        let valid: Value = serde_json::from_str(h.trim()).unwrap();
+        for (key, bad) in [
+            ("reads", serde_json::json!("none")),
+            ("exclude", serde_json::json!([3])),
+            ("sync", Value::Null),
+            ("not_observed", serde_json::json!(["open"])),
+        ] {
+            for remove in [false, true] {
+                let mut header = valid.clone();
+                if remove {
+                    header["observation"].as_object_mut().unwrap().remove(key);
+                } else {
+                    header["observation"][key] = bad.clone();
+                }
+                let got = coverage(&format!("{header}\n{}", end(0, 0)), None, None);
+                assert_eq!(got["complete"], false, "{key} remove={remove}: {got}");
+                assert_eq!(got["reasons"], serde_json::json!(["invalid_observation"]));
+            }
+        }
+    }
+
+    /// Regression: a torn first header followed by a new session erased
+    /// evidence of interrupted observation from the whole-journal summary.
+    #[test]
+    fn regression_journal_coverage_torn_initial_session() {
+        let input = format!(
+            "{{\"journal\":1,\"mount\":\n{}{{\"op\":\"mark\",\"label\":\"s\"}}\n{}",
+            header("all", &[]),
+            end(1, 0)
+        );
+        let whole = coverage(&input, None, None);
+        assert_eq!(whole["complete"], false);
+        assert_eq!(whole["reasons"], serde_json::json!(["truncated_tail"]));
+        assert_eq!(whole["semantics"]["open_absence"], "unknown");
+        assert_eq!(coverage(&input, Some("s"), None)["complete"], true);
+    }
+
+    /// Regression: scanning beyond the until-mark made an I/O failure outside
+    /// the selected window fail a summary that previously stopped at the mark.
+    #[test]
+    fn regression_journal_coverage_io_error_after_until_mark() {
+        use std::io::Read;
+        struct Unreadable;
+        impl Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected read failure"))
+            }
+        }
+        let prefix = format!(
+            "{}{READ_A}{{\"op\":\"mark\",\"label\":\"u\"}}\n",
+            header("all", &[])
+        );
+        let input = || BufReader::new(prefix.as_bytes().chain(Unreadable));
+        let summary = summarize(input(), None, Some("u")).unwrap();
+        assert!(summary.coverage.complete);
+        assert_eq!(summary.files_read, ["a"]);
+        assert_eq!(summary.coverage.segments[0].ended, ENDED_CLOSED_BY_MARK);
+        assert!(summarize(input(), None, None).is_err());
     }
 
     /// Regression (observation coverage): `summarize` could not tell a clean
@@ -715,11 +875,11 @@ mod tests {
                 "excluded_globs": ["t/**"], "reads_mode": ["all"],
                 "segments": [{"mount": "/m", "t0": "2026-11-15T00:00:00Z",
                     "observation": {"reads": "all", "exclude": ["t/**"], "sync": false,
-                        "not_observed": ["lookup"]},
+                        "not_observed": ratarmount_fuse::oplog::NOT_OBSERVED},
                     "ended": "clean", "records": 2, "records_match": true, "excluded": 0,
                     "in_window": true}],
                 "semantics": {"complete": "every_emitted_record_present",
-                    "read_absence": "unknown", "bytes_read": "lower_bound",
+                    "read_absence": "unknown", "bytes_read": "fuse_callback_bytes",
                     "open_absence": "conclusive"}})
         );
         let pre = format!("{{\"journal\":1}}\n{READ_A}{}", end(2, 0));
@@ -762,8 +922,8 @@ mod tests {
                 "record_after_end",
                 format!("{h}{READ_A}{}{READ_A}", end(2, 0)),
                 false,
-                vec!["record_count_mismatch"],
-                vec!["clean"],
+                vec!["invalid_end", "record_count_mismatch"],
+                vec!["invalid_end"],
                 "unknown",
             ),
             (

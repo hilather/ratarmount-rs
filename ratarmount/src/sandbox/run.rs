@@ -2685,7 +2685,8 @@ mod tests {
 
     /// Writes `testdata/sandbox-run-finish-golden.jsonl` from `finish`. The
     /// committed fixture was recorded from the `finish` that predates
-    /// `finalize_top` (R1c-1 step 2a); regenerate only on purpose.
+    /// `finalize_top` (R1c-1 step 2a), then deliberately extended with journal
+    /// coverage fields; regenerate only on purpose.
     #[test]
     #[ignore = "fixture generator: cargo test -p ratarmount --bin ratarmount generate_sandbox_run_finish_golden -- --ignored"]
     fn generate_sandbox_run_finish_golden() {
@@ -2698,7 +2699,8 @@ mod tests {
     }
 
     /// Regression (R1c-1 T1, source test 10): `finalize_top` must leave every
-    /// `sandbox run` report byte for byte as the `finish` before it wrote it,
+    /// `sandbox run` report byte for byte as the recorded `finish` baseline
+    /// (with the deliberate journal coverage additions),
     /// and keep its error order (classify, gate, compose): a bundle lower over
     /// an edited base is refused with the gate's text, never with a bundle
     /// verification error.

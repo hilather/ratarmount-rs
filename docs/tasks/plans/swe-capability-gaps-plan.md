@@ -33,9 +33,10 @@ failures, disabled observation, and a distinction between "observed zero" and
   `--journal-exclude`), so a later reader cannot tell "no reads under `t/`" from
   "reads under `t/` were excluded".
 - `files_read` and friends are positive evidence only. Absence of a path is
-  "unknown" whenever coverage is incomplete, and read byte counts are lower bounds
-  because page-cache and mmap hits produce no READ callback. Nothing in the
-  output says so.
+  "unknown" whenever coverage is incomplete. Read byte counts measure FUSE
+  callbacks, not application consumption: page-cache and mmap hits can omit
+  callbacks, while page filling/readahead can fetch unused bytes. Nothing in
+  the output says so.
 
 ### Design (journal format stays version 1; all additions are additive, and
 older readers already ignore unknown records and fields)
@@ -45,17 +46,23 @@ older readers already ignore unknown records and fields)
    `other_protocols`, `outside_mount`.
 2. **End record**, written by the writer thread as the last line on a clean
    finish: `{"op":"end","ts":…,"records":N}`, where `N` counts the records
-   written in this segment after the header. It is written only when the writer
-   has no error, so its presence proves the segment was flushed completely.
+   written in this segment after the header, excluding `end`. Publish it only
+   after successful record flush and optional fsync. The marker has no trailing
+   newline and is written directly, with no subsequent flush/fsync: a failed
+   partial publication cannot be completed by the next session's separator.
+   The marker itself may be lost on power failure, leaving coverage unknown.
+   Hold a nonblocking exclusive lock on the acquired journal inode through
+   writer shutdown, so overlapping mounts cannot interleave segment boundaries.
 3. **`journal summarize` gains `coverage`:**
    - `segments`: one per mount header, each with `mount`, `t0`, `observation`
      (or `null` for a pre-coverage journal), `ended` (`clean` / `missing_end` /
-     `truncated_tail` / `closed_by_mark`), `records_match` and the `excluded` count from `end`.
+     `truncated_tail` / `closed_by_mark` / `invalid_end`), `records_match` and the `excluded` count from the first `end`.
    - `complete`: true only if every segment overlapping the selected window
      recorded its observation settings and ended `clean` with a matching count,
-     or (for a `--until-mark` window) the until-mark itself is present. Marks go
+     or (for a `--until-mark` window) the until-mark itself is present, with no
+     invalid settings, ends or contradictory counts. Marks go
      through the same FIFO writer queue as every other record, so a present
-     until-mark proves everything emitted before it was written.
+     until-mark establishes the FIFO prefix enqueued before it.
    - **What `complete` means, and what it does not:** the file holds every record
      the daemon emitted for that window. It is never negative evidence of reads:
      page-cache and mmap hits produce no READ callback, so a path missing from
@@ -64,7 +71,10 @@ older readers already ignore unknown records and fields)
      entries) over a complete, unwindowed, unexcluded segment: then no OPEN of
      it reached the mount. `semantics` states this in fixed fields.
    - `reasons`: a small closed set of fixed strings (`missing_end`,
-     `truncated_tail`, `record_count_mismatch`, `pre_coverage_journal`).
+     `truncated_tail`, `record_count_mismatch`, `pre_coverage_journal`,
+     `invalid_observation`, `invalid_end`). Validate the required observation
+     settings and refuse duplicate, malformed and nonterminal ends as evidence
+     of completeness. Preserve uncertainty from a torn initial header.
    - `excluded_globs`, `reads_mode`: unions over segments, so a consumer can
      tell "excluded" from "not touched".
    - Summarize keeps scanning after the `--until-mark` record (it currently
@@ -99,6 +109,11 @@ older readers already ignore unknown records and fields)
 - FUSE: a real journaled mount, clean unmount → `complete: true`; SIGKILLed mount
   → `complete: false`, `missing_end`.
 - Finalize/`sandbox run` reports carry `complete`.
+
+Coverage assumes trusted, unmodified writer output; it is not authentication
+against forged records. A mark certifies the enqueued prefix in the file, not
+fsync success or completion of concurrent callbacks. Unreleased handles are
+attributed at release/unmount; `reads=first` suppresses ranges, not byte totals.
 
 ## PR 2: receipt inputs (follow-up, only if cpanmine asks)
 `sandbox run` and finalize already report layer digest, base digest and journal

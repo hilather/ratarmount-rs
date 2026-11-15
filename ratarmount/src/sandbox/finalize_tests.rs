@@ -7993,13 +7993,45 @@ fn regression_supervisor_retain_report_fits_the_preflight_estimate() {
     let attempt = env.attempt(true, true);
     fs::write(
         attempt.path.parent().unwrap().join("journal.jsonl"),
-        "{\"journal\":1}\n{\"op\":\"read\",\"path\":\"/f\",\"ts\":1,\"bytes\":9}\n",
+        // Exercise the widest actual coverage, rather than estimating only
+        // the two reasons a legacy journal produces.
+        concat!(
+            "{\"journal\":1}\n",
+            "{\"op\":\"read\",\"path\":\"/f\",\"ts\":1,\"bytes\":9}\n",
+            "{\"journal\":1,\"observation\":{}}\n",
+            "{\"op\":\"end\",\"records\":99}\n",
+            "{\"journal\":1}\n{\"op\":\"read\"",
+        ),
     )
     .unwrap();
     let report = env.finalize(&attempt.id, true, None).unwrap();
     assert_eq!(report["status"], "retained", "{report}");
+    let reasons = report["journal_summary"]["reasons"].as_array().unwrap();
+    assert_eq!(reasons.len(), crate::journal_cmd::COVERAGE_REASONS.len());
+    for reason in crate::journal_cmd::COVERAGE_REASONS {
+        assert!(reasons.contains(&json!(reason)), "{report}");
+    }
     let entry = &env.sup.retained[&attempt.id];
     let widest = super::retained::widest_report(&entry.attempt, &env.kept(&attempt.id));
+    let estimated_reasons: std::collections::BTreeSet<_> = widest["journal_summary"]["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|reason| reason.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        estimated_reasons,
+        reasons
+            .iter()
+            .map(|reason| reason.as_str().unwrap())
+            .collect()
+    );
+    assert!(
+        serde_json::to_vec(&json!({"complete": false, "reasons": reasons}))
+            .unwrap()
+            .len()
+            < 200
+    );
     let real = serde_json::to_vec(&entry.report).unwrap().len();
     let estimate = serde_json::to_vec(&widest).unwrap().len();
     assert!(real <= estimate, "real report {real} > estimate {estimate}");
