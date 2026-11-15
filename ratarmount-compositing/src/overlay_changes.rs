@@ -1350,6 +1350,52 @@ mod tests {
         assert_eq!(digest, canonical_hash(&rowed, &opts).unwrap());
     }
 
+    /// Regression: fixing comparison fixtures to 0644 must not hide COW mode
+    /// loss or make a real 0664-to-0644 difference disappear from the hash.
+    #[test]
+    fn regression_cow_changes_match_rowed_edits_for_group_writable_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, base) = fixture();
+        fs::set_permissions(tmp.path().join("base/a"), fs::Permissions::from_mode(0o664)).unwrap();
+        let opts = ChangeOptions::default();
+        let cow = edits(tmp.path(), "cow", base.clone(), b"new\n", &opts);
+        assert_eq!(cow.len(), 1);
+        assert_eq!(cow[0].old.as_ref().unwrap().mode, 0o100664);
+        assert_eq!(cow[0].new.as_ref().unwrap().mode, 0o100664);
+        let digest = canonical_hash(&cow, &opts).unwrap();
+
+        let dir = tmp.path().join("rowed");
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+        put(&ov, "/a", b"new\n");
+        drop(ov);
+        let rowed = change_set(&dir, base.clone(), &opts).unwrap();
+        assert_eq!(rowed.len(), 1);
+        assert_eq!(rowed[0].new.as_ref().unwrap().mode, 0o100644);
+        assert_ne!(digest, canonical_hash(&rowed, &opts).unwrap());
+        let ignore_mode = ChangeOptions {
+            ignore_mode: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            canonical_hash(&cow, &ignore_mode).unwrap(),
+            canonical_hash(&rowed, &ignore_mode).unwrap()
+        );
+
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+        ov.set_metadata(
+            "/a",
+            &OverlayMetadata {
+                mode: Some(0o664),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(ov);
+        let rowed = change_set(&dir, base, &opts).unwrap();
+        assert_eq!(rowed[0].new.as_ref().unwrap().mode, 0o100664);
+        assert_eq!(digest, canonical_hash(&rowed, &opts).unwrap());
+    }
+
     /// Regression: between and base-less diff ignored host-only edits on either side.
     #[test]
     fn regression_cow_between_and_without_base() {

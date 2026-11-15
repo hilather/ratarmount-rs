@@ -1368,6 +1368,16 @@ impl Drop for SandboxDaemon {
     }
 }
 
+/// Regression: the agreement fixture's socket parent was group-writable under
+/// umask 0002. Exercise startup without the separate implicit-COW-parent bug.
+#[test]
+fn regression_supervisor_socket_fixture_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = SandboxDaemon::start(tmp.path());
+    let attempts = daemon.call(json!({"version": 1, "op": "list"}));
+    assert_eq!(attempts, json!([]));
+}
+
 /// Regression (R1c-1 F4): a layer the real supervisor finalized (its own
 /// stop, fsck, seal and pack over a prepared TAR base, after an agent's
 /// copy-on-write edits through the attempt's mount) must give the report's

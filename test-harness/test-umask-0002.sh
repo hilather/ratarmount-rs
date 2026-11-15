@@ -8,7 +8,8 @@
 #
 # CI runs everything under 022, so this script is the guard. Extra arguments
 # are passed to every `cargo test` (e.g. `--release`). Set CARGO to override
-# the cargo command.
+# the cargo command. Each invocation must report at least one passed test;
+# build-only, list-only and empty selections are failures.
 #
 # Not here yet: overlay_changes regression_cow_lower_view_lists_base_and_build_edits,
 # overlay_import regression_cow_git_import_hash_roundtrip_base_and_lower and
@@ -24,11 +25,17 @@ if [ "$(umask)" != "0002" ]; then
     exit 1
 fi
 
+log=$(mktemp "${TMPDIR:-/tmp}/ratarmount-umask.XXXXXX")
+trap 'rm -f "$log"' EXIT
 cargo_cmd=(${CARGO:-cargo})
 status=0
 run() {
     echo "+ umask 0002; cargo test $*" >&2
-    if ! "${cargo_cmd[@]}" test "$@"; then
+    if ! "${cargo_cmd[@]}" test "$@" 2>&1 | tee "$log"; then
+        echo "FAIL: cargo test $* failed under umask 0002" >&2
+        status=1
+    elif ! LC_ALL=C grep -Eq '^test result: ok\. [1-9][0-9]* passed;' "$log"; then
+        echo "FAIL: cargo test $* reported no passed tests under umask 0002" >&2
         status=1
     fi
 }
@@ -42,6 +49,7 @@ run -p ratarmount --test diff "${@}"
 # The mount tests print `skip:` without /dev/fuse or fusermount3; the daemon
 # binds its socket (the check that refused under 0002) before any mount.
 run -p ratarmount --test sandbox "${@}"
+run -p ratarmount --test fuse_cow_agreement regression_supervisor_socket_fixture_starts "${@}"
 
 if [ "$status" -ne 0 ]; then
     echo "FAIL: a test failed under umask 0002" >&2

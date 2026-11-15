@@ -4755,8 +4755,11 @@ pub(crate) mod tests {
         assert!(error.contains("lf"), "{error}");
     }
 
-    /// A directory base without `--base-digest` has only a weak identity, so no
-    /// marker is trusted: a same-size edit with the mtime restored is caught.
+    /// Regression: a directory base has no trusted verification marker, so each
+    /// use recomputes the change set. Making the base equal the replacement
+    /// removes its change row and is caught even with size/mtime preserved.
+    /// This does not prove general preimage integrity: a third, different base
+    /// payload leaves the modified row unchanged (canonical rows omit base hashes).
     #[test]
     fn regression_lower_cache_weak_directory_base_always_reverifies() {
         let f = Fixture::new(true);
@@ -4818,7 +4821,7 @@ pub(crate) mod tests {
             &crate::lower_stack_services(),
         )
         .err()
-        .expect("edited base must fail closed");
+        .expect("base edit removing the sealed change row must fail closed");
         assert!(error.contains("deleted"), "{error}");
         // A directory has no computed strong digest, and a supplied
         // `--base-digest` is only a claim: still no marker.
