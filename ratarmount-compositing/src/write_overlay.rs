@@ -342,7 +342,8 @@ CREATE TABLE IF NOT EXISTS meta (
 "#;
 
 /// Optional metadata changes. Missing times mean UTIME_OMIT; frontends resolve
-/// UTIME_NOW once per request. Ownership changes are refused with EPERM.
+/// UTIME_NOW once per request. Ownership changes are refused with EPERM;
+/// frontends drop a uid/gid equal to the presented owner first (#327).
 #[derive(Clone, Debug, Default)]
 pub struct OverlayMetadata {
     pub mode: Option<u32>,
@@ -3295,6 +3296,11 @@ impl WriteOverlay {
         size: Option<u64>,
         attrs: &OverlayMetadata,
     ) -> Result<()> {
+        // A frontend may have removed a same-owner chown. It still needs the
+        // policy and existence checks, without writing metadata or copying up.
+        if size.is_none() && attrs.is_empty() {
+            return self.set_metadata(path, attrs);
+        }
         if !attrs.is_empty() {
             let _policy = self.policy_lock();
             self.check_mutation(OverlayMutation::Write, &[path])?;

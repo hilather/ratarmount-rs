@@ -376,14 +376,26 @@ impl RatarmountNfs4 {
             embednfs::SetTime::ServerNow => now,
             embednfs::SetTime::Client(t) => t.seconds as f64 + t.nanos as f64 / 1e9,
         };
-        let metadata = OverlayMetadata {
+        let mut metadata = OverlayMetadata {
             mode: attrs.mode,
             uid: attrs.uid,
             gid: attrs.gid,
             atime: attrs.atime.as_ref().map(time),
             mtime: attrs.mtime.as_ref().map(time),
         };
-        if !metadata.is_empty() || attrs.size.is_some() {
+        let requested = !metadata.is_empty() || attrs.size.is_some();
+        if metadata.uid.is_some() || metadata.gid.is_some() {
+            // A chown to the owner already presented is a no-op (#327).
+            if let Ok(fi) = self.file_info_for_id(id) {
+                (metadata.uid, metadata.gid) = self.attribute_mapping.drop_presented_owner(
+                    fi.uid,
+                    fi.gid,
+                    metadata.uid,
+                    metadata.gid,
+                );
+            }
+        }
+        if requested {
             ov.set_attributes(&path, attrs.size, &metadata)
                 .map_err(|e| match &e {
                     ratarmount_compositing::OverlayError::Io(io)
@@ -1611,6 +1623,97 @@ mod tests {
 #[cfg(test)]
 mod sandbox_attr_tests {
     use super::*;
+
+    /// Regression: NFSv4 must retain read-only denials after filtering chown,
+    /// and refuse a real owner change before applying a combined truncate (#327).
+    #[test]
+    fn regression_327_chown_preserves_policy_and_readonly() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("member"), b"base").unwrap();
+        let source = Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+        for protected in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut ov =
+                crate::test_overlay::new_overlay(source.clone(), directory.path()).unwrap();
+            let rules = Arc::new(ratarmount_compositing::ReadOnlyGlobs::new(["member"]).unwrap());
+            if protected {
+                ov.set_policy(Some(rules.clone()));
+            }
+            let ov = Arc::new(ov);
+            for writable in [true, false] {
+                let fs = RatarmountNfs4::with_overlay(ov.clone(), 0, writable.then(|| ov.clone()))
+                    .with_attribute_mapping(
+                        ratarmount_core::AttributeMapping::parse("uid=12345,gid=23456").unwrap(),
+                    );
+                let id = fs.lookup_sync(1, "member").unwrap();
+                let chown = |size: Option<u64>, uid| {
+                    let attrs = OverlayMetadata {
+                        uid: Some(uid),
+                        gid: Some(23456),
+                        ..Default::default()
+                    };
+                    fs.setattr_sync(
+                        id,
+                        &SetAttrs {
+                            uid: attrs.uid,
+                            gid: attrs.gid,
+                            size,
+                            ..Default::default()
+                        },
+                    )
+                };
+                if !writable || protected {
+                    assert_eq!(chown(None, 12345).unwrap_err(), FsError::ReadOnly);
+                } else {
+                    assert!(chown(None, 12345).is_ok());
+                    assert_eq!(
+                        chown(Some(0), 12346).unwrap_err(),
+                        FsError::PermissionDenied
+                    );
+                }
+                assert!(!ov.has_file("/member"));
+                assert_eq!(ov.lookup("/member", 0).unwrap().size, 4);
+            }
+            assert_eq!(rules.erofs_denied(), u64::from(protected));
+        }
+    }
+
+    /// Regression: `cp -p` over NFSv4 failed because a SETATTR to the owner
+    /// already presented was refused with EPERM (#327).
+    #[test]
+    fn regression_nfs4_setattr_same_owner_chown_is_noop() {
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        for (mapping, shown) in [("", (uid, gid)), ("uid=12345,gid=23456", (12345, 23456))] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::write(base.path().join("member"), b"base").unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let source =
+                Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+            let ov = Arc::new(crate::test_overlay::new_overlay(source, directory.path()).unwrap());
+            let nfs = RatarmountNfs4::with_overlay(ov.clone(), 0, Some(ov))
+                .with_attribute_mapping(AttributeMapping::parse(mapping).unwrap());
+            let id = nfs.lookup_sync(1, "member").unwrap();
+            let chown = |uid: Option<u32>, gid: Option<u32>| {
+                nfs.setattr_sync(
+                    id,
+                    &SetAttrs {
+                        uid,
+                        gid,
+                        ..SetAttrs::default()
+                    },
+                )
+            };
+            assert!(chown(Some(shown.0), Some(shown.1)).is_ok(), "{mapping}");
+            assert!(chown(Some(shown.0), None).is_ok(), "{mapping}");
+            assert!(chown(None, Some(shown.1)).is_ok(), "{mapping}");
+            assert_eq!(
+                chown(Some(shown.0.wrapping_add(1)), None).unwrap_err(),
+                FsError::PermissionDenied,
+                "{mapping}"
+            );
+            assert!(chown(None, Some(shown.1.wrapping_add(1))).is_err());
+        }
+    }
 
     /// Regression: NFS attributes must report mapped owners and mode for every Unix type.
     #[test]
