@@ -277,8 +277,12 @@ impl OverlayMeta {
 
     /// [`Self::read_no_recovery`] of a record that must have a `files` table
     /// when `required` (a marked overlay: its record is the one it used).
-    pub(crate) fn read_no_recovery_required(dir: &Path, required: bool) -> Result<Option<Self>> {
-        Self::read_with_required(dir, false, required)
+    /// Keep requirements observed during acquisition in the caller's latch.
+    pub(crate) fn read_no_recovery_required(
+        dir: &Path,
+        required: &std::cell::Cell<bool>,
+    ) -> Result<Option<Self>> {
+        Self::read_latched(dir, false, required)
     }
 
     fn read_with(dir: &Path, recover_hot: bool) -> Result<Option<Self>> {

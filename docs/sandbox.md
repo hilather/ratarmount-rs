@@ -431,7 +431,13 @@ mount's top and directory lowers, the offline overlay, the live mount's own
 database, which must still be the file it opened) is classified again under
 the archive lock; a lost record or one whose database path cannot be resolved
 refuses the recovery with the locator, the archive and any journal left as
-they were. Every named overlay database and its `-wal`, `-journal`, and `-shm`
+they were. Offline commits retain the entry check's database-presence requirement
+and every marker requirement observed by its metadata read or identity gate.
+Removing both the database and marker, or removing the marker and emptying the
+database or dropping its `files` table, therefore refuses before recovery
+writes, including stale-locator cleanup and under `--force-base-mismatch`.
+A raw directory that never had a database keeps its usual recovery behavior.
+Every named overlay database and its `-wal`, `-journal`, and `-shm`
 companions are checked again before recovery mutations; offline recovery and
 mount recovery both refuse symlinks with exit 1, including under force. That
 refusal is a refused recovery, also next to a complete journal: a live mount

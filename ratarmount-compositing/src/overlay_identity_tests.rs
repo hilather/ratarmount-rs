@@ -4188,6 +4188,182 @@ fn regression_offline_db_deleted_after_gate_keeps_recorded_owner() {
     );
 }
 
+/// Regression: #164: offline recovery built its rows guard from a fresh
+/// classification after the entry gate. When the database AND its marker
+/// vanished in that window, nothing said a record had been seen, the guard
+/// accepted `Absent` and a stale prepare locator was cleared before the later
+/// gate refused. Presence stays required with or without a marker at the
+/// gate, including under force: the locator, archive and overlay data stay.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_164_offline_recovery_keeps_the_gates_record_requirement() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for marked in [false, true] {
+        for force in [false, true] {
+            let what = format!("marked={marked}, force={force}");
+            let fx = Fixture::new();
+            let ov = fx.open(BaseDigestRequest::Compute, false);
+            fs::write(ov.root().join("new"), b"new").unwrap();
+            drop(ov);
+            if !marked {
+                fs::remove_file(fx.overlay.join(crate::OVERLAY_MARKER)).unwrap();
+            }
+            stale_prepare(&fx.archive);
+            let before = locator(&fx.archive);
+            let archive_before = fs::read(&fx.archive).unwrap();
+            let overlay = fx.overlay.clone();
+            crate::write_overlay::BEFORE_OFFLINE_RECOVERY.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    fs::remove_file(overlay.join(HIDDEN_DB)).unwrap();
+                    if marked {
+                        fs::remove_file(overlay.join(crate::OVERLAY_MARKER)).unwrap();
+                    }
+                }));
+            });
+            let opts = CommitOverlayOptions {
+                yes: true,
+                force_base_mismatch: force,
+                ..Default::default()
+            };
+            let result =
+                crate::commit_overlay(&fx.overlay, &fx.archive, &archive_token(&fx.archive), &opts);
+            crate::write_overlay::BEFORE_OFFLINE_RECOVERY.with(|hook| *hook.borrow_mut() = None);
+            let error = result.expect_err(&what).to_string();
+            assert_eq!(
+                locator(&fx.archive),
+                before,
+                "{what}: stale locator kept: {error}"
+            );
+            assert!(error.contains("disappeared"), "{what}: {error}");
+            assert_eq!(
+                fs::read(&fx.archive).unwrap(),
+                archive_before,
+                "{what}: archive"
+            );
+            assert_eq!(fs::read(fx.overlay.join("new")).unwrap(), b"new", "{what}");
+        }
+    }
+}
+
+/// Regression: #164: a marker observed by the identity gate, after the entry
+/// classification, must still require the files table during recovery even
+/// when the marker is removed again before recovery starts.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_164_offline_recovery_keeps_later_gate_observations() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for after_acquire in [false, true] {
+        for force in [false, true] {
+            for empty in [false, true] {
+                let what = format!("after_acquire={after_acquire}, force={force}, empty={empty}");
+                let fx = Fixture::new();
+                drop(fx.open(BaseDigestRequest::Compute, false));
+                fs::write(fx.overlay.join("new"), b"new").unwrap();
+                fs::remove_file(fx.overlay.join(crate::OVERLAY_MARKER)).unwrap();
+                stale_prepare(&fx.archive);
+                let before = locator(&fx.archive);
+                let archive_before = fs::read(&fx.archive).unwrap();
+                let base = archive_token(&fx.archive);
+                let commit = crate::OverlayCommitGuard::acquire(&fx.overlay).unwrap();
+
+                let opens = std::rc::Rc::new(std::cell::Cell::new(0));
+                let observed = opens.clone();
+                let overlay = fx.overlay.clone();
+                crate::overlay_db::AFTER_ACQUIRE.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |_| {
+                        observed.set(observed.get() + 1);
+                        let marker = overlay.join(crate::OVERLAY_MARKER);
+                        // Open 1 is the unsealed check after the initial
+                        // classification; open 2 is the identity gate.
+                        if observed.get() == if after_acquire { 2 } else { 1 } {
+                            fs::write(&marker, b"").unwrap();
+                        } else if observed.get() == 2 && !after_acquire {
+                            // Only the gate's acquisition retained the marker.
+                            fs::remove_file(&marker).unwrap();
+                        }
+                    }));
+                });
+                let overlay = fx.overlay.clone();
+                crate::write_overlay::BEFORE_OFFLINE_RECOVERY.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        crate::overlay_db::AFTER_ACQUIRE.with(|hook| *hook.borrow_mut() = None);
+                        if after_acquire {
+                            fs::remove_file(overlay.join(crate::OVERLAY_MARKER)).unwrap();
+                        }
+                        let db = overlay.join(HIDDEN_DB);
+                        if empty {
+                            fs::write(db, b"").unwrap();
+                        } else {
+                            rusqlite::Connection::open(db)
+                                .unwrap()
+                                .execute_batch("DROP TABLE files")
+                                .unwrap();
+                        }
+                    }));
+                });
+                let result = commit.commit(
+                    &fx.archive,
+                    &base,
+                    &CommitOverlayOptions {
+                        yes: true,
+                        force_base_mismatch: force,
+                        ..Default::default()
+                    },
+                );
+                crate::overlay_db::AFTER_ACQUIRE.with(|hook| *hook.borrow_mut() = None);
+                crate::write_overlay::BEFORE_OFFLINE_RECOVERY
+                    .with(|hook| *hook.borrow_mut() = None);
+                assert_eq!(
+                    opens.get(),
+                    2,
+                    "{what}: unsealed read and identity gate both ran"
+                );
+                assert_eq!(
+                    locator(&fx.archive),
+                    before,
+                    "{what}: stale locator kept: {result:?}"
+                );
+                let error = result.expect_err(&what).to_string();
+                assert!(
+                    error.contains(if empty {
+                        "empty"
+                    } else {
+                        crate::overlay_meta::NO_FILES_TABLE
+                    }),
+                    "{what}: {error}"
+                );
+                assert_eq!(fs::read(&fx.archive).unwrap(), archive_before, "{what}");
+                assert_eq!(fs::read(fx.overlay.join("new")).unwrap(), b"new", "{what}");
+            }
+        }
+    }
+}
+
+/// Regression: #164: a raw directory has never required a database. Retaining
+/// an offline gate's observations must still allow its stale locator cleanup.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_164_raw_directory_recovery_stays_optional() {
+    let fx = Fixture::new();
+    fs::create_dir(&fx.overlay).unwrap();
+    stale_prepare(&fx.archive);
+    let archive_before = fs::read(&fx.archive).unwrap();
+    let result = crate::commit_overlay_raw_dir(
+        &fx.overlay,
+        &fx.archive,
+        &CommitOverlayOptions {
+            yes: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!result.committed, "the directory is empty");
+    assert!(!result.identity_checked);
+    assert!(locator(&fx.archive).is_empty(), "stale locator cleared");
+    assert_eq!(fs::read(&fx.archive).unwrap(), archive_before);
+    assert!(!fx.overlay.join(HIDDEN_DB).exists(), "no database created");
+}
+
 /// What replaces the overlay database in [`regression_offline_gates_refuse_non_regular_db`].
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
@@ -7840,7 +8016,7 @@ fn regression_required_marker_observation_is_monotonic() {
             "no files table" => assert_eq!(seen, Some(true), "{row}"),
             _ => assert_eq!(seen, None, "{row}: the hook ran"),
         }
-        let read = OverlayMeta::read_no_recovery_required(&fx.overlay, true);
+        let read = OverlayMeta::read_no_recovery_required(&fx.overlay, &std::cell::Cell::new(true));
         assert!(read.is_err(), "{row}: {read:?}");
         let open = crate::overlay_db::open_overlay_db_required(
             &db,
@@ -8035,7 +8211,8 @@ fn regression_late_companion_non_utf8_metadata_read_preserves_policy() {
                 }));
             });
             let result = if reader == "read" {
-                OverlayMeta::read_no_recovery_required(&overlay, true).map(|_| ())
+                OverlayMeta::read_no_recovery_required(&overlay, &std::cell::Cell::new(true))
+                    .map(|_| ())
             } else {
                 crate::overlay_gate::check_commit_base_offline(&overlay, &base, &archive)
                     .map(|_| ())

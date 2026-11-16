@@ -10,7 +10,13 @@ fn commit_overlay(
     opts: &CommitOverlayOptions,
 ) -> Result<bool> {
     let _seal_commit = SealCommitGuard::acquire(write_overlay.as_ref())?;
-    commit_overlay_inner(write_overlay.as_ref(), archive_file.as_ref(), None, opts)
+    commit_overlay_inner(
+        write_overlay.as_ref(),
+        archive_file.as_ref(),
+        None,
+        opts,
+        None,
+    )
 }
 
 use ratarmount_compress::{open_seekable_bzip2, open_seekable_xz};
