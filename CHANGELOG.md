@@ -21,6 +21,7 @@
 
 ### Fixes
 
+- The CSI driver and the Docker volume plugin check socket staging directories for their effective user and mode 0700, clearing inherited setgid on private staging directories so shared parents work. Binding verifies the checked directory, and publication and cleanup retain its descriptor to prevent directory swaps from redirecting chmod, rename or socket removal. Refusal preserves pre-existing files. The socket helpers are shared in `ratarmount-core`. (#182)
 - Offline verbs (`overlay seal`, `pack`, `verify`, `diff`, `import`) given a `file://` URL of their base now check the commit journal of the local file the URL names. They used to look for it at the URL as a path, find nothing, and read an archive left mid-commit; they now refuse it as they do for a plain path, leaving the archive and journal untouched. (#212)
 - `--help` no longer says a folder's default mount point is `<folder>.mounted`: the default is the first input's file name (the active numbered archive with `--roll-every`), minus a compression suffix and one more extension, in the current directory, and `.mounted` is appended only when that would be the folder itself. TAR shorthands such as `.tgz` count as `.tar.gz`, so `v1.2.tgz` mounts at `./v1.2` (#224).
 - The offline verbs' refusal of an archive whose active commit-journal locator has lost its journal now reads "carries an active commit-journal locator" instead of "carries a active" (#223).

@@ -150,9 +150,16 @@ async fn regression_185_too_long_endpoint_creates_no_parent_dirs() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn regression_binary_socket_cli_and_shutdown() {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = tempfile::tempdir().unwrap();
+    // Regression #182: inherit setgid on a shared filesystem, with the daemon's
+    // umask set in its own shell process rather than this threaded test process.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o2775)).unwrap();
     let socket = dir.path().join("binary.sock");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_ratarmount-csi"))
+    let mut child = tokio::process::Command::new("/bin/sh")
+        .args(["-c", "umask 0002; exec \"$@\"", "sh"])
+        .arg(env!("CARGO_BIN_EXE_ratarmount-csi"))
         .env("NODE_ID", "env-node")
         .arg("--endpoint")
         .arg(format!("unix://{}", socket.display()))
