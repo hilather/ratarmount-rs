@@ -829,6 +829,9 @@ __inventory_value_0
         )]
         let lock = options.open(locks.join(format!("{etag}.lock")))?;
         try_lock(&lock)?;
+        // Unlocked explicitly when this returns (#187): a child forked
+        // meanwhile holds a copy of the descriptor until it execs.
+        let _lock = ratarmount_core::held_lock::HeldLock::new(lock, "Hub blob publication");
         #[cfg(test)]
         {
             let gate = self.stats.before_install.lock().unwrap().take();

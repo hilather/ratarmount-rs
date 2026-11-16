@@ -97,6 +97,7 @@ impl Owner<'_> {
                 base,
                 archive,
                 Some((header, locked)),
+                &Cell::new(false),
             )
             .map(drop)
             .map_err(refusal),
@@ -277,6 +278,29 @@ impl<'a> Rows<'a> {
         };
         if let Ok(entry) = classify(db_dir(db)) {
             rows.observe(&entry);
+        }
+        rows
+    }
+
+    /// [`Rows::path`] that also keeps what an earlier gate saw (#164): a
+    /// present database (`Some(marked)`) stays required even if it and its
+    /// marker vanished before this classification, so the guard refuses
+    /// `Absent` instead of reading it as "no record".
+    pub(crate) fn path_seen(db: &'a Path, seen_present: Option<bool>) -> Self {
+        let rows = Self::path(db);
+        if let (
+            Some(marked),
+            Rows::Path {
+                must_exist,
+                required_files,
+                ..
+            },
+        ) = (seen_present, &rows)
+        {
+            must_exist.set(true);
+            if marked {
+                required_files.set(true);
+            }
         }
         rows
     }
@@ -750,6 +774,21 @@ pub fn recover_journal_at(
     recover_journal(archive, rows, owner)
 }
 
+/// [`recover_journal_at`] of an offline commit whose entry gate saw the
+/// overlay database present (`Some(marked)`) before this call (#164): that
+/// observation is kept in the rows guard, so a database and marker that both
+/// vanished since refuse before any recovery write (a stale locator's clear
+/// included) instead of reading as "no record".
+pub(crate) fn recover_journal_at_seen(
+    archive: &Path,
+    overlay_db: &Path,
+    owner: Owner<'_>,
+    seen_present: Option<bool>,
+) -> std::result::Result<Option<Applied>, RecoverError> {
+    crate::overlay_db::validate_overlay_state(overlay_db).map_err(RecoverError::Refused)?;
+    recover_journal(archive, Rows::path_seen(overlay_db, seen_present), owner)
+}
+
 /// The journal rule an offline open owes a base. Journals are never applied
 /// here — recovery is a mount's or a commit's write — but the states a
 /// recovery would refuse stay refused, read-only: a pending journal that was
@@ -772,16 +811,29 @@ pub fn check_offline_journal(member: &Path) -> io::Result<()> {
         }
     }
     if let Some((phase, path)) = missing {
-        return Err(io::Error::other(format!(
-            "{} carries a {phase} commit-journal locator but its journal {} is missing or \
-                 moved; recover it through the archive's current directory name, or verify the \
-                 archive and remove its user.ratarmount.commit-journal xattr (setfattr -x on \
-                 Linux, xattr -d on macOS)",
-            member.display(),
-            path.display()
+        return Err(io::Error::other(missing_journal_message(
+            member, phase, &path,
         )));
     }
     Ok(())
+}
+
+/// The refusal for an active or complete locator whose journal is missing or
+/// moved. `phase` is "active" or "complete"; the article follows it (#223).
+fn missing_journal_message(member: &Path, phase: &str, path: &Path) -> String {
+    let article = if phase.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "an"
+    } else {
+        "a"
+    };
+    format!(
+        "{} carries {article} {phase} commit-journal locator but its journal {} is missing or \
+             moved; recover it through the archive's current directory name, or verify the \
+             archive and remove its user.ratarmount.commit-journal xattr (setfattr -x on \
+             Linux, xattr -d on macOS)",
+        member.display(),
+        path.display()
+    )
 }
 
 /// `verify`'s journal rule: the archive at `path` carries its OWN pending
@@ -867,10 +919,47 @@ fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
         DbEntry::Present { marked, .. } => marked,
         _ => true,
     };
-    OverlayMeta::read_no_recovery_required(dir, marked).map_err(|error| match error {
+    OverlayMeta::read_no_recovery_required(dir, &Cell::new(marked)).map_err(|error| match error {
         OverlayError::Io(error) => error,
+        OverlayError::Sqlite(error) if crate::overlay_meta::is_hot_journal(&error) => {
+            io::Error::other(HotOverlayJournal {
+                dir: dir.to_path_buf(),
+                source: error,
+            })
+        }
         other => io::Error::other(other),
     })
+}
+
+/// Recovery cannot read this record without writing its database. Deferring
+/// to a writable open would roll it back before sealing, durability and
+/// identity could be checked, so name the explicit recovery route (#163).
+#[derive(Debug)]
+struct HotOverlayJournal {
+    dir: PathBuf,
+    source: rusqlite::Error,
+}
+
+impl std::fmt::Display for HotOverlayJournal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the overlay database in {} has an interrupted write (a hot rollback journal); \
+             its identity, sealing and durability state cannot be checked without modifying \
+             it. Recovery stopped; the archive's commit journal or stale prepare \
+             locator is kept. Recover the archive separately with `ratarmount --no-mount \
+             ARCHIVE` (without -w or --lower), then inspect the overlay on a writable copy \
+             before retrying: {}",
+            self.dir.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for HotOverlayJournal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// The decision table on the journal header and the file's current identity.
@@ -895,31 +984,49 @@ fn decide(
         why,
         force_flag: flag,
     };
+    // A bundle or an earlier mismatching record may defer an otherwise usable
+    // journal, but must not hide a record whose writable open would mutate it
+    // before the gates. Read each directory once before deciding to defer.
+    let voters = records
+        .top
+        .iter()
+        .map(|d| (d, true))
+        .chain(records.lowers.iter().map(|d| (d, false)))
+        .map(|(dir, is_top)| {
+            let read = match read_record(dir) {
+                // Path policy and hot journals outrank deferral: force cannot
+                // turn either refusal into recovery authority.
+                Err(e)
+                    if crate::overlay_db::is_overlay_state_error(&e)
+                        || e.get_ref()
+                            .is_some_and(|inner| inner.is::<HotOverlayJournal>()) =>
+                {
+                    return Err(e);
+                }
+                other => other,
+            };
+            if let Ok(meta) = &read {
+                crate::relaxed_durability::refuse_unclean(meta.as_ref())
+                    .map_err(io::Error::other)?;
+            }
+            Ok((dir, is_top, read))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     if records.bundles {
         return Ok(defer(
             "a --lower bundle's record is read after unpacking".into(),
             "--force-stack-mismatch",
         ));
     }
-    let voters = records
-        .top
-        .iter()
-        .map(|d| (d, true))
-        .chain(records.lowers.iter().map(|d| (d, false)));
-    for (dir, is_top) in voters {
+    for (dir, is_top, read) in voters {
         let flag = if is_top {
             "--force-base-mismatch"
         } else {
             "--force-stack-mismatch"
         };
-        let meta = match read_record(dir) {
+        let meta = match read {
             Ok(meta) => meta,
             Err(e) => {
-                // Path policy outranks journal deferral: force cannot turn a
-                // typed acquisition/metadata refusal into recovery authority.
-                if crate::overlay_db::is_overlay_state_error(&e) {
-                    return Err(e);
-                }
                 return Ok(defer(
                     format!(
                         "has an overlay record ({}) that cannot be read: {e}",
@@ -930,11 +1037,6 @@ fn decide(
             }
         };
         let Some(meta) = meta else { continue };
-        // #328: even an inode-owned archive journal cannot be recovered using
-        // a record left unclean by relaxed durability. Refuse before recovery
-        // writes, not later when the writable overlay is opened. Force may
-        // override a base mismatch, but cannot validate this database.
-        crate::relaxed_durability::refuse_unclean(Some(&meta)).map_err(io::Error::other)?;
         if is_top && meta.layer_sealed() {
             return Ok(defer("is guarded by a sealed overlay".into(), flag));
         }
@@ -1411,6 +1513,30 @@ where
 mod tests {
     use super::*;
     use std::rc::Rc;
+
+    /// Regression: #223 "carries a active commit-journal locator": the
+    /// missing-journal refusal must take "an" before "active" and "a" before
+    /// "complete".
+    #[test]
+    fn regression_223_missing_journal_message_article() {
+        let member = Path::new("/x/base.tar");
+        let journal = Path::new("/x/.base.tar.ratarmount-commit-journal");
+        let active = missing_journal_message(member, "active", journal);
+        assert!(
+            active.starts_with(
+                "/x/base.tar carries an active commit-journal locator but its journal /x/"
+            ),
+            "{active}"
+        );
+        let complete = missing_journal_message(member, "complete", journal);
+        assert!(
+            complete.starts_with(
+                "/x/base.tar carries a complete commit-journal locator but its journal /x/"
+            ),
+            "{complete}"
+        );
+        assert!(!active.contains("a active") && !complete.contains("an complete"));
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn assert_archive_locked(archive: &Path) {

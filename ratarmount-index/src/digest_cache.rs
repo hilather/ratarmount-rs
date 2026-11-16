@@ -483,7 +483,12 @@ impl Drop for HashGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.path);
-        // Closing `_file` releases the flock.
+        // Unlock explicitly (#187): a child forked meanwhile holds a copy of
+        // the descriptor until it execs, so the close alone may not release it.
+        #[cfg(unix)]
+        if let Some(file) = &self._file {
+            ratarmount_core::held_lock::unlock_or_log(file, "archive digest");
+        }
     }
 }
 
@@ -1064,6 +1069,31 @@ mod tests {
             releaser.join().unwrap();
         }
         assert_eq!(hashes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Regression (#187): the digest lock was released only by closing its
+    /// descriptor, so a copy held by a child forked meanwhile kept it.
+    #[cfg(unix)]
+    #[test]
+    fn regression_187_hash_guard_unlocks_while_copy_is_held() {
+        use std::os::fd::AsFd;
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        fs::write(&archive, b"abc").unwrap();
+        let index = index_with_files(dir.path()).canonicalize().unwrap();
+        let guard = HashGuard::acquire(&archive, &index, &|| Ok(())).unwrap();
+        let copy = guard
+            ._file
+            .as_ref()
+            .unwrap()
+            .as_fd()
+            .try_clone_to_owned()
+            .unwrap();
+        let probe = open_lock_file(&index).unwrap();
+        assert!(!try_flock(&probe).unwrap(), "the guard holds the lock");
+        drop(guard);
+        assert!(try_flock(&probe).unwrap(), "released while a copy is open");
+        drop(copy);
     }
 
     /// Regression: C3, a hasher waiting on another process's lock must still be

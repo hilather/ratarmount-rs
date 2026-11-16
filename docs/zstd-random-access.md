@@ -167,8 +167,19 @@ Plain multi-frame without a footer still works well (`kind`: multi-frame scan).
 | **Full decode** | Stream-decompress once into RAM or temp; then seek in the decoded body |
 | **Threads (`-P` / backend hint)** | Multi-frame maps already isolate frames; full multi-frame materialization can decode frames in parallel when threads > 1 |
 | **Index side tables** | Python-compatible `zstdblocks` import/export for cross-tool maps. After a last-frame splice, F-2 rewrites `zstdblocks` from a **fresh** frame scan of the new file inside the sidecar patch transaction (pre-splice maps are not imported). |
-| **Incremental reindex (F-2)** | Persist patches the on-disk sidecar from the rewrite window; remount does **not** rescan prefix frames. Persist still **copies** the compressed prefix. `:memory:` / discarded sidecar / single-frame `.tar.zst` still full-rebuild. ZIP commit is still a full rebuild. |
+| **Incremental reindex (F-2)** | Persist normally patches the on-disk sidecar from the rewrite window; remount does **not** rescan prefix frames. Ambiguous generated offset-zero rows require a full reparse during persist (see below). Persist still **copies** the compressed prefix. `:memory:` / discarded sidecar / single-frame `.tar.zst` still full-rebuild. ZIP commit is still a full rebuild. |
 | **Nested / Shared** | From-reader path shares the compressed stream under a mutex; each open tracks a **private compressed offset** so concurrent FUSE readers cannot interleave `seek`+`read` |
+
+When a commit removes a directory, the sidecar patch also prunes its childless
+implied rows and implied ancestors. This includes legacy duplicates of explicit
+directories that were already empty before the commit. Directories still needed
+by prefix children and retained explicit empty-directory members remain visible;
+the suffix parse regenerates any implied parents needed by rewritten members.
+A cold or suffix parse can overwrite a real first directory member with
+an implied row at the same offset-zero key. If generated offset-zero rows exist
+but no real offset-zero row remains, the sidecar cannot distinguish that case
+from purely implied parents. Persist conservatively reparses from zero before
+publishing the patched index, preserving any real directory in the prefix.
 
 Plain `.zst` (non-TAR payload) uses the same seekable body under a single-file
 mount — no full payload spool just to present one file.

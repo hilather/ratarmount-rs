@@ -1669,6 +1669,40 @@ fn regression_required_latch_survives_hot_journal_retry() {
     }
 }
 
+/// Regression: #164: a no-recovery read returned only metadata, forgetting a
+/// marker observed during acquisition before the caller started recovery.
+#[test]
+fn regression_164_no_recovery_read_returns_acquired_requirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join(HIDDEN_DB);
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch("CREATE TABLE files (path)")
+        .unwrap();
+    let marker = dir.path().join(crate::OVERLAY_MARKER);
+    fs::write(&marker, b"").unwrap();
+    crate::overlay_db::AFTER_ACQUIRE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_| {
+            fs::remove_file(&marker).unwrap();
+        }));
+    });
+    let required = std::cell::Cell::new(false);
+    let result = OverlayMeta::read_no_recovery_required(dir.path(), &required);
+    crate::overlay_db::AFTER_ACQUIRE.with(|hook| *hook.borrow_mut() = None);
+    assert!(result.unwrap().is_none(), "legacy record without metadata");
+    assert!(
+        required.get(),
+        "the operation retains the acquired requirement"
+    );
+
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP TABLE files")
+        .unwrap();
+    let error = OverlayMeta::read_no_recovery_required(dir.path(), &required).unwrap_err();
+    assert!(error.to_string().contains(NO_FILES_TABLE), "{error}");
+}
+
 // ---------------------------------------------------------------------
 // R11-S7 (#151): base hashing reads through managed readers.
 // ---------------------------------------------------------------------
