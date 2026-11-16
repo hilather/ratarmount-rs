@@ -433,6 +433,10 @@ pub(crate) fn check_connection(
 }
 
 #[cfg(test)]
+#[path = "../../test-harness/child_process.rs"]
+mod test_child;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{FolderMountSource, OverlayMetadata, WriteOverlay};
@@ -769,12 +773,24 @@ mod tests {
         assert!(!tmp.path().join(HIDDEN_DB).exists());
     }
 
+    /// Set by [`regression_fsck_reports_incomplete_import`] for
+    /// [`hot_journal_child`] (#310).
+    const HOT_JOURNAL_CHILD: &str = "RATARMOUNT_TEST_FSCK_HOT_JOURNAL_CHILD";
+
     /// Child half of [`regression_fsck_reports_incomplete_import`]: marks an
     /// import in progress, opens a write transaction and blocks until killed.
-    /// Ignored, so it only runs when the parent re-executes the test binary.
+    /// Ignored, so it only runs when the parent re-executes the test binary
+    /// and sets [`HOT_JOURNAL_CHILD`]; `--ignored` alone skips it.
     #[test]
     #[ignore = "child process of regression_fsck_reports_incomplete_import"]
     fn hot_journal_child() {
+        if std::env::var_os(HOT_JOURNAL_CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            eprintln!(
+                "skip: hot_journal_child runs only as a child of \
+                 regression_fsck_reports_incomplete_import ({HOT_JOURNAL_CHILD}=1 is not set)"
+            );
+            return;
+        }
         let dir = std::env::var_os("RATARMOUNT_TEST_CHILD_OVERLAY").expect("child overlay dir");
         let base = std::path::PathBuf::from(dir.clone()).with_file_name("base");
         let source = Arc::new(FolderMountSource::new(&base).unwrap());
@@ -783,6 +799,56 @@ mod tests {
             .set_meta("import_in_progress", "123:2026-10-18T00:00:00Z")
             .unwrap();
         overlay.test_hold_open_transaction();
+    }
+
+    /// Regression: #310 [`hot_journal_child`] run directly (`cargo test --
+    /// --ignored`) marked an import and held a transaction outside its
+    /// parent. Without [`HOT_JOURNAL_CHILD`] it skips, leaving the overlay
+    /// and the hold marker untouched although both paths are given.
+    #[cfg(unix)]
+    #[test]
+    fn regression_310_hot_journal_child_skips_without_its_parent() {
+        let _process_guard = ratarmount_index::test_process::spawning();
+        let (tmp, dir, _source) = fixture();
+        let listing = |dir: &Path| {
+            let mut names: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = listing(&dir);
+        let ready = tmp.path().join("ready");
+        let output = super::test_child::TestChild::spawn(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "overlay_fsck::tests::hot_journal_child",
+                    "--nocapture",
+                ])
+                .env_remove(HOT_JOURNAL_CHILD)
+                .env("RATARMOUNT_TEST_CHILD_OVERLAY", &dir)
+                .env("RATARMOUNT_TEST_JOURNAL_HOLD", &ready),
+        )
+        .unwrap()
+        .output(std::time::Duration::from_secs(5))
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        assert!(stderr.contains("skip: hot_journal_child"), "{stderr}");
+        assert!(!ready.exists());
+        assert_eq!(before, listing(&dir));
+        assert_eq!(
+            OverlayMeta::read(&dir)
+                .unwrap()
+                .unwrap()
+                .get("import_in_progress"),
+            None
+        );
     }
 
     /// Regression: a killed `overlay import --no-seal` left a partial overlay
@@ -803,6 +869,7 @@ mod tests {
             ])
             .env("RATARMOUNT_TEST_CHILD_OVERLAY", &dir)
             .env("RATARMOUNT_TEST_JOURNAL_HOLD", &ready)
+            .env(HOT_JOURNAL_CHILD, "1")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()

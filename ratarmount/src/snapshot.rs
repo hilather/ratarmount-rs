@@ -1381,7 +1381,7 @@ mod tests {
         assert!(listing.contains("[\"one\"]"));
         assert!(listing.contains("[\"two\"]"));
         // Isolate reader credentials in a subprocess instead of mutating the test runner's env.
-        let status = Command::new(std::env::current_exe().unwrap())
+        let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "snapshot::tests::snapshot_restic_reader_child",
@@ -1396,9 +1396,16 @@ mod tests {
             .env("AI_SNAP_TEST_SHARED", temp.path().join("one/shared.bin"))
             .env_remove("RESTIC_PASSWORD")
             .env("RESTIC_PASSWORD_FILE", &password)
-            .status()
+            .env(crate::child_helpers::SNAPSHOT_RESTIC_READER_CHILD, "1")
+            .output()
             .unwrap();
-        assert!(status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("restic reader verified"),
+            "{stdout}\n{stderr}"
+        );
     }
 
     #[test]
@@ -1407,6 +1414,13 @@ mod tests {
         use ratarmount_session::{
             IndexPolicy, OpenRequest, ReadRequest, Recreate, Session, SourceSpec,
         };
+        if !crate::child_helpers::spawned_by_parent(
+            crate::child_helpers::SNAPSHOT_RESTIC_READER_CHILD,
+            "snapshot_restic_reader_child",
+            "regression_snapshot_restic_dedup_roundtrip",
+        ) {
+            return;
+        }
         let repo = std::env::var_os("AI_SNAP_TEST_REPO").expect("reader subprocess repository");
         let session = Session::open(OpenRequest {
             source: SourceSpec::Url(format!("restic:{}", Path::new(&repo).display())),
@@ -1441,5 +1455,6 @@ mod tests {
                 assert_eq!(bytes, expected);
             }
         }
+        println!("restic reader verified");
     }
 }
