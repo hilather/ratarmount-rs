@@ -34,6 +34,16 @@ const HEAD: &[u8] = b"ref: refs/heads/sandbox\n";
 #[cfg(unix)]
 pub(super) const CONFIG: &[u8] = b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tfilemode = true\n\tlogallrefupdates = false\n\tcheckStat = minimal\n\ttrustctime = false\n\tfsmonitor = false\n[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n";
 
+#[cfg(all(test, unix))]
+type CacheLockHook = Box<dyn FnOnce(&File)>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Runs right after `build` locks the cache root, with that descriptor.
+    pub(crate) static AFTER_CACHE_LOCK: std::cell::RefCell<Option<CacheLockHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) struct SyntheticGit {
     #[cfg(unix)]
     root: Directory,
@@ -68,6 +78,33 @@ impl SyntheticGit {
             let cache = Directory::root(cache_root)?;
             // Lock the directory itself: no removable lock inode or stale new lock files.
             cache.0.lock()?;
+            #[cfg(test)]
+            AFTER_CACHE_LOCK.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook(&cache.0);
+                }
+            });
+            // Unlock explicitly (#187): a git child forked meanwhile by any
+            // thread holds a copy of the descriptor, and the lock, until it
+            // execs, so closing ours would not release it.
+            let built = Self::build_locked(&cache, source, repo_path, commit, tree, timestamp);
+            let unlocked = cache.0.unlock();
+            let built = built?;
+            unlocked?;
+            Ok(built)
+        }
+    }
+
+    #[cfg(unix)]
+    fn build_locked(
+        cache: &Directory,
+        source: &Repository,
+        repo_path: &Path,
+        commit: Oid,
+        tree: Oid,
+        timestamp: i64,
+    ) -> Result<Self> {
+        {
             cache.reclaim(std::time::SystemTime::now())?;
             let repo_key =
                 Oid::hash_object(ObjectType::Blob, repo_path.as_os_str().as_encoded_bytes())?;

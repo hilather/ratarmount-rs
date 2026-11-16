@@ -739,8 +739,10 @@ impl SqliteIndexedTar {
     /// hits in this walk. Nested flatten applies only to members discovered
     /// in the suffix.
     ///
-    /// Seeks below `window_start` (including `seek(Start(0))`) are a hard
-    /// error unless `window_start == 0`.
+    /// Normally never seeks below `window_start`. If generated offset-zero
+    /// rows could conceal a real first directory member, reparses from zero:
+    /// pruning those rows from the catalog alone could erase a retained prefix
+    /// directory. This fallback also repairs such legacy sidecars (#255).
     ///
     /// # Residuals
     ///
@@ -757,6 +759,14 @@ impl SqliteIndexedTar {
         product_version: &str,
     ) -> Result<PatchStats> {
         let t0 = Instant::now();
+        let window_start = if window_start > 0 && index.has_ambiguous_zero_offset_rows()? {
+            log::info!(
+                "reparsing TAR index from zero: generated rows may conceal the first member"
+            );
+            0
+        } else {
+            window_start
+        };
         let file_len = reader.seek(SeekFrom::End(0))?;
         let before = index.files_table_row_count()?;
         let rows_deleted = index.delete_from_offsetheader(window_start as i64)?;
