@@ -684,19 +684,25 @@ recorded identity is `weak` or `strong` therefore also records, in a
 `seal_preimages` table, the base side of every row that has one: a `modified`,
 `deleted` or `type_changed` path (a rename's source is a `deleted` row), as
 its type, mode (none for a symlink), size and content hash (a symlink's
-target). A base directory is not pinned; its removed descendants are. The
-hashes are the ones the seal already computes for its change set: sealing reads
+target, including non-UTF-8 target bytes). A base directory is not pinned; its
+removed descendants are. Regular-file hashes come from the seal's change set;
+symlink pins hash the native target bytes preserved during lookup. Sealing reads
 nothing more. The meta row `base_preimage_digest` binds the rows to the
 layer's `layer_digest`; a changed, added or deleted pin row fails that binding.
+Duplicate pin paths and a missing table with a remaining binding are refused.
 Pins are not part of the canonical hash, `layer_digest`, `stack_digest` or the
 sentinel (canonical hash format stays `2`); they travel in bundles with the
 layer database and `meta.json` (bundle layout unchanged). Every reuse rehashes
 only the pinned entries in the view beneath the layer (the base and the lowers
 under it, so a nested lower's pins are checked against what its own lower view
 serves): `--lower` (directory or bundle, read-only or under a `-w` top, the
-sandbox supervisor's attempts), `diff` of a top over sealed lowers, `overlay
-verify` and `overlay unpack`, the bundle cache, and a moved or forced `overlay
-pack`. A mismatch is refused
+sandbox supervisor's attempts), `diff` of a top over sealed lowers (including
+`--between` and supervisor diff after retained restore), supervisor finalize,
+`overlay verify` and `overlay unpack`, the bundle cache, and every `overlay
+pack`. Pack reuses the preimage hashes already computed for its manifest.
+Cached hash attributes are trusted only for immutable sources; a mutable
+directory base is read even when a lower overrides `user.hash.sha256`.
+A mismatch is refused
 naming each path (`content changed`, `size changed`, `mode changed`, `type
 changed`, or `missing`) and how to recover: restore the base, or seal the layer
 again over the base as it is now (`overlay unseal --i-know`, then `overlay
@@ -715,6 +721,8 @@ behaviour; unseal and seal it again to add them. Pins guard against accidental
 or casual base edits; anyone who can rewrite the overlay database without
 resealing can also remove the table and its meta row together, and the layer
 then reads as an unpinned seal.
+On non-Unix platforms, a pin binding or leftover pin rows refuse reuse because
+their contents cannot be checked there.
 
 Verify opens the top database immutable and read-only, recomputes the exact
 hash and compares both metadata and sentinel. Exit 0 means a match; exit 1
@@ -726,6 +734,9 @@ not match their binding) and `preimage_mismatched` (`path: reason` per pinned
 base entry that differs; text output prints `base preimage changed: ...`
 lines); any of them failing makes `ok` false. It works on the
 read-only tree and detects unindexed host additions as well as changed bytes.
+For a weak or strong local-directory seal, `preimages_bound: null` explicitly
+means an older, unpinned seal; successful verification does not establish its
+preimage integrity. Unseal and seal it again to add pins.
 
 Verify also compares the **base** with the digest recorded at creation (mounts
 never do; this is where a supplied `--base-digest` is checked). The base is the
@@ -746,8 +757,8 @@ a same-size content edit whose mtime was restored (pass a strong digest from
 `overlay digest-base` for that); it does catch size changes, added or removed
 entries and a retargeted symlink. Under a path the layer modifies or deletes,
 the layer's preimage pins catch that edit too (`ok` false, `base_ok` still
-`true`). `--no-base-check` (experimental) skips the
-comparison and never opens the base, for bases too large to rehash.
+`true`). `--no-base-check` (experimental) skips only the whole-base identity
+comparison. It still opens the base to recompute changes and check preimage pins.
 
 Unseal requires `--i-know` (otherwise exit 2), restores owner write permission
 on files and directories, removes the sentinel, clears the seal, per-path

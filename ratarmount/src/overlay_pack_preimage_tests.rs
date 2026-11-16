@@ -7,8 +7,10 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ratarmount_compositing::overlay_seal::{self, PREIMAGES_UNBOUND, PREIMAGE_DIGEST_KEY};
@@ -17,6 +19,7 @@ use ratarmount_compositing::{
     OverlayMeta, WriteOverlay, HIDDEN_DB,
 };
 use ratarmount_core::MountSource;
+use ratarmount_core::{ArchiveRead, FileInfo, ListResult};
 
 use super::{pack, unpack, PackOptions};
 use crate::base_identity::fixtures;
@@ -204,6 +207,90 @@ fn sha256(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+struct ObservedBase {
+    inner: Arc<dyn MountSource>,
+    opens: AtomicUsize,
+    unreadable: bool,
+}
+
+impl MountSource for ObservedBase {
+    fn list(&self, path: &str) -> Option<ListResult> {
+        self.inner.list(path)
+    }
+
+    fn lookup(&self, path: &str, version: i32) -> Option<FileInfo> {
+        self.inner.lookup(path, version)
+    }
+
+    fn open(&self, fi: &FileInfo, buffering: i32) -> io::Result<Box<dyn ArchiveRead>> {
+        self.opens.fetch_add(1, Ordering::Relaxed);
+        if self.unreadable {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        self.inner.open(fi, buffering)
+    }
+
+    fn is_immutable(&self) -> bool {
+        self.inner.is_immutable()
+    }
+}
+
+/// Regression: the ordinary pack bypass was fixed using its existing
+/// hashes; forcing a pack must not read the base files two or three times.
+#[test]
+fn regression_preimage_pin_pack_reads_each_preimage_once() {
+    let base = Base::new(&[("f", b"old"), ("untouched", b"do not read")]);
+    let layer = base.layer("layer", &[], |ov, dir| replace(ov, dir, "f", b"new"));
+    let observed = Arc::new(ObservedBase {
+        inner: base.source.clone(),
+        opens: AtomicUsize::new(0),
+        unreadable: false,
+    });
+    pack(
+        &layer,
+        &base.path("bundle.tar.zst"),
+        observed.clone(),
+        &PackOptions {
+            check_change_set: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(observed.opens.load(Ordering::Relaxed), 1);
+}
+
+/// Regression: verify and pack failed closed on unreadable preimages but
+/// omitted the failing path, unlike the lower reuse check.
+#[test]
+fn regression_preimage_pin_unreadable_base_names_the_path() {
+    let base = Base::new(&[("f", b"old")]);
+    let layer = base.layer("layer", &[], |ov, dir| replace(ov, dir, "f", b"new"));
+    let unreadable: Arc<dyn MountSource> = Arc::new(ObservedBase {
+        inner: base.source.clone(),
+        opens: AtomicUsize::new(0),
+        unreadable: true,
+    });
+    let mismatched = overlay_seal::check_preimages(&layer, unreadable.clone()).unwrap();
+    assert!(mismatched[0].contains("f: cannot read the base entry"));
+    for error in [
+        overlay_seal::verify(&layer, unreadable.clone()).unwrap_err(),
+        pack(
+            &layer,
+            &base.path("bundle.tar.zst"),
+            unreadable,
+            &PackOptions::default(),
+        )
+        .unwrap_err(),
+    ] {
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains("f: cannot read the base entry"),
+            "{error}"
+        );
+    }
+    assert!(!base.path("bundle.tar.zst").exists());
+}
+
 /// Regression (#341): a sealed directory lower over a weak directory base
 /// accepted a base file edited to a third value of the same size with its
 /// mtime restored (the `modified` row is unchanged). Now refused at
@@ -299,6 +386,39 @@ fn regression_preimage_pin_refuses_deleted_renamed_and_symlink_edits() {
     assert!(error.contains("link: content changed"), "{error}");
 }
 
+/// Regression: distinct non-UTF-8 symlink targets both became the Unicode
+/// replacement character in FileInfo and therefore had identical pins.
+#[test]
+fn regression_preimage_pin_symlink_targets_use_exact_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let base = Base::new(&[]);
+    let link = base.dir.join("link");
+    let old = std::ffi::OsStr::from_bytes(b"target-\xff");
+    let alt = std::ffi::OsStr::from_bytes(b"target-\xfe");
+    std::os::unix::fs::symlink(old, &link).unwrap();
+    let layer = base.layer("layer", &[], |ov, _| ov.unlink("/link").unwrap());
+    assert_eq!(pins(&layer)["link"], sha256(old.as_bytes()));
+    base.open(std::slice::from_ref(&layer)).unwrap();
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(alt, &link).unwrap();
+    assert!(base
+        .open(std::slice::from_ref(&layer))
+        .unwrap_err()
+        .contains("link: content changed"));
+    let report = overlay_seal::verify(&layer, base.source.clone()).unwrap();
+    assert_eq!(report.preimage_mismatched, ["link: content changed"]);
+
+    // A symlink provided by a lower must retain its bytes through composition.
+    let lower = base.layer("lower", &[], |ov, dir| {
+        ov.create_symlink("/added-link", "temporary").unwrap();
+        fs::remove_file(dir.join("added-link")).unwrap();
+        std::os::unix::fs::symlink(old, dir.join("added-link")).unwrap();
+    });
+    let top = base.layer("top", &[&lower], |ov, _| ov.unlink("/added-link").unwrap());
+    assert_eq!(pins(&top)["added-link"], sha256(old.as_bytes()));
+    base.open(&[lower, top]).unwrap();
+}
+
 /// Regression (#341): no false positives. An unchanged base, an mtime-only
 /// touch (pins hash content; the mount's weak manifest check still sees the
 /// touch, `MountLowerStack` alone does not) and edits of unpinned files are
@@ -349,6 +469,22 @@ fn regression_preimage_pin_old_seal_without_pins_is_unchanged() {
     let report = overlay_seal::verify(&layer, base.source.clone()).unwrap();
     assert!(report.ok, "{report:?}");
     assert_eq!(report.preimages_bound, None);
+    let (output, code) = crate::overlay_cmd::verify(
+        &crate::overlay_cmd::VerifyArgs {
+            seal: crate::overlay_cmd::SealArgs {
+                directory: layer.clone(),
+                base: None,
+                lower: Vec::new(),
+                json: true,
+            },
+            no_base_check: true,
+        },
+        &Default::default(),
+    )
+    .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(json.get("preimages_bound"), Some(&serde_json::Value::Null));
     // Unseal removes pins and their row; sealing again pins the base as it
     // is now, which is then accepted (and its next edit refused).
     overlay_seal::unseal(&layer).unwrap();
@@ -415,6 +551,93 @@ fn regression_preimage_pin_tampered_pins_are_detected() {
         .contains(PREIMAGES_UNBOUND));
 }
 
+/// Regression: collecting pin rows into a map silently discarded duplicate
+/// paths, allowing a rebuilt table to pass its unchanged binding.
+#[test]
+fn regression_preimage_pin_duplicate_paths_are_refused() {
+    let base = Base::new(&[("f", b"old")]);
+    let layer = base.layer("layer", &[], |ov, dir| replace(ov, dir, "f", b"new"));
+    tamper(&layer, |conn| {
+        conn.execute_batch(
+            "ALTER TABLE seal_preimages RENAME TO original;
+             CREATE TABLE seal_preimages AS SELECT * FROM original;
+             INSERT INTO seal_preimages SELECT * FROM original;
+             DROP TABLE original;",
+        )
+        .unwrap();
+    });
+    let error = base.open(std::slice::from_ref(&layer)).unwrap_err();
+    assert!(
+        error.contains("duplicate preimage pin") && error.contains('f'),
+        "{error}"
+    );
+    let error = overlay_seal::verify(&layer, base.source.clone()).unwrap_err();
+    assert!(
+        error.to_string().contains("duplicate preimage pin"),
+        "{error}"
+    );
+}
+
+/// Regression: dropping an empty pin table while keeping its binding was
+/// accepted as a valid empty table; only removing BOTH is legacy compatibility.
+#[test]
+fn regression_preimage_pin_missing_empty_table_is_unbound() {
+    let base = Base::new(&[("f", b"old")]);
+    let layer = base.layer("layer", &[], |_, dir| {
+        fs::write(dir.join("added"), b"new").unwrap();
+    });
+    assert!(pins(&layer).is_empty());
+    tamper(&layer, |conn| {
+        conn.execute_batch("DROP TABLE seal_preimages").unwrap();
+    });
+    let error = base.open(std::slice::from_ref(&layer)).unwrap_err();
+    assert!(error.contains(PREIMAGES_UNBOUND), "{error}");
+    let report = overlay_seal::verify(&layer, base.source.clone()).unwrap();
+    assert!(!report.ok);
+    assert_eq!(report.preimages_bound, Some(false));
+}
+
+/// Regression: the binding must ignore row order but include the layer
+/// digest, even when two different layers have identical preimage rows.
+#[test]
+fn regression_preimage_pin_binding_is_sorted_and_layer_specific() {
+    let base = Base::new(&[("f", b"old"), ("g", b"old")]);
+    let make = |name, bytes| {
+        base.layer(name, &[], |ov, dir| {
+            replace(ov, dir, "f", bytes);
+            ov.unlink("/g").unwrap();
+        })
+    };
+    let a = make("a", &b"new"[..]);
+    let b = make("b", &b"alt"[..]);
+    assert_eq!(pins(&a), pins(&b));
+    tamper(&a, |conn| {
+        conn.execute_batch(
+            "ALTER TABLE seal_preimages RENAME TO original;
+            CREATE TABLE seal_preimages AS SELECT * FROM original ORDER BY path DESC;
+            DROP TABLE original;",
+        )
+        .unwrap();
+    });
+    assert!(overlay_seal::verify(&a, base.source.clone()).unwrap().ok);
+    let foreign = OverlayMeta::read(&b).unwrap().unwrap();
+    tamper(&a, |conn| {
+        OverlayMeta::set(
+            conn,
+            PREIMAGE_DIGEST_KEY,
+            foreign.get(PREIMAGE_DIGEST_KEY).unwrap(),
+        )
+        .unwrap();
+    });
+    assert_eq!(
+        overlay_seal::verify(&a, base.source.clone())
+            .unwrap()
+            .preimages_bound,
+        Some(false)
+    );
+    assert!(base.open(&[a]).unwrap_err().contains(PREIMAGES_UNBOUND));
+}
+
 /// Regression (#341): a bundle round trip carries the pins (the database and
 /// `meta.json`); the bundle `--lower` cache refuses a same-size base edit,
 /// and the unpacked layer verifies until the base is edited.
@@ -452,9 +675,8 @@ fn regression_preimage_pin_bundle_round_trip_carries_pins() {
     assert!(outcome.verified && !outcome.ok, "{outcome:?}");
 }
 
-/// Regression (#341): a moved/forced `overlay pack` (the bundle names the base
-/// actually used) refuses a base whose pinned content differs, although the
-/// change set on it is the sealed one.
+/// Regression (#341): ordinary and moved/forced packs must both refuse a
+/// changed preimage, although the canonical change set is unchanged.
 #[test]
 fn regression_preimage_pin_checked_pack_refuses_changed_preimage() {
     let base = Base::new(&[("f", b"old")]);
@@ -471,16 +693,19 @@ fn regression_preimage_pin_checked_pack_refuses_changed_preimage() {
     )
     .unwrap();
     edit_keeping_mtime(&base.dir.join("f"), b"alt");
-    let error = pack(
-        &layer,
-        &base.path("no.tar.zst"),
-        base.source.clone(),
-        &options,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("preimage pins"), "{error}");
-    assert!(!base.path("no.tar.zst").exists());
+    for options in [PackOptions::default(), options] {
+        let error = pack(
+            &layer,
+            &base.path("no.tar.zst"),
+            base.source.clone(),
+            &options,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("preimage pins"), "{error}");
+        assert!(error.contains("f: content changed"), "{error}");
+        assert!(!base.path("no.tar.zst").exists());
+    }
 }
 
 /// Regression (#341): nested lowers. Lower 1's pins are hashes of what the
@@ -525,6 +750,105 @@ fn regression_preimage_pin_nested_lowers_check_their_own_view() {
     // Lower 1's pin of `a` is lower 0's content, unaffected by the base.
     let report = overlay_seal::verify(&l1, base.view(&[&l0])).unwrap();
     assert!(report.ok, "{report:?}");
+}
+
+/// Regression: a metadata-only lower can supply a stale user.hash.sha256
+/// xattr while the payload still comes from the mutable directory base.
+/// Neither sealing nor reuse may mistake that cached claim for a byte read.
+#[test]
+fn regression_preimage_pin_ignores_mutable_base_hash_xattrs() {
+    let base = Base::new(&[("f", b"old")]);
+    let metadata = base.layer("metadata", &[], |ov, _| {
+        ov.set_xattr("/f", "user.hash.sha256", sha256(b"old").as_bytes(), 0)
+            .unwrap();
+    });
+    assert!(
+        !metadata.join("f").exists(),
+        "the payload must remain in the base"
+    );
+    let layer = base.layer("layer", &[&metadata], |ov, dir| {
+        replace(ov, dir, "f", b"new")
+    });
+    base.open(&[metadata.clone(), layer.clone()]).unwrap();
+    edit_keeping_mtime(&base.dir.join("f"), b"alt");
+    let error = base.open(&[metadata.clone(), layer.clone()]).unwrap_err();
+    assert!(error.contains("f: content changed"), "{error}");
+    let report = overlay_seal::verify(&layer, base.view(&[&metadata])).unwrap();
+    assert_eq!(report.preimage_mismatched, ["f: content changed"]);
+    // A fresh seal on the edited base must record its bytes, not the xattr.
+    let fresh = base.layer("fresh", &[&metadata], |ov, dir| {
+        replace(ov, dir, "f", b"new")
+    });
+    assert_eq!(pins(&fresh)["f"], sha256(b"alt"));
+}
+
+/// Regression: --between and import --lower must check the common lower
+/// stack even when neither top itself changes the pinned base path.
+#[test]
+fn regression_preimage_pin_diff_between_and_import_lower() {
+    let base = Base::new(&[("f", b"old")]);
+    let lower = base.layer("lower", &[], |ov, dir| replace(ov, dir, "f", b"new"));
+    let a = base.layer("a", &[&lower], |_, _| {});
+    let b = base.layer("b", &[&lower], |_, _| {});
+    let args = crate::diff::DiffArgs {
+        directory: a,
+        between: Some(b),
+        hash: true,
+        ..Default::default()
+    };
+    let context = crate::base_identity::OverlayRunContext::default();
+    assert_eq!(crate::diff::run(&args, &context), 0);
+    let import = || {
+        crate::overlay_import::ImportStack::open_base(
+            base.dir.to_str().unwrap(),
+            std::slice::from_ref(&lower),
+            false,
+            &context,
+        )
+    };
+    assert!(import().is_ok());
+    edit_keeping_mtime(&base.dir.join("f"), b"alt");
+    assert_ne!(crate::diff::run(&args, &context), 0);
+    let error = import().err().expect("import must refuse the stale lower");
+    assert!(error.contains("f: content changed"), "{error}");
+}
+
+/// Regression: type changes and removed subtrees must pin the old file
+/// contents; a pinned path replaced by a special file is refused before open.
+#[test]
+fn regression_preimage_pin_type_changes_and_special_files() {
+    let base = Base::new(&[("f", b"old"), ("dir/child", b"old")]);
+    let layer = base.layer("layer", &[], |ov, dir| {
+        ov.unlink("/f").unwrap();
+        ov.mkdir("/f", 0o755).unwrap();
+        ov.unlink("/dir/child").unwrap();
+        ov.rmdir("/dir").unwrap();
+        let fd = ov.create_file("/dir", 0o644).unwrap();
+        ov.close_overlay_fd(fd);
+        fs::write(dir.join("dir"), b"new").unwrap();
+    });
+    assert_eq!(
+        pins(&layer).keys().cloned().collect::<Vec<_>>(),
+        ["dir/child", "f"]
+    );
+    base.open(std::slice::from_ref(&layer)).unwrap();
+    edit_keeping_mtime(&base.dir.join("dir/child"), b"alt");
+    assert!(base
+        .open(std::slice::from_ref(&layer))
+        .unwrap_err()
+        .contains("dir/child: content changed"));
+    edit_keeping_mtime(&base.dir.join("dir/child"), b"old");
+    fs::remove_file(base.dir.join("f")).unwrap();
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        base.dir.join("f"),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+    let error = base.open(std::slice::from_ref(&layer)).unwrap_err();
+    assert!(error.contains("f: cannot read the base entry"), "{error}");
 }
 
 /// Regression (#341): which bases are pinned. A supplied strong digest on a

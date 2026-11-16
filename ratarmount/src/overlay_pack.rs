@@ -375,26 +375,25 @@ pub fn pack(
     };
     let changes = overlay_changes::change_set(directory, lower_view.clone(), &opts)?;
     if (options.base_rows.is_some() || options.check_change_set)
-        && (ratarmount_compositing::overlay_seal::current_layer_digest(
-            directory,
-            lower_view.clone(),
-        )? != digest
-            // #341: the pins must describe the base the bundle will name.
-            || !ratarmount_compositing::overlay_seal::check_preimages(
-                directory,
-                lower_view.clone(),
-            )?
-            .is_empty())
+        && overlay_changes::canonical_hash(&changes, &opts)? != digest
     {
         // The sealed digest covers the change set on the base the layer was
         // sealed on. Replacing only the base rows would make a bundle whose
         // unpack / verify fails against the base it names; recomputing the
         // digest would make the layer claim a seal it never had.
         return Err(invalid(
-            "the layer's change set on the base as it is now differs from the one it was sealed with \
-             (or the base content under a path it changes does, see its preimage pins); \
+            "the layer's change set on the base as it is now differs from the one it was sealed with; \
              run `overlay unseal --i-know`, then `overlay seal --force-base-mismatch` against this base, then pack",
         ));
+    }
+    let differing =
+        ratarmount_compositing::overlay_seal::check_preimages_for_changes(directory, &changes)?;
+    if !differing.is_empty() {
+        return Err(invalid(format!(
+            "base preimage pins of {} no longer match: {}; restore the base, or run \
+             `overlay unseal --i-know`, then `overlay seal --force-base-mismatch` against this base, then pack",
+            directory.display(), differing.join("; ")
+        )));
     }
     #[expect(
         clippy::disallowed_methods,

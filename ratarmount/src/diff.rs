@@ -11,7 +11,7 @@ use clap::{ArgGroup, Parser};
 use ratarmount_compositing::overlay_changes::{
     self as core, Algorithm, ChangeOptions, Entry, Normalize,
 };
-use ratarmount_compositing::{compose_stack, Immutability, OverlayMeta};
+use ratarmount_compositing::{Immutability, OverlayMeta};
 use ratarmount_core::{MountSource, S_IFDIR, S_IFMT};
 
 mod live;
@@ -394,26 +394,7 @@ fn prepare(
             )
         })
     });
-    let source = classified.source();
-    // #341: each sealed lower's preimage pins against the view beneath it, as
-    // `--lower` mounts check them, so a patch is never rendered against a
-    // base the layer was not made from.
-    let mut beneath = source.clone();
-    for (dir, immutability) in &layers {
-        if *immutability == Immutability::Immutable {
-            let differing =
-                ratarmount_compositing::overlay_seal::check_preimages(dir, beneath.clone())?;
-            if !differing.is_empty() {
-                return Err(io::Error::other(format!(
-                    "lower {} was sealed over base content that has changed under it (preimage pins): {}; restore the base, or seal the lower again over it",
-                    dir.display(),
-                    differing.join("; ")
-                )));
-            }
-        }
-        beneath = compose_stack(beneath, &[(dir.clone(), *immutability)])?;
-    }
-    let stack = compose_stack(source, &layers)?;
+    let stack = crate::MountLowerStack::compose_layers(classified.source(), &layers)?;
     let changes = if let Some(other) = &args.between {
         core::between(&args.directory, other, stack, &options)?
     } else {

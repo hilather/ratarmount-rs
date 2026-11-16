@@ -792,7 +792,7 @@ impl<M: Mounter> Supervisor<M> {
                 } else {
                     (None, open_base(&base, &indexes)?.source)
                 };
-                let composed = ratarmount_compositing::compose_stack(source, &layers)
+                let composed = crate::MountLowerStack::compose_layers(source, &layers)
                     .map_err(|e| ApiError::new("diff_failed", e.to_string()))?;
                 let patch = crate::diff::render_source(
                     &crate::diff::DiffArgs {

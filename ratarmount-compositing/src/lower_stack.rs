@@ -96,6 +96,22 @@ enum Bottom<'a> {
 }
 
 impl MountLowerStack {
+    /// Compose already resolved layers, checking each sealed lower's pins
+    /// against exactly the view beneath it. Offline diff and the supervisor
+    /// use this when their recorded paths already name layer directories.
+    pub fn compose_layers(
+        mut view: Arc<dyn MountSource>,
+        layers: &[(PathBuf, Immutability)],
+    ) -> std::io::Result<Arc<dyn MountSource>> {
+        for (dir, immutability) in layers {
+            if *immutability == Immutability::Immutable {
+                check_preimages(dir, dir, view.clone()).map_err(std::io::Error::other)?;
+            }
+            view = compose_stack(view, &[(dir.clone(), *immutability)])?;
+        }
+        Ok(view)
+    }
+
     /// Open the same sealed lower stack used by the mount CLI for offline consumers.
     pub fn compose(
         base: Arc<dyn MountSource>,

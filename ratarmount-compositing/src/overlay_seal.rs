@@ -72,6 +72,16 @@ fn pin_of(entry: &changes::Entry) -> Option<Pin> {
     if kind == "dir" {
         return None;
     }
+    let (size, hash) = if kind == "symlink" {
+        use sha2::{Digest, Sha256};
+        let target = entry.symlink_target_bytes();
+        (
+            target.len() as u64,
+            format!("sha256:{:x}", Sha256::digest(target)),
+        )
+    } else {
+        (entry.size, entry.hash.clone()?)
+    };
     Some(Pin {
         kind: kind.into(),
         mode: if kind == "symlink" {
@@ -79,8 +89,8 @@ fn pin_of(entry: &changes::Entry) -> Option<Pin> {
         } else {
             format!("{:06o}", entry.mode)
         },
-        size: entry.size,
-        hash: entry.hash.clone()?,
+        size,
+        hash,
     })
 }
 
@@ -141,23 +151,33 @@ fn read_pins(conn: &rusqlite::Connection) -> io::Result<Option<Pins>> {
     if !table_exists(conn, "seal_preimages")? {
         return Ok(None);
     }
-    conn.prepare("SELECT path,kind,mode,size,hash FROM seal_preimages")
-        .map_err(sql_error)?
+    let mut stmt = conn
+        .prepare("SELECT path,kind,mode,size,hash FROM seal_preimages")
+        .map_err(sql_error)?;
+    let rows = stmt
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 Pin {
                     kind: r.get(1)?,
                     mode: r.get(2)?,
-                    size: r.get::<_, i64>(3)?.try_into().unwrap_or(u64::MAX),
+                    size: r.get(3)?,
                     hash: r.get(4)?,
                 },
             ))
         })
-        .map_err(sql_error)?
-        .collect::<rusqlite::Result<Pins>>()
-        .map(Some)
-        .map_err(sql_error)
+        .map_err(sql_error)?;
+    let mut pins = Pins::new();
+    for row in rows {
+        let (path, pin) = row.map_err(sql_error)?;
+        if pins.insert(path.clone(), pin).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate preimage pin for {path}"),
+            ));
+        }
+    }
+    Ok(Some(pins))
 }
 
 /// The pins a sealed layer records and whether they belong to its seal, or
@@ -172,8 +192,9 @@ fn recorded_pins(
         (None, Some(pins)) if pins.is_empty() => Ok(None),
         // Rows whose binding was removed.
         (None, Some(pins)) => Ok(Some((pins, false))),
-        (Some(recorded), table) => {
-            let pins = table.unwrap_or_default();
+        // Even an empty pin set must retain its table while its binding exists.
+        (Some(_), None) => Ok(Some((Pins::new(), false))),
+        (Some(recorded), Some(pins)) => {
             let bound = meta
                 .get("layer_digest")
                 .is_some_and(|layer| preimage_digest(layer, &pins) == recorded);
@@ -200,12 +221,17 @@ fn pin_difference(pinned: Option<&Pin>, now: Option<&Pin>) -> Option<&'static st
 pub const PREIMAGES_UNBOUND: &str =
     "seal_preimages: the pin rows do not match base_preimage_digest (changed after sealing)";
 
-/// The cheap reuse check (#341): rehash only the base entries a sealed layer
-/// pinned, in `lower_view` (the base and the lowers beneath the layer), and
-/// check that the pins belong to the seal. Returns `path: reason` per
-/// difference (empty when the layer records no pins or nothing changed).
-/// An unsealed directory has no pins.
-pub fn check_preimages(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Vec<String>> {
+fn pin_differences(pins: &Pins, now: &Pins) -> Vec<String> {
+    let paths: BTreeSet<_> = pins.keys().chain(now.keys()).collect();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            pin_difference(pins.get(path), now.get(path)).map(|reason| format!("{path}: {reason}"))
+        })
+        .collect()
+}
+
+fn read_sealed_pins(dir: &Path) -> io::Result<Option<(Pins, bool)>> {
     let required = !crate::write_overlay::overlay_markers(dir)
         .map_err(overlay_error)?
         .is_empty();
@@ -214,12 +240,37 @@ pub fn check_preimages(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Resu
         .map_err(overlay_error)?
         .filter(OverlayMeta::layer_sealed)
     else {
+        return Ok(None);
+    };
+    recorded_pins(&conn, &meta)
+}
+
+/// Check a seal's pins against an already computed complete, exact SHA-256
+/// change set (including `.git`, without exclusions or ignored modes). Pack
+/// uses this to validate every base without reading the preimages twice.
+pub fn check_preimages_for_changes(
+    dir: &Path,
+    changes: &[changes::Change],
+) -> io::Result<Vec<String>> {
+    let Some((pins, bound)) = read_sealed_pins(dir)? else {
         return Ok(Vec::new());
     };
-    let Some((pins, bound)) = recorded_pins(&conn, &meta)? else {
+    let mut differing = pin_differences(&pins, &pins_of(changes)?);
+    if !bound {
+        differing.insert(0, PREIMAGES_UNBOUND.to_owned());
+    }
+    Ok(differing)
+}
+
+/// The cheap reuse check (#341): rehash only the base entries a sealed layer
+/// pinned, in `lower_view` (the base and the lowers beneath the layer), and
+/// check that the pins belong to the seal. Returns `path: reason` per
+/// difference (empty when the layer records no pins or nothing changed).
+/// An unsealed directory has no pins.
+pub fn check_preimages(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Vec<String>> {
+    let Some((pins, bound)) = read_sealed_pins(dir)? else {
         return Ok(Vec::new());
     };
-    drop(conn);
     let mut out = Vec::new();
     if !bound {
         out.push(PREIMAGES_UNBOUND.to_owned());
@@ -1044,17 +1095,7 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
     };
     let (preimages_bound, preimage_mismatched) = match &pinned {
         None => (None, Vec::new()),
-        Some((pins, bound)) => {
-            let paths: BTreeSet<_> = pins.keys().chain(now_pins.keys()).collect();
-            let differing = paths
-                .into_iter()
-                .filter_map(|path| {
-                    pin_difference(pins.get(path), now_pins.get(path))
-                        .map(|reason| format!("{path}: {reason}"))
-                })
-                .collect();
-            (Some(*bound), differing)
-        }
+        Some((pins, bound)) => (Some(*bound), pin_differences(pins, &now_pins)),
     };
     Ok(VerifyReport {
         ok: recorded == computed

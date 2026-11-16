@@ -178,6 +178,25 @@ fn regression_docs_daemon_wait() {
         .contains("daemonized mounts detach standard streams while continuing to log"));
 }
 
+/// Regression: the pin documentation overstated --no-base-check and omitted
+/// which reuse paths and legacy seals do (and do not) check preimages.
+#[test]
+fn regression_docs_preimage_scope_and_legacy_visibility() {
+    let docs = read("docs/sandbox.md");
+    for required in [
+        "every `overlay pack`",
+        "supervisor finalize",
+        "supervisor diff after retained restore",
+        "including non-UTF-8 target bytes",
+        "Duplicate pin paths and a missing table with a remaining binding are refused.",
+        "`preimages_bound: null` explicitly means an older, unpinned seal",
+        "It still opens the base to recompute changes and check preimage pins.",
+    ] {
+        assert!(docs.contains(required), "missing pin contract: {required}");
+    }
+    assert!(read("CHANGELOG.md").contains("ordinary packs, supervisor diff"));
+}
+
 /// Regression: required-session wording and offline no-recovery rules survive reconciliation.
 #[test]
 fn regression_docs_required_record_latch_and_offline_no_recovery() {

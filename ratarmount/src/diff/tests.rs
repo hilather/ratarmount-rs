@@ -1,5 +1,5 @@
 use super::*;
-use ratarmount_compositing::{is_overlay_internal_path, HIDDEN_DB};
+use ratarmount_compositing::{compose_stack, is_overlay_internal_path, HIDDEN_DB};
 use ratarmount_core::OpenOptions;
 use ratarmount_core::S_IFLNK;
 use ratarmount_session::factory;

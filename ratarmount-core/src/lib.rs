@@ -401,6 +401,9 @@ pub struct SQLiteIndexedTarUserData {
 #[derive(Clone, Debug)]
 pub enum UserData {
     Tar(SQLiteIndexedTarUserData),
+    /// Native symlink target bytes for integrity checks. Kept separately
+    /// from FileInfo::linkname's historical lossy UTF-8 representation.
+    SymlinkTarget(Vec<u8>),
     /// Opaque payload for other backends until typed.
     Other(String),
 }

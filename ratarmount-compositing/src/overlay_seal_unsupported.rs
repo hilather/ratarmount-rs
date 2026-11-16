@@ -44,7 +44,25 @@ pub const PREIMAGE_DIGEST_KEY: &str = "base_preimage_digest";
 /// records none has nothing to check.
 pub fn check_preimages(dir: &Path, _lower_view: Arc<dyn MountSource>) -> io::Result<Vec<String>> {
     let meta = crate::OverlayMeta::read(dir).map_err(io::Error::other)?;
-    if meta.is_some_and(|meta| meta.get(PREIMAGE_DIGEST_KEY).is_some()) {
+    let Some(meta) = meta else {
+        return Ok(Vec::new());
+    };
+    let conn = crate::open_overlay_db(
+        &dir.join(crate::HIDDEN_DB),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        crate::DbName::Immutable,
+    )?;
+    let table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='seal_preimages')",
+        [], |row| row.get(0),
+    ).map_err(io::Error::other)?;
+    let rows: bool = table
+        && conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM seal_preimages)", [], |row| {
+                row.get(0)
+            })
+            .map_err(io::Error::other)?;
+    if meta.get(PREIMAGE_DIGEST_KEY).is_some() || rows {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "the layer records preimage pins, which can only be checked on Unix",
@@ -134,6 +152,26 @@ mod tests {
             .is_empty());
         let conn = rusqlite::Connection::open(dir.path().join(crate::HIDDEN_DB)).unwrap();
         crate::OverlayMeta::set(&conn, PREIMAGE_DIGEST_KEY, "sha256:x").unwrap();
+        drop(conn);
+        let error = check_preimages(dir.path(), source).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// Regression: removing only the binding left a pin table that the
+    /// non-Unix fallback silently accepted instead of refusing to skip it.
+    #[test]
+    fn regression_nonunix_preimage_pins_without_binding_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let source: Arc<dyn MountSource> =
+            Arc::new(crate::FolderMountSource::new(dir.path()).unwrap());
+        let conn = rusqlite::Connection::open(dir.path().join(crate::HIDDEN_DB)).unwrap();
+        conn.execute_batch(crate::overlay_meta::META_SCHEMA)
+            .unwrap();
+        crate::OverlayMeta::set(&conn, "format_version", "2").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE seal_preimages(path TEXT); INSERT INTO seal_preimages VALUES ('f');",
+        )
+        .unwrap();
         drop(conn);
         let error = check_preimages(dir.path(), source).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);

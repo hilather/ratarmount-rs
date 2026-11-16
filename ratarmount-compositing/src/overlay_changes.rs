@@ -193,6 +193,21 @@ impl Entry {
             _ => "file",
         }
     }
+
+    /// Pins need the native target bytes even though the canonical change
+    /// format uses FileInfo's historical UTF-8 representation.
+    #[cfg(unix)]
+    pub(crate) fn symlink_target_bytes(&self) -> &[u8] {
+        self.info
+            .userdata
+            .iter()
+            .rev()
+            .find_map(|data| match data {
+                ratarmount_core::UserData::SymlinkTarget(bytes) => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.target.as_deref().unwrap_or_default())
+    }
     pub fn git_mode(&self) -> u32 {
         if self.mode & S_IFMT == S_IFLNK {
             0o120000
@@ -1116,7 +1131,13 @@ pub fn compare_paths(
     for (path, old, new) in candidates {
         let before = old
             .map(|fi| entry(lower.as_ref().unwrap().clone(), fi, opts, true))
-            .transpose()?;
+            .transpose()
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("{path}: cannot read the base entry: {error}"),
+                )
+            })?;
         let after = new
             .map(|fi| entry(top.clone(), fi, opts, false))
             .transpose()?;
@@ -1152,6 +1173,7 @@ pub fn compare_paths(
 /// The base side of `path` in `lower` as [`compare_paths`] resolves it (no
 /// lookup through a symlinked ancestor, the same hashing), or `None` when
 /// nothing is there. Re-checks a seal's preimage pins (#341).
+#[cfg(unix)]
 pub(crate) fn base_entry(
     lower: Arc<dyn MountSource>,
     path: &str,
@@ -1202,6 +1224,9 @@ fn entry(
             if tag.strip_prefix("overlay-layer:").and_then(|s| s.split_once(':')).is_some_and(|(_, rest)| rest.starts_with("host:")))
     });
     if lower
+        // A metadata-only lower can override this xattr while its bytes still
+        // come from a mutable directory. Such a claim is not a preimage read.
+        && result.source.is_immutable()
         && !replaced_payload
         && kind == S_IFREG
         && opts.normalize == Normalize::Exact
@@ -2103,6 +2128,7 @@ mod tests {
         inner: Arc<dyn MountSource>,
         opens: Arc<AtomicUsize>,
         cached: bool,
+        immutable: bool,
     }
     impl MountSource for Counting {
         fn list(&self, path: &str) -> Option<ListResult> {
@@ -2116,7 +2142,7 @@ mod tests {
             self.inner.open(fi, buffering)
         }
         fn is_immutable(&self) -> bool {
-            self.inner.is_immutable()
+            self.immutable
         }
         fn get_xattr(&self, _: &FileInfo, key: &str) -> Option<Vec<u8>> {
             (self.cached && key == "user.hash.sha256").then(|| {
@@ -2137,6 +2163,7 @@ mod tests {
             inner: base,
             opens: count.clone(),
             cached: false,
+            immutable: false,
         });
         let dir = tmp.path().join("overlay");
         let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
@@ -2155,33 +2182,37 @@ mod tests {
         assert_eq!(count.load(Ordering::Relaxed), 0);
         assert_eq!(TOP_OPENS.get(), 0);
     }
-    /// Regression: cached lower SHA-256 avoids reads only for exact SHA-256.
+    /// Regression: cached lower SHA-256 avoids reads only for immutable
+    /// sources and exact SHA-256; a mutable source must read its bytes.
     #[test]
     fn regression_changes_cached_lower_hash() {
-        let (tmp, source) = fixture();
-        let count = Arc::new(AtomicUsize::new(0));
-        let base: Arc<dyn MountSource> = Arc::new(Counting {
-            inner: source,
-            opens: count.clone(),
-            cached: true,
-        });
-        let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
-        put(&ov, "/a", b"new");
-        drop(ov);
-        count.store(0, Ordering::Relaxed);
-        change_set(&dir, base.clone(), &ChangeOptions::default()).unwrap();
-        assert_eq!(count.load(Ordering::Relaxed), 0);
-        change_set(
-            &dir,
-            base,
-            &ChangeOptions {
-                normalize: Normalize::Strict,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert!(count.load(Ordering::Relaxed) > 0);
+        for immutable in [false, true] {
+            let (tmp, source) = fixture();
+            let count = Arc::new(AtomicUsize::new(0));
+            let base: Arc<dyn MountSource> = Arc::new(Counting {
+                inner: source,
+                opens: count.clone(),
+                cached: true,
+                immutable,
+            });
+            let dir = tmp.path().join("overlay");
+            let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+            put(&ov, "/a", b"new");
+            drop(ov);
+            count.store(0, Ordering::Relaxed);
+            change_set(&dir, base.clone(), &ChangeOptions::default()).unwrap();
+            assert_eq!(count.load(Ordering::Relaxed), usize::from(!immutable));
+            change_set(
+                &dir,
+                base,
+                &ChangeOptions {
+                    normalize: Normalize::Strict,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(count.load(Ordering::Relaxed) > 0);
+        }
     }
     /// Regression: gitignore globs respect anchoring, directory-only rules, classes and globstars.
     #[test]
@@ -2460,12 +2491,13 @@ mod tests {
             inner: source,
             opens: Arc::new(AtomicUsize::new(0)),
             cached: true,
+            immutable: true,
         });
         let lower_dir = tmp.path().join("lower");
         let ov = WriteOverlay::new_for_tests(base.clone(), &lower_dir).unwrap();
         put(&ov, "/a", b"prepared");
         drop(ov);
-        let lower = crate::compose_stack(base, &[(lower_dir, Immutability::Shared)]).unwrap();
+        let lower = crate::compose_stack(base, &[(lower_dir, Immutability::Immutable)]).unwrap();
         let top = tmp.path().join("top");
         let ov = WriteOverlay::new_for_tests(lower.clone(), &top).unwrap();
         put(&ov, "/a", b"old\n");

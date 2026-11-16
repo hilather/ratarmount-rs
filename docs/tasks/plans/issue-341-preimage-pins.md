@@ -51,15 +51,19 @@ A base *directory* gets no pin: a removed or replaced directory's descendants
 are expanded by `compare_paths` and pinned individually. Directories are only
 names; an added entry under them is the weak manifest's job.
 
-The preimage hashes are not new work: `compare_paths` already hashes the base
-side of every changed path (`Change.old`), through the composed
-`MountSource`, at both seal and verify time. The pins record what the seal
-already computed. No new file opens are added (no internal-read inventory
+Regular-file preimage hashes reuse the base side of every changed path
+(`Change.old`), already hashed by `compare_paths` through the composed
+`MountSource` at seal and verify time. Symlink pins hash native target bytes
+preserved during lookup, independently of the canonical row's historical UTF-8
+representation. No new file opens are added (no internal-read inventory
 change): every read goes through the base `MountSource`, as all change-set
 hashing does.
 
 Pins never use size or mtime as a skip-the-hash shortcut; that would
 reintroduce the bug. Size is stored to name a size change in messages.
+Cached hash attributes are reused only for immutable sources, so a stale
+`user.hash.sha256` supplied by a metadata-only lower cannot bypass a mutable
+directory base's preimage reads.
 
 ### Which seals record pins
 
@@ -98,6 +102,8 @@ not validate. `verify` recomputes the expected pins from the change set and
 compares them with the table, so an edited pin row is reported against the
 real base; the meta digest additionally catches a deleted or added row. A
 table with rows and no meta row is also a failure (meta row stripped).
+Duplicate paths are refused rather than collected into one map entry. A missing
+table with a remaining binding fails even when the original pin set was empty.
 
 The canonical hash, `layer_digest`, `CANONICAL_HASH_FORMAT` (still `2`),
 `seal_rows`, the sentinel and `stack_digest` are unchanged: the golden fixture
@@ -116,6 +122,7 @@ The bundle layout (`bundle.json` `bundle_format` 1) is unchanged: it describes
 TAR members, not database contents. An older build reads a pinned bundle and
 ignores the pins; this build reads an old bundle as unpinned.
 
+Every `overlay pack` checks pins, reusing the hashes computed for its manifest.
 A forced or moved-base `overlay pack` (`--force-base-mismatch`, accepted move)
 already refuses when the change set on the new base differs from the sealed
 one; it now also refuses when a pin differs, with the same unseal/reseal
@@ -141,7 +148,9 @@ advice, so a bundle never names a base its pins do not describe.
    the remedy is a reseal.
 3. **`diff`** of a top over sealed lowers composes them itself; it checks each
    sealed lower's pins against the view beneath it the same way.
-4. **`overlay pack`** of a moved/forced base: see Bundles.
+4. **`overlay pack`** on every base: see Bundles.
+5. **Supervisor `diff` and `finalize`** compose the recorded lowers with the
+   same pin checks, including diff of retained attempts after restart.
 
 Nested lowers: pins of lower N are hashes of what the view beneath it (base +
 lowers 0..N-1) served at seal time, because `compare_paths` resolves the base
@@ -171,6 +180,9 @@ bundle verification failure does today.
 - Seals made before #341 (no meta row, no table): unchanged behaviour;
   documented. `overlay unseal --i-know` + `overlay seal` adds pins.
 - A pinned layer read by an older build: pins ignored (older behaviour).
+- `overlay verify --json` reports `preimages_bound: null` for an unpinned seal;
+  successful verification of such a seal does not establish preimage integrity.
+- Non-Unix reuse refuses either a pin binding or leftover pin rows.
 - `overlay seal` re-run on a sealed layer finishes the recorded seal and does
   not add pins (it never rehashes).
 - `--force-base-mismatch` seal: the pins are measured on the base actually
@@ -182,7 +194,9 @@ bundle verification failure does today.
   `compare_paths` (it hashes the base side); unchanged, documented. On reuse an
   unreadable or vanished pinned path is a mismatch (`missing` / read error
   names the path).
-- **Symlinks in the base**: the pin hashes the target bytes; a retargeted
+- **Symlinks in the base**: the pin hashes the native target bytes, including
+  non-UTF-8 targets (preserved separately from the canonical row's historical
+  UTF-8 representation); a retargeted
   symlink with the same target length is now refused. Lookups go through
   `safe_lookup`, which refuses to look through symlinked ancestors, so a path
   under a now-symlinked directory reads as missing.
@@ -233,9 +247,6 @@ the layer modifies or deletes, not with the base.
   restored-mtime limit; not pinned (see "Which seals record pins").
 - `diff` run on the sealed layer itself (as the top) compares against the base
   as it is now and does not consult its pins.
-- The sandbox supervisor's attempt `diff`/`finalize` compose the lowers the
-  child mounted without rechecking pins after the mount; a base edited while
-  an attempt runs is seen at the next mount.
 - A weak-directory bundle lower hashes its pinned files twice per use (bundle
   verification, then the pin check); each supervisor child repeats the check.
 - Resealing a lower to accept a changed base changes its `sealed_at`, so tops

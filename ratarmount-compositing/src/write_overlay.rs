@@ -5607,13 +5607,20 @@ pub(crate) fn file_info_from_overlay_meta(
     host: &Path,
     meta: &fs::Metadata,
 ) -> FileInfo {
+    let mut userdata = Vec::new();
     let linkname = if meta.file_type().is_symlink() {
         fs::read_link(host)
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| {
+                userdata.push(UserData::SymlinkTarget(
+                    p.as_os_str().as_encoded_bytes().to_vec(),
+                ));
+                p.to_string_lossy().into_owned()
+            })
             .unwrap_or_default()
     } else {
         String::new()
     };
+    userdata.push(UserData::Other(format!("overlay:{path}")));
     let mut fi = FileInfo {
         size: meta.len(),
         mtime: metadata_mtime_secs(meta) as f64,
@@ -5621,7 +5628,7 @@ pub(crate) fn file_info_from_overlay_meta(
         linkname,
         uid: metadata_uid(meta),
         gid: metadata_gid(meta),
-        userdata: vec![UserData::Other(format!("overlay:{path}"))],
+        userdata,
     };
     #[cfg(unix)]
     {
