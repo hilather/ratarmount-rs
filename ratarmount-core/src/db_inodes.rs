@@ -282,6 +282,11 @@ mod unix {
         /// create (`EEXIST`) and its fallback open (#214 item 2).
         pub(super) static UNLINK_BEFORE_FALLBACK: std::cell::RefCell<Option<std::path::PathBuf>> =
             const { std::cell::RefCell::new(None) };
+        /// Rename the first path over the second just before the generic
+        /// read-only truncation's writable reopen (#214 item 3).
+        pub(super) static REPLACE_BEFORE_TRUNC_REOPEN:
+            std::cell::RefCell<Option<(std::path::PathBuf, std::path::PathBuf)>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     fn fstat(fd: RawFd) -> io::Result<libc::stat> {
@@ -562,6 +567,12 @@ mod unix {
                 // own `O_TRUNC`). The writer follows the final component as
                 // the caller's open did (#214 item 3); the identity check
                 // below refuses a name swapped to another file meanwhile.
+                #[cfg(test)]
+                if let Some((from, to)) =
+                    REPLACE_BEFORE_TRUNC_REOPEN.with(|p| p.borrow_mut().take())
+                {
+                    std::fs::rename(from, to).expect("test seam rename");
+                }
                 let writer = openat_raw(
                     dir,
                     c,
@@ -1190,6 +1201,88 @@ mod tests {
             open_admitted(&link, libc::O_RDONLY | libc::O_TRUNC, 0)
                 .unwrap_or_else(|e| panic!("{generic}: {e}"));
             assert_eq!(fs::metadata(&target).unwrap().len(), 0, "{generic}");
+        }
+    }
+
+    /// Regression: following symlinks on the generic writable reopen (#214)
+    /// must still refuse a swapped inode before truncation, and quarantine
+    /// a descriptor of a database rather than close it and release its locks.
+    /// Cover both hard-link and symlink replacements, including O_NOFOLLOW.
+    #[test]
+    fn regression_214_generic_trunc_reopen_refuses_swapped_names() {
+        use super::unix::REPLACE_BEFORE_TRUNC_REOPEN;
+        use std::os::fd::AsFd;
+
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _generic = ForceGenericGuard::enter();
+        for nofollow in [false, true] {
+            for symlink in [false, true] {
+                for database in [false, true] {
+                    let case =
+                        format!("nofollow={nofollow}, symlink={symlink}, database={database}");
+                    let tmp = tempfile::tempdir().unwrap();
+                    let dir = fs::File::open(tmp.path()).unwrap();
+                    let original = tmp.path().join("original");
+                    let replacement = tmp.path().join("replacement");
+                    let name = tmp.path().join("name");
+                    let staged = tmp.path().join("staged");
+                    fs::write(&original, b"original bytes").unwrap();
+                    fs::write(&replacement, b"replacement bytes").unwrap();
+                    fs::hard_link(&original, &name).unwrap();
+                    if symlink {
+                        std::os::unix::fs::symlink(&replacement, &staged).unwrap();
+                    } else {
+                        fs::hard_link(&replacement, &staged).unwrap();
+                    }
+                    let registration =
+                        database.then(|| register_db_inode(id_of(&replacement), &replacement));
+                    let before = quarantined();
+                    REPLACE_BEFORE_TRUNC_REOPEN.with(|p| {
+                        *p.borrow_mut() = Some((staged, name));
+                    });
+                    let flags = libc::O_RDONLY
+                        | libc::O_TRUNC
+                        | if nofollow { libc::O_NOFOLLOW } else { 0 };
+                    let opened = openat_admitted(Some(dir.as_fd()), Path::new("name"), flags, 0);
+                    let fired = REPLACE_BEFORE_TRUNC_REOPEN
+                        .with(|p| p.borrow_mut().take())
+                        .is_none();
+                    assert!(fired, "{case}: writable reopen was not reached");
+                    let error = opened.unwrap_err();
+                    let quarantines = if nofollow && symlink {
+                        assert_eq!(error.raw_os_error(), Some(libc::ELOOP), "{case}: {error}");
+                        0
+                    } else if database {
+                        assert_eq!(
+                            error.kind(),
+                            io::ErrorKind::PermissionDenied,
+                            "{case}: {error}"
+                        );
+                        assert!(
+                            error
+                                .to_string()
+                                .contains(&replacement.display().to_string()),
+                            "{case}: {error}"
+                        );
+                        1
+                    } else {
+                        assert_eq!(error.kind(), io::ErrorKind::Other, "{case}: {error}");
+                        assert!(
+                            error.to_string().contains("changed while it was opened"),
+                            "{case}: {error}"
+                        );
+                        0
+                    };
+                    assert_eq!(quarantined(), before + quarantines, "{case}");
+                    drop(registration);
+                    assert_eq!(fs::read(&original).unwrap(), b"original bytes", "{case}");
+                    assert_eq!(
+                        fs::read(&replacement).unwrap(),
+                        b"replacement bytes",
+                        "{case}"
+                    );
+                }
+            }
         }
     }
 }
