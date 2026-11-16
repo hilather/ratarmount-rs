@@ -126,6 +126,31 @@ mod tests {
         }
     }
 
+    /// Regression (#316): overlay mkdir of an existing name re-moded the
+    /// directory; it maps to EEXIST for a directory, a file, and a
+    /// read-only-protected existing directory (EEXIST before EROFS).
+    #[test]
+    fn regression_316_mkdir_existing_is_eexist() {
+        let td = tempfile::tempdir().unwrap();
+        let mut ov = crate::test_overlay::new_overlay(Arc::new(EmptyFs), td.path()).unwrap();
+        ov.mkdir("/locked", 0o755).unwrap();
+        let fd = ov.create_file("/file", 0o644).unwrap();
+        ov.close_overlay_fd(fd);
+        ov.set_policy(Some(Arc::new(TestPolicy)));
+        let ov = Arc::new(ov);
+        for path in ["/locked", "/file", "/"] {
+            assert_eq!(
+                io_to_errno(&overlay_mkdir(&ov, path, 0o700).unwrap_err()),
+                libc::EEXIST,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            io_to_errno(&overlay_mkdir(&ov, "/locked/newdir", 0o755).unwrap_err()),
+            libc::EROFS
+        );
+    }
+
     /// Regression: policy errors survive overlay conversion and errno mapping.
     #[test]
     fn regression_overlay_policy_denials() {

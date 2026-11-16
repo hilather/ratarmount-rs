@@ -268,3 +268,65 @@ fn regression_fuse_same_owner_chown_cp_p_and_sed_i() {
         );
     }
 }
+
+/// Regression (#316): mkdir of an existing name inside a `-w` mount must
+/// fail with EEXIST and leave the directory's mode alone, for an archive
+/// directory, an overlay directory and an archive file. (The kernel usually
+/// answers from its own LOOKUP; the daemon path is pinned by the
+/// `ratarmount-fuse` unit test `regression_316_mkdir_existing_is_eexist`.)
+#[test]
+fn regression_316_fuse_mkdir_existing_is_eexist() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if !fuse_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("base.tar");
+    let overlay = dir.path().join("overlay");
+    let mount = dir.path().join("mnt");
+    let mut tar = Vec::new();
+    let member = |path, payload, mode| ratarmount_formats_tar::UstarMember {
+        path,
+        payload,
+        mode,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+        xattrs: &[],
+    };
+    ratarmount_formats_tar::write_ustar_members(
+        &mut tar,
+        &[
+            member(
+                "trace",
+                ratarmount_formats_tar::UstarPayload::File { bytes: b"x" },
+                0o644,
+            ),
+            member(
+                "basedir",
+                ratarmount_formats_tar::UstarPayload::Directory,
+                0o750,
+            ),
+        ],
+    )
+    .unwrap();
+    ratarmount_formats_tar::write_tar_eof(&mut tar).unwrap();
+    fs::write(&archive, tar).unwrap();
+    let _mounted = Mount::start(&archive, &mount, Some(&overlay));
+    fs::DirBuilder::new()
+        .mode(0o750)
+        .create(mount.join("made"))
+        .unwrap();
+    let mode = |name: &str| fs::metadata(mount.join(name)).unwrap().permissions().mode();
+    for name in ["basedir", "made", "trace"] {
+        let before = mode(name);
+        let err = fs::DirBuilder::new()
+            .mode(0o700)
+            .create(mount.join(name))
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EEXIST), "{name}: {err}");
+        assert_eq!(mode(name), before, "{name}");
+    }
+    assert_eq!(mode("basedir") & 0o7777, 0o750);
+    assert!(fs::metadata(mount.join("trace")).unwrap().is_file());
+}

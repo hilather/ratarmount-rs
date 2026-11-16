@@ -816,6 +816,24 @@ mod tests {
         assert_eq!(fs.setstat_size("/x", 0).unwrap_err(), libc::EROFS);
     }
 
+    /// Regression (#316): SFTP MKDIR of an existing directory changed its
+    /// mode instead of failing; it is EEXIST (SSH_FX_FAILURE on the wire in
+    /// SFTP v3) and the mode is kept.
+    #[test]
+    fn regression_316_mkdir_existing_is_eexist() {
+        let td = tempfile::tempdir().unwrap();
+        let ov = Arc::new(
+            crate::test_overlay::new_overlay(Arc::new(EmptyFs) as Arc<dyn MountSource>, td.path())
+                .expect("overlay"),
+        );
+        let fs = RatarmountSftp::with_overlay(ov.clone(), 0, 8, Some(ov));
+        fs.mkdir("/d", 0o750).expect("mkdir");
+        let before = fs.file_info_at("/d").unwrap().mode;
+        assert_eq!(fs.mkdir("/d", 0o700).unwrap_err(), libc::EEXIST);
+        assert_eq!(fs.file_info_at("/d").unwrap().mode, before);
+        assert_eq!(before & 0o7777, 0o750);
+    }
+
     #[test]
     fn overlay_write_roundtrip() {
         let td = tempfile::tempdir().unwrap();

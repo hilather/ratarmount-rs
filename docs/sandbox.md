@@ -1379,7 +1379,7 @@ For these rules:
 
 | Operation | `t/suite` | `t/agent` | `t/agent/leaf` | `outside` |
 | --- | --- | --- | --- | --- |
-| Create, mkdir, write, truncate, unlink, chmod, setxattr | EROFS | allowed | allowed | allowed |
+| Create, mkdir², write, truncate, unlink, chmod, setxattr | EROFS | allowed | allowed | allowed |
 | Rename endpoint, rmdir, reset | EROFS | EROFS¹ | allowed | allowed |
 
 ¹ `rmdir` of an exception root is allowed when the overlay created it: an empty
@@ -1400,6 +1400,10 @@ mode for the mount, diff, seal and pack. Existing chmod overrides take precedenc
 an explicit chmod still counts as a change. Setgid and sticky bits are retained.
 A `t/agent` the base or a lower layer provides stays anchored (EROFS), as do
 rename and reset of either.
+
+² mkdir of a name that already exists (for example `t/suite` itself) fails
+with `EEXIST` before any rule is checked, as on a read-only Linux mount, and is
+not counted as a denial; only a new name under a protected path gets `EROFS`.
 
 The second row also checks possible protected descendants. Exception roots inside
 protected subtrees stay anchored: renaming `t` or `t/agent` is refused; renaming an allowed leaf within
@@ -1904,6 +1908,18 @@ NFSv3/v4 SETATTR, 9P Tsetattr and SFTP SETSTAT also apply mode and time changes.
 SFTP OPEN honors requested creation permissions. The current NFSv3 server dependency
 does not forward MKDIR attributes to the filesystem adapter, so newly created
 NFSv3 directories initially use mode 0755; SETATTR can change it afterwards.
+In a write overlay (`-w`), mkdir on any frontend of a name that is already visible (a base, lower or
+overlay directory, a file or a symlink) fails with `EEXIST` (NFS3ERR_EXIST,
+NFS4ERR_EXIST, SMB `STATUS_OBJECT_NAME_COLLISION`, WebDAV MKCOL 405, SFTP v3
+`SSH_FX_FAILURE`) and leaves the entry and its mode unchanged; it used to
+change the existing directory's mode. As with `mkdir(2)` on a read-only Linux
+mount, `EEXIST` takes precedence over a read-only rule's `EROFS` and is not
+counted as a denial. A name deleted in the overlay is not visible, so mkdir
+over it succeeds. Unlink serializes its removal and tombstone update with mkdir
+so a concurrent recreation stays visible. Host leaf creation is exclusive: a directory created by a
+concurrent host writer returns `EEXIST` without changing its permissions.
+SMB directory `FILE_OPEN_IF` opens the winning directory after a creation race
+and reports `FILE_OPENED`; `FILE_CREATE` still returns a collision. (#316)
 A chown on a writable path to the owner an entry is already shown with (after any
 `-o uid=...,gid=...` mapping) succeeds as a no-op, so ownership-preserving tools
 such as `cp -p` and `sed -i` work, also as root; each ID is

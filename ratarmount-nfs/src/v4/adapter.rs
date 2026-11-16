@@ -1438,6 +1438,34 @@ mod tests {
         assert!(names.contains(&"keep"), "{names:?}");
     }
 
+    /// Regression (#316): NFSv4 CREATE of a directory over an existing name
+    /// changed the directory's mode instead of failing; it is
+    /// `FsError::AlreadyExists` (NFS4ERR_EXIST) and the mode is kept.
+    #[test]
+    fn regression_316_v4_mkdir_existing_is_exist() {
+        let mut base = Synth::new();
+        base.add_file("/keep", b"archive", vec![UserData::Other("t".into())]);
+        let (_td, nfs) = overlay_export(base);
+        let dir = |mode| CreateRequest {
+            kind: CreateKind::Directory,
+            attrs: SetAttrs {
+                mode: Some(mode),
+                ..SetAttrs::default()
+            },
+        };
+        let made = nfs.create_sync(1, "sub", dir(0o750)).expect("mkdir");
+        assert_eq!(made.attrs.mode, 0o750);
+        assert!(matches!(
+            nfs.create_sync(1, "sub", dir(0o700)),
+            Err(FsError::AlreadyExists)
+        ));
+        assert_eq!(nfs.getattr_sync(made.handle).unwrap().mode, 0o750);
+        assert!(matches!(
+            nfs.create_sync(1, "keep", dir(0o700)),
+            Err(FsError::AlreadyExists)
+        ));
+    }
+
     /// Regression: write-then-cat empty when NFSv4 READ used a stale size-0
     /// inode cache instead of re-lookup.
     #[test]

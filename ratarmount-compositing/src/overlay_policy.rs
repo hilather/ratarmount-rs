@@ -1278,7 +1278,11 @@ mod tests {
         };
         denied(overlay.set_metadata("/t/file", &attrs), ro);
         denied(overlay.set_xattr("/t/file", "user.test", b"x", 0), ro);
-        overlay.mkdir("/t/agent", 0o755).unwrap();
+        // `/t/agent` is an archive directory: mkdir is EEXIST (#316).
+        denied(
+            overlay.mkdir("/t/agent", 0o755),
+            io::ErrorKind::AlreadyExists,
+        );
         overlay.mkdir("/t/agent/dir", 0o755).unwrap();
         let file = new_file(&overlay, "/t/agent/dir/new");
         overlay
