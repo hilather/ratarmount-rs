@@ -7,6 +7,32 @@ use super::*;
 
 use std::io::Write;
 
+/// Regression: #179: recovery errors must expose their I/O cause through the
+/// public Error trait, without requiring callers to match an enum variant.
+#[test]
+fn regression_179_recover_error_exposes_io_source() {
+    use std::error::Error;
+
+    for wrap in [
+        RecoverError::Refused,
+        RecoverError::Journal,
+        RecoverError::Committed,
+    ] {
+        let cause = io::Error::from_raw_os_error(libc::EIO);
+        let kind = cause.kind();
+        let message = cause.to_string();
+        let error = wrap(cause);
+        let source = error
+            .source()
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .expect("the original I/O error is the source");
+        assert_eq!(source.raw_os_error(), Some(libc::EIO), "{error:?}");
+        assert_eq!(source.kind(), kind);
+        assert_eq!(error.to_string(), message);
+        assert_eq!(error.into_io().raw_os_error(), Some(libc::EIO));
+    }
+}
+
 /// Regression: ENOSPC must roll back before returning to a live reader.
 #[test]
 fn append_journal_write_error_rolls_back_immediately() {

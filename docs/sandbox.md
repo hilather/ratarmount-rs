@@ -349,6 +349,12 @@ mount keeps serving, and `--force-base-mismatch` accepts the new base. A swap of
 the base with the same size and mtime cannot be caught without hashing; only
 `overlay verify` with a strong digest catches it (`overlay seal` of an
 already-strong base compares the stamp and does not rehash).
+A commit-journal recovery guard that refuses before recovery writes also keeps
+the mount serving and interval commits enabled. Restore the required overlay
+database state before retrying; `--force-base-mismatch` does not bypass that
+guard. During a live commit, a recovery failure that may have written disables
+later live commits and refuses base reads until a remount. Overlay payloads
+remain readable.
 `--commit-overlay` on a raw directory of files (no overlay database) has no
 identity to check and says so. Only an absent database path in an unused
 overlay counts as "no database".
@@ -425,14 +431,34 @@ mount's top and directory lowers, the offline overlay, the live mount's own
 database, which must still be the file it opened) is classified again under
 the archive lock; a lost record or one whose database path cannot be resolved
 refuses the recovery with the locator, the archive and any journal left as
-they were. Every named overlay database and its `-wal`, `-journal`, and `-shm`
+they were. Offline commits retain the entry check's database-presence requirement
+and every marker requirement observed by its metadata read or identity gate.
+Removing both the database and marker, or removing the marker and emptying the
+database or dropping its `files` table, therefore refuses before recovery
+writes, including stale-locator cleanup and under `--force-base-mismatch`.
+A raw directory that never had a database keeps its usual recovery behavior.
+Every named overlay database and its `-wal`, `-journal`, and `-shm`
 companions are checked again before recovery mutations; offline recovery and
 mount recovery both refuse symlinks with exit 1, including under force. That
 refusal is a refused recovery, also next to a complete journal: a live mount
 is not marked as having a base changed by a failed commit, and the next gate
 still refuses. The restamp after a roll-forward re-checks the record too, and a
 used overlay's database must still have its `files` table, else the journal is
-kept. A stale prepare locator without a journal is otherwise cleared
+kept. A hot overlay rollback journal is a separate refusal: its record cannot be read
+without first modifying the database, so archive recovery must not defer it to
+a writable open that checks identity, sealing and relaxed durability afterward.
+This applies to the `-w` top and directory lowers, even with force or a pending
+complete commit journal. A stale prepare locator beside a hot overlay journal is kept, with the archive, database and hot journal unchanged.
+The error names the explicit recovery route: `ratarmount --no-mount ARCHIVE`
+without `-w` or `--lower`. That command recovers only the archive; it does not
+open the overlay. Inspect the overlay on a writable copy before retrying:
+SQLite can roll its hot journal back on that copy before sealed or unclean
+metadata becomes readable. Ordinary writable opens without archive recovery
+retain that SQLite behavior. The same refusal runs before `--no-mount` returns,
+before export servers or interval commits start, and in a daemonized mount's
+serving child after its early fork (#163).
+
+A stale prepare locator without a journal is otherwise cleared
 after a directory sync; a complete locator whose journal cannot be found is
 refused, never cleared (the commit's hook may not have run), and the error
 names the manual escape: verify the archive, then remove its
@@ -2204,11 +2230,27 @@ and a message naming the database (logged once per inode). On
 Linux the check runs on an `O_PATH` descriptor, whose close releases nothing,
 and the file is then reopened through `/proc/self/fd`; `O_TRUNC` and the
 create mode apply only after the check. Elsewhere (macOS, or Linux without
-`/proc`) the refused descriptor, or one whose identity could not be read, is
-kept open for the life of the process (one descriptor per refused open).
-Remove the extra link to read the file. The
+`/proc`) the first refused descriptor of an inode, or one whose identity could
+not be read, is kept open for the life of the process. Further opens of that
+inode are refused before `open` once the external-alias epoch cap (one
+descriptor) is reached, including after the database registration is dropped
+and created again; those refusals keep no further descriptor. An exclusive
+create (`O_CREAT` with `O_EXCL`) over an existing name is `EEXIST` and does
+not open, including after the cap. Two opens that
+both pass the check before either is recorded can each keep one descriptor.
+An unidentified descriptor is still kept and does not count toward the cap.
+Linux `O_PATH` refusals do not count. Descriptors are not pooled. Remove the
+extra link to read the file while the database is open; while it is not
+registered the name opens normally, and the next registration of the same
+inode is refused again without another descriptor. The
 check never holds its lock across an open, so a FIFO under a payload name
 blocks only the request that opens it, never another overlay-database open.
+Unlike `open(2)`, a checked open with `O_CREAT` but neither `O_NOFOLLOW` nor
+`O_EXCL` does not create the target of a dangling symlink; it is refused
+(`EINVAL`, naming the symlink), on Linux and macOS alike. Creating through a symlink
+needs a non-exclusive open that could reach an existing inode before the check.
+The mount's own creates pass `O_NOFOLLOW` and get `ELOOP` there, as `open(2)`
+does.
 
 Not covered: a payload descriptor opened before its inode is first opened as
 a database in this process (no mount path does this: the database is opened
@@ -2336,6 +2378,20 @@ checked `overlay pack --include-index` snapshot uses the checked family above
 (`"unix-posix"` on macOS). Managed byte readers are not connections; see
 [Internal reads of index and database files](#internal-reads-of-index-and-database-files).
 
+On an unsupported Unix ABI the overlay row above stays a refusal. Index, SQLAR,
+digest-cache and publication connections on that host stay ordinary default-VFS
+opens and are labeled `LegacyUnverified`: no descriptor check, no reuse check,
+and no pathname type check. On Linux glibc, macOS and Windows those same
+non-overlay connections stay ordinary default-VFS opens and are not
+`LegacyUnverified`. Windows overlay opens stay pathname type checks
+(`WindowsPathTypeOnly`). `disk_open_state` is that table (#196):
+
+| Host | Overlay database | Non-overlay disk DB |
+|---|---|---|
+| Verified Unix (64-bit little-endian Linux glibc, macOS) | Checked (`UnixDescriptor` or `UnixReuse`) | Ordinary default VFS |
+| Windows | Pathname type only (`WindowsPathTypeOnly`) | Ordinary default VFS |
+| Unsupported Unix | Refused | `LegacyUnverified` |
+
 The optional `sqlcipher` feature links SQLCipher's SQLite (older than 3.46.0),
 which is checked the same way. One difference: when its read-write open is
 refused, its read-only retry calls `open` again instead of reusing a parked
@@ -2405,7 +2461,11 @@ SQLAR byte probes; export-index inputs; shard artifact hashes; the private
 lookup copy of an index with a hot journal; and the sync of a published index.
 
 Not covered, by design of this slice (#196; each site has a residual entry with
-its reason, and the list is open): generic folder reads and backing extents,
+its reason, and the list is open). The rule for a `.sqlar` in the factory is:
+`FormatBackend::Sqlar`'s own `looks_like_sqlar` and `SqlarMountSource::open` are
+managed reads; every earlier backend's `looks_like_*` of that same file is a
+residual `File::open` (one open and close per backend) and stays uncovered.
+Also uncovered: generic folder reads and backing extents,
 overlay payload descriptors (admitted opens) and the TAR commit helper, the
 plain TAR backend, the HF payload cache and its repository backing, the range
 and payload caches (the payload-v1 header read and staging reopen included),

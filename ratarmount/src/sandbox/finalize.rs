@@ -1294,11 +1294,24 @@ impl<M: Mounter> Supervisor<M> {
             }
             Err(e) => return Err(io_error("finalize: locking a lower", path, e)),
         };
+        let synced = self.sync_locked_lower(record, &locked);
+        // Unlocked explicitly (#187): a child forked meanwhile holds a copy.
+        crate::overlay_pack::unlock_layer_entry(&locked, path);
+        synced
+    }
+
+    /// [`sync_lower`](Self::sync_lower) under the entry lock on `locked`.
+    fn sync_locked_lower(
+        &mut self,
+        record: &LowerLayerRecord,
+        locked: &std::os::fd::OwnedFd,
+    ) -> ApiResult<()> {
+        let path = &record.path;
         #[cfg(test)]
         if let Some(hook) = self.seams.after_lower_lock.take() {
             hook(path);
         }
-        let stat = ratarmount_compositing::host_stat::fstat_named(&locked, path)
+        let stat = ratarmount_compositing::host_stat::fstat_named(locked, path)
             .map_err(|e| io_error("finalize: step S", path, e))?;
         if stat.st_mode & 0o222 != 0 {
             return Err(writable_lower(path, path));
@@ -1319,11 +1332,10 @@ impl<M: Mounter> Supervisor<M> {
                 path.display()
             )));
         }
-        self.sync_one_tree(&locked, path, Some(path))?;
+        self.sync_one_tree(locked, path, Some(path))?;
         if let Some(parent) = path.parent() {
             self.sync_dir_strict(parent)?;
         }
-        drop(locked);
         Ok(())
     }
 

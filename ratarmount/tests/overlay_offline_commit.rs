@@ -661,6 +661,327 @@ fn regression_mount_roll_forward_restamps_then_remount_accepts() {
     }
 }
 
+/// Parent-set switch for [`hot_overlay_journal_child`] (#310 pattern).
+#[cfg(unix)]
+const HOT_OVERLAY_JOURNAL_CHILD: &str = "RATARMOUNT_TEST_HOT_OVERLAY_JOURNAL_CHILD";
+
+/// Child of [`regression_163_mount_hot_journal_and_stale_prepare`]: leave a
+/// hot rollback `-journal` beside the overlay database named in
+/// `RATARMOUNT_TEST_HOT_OVERLAY_DB`, like a writer killed mid-transaction.
+#[cfg(unix)]
+#[test]
+#[ignore = "child process of regression_163_mount_hot_journal_and_stale_prepare"]
+fn hot_overlay_journal_child() {
+    if std::env::var_os(HOT_OVERLAY_JOURNAL_CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        eprintln!(
+            "skip: hot_overlay_journal_child runs only as a child of \
+             regression_163_mount_hot_journal_and_stale_prepare \
+             ({HOT_OVERLAY_JOURNAL_CHILD}=1 is not set)"
+        );
+        return;
+    }
+    let db = std::env::var_os("RATARMOUNT_TEST_HOT_OVERLAY_DB").expect("child overlay db");
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=DELETE; PRAGMA cache_size=1; BEGIN IMMEDIATE; \
+         CREATE TABLE hot_filler(x); INSERT INTO hot_filler SELECT zeroblob(1000000); \
+         DELETE FROM files",
+    )
+    .unwrap();
+    // A crashed writer: exit without rolling back or closing the connection.
+    std::process::exit(0);
+}
+
+/// Regression: #310 pattern for [`hot_overlay_journal_child`]: run directly
+/// (`cargo test -- --ignored`) with a database path but without its parent's
+/// variable, it skips and leaves the database and its journal untouched.
+#[cfg(unix)]
+#[test]
+fn regression_163_hot_overlay_journal_child_skips_without_its_parent() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    let env = Env::new();
+    let db = env.path("overlay.sqlite");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("CREATE TABLE files (path, name, deleted)")
+        .unwrap();
+    let before = fs::read(&db).unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "hot_overlay_journal_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env_remove(HOT_OVERLAY_JOURNAL_CHILD)
+        .env("RATARMOUNT_TEST_HOT_OVERLAY_DB", &db)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    let all = text(&output);
+    assert!(all.contains("1 passed"), "{all}");
+    assert!(
+        all.contains("skip: hot_overlay_journal_child runs only as a child"),
+        "{all}"
+    );
+    assert_eq!(fs::read(&db).unwrap(), before, "database untouched");
+    assert!(!PathBuf::from(format!("{}-journal", db.display())).exists());
+}
+
+/// Regression: #163 (hot-journal route): one SIGKILL during a live commit can
+/// leave a hot `-journal` on the `-w` top database AND a stale prepare
+/// locator on the archive. Mount recovery read the top's record without
+/// rolling the journal back and exited 2 without a remedy. It now names the
+/// explicit recovery route and preserves both files until the user chooses
+/// it. Once the archive is recovered separately, the ordinary writable open
+/// rolls the interrupted overlay write back and a second remount is clean.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_163_mount_hot_journal_and_stale_prepare() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    let env = Env::new();
+    let archive = regression_238_tar(&env);
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    let db = overlay.join(ratarmount_compositing::HIDDEN_DB);
+    // A tombstone the interrupted transaction deletes: it must survive.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO files (path, name, deleted) VALUES ('/', 'a.txt', 1)",
+            [],
+        )
+        .unwrap();
+    stale_prepare_locator(&archive);
+    let archive_before = fs::read(&archive).unwrap();
+    let journal = hot_overlay_journal(&db);
+
+    let db_before = fs::read(&db).unwrap();
+    let journal_before = fs::read(&journal).unwrap();
+    let locator_before = policy_locator(&archive);
+    let out = env.run(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert!(
+        text(&out).contains("stale prepare locator is kept"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        text(&out).contains("ratarmount --no-mount ARCHIVE"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(fs::read(&db).unwrap(), db_before);
+    assert_eq!(fs::read(&journal).unwrap(), journal_before);
+    assert_eq!(policy_locator(&archive), locator_before);
+
+    // Exercise the documented remedy, including the boundary between archive
+    // recovery and the user's later decision to open this unsealed overlay.
+    env.ok(&["--no-mount", s(&archive)]);
+    assert_eq!(fs::read(&db).unwrap(), db_before);
+    assert_eq!(fs::read(&journal).unwrap(), journal_before);
+    assert!(
+        policy_locator(&archive).is_empty(),
+        "stale locator cleared explicitly"
+    );
+    assert!(
+        fs::read(&archive).unwrap() == archive_before,
+        "archive unchanged"
+    );
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    assert!(
+        !journal.exists(),
+        "explicit -w open rolled the journal back"
+    );
+    let tombstones: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT count(*) FROM files WHERE deleted = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(tombstones, 1, "the interrupted delete was rolled back");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+}
+
+/// Leave just a prepare locator; no archive bytes have been replaced.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stale_prepare_locator(archive: &Path) {
+    let mut suffix = tempfile::tempfile().unwrap();
+    suffix.write_all(&[0; 1536]).unwrap();
+    assert!(
+        ratarmount_compress::commit_journal::replace_suffix_with_hook(
+            archive,
+            fs::metadata(archive).unwrap().len() - 1024,
+            &mut suffix,
+            &mut |step| {
+                if step == "locator prepare" {
+                    Err(std::io::Error::other("crash"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .is_err()
+    );
+    let _ = fs::remove_file(ratarmount_compress::commit_journal::journal_path(archive));
+    assert_eq!(policy_locator(archive).get(4), Some(&b'P'));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hot_overlay_journal(db: &Path) -> PathBuf {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "hot_overlay_journal_child", "--ignored"])
+        .env(HOT_OVERLAY_JOURNAL_CHILD, "1")
+        .env("RATARMOUNT_TEST_HOT_OVERLAY_DB", db)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    let journal = PathBuf::from(format!("{}-journal", db.display()));
+    assert!(
+        fs::metadata(&journal).is_ok_and(|m| m.len() > 0),
+        "hot journal"
+    );
+    journal
+}
+
+/// Regression: #163 deferral rolled back a sealed or unclean top's database
+/// before its metadata could refuse the open. Neither force nor startup mode
+/// may authorize that write while the record cannot be read without recovery.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_163_hot_top_preserves_sealed_and_unclean_database() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    for state in ["sealed", "sealed without sentinel", "unclean"] {
+        for phase in ["stale", "torn", "complete"] {
+            let env = Env::new();
+            let archive = regression_238_tar(&env);
+            let overlay = regression_238_overlay(&env, &archive);
+            let db = overlay.join(ratarmount_compositing::HIDDEN_DB);
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let (key, value) = if state == "unclean" {
+                ("relaxed_durability", "unknown:42")
+            } else {
+                ("sealed_at", "2026-11-16T00:00:00Z")
+            };
+            conn.execute("INSERT INTO meta(key,value) VALUES (?1,?2)", [key, value])
+                .unwrap();
+            drop(conn);
+            if state == "sealed" {
+                // Sealing publishes its rows and sentinel before chmod; a crash
+                // can leave the files writable. Refusal must not rely on modes.
+                fs::write(overlay.join(".ratarmount-sealed"), b"sealed\n").unwrap();
+            }
+            match phase {
+                "stale" => stale_prepare_locator(&archive),
+                "torn" => interrupt_append(&archive),
+                _ => interrupt_complete(&archive),
+            }
+            let journal = hot_overlay_journal(&db);
+            let commit_journal = ratarmount_compress::commit_journal::journal_path(&archive);
+            let marker = overlay.join(ratarmount_compositing::OVERLAY_MARKER);
+            let paths = [&archive, &db, &journal, &commit_journal, &marker];
+            let before = paths.map(|p| fs::read(p).ok());
+            let locator_before = policy_locator(&archive);
+            let mountpoint = env.path("mnt");
+            fs::create_dir(&mountpoint).unwrap();
+            for force in [false, true] {
+                for mode in ["no-mount", "serve", "daemon", "interval"] {
+                    if matches!(mode, "daemon" | "interval") {
+                        if let Err(error) = ratarmount_fuse::preflight_mount_backend() {
+                            eprintln!("skip: {mode}: {error}");
+                            continue;
+                        }
+                    }
+                    let mut args = match mode {
+                        "no-mount" => vec!["--no-mount"],
+                        "serve" => vec!["serve", "--http", "--http-bind=127.0.0.1:0"],
+                        "interval" => vec!["-f", "--commit-overlay-interval=1s"],
+                        _ => vec![],
+                    };
+                    args.extend(["-w", s(&overlay), s(&archive)]);
+                    if matches!(mode, "daemon" | "interval") {
+                        args.push(s(&mountpoint));
+                    }
+                    if force {
+                        args.push("--force-base-mismatch");
+                    }
+                    let out = Regression238Child::spawn(&env, &args, &[]).finish();
+                    let row = format!("{state}/{phase}/{mode}/force={force}");
+                    assert_eq!(out.status.code(), Some(2), "{row}: {}", text(&out));
+                    assert!(
+                        text(&out).contains("hot rollback journal"),
+                        "{row}: {}",
+                        text(&out)
+                    );
+                    for (path, bytes) in paths.into_iter().zip(&before) {
+                        assert!(
+                            fs::read(path).ok() == *bytes,
+                            "{row}: {} changed before refusal: {}",
+                            path.display(),
+                            text(&out)
+                        );
+                    }
+                    assert_eq!(policy_locator(&archive), locator_before, "{row}");
+                }
+            }
+        }
+    }
+}
+
+/// Regression: #163 recovery must not treat a hot lower as a writable top or
+/// adopt a journal belonging to a foreign inode or to B renamed over A.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_163_hot_journal_refuses_lowers_and_foreign_archives() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    for case in ["lower", "foreign inode", "renamed torn", "renamed complete"] {
+        let env = Env::new();
+        let archive = regression_238_tar(&env);
+        let overlay = regression_238_overlay(&env, &archive);
+        let db = overlay.join(ratarmount_compositing::HIDDEN_DB);
+        let commit_journal = if case == "lower" {
+            stale_prepare_locator(&archive);
+            ratarmount_compress::commit_journal::journal_path(&archive)
+        } else if case == "foreign inode" {
+            let copy = env.path("copy.tar");
+            fs::copy(&archive, &copy).unwrap();
+            interrupt_complete(&archive);
+            fs::rename(copy, &archive).unwrap();
+            ratarmount_compress::commit_journal::journal_path(&archive)
+        } else {
+            let foreign = env.path("b.tar");
+            fs::copy(&archive, &foreign).unwrap();
+            if case == "renamed torn" {
+                interrupt_append(&foreign);
+            } else {
+                interrupt_complete(&foreign);
+            }
+            fs::rename(&foreign, &archive).unwrap();
+            ratarmount_compress::commit_journal::journal_path(&foreign)
+        };
+        let hot = hot_overlay_journal(&db);
+        let paths = [&archive, &db, &hot, &commit_journal];
+        let before = paths.map(|p| fs::read(p).ok());
+        let locator_before = policy_locator(&archive);
+        let mut args = vec!["--no-mount", s(&archive)];
+        if case == "lower" {
+            args.extend(["--lower", s(&overlay), "--allow-unsealed-lower"]);
+        } else {
+            args.extend(["-w", s(&overlay)]);
+        }
+        let out = env.run(&args);
+        assert_eq!(out.status.code(), Some(2), "{case}: {}", text(&out));
+        let expected = if case == "foreign inode" {
+            "started for another file"
+        } else {
+            "hot rollback journal"
+        };
+        assert!(text(&out).contains(expected), "{case}: {}", text(&out));
+        assert_eq!(paths.map(|p| fs::read(p).ok()), before, "{case}");
+        assert_eq!(policy_locator(&archive), locator_before, "{case}");
+    }
+}
+
 /// Regression (#328): startup must reject an unclean relaxed overlay before
 /// archive recovery, even with force. Preserve both torn and complete journals.
 #[cfg(unix)]
