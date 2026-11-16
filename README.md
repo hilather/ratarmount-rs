@@ -466,6 +466,7 @@ and the [parity checklist](docs/parity-todo.md). The short version:
 
 - Gzip throughput is below Python's rapidgzip on small `.tar.gz` files; `--repack-seekable` or multi-frame zstd is the fix for archives you own.
 - Some formats are read-only or partial: NTFS compression, HFS+/APFS inside DMG, WIM LZX, QCOW2 zstd clusters, differencing VHD, ESXi VMDK, classic SquashFS LZMA, pure RAR.
+- Solid 7z hashes are available through mount xattrs; index-only searches omit shared-slot hashes. Older hashed indexes need rebuilding; see [7z limits](docs/formats.md#known-limits).
 - Writes commit TAR variants and ZIP; live commits cover uncompressed TAR and `.tar.zst` only, and ZIP commits rebuild the archive.
 - NFS has no Kerberos; SMB has no Kerberos or DFS; exports bind to localhost unless you say otherwise.
 - macOS is first-class on Apple silicon only; the CLI does not build for Windows (the core library crates do).

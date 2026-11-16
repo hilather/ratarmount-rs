@@ -180,11 +180,14 @@ fn query_index_cli(
         .iter()
         .map(|s| parse_xattr_filter(s))
         .collect::<Result<Vec<_>, _>>()?;
+    let filter_hashes = predicates
+        .iter()
+        .any(|(name, _, _)| name.starts_with("user.hash."));
     let mut hits = Vec::new();
     let mut cursor: Option<(String, Option<i64>)> = None;
     loop {
         let q = SearchQuery {
-            include_hashes: loc.include_hashes,
+            include_hashes: loc.include_hashes || filter_hashes,
             offset_order: false,
             after: cursor
                 .as_ref()
@@ -204,12 +207,20 @@ fn query_index_cli(
         if let Some(last) = page.last() {
             cursor = Some((last.path.clone(), last.offsetheader));
         }
-        for hit in page {
+        for mut hit in page {
             let mut matches = true;
             for (name, op, expected) in &predicates {
-                let value = match hit.offsetheader {
-                    Some(offset) => idx.get_xattr(offset, name).map_err(|e| e.to_string())?,
-                    None => None,
+                let value = if name.starts_with("user.hash.")
+                    && !hit.hashes.iter().any(|(key, _)| key == name)
+                {
+                    // Use the same ambiguity filtering as --hashes, including
+                    // presence and != predicates when hashes are not printed.
+                    None
+                } else {
+                    match hit.offsetheader {
+                        Some(offset) => idx.get_xattr(offset, name).map_err(|e| e.to_string())?,
+                        None => None,
+                    }
                 };
                 matches &= match op {
                     0 => value.is_some(),
@@ -218,6 +229,9 @@ fn query_index_cli(
                 };
             }
             if matches {
+                if !loc.include_hashes {
+                    hit.hashes.clear();
+                }
                 hits.push(hit);
             }
             if hits.len() == DEFAULT_SEARCH_LIMIT {
@@ -559,6 +573,46 @@ mod tests {
             assert_eq!(hits.len(), expected, "{filter}");
             if expected == 1 {
                 assert_eq!(hits[0].path, "/tagged");
+            }
+        }
+    }
+
+    /// Regression: #320 --xattr must not match ambiguous hashes through its
+    /// direct index lookup; ordinary shared attributes remain queryable.
+    #[test]
+    fn regression_320_find_xattr_refuses_shared_hash() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        for (name, oh, offset) in [("b.txt", 32, 0), ("text.txt", 32, 12), ("own.txt", 64, 0)] {
+            idx.insert_file(
+                "", name, oh, offset, 12, 0.0, 0o100644, 0, "", 0, 0, false, false, false, 0,
+            )
+            .unwrap();
+        }
+        idx.insert_xattr(32, "user.hash.sha256", b"stale").unwrap();
+        idx.insert_xattr(64, "user.hash.sha256", b"own").unwrap();
+        idx.insert_xattr(32, "user.teacher", b"shared").unwrap();
+        for (filter, expected) in [
+            ("hash.sha256", vec!["/own.txt"]),
+            ("hash.sha256=stale", vec![]),
+            ("hash.sha256!=own", vec![]),
+            ("hash.sha256=own", vec!["/own.txt"]),
+            ("hash.sha256!=stale", vec!["/own.txt"]),
+            ("teacher=shared", vec!["/b.txt", "/text.txt"]),
+        ] {
+            for include_hashes in [false, true] {
+                let filters = vec![filter.into()];
+                let options = LocateOptions {
+                    xattrs: &filters,
+                    include_hashes,
+                    ..Default::default()
+                };
+                let hits =
+                    query_index_cli(&idx, Path::new("unused.7z"), "*", &options, false).unwrap();
+                assert_eq!(
+                    hit_paths(&hits),
+                    expected,
+                    "{filter}, hashes={include_hashes}"
+                );
             }
         }
     }

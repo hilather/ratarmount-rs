@@ -118,6 +118,13 @@ ratarmount find --offset-order '*.fits' archive.tar # results in archive order, 
 ratarmount find --xattr train_ok=false traces.tar.zst   # by provenance attribute
 ```
 
+For solid 7z archives, content hashes are available through mount xattrs;
+index-only searches omit hashes stored at shared pack offsets, including
+`find --xattr hash.sha256=...`. Rebuild an older hashed index with
+`ratarmount --no-mount --recreate-index --hashes sha256 archive.7z`.
+If a read-only FTS search reports ambiguous shared hashes, stop workers and
+run `ratarmount find --fts PATTERN archive.7z` to rebuild FTS before reuse.
+
 A mounted archive answers the same question through its control interface:
 
 ```bash

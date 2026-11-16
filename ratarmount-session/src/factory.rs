@@ -5614,10 +5614,107 @@ fn strip_source_name(name: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "../../test-harness/sevenzip_fixture.rs"]
+mod sevenzip_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
     use std::process::Command;
+
+    /// Regression: #320 through the factory and payload cache (the FUSE xattr
+    /// and open path): solid 7z members report their own `user.hash.sha256`,
+    /// and a stale shared-slot digest from an older build is not reported, so a
+    /// same-size sibling's cached bytes are never served for a member.
+    #[test]
+    fn regression_320_solid_7z_hashes_through_factory_and_payload_cache() {
+        let members: [(&str, &[u8]); 3] = [
+            ("b.txt", b"second file\n"),
+            ("c.txt", b"third member\n"),
+            ("text.txt", b"content hash\n"),
+        ];
+        assert_eq!(members[1].1.len(), members[2].1.len());
+        let dir = tempfile::tempdir().unwrap();
+        let hashed = dir.path().join("hashed.7z");
+        let stale = dir.path().join("stale.7z");
+        for path in [&hashed, &stale] {
+            std::fs::write(
+                path,
+                super::sevenzip_fixture::copy_7z_fixture(&members, true),
+            )
+            .unwrap();
+        }
+        let with_hashes = OpenOptions {
+            hashes: vec!["sha256".into()],
+            ..OpenOptions::default()
+        };
+        let source = open_path(&hashed, &with_hashes, true).unwrap();
+        for (name, body) in members {
+            let fi = source.lookup(&format!("/{name}"), 0).unwrap();
+            assert_eq!(
+                source.get_xattr(&fi, "user.hash.sha256"),
+                Some(ratarmount_index::sha256_hex(body).into_bytes()),
+                "{name}"
+            );
+            assert_eq!(source.list_xattr(&fi), vec!["user.hash.sha256".to_string()]);
+        }
+        drop(source);
+        let warm = open_path(&hashed, &OpenOptions::default(), false).unwrap();
+        for (name, body) in members {
+            let fi = warm.lookup(&format!("/{name}"), 0).unwrap();
+            assert_eq!(
+                warm.get_xattr(&fi, "user.hash.sha256"),
+                Some(ratarmount_index::sha256_hex(body).into_bytes()),
+                "{name} warm"
+            );
+        }
+        drop(warm);
+
+        // Older index: the last member's digest under the shared pack offset.
+        let source = open_path(&stale, &OpenOptions::default(), true).unwrap();
+        let fi = source.lookup("/text.txt", 0).unwrap();
+        let pack = fi
+            .userdata
+            .iter()
+            .find_map(|u| match u {
+                ratarmount_core::UserData::Tar(t) => t.offsetheader,
+                _ => None,
+            })
+            .unwrap() as i64;
+        drop(source);
+        let sidecar = dir.path().join("stale.7z.index.sqlite");
+        let index = ratarmount_index::SqliteIndex::open_writable(&sidecar).unwrap();
+        let text_sha = ratarmount_index::sha256_hex(members[2].1);
+        index
+            .insert_xattr(pack, "user.hash.sha256", text_sha.as_bytes())
+            .unwrap();
+        index.wal_checkpoint_truncate().unwrap();
+        drop(index);
+
+        let cache = ratarmount_index::PayloadCache::with_dir(
+            dir.path().join("payload"),
+            Some(1 << 20),
+            1 << 20,
+        );
+        cache
+            .get_or_fill(&text_sha, members[2].1.len() as u64, || {
+                Ok(std::io::Cursor::new(members[2].1.to_vec()))
+            })
+            .unwrap();
+        let inner = open_path(&stale, &OpenOptions::default(), false).unwrap();
+        let layer = ratarmount_compositing::PayloadCacheLayer::new(inner, cache);
+        for (name, body) in members {
+            let fi = layer.lookup(&format!("/{name}"), 0).unwrap();
+            assert!(layer.get_xattr(&fi, "user.hash.sha256").is_none(), "{name}");
+            let mut got = Vec::new();
+            layer.open(&fi, 0).unwrap().read_to_end(&mut got).unwrap();
+            assert_eq!(
+                got, body,
+                "{name} must not be served a sibling's cached bytes"
+            );
+        }
+    }
 
     /// Regression: #102, a factory `eprintln!` (`could not load index;
     /// rebuilding`) panicked (exit 101) once stdout/stderr had no reader.
