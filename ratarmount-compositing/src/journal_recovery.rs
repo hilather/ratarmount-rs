@@ -168,9 +168,13 @@ fn db_dir(db: &Path) -> &Path {
 fn usable_entry(dir: &Path) -> io::Result<DbEntry> {
     match classify(dir) {
         Err(error) if crate::overlay_db::is_overlay_state_error(&error) => Err(error),
-        Err(error) => Err(io::Error::new(
-            error.kind(),
-            format!("the overlay record in {} cannot be classified: {error}; no recovery write was made", dir.display()),
+        // The classifier's error stays the source (#179): its errno survives.
+        Err(error) => Err(crate::write_overlay::io_with_context(
+            error,
+            format!(
+                "the overlay record in {} cannot be classified (no recovery write was made)",
+                dir.display()
+            ),
         )),
         Ok(DbEntry::Lost { markers, .. }) => Err(io::Error::other(
             crate::write_overlay::lost_record_error(dir, &markers).to_string(),
