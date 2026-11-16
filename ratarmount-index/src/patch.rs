@@ -4,6 +4,8 @@
 //! insert in one [`SqliteIndex::begin_write`] / [`SqliteIndex::commit_write`]
 //! (`BEGIN IMMEDIATE`). This module does not fork [`crate::INDEX_VERSION`].
 
+use std::collections::BTreeSet;
+
 use rusqlite::{params, Connection};
 
 use crate::{table_exists, IndexError, Result, SqliteIndex};
@@ -24,6 +26,15 @@ impl SqliteIndex {
     /// (not SQL `substr`). Keys without `oh=` (NULL offsetheader) stay.
     /// `parentfolders` / `filestmp` are not patched (dropped on seal).
     ///
+    /// Implied parent directories (`isgenerated` rows at `offsetheader` 0,
+    /// synthesized by the TAR parser for parents without a member of their
+    /// own) are not tied to any window: after the suffix delete, each such
+    /// row of a parent of a deleted row that has no remaining child row is
+    /// dropped too (and so on up its implied ancestors), so a directory whose
+    /// last member was removed does not come back through its implied row
+    /// (#255). The suffix parse regenerates the parents its members need, so
+    /// the patched catalog keeps the implied rows a full parse would write.
+    ///
     /// This method does **not** begin a transaction. Standalone tests should
     /// wrap it with [`Self::begin_write`] / [`Self::commit_write`]. F2-2 wraps
     /// delete + suffix insert in one txn so concurrent readers never see a
@@ -41,7 +52,9 @@ impl SqliteIndex {
             return Ok(0);
         }
         self.with_conn(|conn| {
-            let n = delete_offsetheader_suffix(conn, "files", window_start)?;
+            let parents = suffix_parent_dirs(conn, window_start)?;
+            let mut n = delete_offsetheader_suffix(conn, "files", window_start)?;
+            n += delete_childless_implied_dirs(conn, parents)?;
             delete_offsetheader_suffix(conn, "xattrsdata", window_start)?;
             delete_offsetheader_suffix(conn, "fileunions", window_start)?;
             delete_nestedindexes_suffix(conn, window_start)?;
@@ -110,6 +123,66 @@ fn delete_offsetheader_suffix(conn: &Connection, table: &str, window_start: i64)
     };
     let n = conn.execute(sql, params![window_start])?;
     Ok(n as u64)
+}
+
+/// Parent directory paths (`files.path`) of the rows the suffix delete is
+/// about to remove: the only directories that can lose their last child.
+fn suffix_parent_dirs(conn: &Connection, window_start: i64) -> Result<BTreeSet<String>> {
+    if !table_exists(conn, "files")?
+        || !column_exists(conn, "files", "isgenerated")?
+        || !column_exists(conn, "files", "offsetheader")?
+    {
+        return Ok(BTreeSet::new());
+    }
+    let mut stmt = conn.prepare(
+        r#"SELECT DISTINCT "path" FROM "files"
+           WHERE offsetheader IS NOT NULL AND offsetheader >= ?1 AND "path" IS NOT NULL"#,
+    )?;
+    let rows = stmt.query_map(params![window_start], |row| row.get::<_, String>(0))?;
+    let mut out = BTreeSet::new();
+    for row in rows {
+        out.insert(row?);
+    }
+    Ok(out)
+}
+
+/// Drop implied parent directories (`isgenerated`, `offsetheader` 0) among
+/// `dirs` that no longer have a child row, then their implied ancestors that
+/// lost their last child that way (#255). Real directory rows and generated
+/// rows at a nonzero offset (a nested archive shown as a directory) stay.
+fn delete_childless_implied_dirs(conn: &Connection, dirs: BTreeSet<String>) -> Result<u64> {
+    // Empty when the table has no `isgenerated` column, so nothing below may
+    // be prepared against it.
+    if dirs.is_empty() {
+        return Ok(0);
+    }
+    let mut has_child =
+        conn.prepare(r#"SELECT EXISTS(SELECT 1 FROM "files" WHERE "path" = ?1)"#)?;
+    let mut delete = conn.prepare(
+        r#"DELETE FROM "files"
+           WHERE "name" = ?2
+             AND ("path" = ?1 OR (?1 = '' AND ("path" IS NULL OR "path" = '/')))
+             AND offsetheader = 0
+             AND COALESCE(isgenerated, 0) != 0"#,
+    )?;
+    let mut total = 0u64;
+    let mut work: Vec<String> = dirs.into_iter().collect();
+    while let Some(dir) = work.pop() {
+        let Some((parent, name)) = dir.rsplit_once('/') else {
+            continue;
+        };
+        if name.is_empty() || has_child.query_row(params![dir], |r| r.get::<_, bool>(0))? {
+            continue;
+        }
+        let n = delete.execute(params![parent, name])?;
+        if n > 0 {
+            total += n as u64;
+            if !parent.is_empty() {
+                work.push(parent.to_string());
+            }
+        }
+    }
+    Ok(total)
 }
 
 fn delete_nestedindexes_suffix(conn: &Connection, window_start: i64) -> Result<()> {
@@ -253,6 +326,113 @@ mod tests {
         );
         assert!(idx.get_xattr(1024, "user.hash.sha256").unwrap().is_none());
         assert_eq!(INDEX_VERSION, "0.7.0");
+    }
+
+    fn row(path: &str, name: &str, oh: i64, dir: bool, generated: bool) -> FileRow {
+        FileRow::new(
+            path,
+            name,
+            oh,
+            if generated { oh } else { oh + 512 },
+            0,
+            1.0,
+            if dir { 0o040755 } else { 0o100644 },
+            if dir { i64::from(b'5') } else { 0 },
+            "",
+            0,
+            0,
+            false,
+            false,
+            generated,
+            0,
+        )
+    }
+
+    fn sql_rows(idx: &SqliteIndex) -> Vec<(String, String, i64, bool)> {
+        idx.with_conn(|c| {
+            let mut stmt = c.prepare(
+                r#"SELECT path, name, offsetheader, COALESCE(isgenerated, 0) != 0 FROM "files"
+                   ORDER BY path, name, offsetheader"#,
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap()
+    }
+
+    /// Regression #255: a sidecar can hold a real `a/b` directory row in the
+    /// patched window and an implied (`isgenerated`, offset 0) `a/b` row that
+    /// the parser synthesized as the parent of `a/b/f`. Deleting the window
+    /// must also drop implied directories left without children, and their
+    /// implied ancestors, or the removed directory comes back on warm reopen.
+    #[test]
+    fn regression_255_suffix_delete_drops_childless_implied_dirs() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        idx.insert_files_batch(&[
+            row("", "keep", 0, false, false),
+            row("", "k", 0, true, true),
+            row("/k", "kept", 512, false, false),
+            row("", "nested.tar", 513, true, true),
+            row("", "a", 0, true, true),
+            row("/a", "b", 1024, true, false),
+            row("/a", "b", 0, true, true),
+            row("/a/b", "f", 1536, false, false),
+            row("/k", "late", 2048, false, false),
+        ])
+        .unwrap();
+        idx.commit_write().unwrap();
+        assert!(idx.lookup("/a/b", 0).unwrap().is_some());
+
+        idx.begin_write().unwrap();
+        let deleted = idx.delete_from_offsetheader(1024).unwrap();
+        idx.commit_write().unwrap();
+        assert_eq!(deleted, 5, "{:?}", sql_rows(&idx));
+        assert_eq!(
+            sql_rows(&idx),
+            vec![
+                ("".into(), "k".into(), 0, true),
+                ("".into(), "keep".into(), 0, false),
+                ("".into(), "nested.tar".into(), 513, true),
+                ("/k".into(), "kept".into(), 512, false),
+            ],
+            "implied /k keeps its child; the generated nested-archive directory \
+             (nonzero offset) and the real offset-0 member stay"
+        );
+        assert!(idx.lookup("/a/b", 0).unwrap().is_none());
+        assert!(idx.lookup("/a", 0).unwrap().is_none());
+        assert_eq!(root_names(&idx), vec!["k", "keep", "nested.tar"]);
+    }
+
+    /// Regression #255: a `files` table without an `isgenerated` column has
+    /// no recognizable implied rows; the suffix delete must still succeed and
+    /// leave the prefix alone.
+    #[test]
+    fn regression_255_patch_without_isgenerated_column() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        idx.insert_files_batch(&[
+            row("", "a", 0, true, true),
+            row("/a", "f", 1024, false, false),
+            row("", "keep", 512, false, false),
+        ])
+        .unwrap();
+        idx.commit_write().unwrap();
+        idx.with_conn(|c| Ok(c.execute_batch("ALTER TABLE files DROP COLUMN isgenerated")?))
+            .unwrap();
+
+        idx.begin_write().unwrap();
+        let deleted = idx.delete_from_offsetheader(1024).unwrap();
+        idx.commit_write().unwrap();
+        assert_eq!(deleted, 1);
+        let names = idx
+            .with_conn(|c| {
+                let mut stmt = c.prepare(r#"SELECT name FROM "files" ORDER BY name"#)?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .unwrap();
+        assert_eq!(names, ["a", "keep"]);
     }
 
     /// Regression: NULL `offsetheader` must not be treated as 0, so a suffix

@@ -13734,3 +13734,131 @@ fn regression_316_mkdir_waits_for_unlink_tombstone() {
         );
     }
 }
+
+/// `(path, name, offsetheader, isgenerated)` rows of one directory entry.
+fn regression_255_rows(sidecar: &Path, path: &str, name: &str) -> Vec<(i64, bool)> {
+    let conn =
+        rusqlite::Connection::open_with_flags(sidecar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let mut stmt = conn
+        .prepare(
+            r#"SELECT offsetheader, COALESCE(isgenerated, 0) != 0 FROM "files"
+               WHERE path = ?1 AND name = ?2 ORDER BY offsetheader"#,
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map(rusqlite::params![path, name], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    rows.map(|r| r.unwrap()).collect()
+}
+
+/// Regression #255: a seekable sidecar holds two rows for a directory that
+/// has its own TAR member and children: the real member row and the implied
+/// (`isgenerated`, offset 0) parent row the parser synthesized for its
+/// children, either during the cold parse or during an earlier commit's
+/// suffix parse. Removing the directory through the overlay rewrote the
+/// archive but the sidecar patch deleted only the window's offsets, so the
+/// implied row survived and the removed directory came back on warm reopen.
+#[test]
+fn regression_255_implied_dir_row_does_not_resurrect_after_remove() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    let dir_member = |path: &'static str| UstarMember {
+        xattrs: &[],
+        path,
+        payload: UstarPayload::Directory,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+    };
+    // `suffix_parse`: the directory's child arrives through a first commit,
+    // so its implied row is written by that commit's suffix parse.
+    for suffix_parse in [false, true] {
+        let cell = format!("suffix_parse={suffix_parse}");
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.zst");
+        let keep = generated_payload("r255-keep");
+        let payload = generated_payload("r255-f");
+        let tail = generated_payload("r255-tail");
+        let f0 = pack_tar_no_eof(&[ustar_file("keep", &keep)]);
+        let f1 = if suffix_parse {
+            pack_tar_no_eof(&[dir_member("a/b")])
+        } else {
+            pack_tar_no_eof(&[dir_member("a/b"), ustar_file("a/b/f", &payload)])
+        };
+        let mut f2 = pack_tar_no_eof(&[ustar_file("tail", &tail)]);
+        ratarmount_formats_tar::write_tar_eof(&mut f2).unwrap();
+        fs::write(&archive, concat_zstd_frames(&[&f0, &f1, &f2], false)).unwrap();
+
+        let sidecar = ratarmount_index::default_index_path(&archive);
+        {
+            let body = open_seekable_zstd(&archive).expect("open zstd");
+            let _ = ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
+                &archive,
+                body,
+                Some(&sidecar),
+                &OpenOptions::default(),
+                "test",
+            )
+            .expect("create sidecar");
+        }
+        let overlay = dir.path().join("ov");
+        if suffix_parse {
+            let first = dir.path().join("ov-first");
+            fs::create_dir_all(first.join("a/b")).unwrap();
+            fs::write(first.join("a/b/f"), &payload).unwrap();
+            assert!(
+                commit_overlay(&first, &archive, &yes_commit_opts()).expect("first commit"),
+                "{cell}"
+            );
+        }
+        let rows = regression_255_rows(&sidecar, "/a", "b");
+        assert_eq!(rows[0], (0, true), "{cell}: implied a/b row: {rows:?}");
+        assert!(
+            rows.len() >= 2 && rows[1..].iter().all(|&(oh, gen)| oh > 0 && !gen),
+            "{cell}: real a/b rows: {rows:?}"
+        );
+
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        ov.unlink("/a/b/f").unwrap();
+        ov.rmdir("/a/b").unwrap();
+        drop(ov);
+        assert!(
+            commit_overlay(&overlay, &archive, &yes_commit_opts()).expect("remove commit"),
+            "{cell}"
+        );
+
+        let idx = ratarmount_index::SqliteIndex::open_read_only(&sidecar).expect("open patched");
+        idx.check_tarstats_matches_archive(&archive)
+            .expect("patched sidecar must match the archive");
+        drop(idx);
+        assert!(
+            regression_255_rows(&sidecar, "/a", "b").is_empty(),
+            "{cell}: no a/b row may survive the patch"
+        );
+        let body = open_seekable_zstd(&archive).expect("fresh zstd");
+        let warm = ratarmount_formats_tar::SqliteIndexedTar::open_with_existing_index_body(
+            &archive,
+            body,
+            &sidecar,
+            OpenOptions::default(),
+        )
+        .expect("warm-open patched sidecar");
+        let cold = open_tar_zst_base(&archive, false);
+        for path in ["/a/b/f", "/a/b"] {
+            assert!(warm.lookup(path, 0).is_none(), "{cell}: {path} resurrected");
+            assert!(cold.lookup(path, 0).is_none(), "{cell}: {path} in archive");
+        }
+        // `/a` stays only when a commit appended an `a/` member of its own.
+        assert_eq!(
+            warm.lookup("/a", 0).is_some(),
+            cold.lookup("/a", 0).is_some(),
+            "{cell}: warm and cold /a disagree"
+        );
+        assert_eq!(cold.lookup("/a", 0).is_some(), suffix_parse, "{cell}");
+        assert_eq!(read_member(&warm, "/keep"), keep, "{cell}");
+        assert_eq!(read_member(&warm, "/tail"), tail, "{cell}");
+    }
+}
