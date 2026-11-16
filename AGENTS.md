@@ -93,6 +93,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 
 | Symptom / fix | Commands |
 |---------------|----------|
+| #180 review: database-inode admission docs must name the checked sites and ordinary bundle/staging-lock opens; unpack finalization also opens regular-file `O_PATH` pins on Linux, not only directories. | `cargo test -p ratarmount --test docs_base_identity regression_docs_db_inode_` · `cargo test -p ratarmount --bin ratarmount regression_finalize_stage_chmod_keeps_db_alias_lock` |
 | #169: the unchecked commit-path archive-open inventory named only the commit journal and omitted the ZIP/TAR format probes; keep both probes named among opens that bypass overlay-database admission. | `cargo test -p ratarmount --test docs_base_identity regression_docs_169_names_unchecked_commit_probes` |
 | #168: the overlay-database hard-link residuals omitted the unchecked `--journal` operation-log writer, its append/close hazards and the warning against database aliases. | `cargo test -p ratarmount --test docs_base_identity regression_docs_168_operation_log_unchecked_open` |
 | #341 review: a metadata-only lower's stale `user.hash.sha256` bypassed pin reads of a mutable directory base; cached hashes are reusable only for immutable sources. | `cargo test -p ratarmount --bin ratarmount regression_preimage_pin_ignores_mutable_base_hash_xattrs` · `cargo test -p ratarmount-compositing --lib regression_changes_cached_lower_hash` · `cargo test -p ratarmount-compositing --lib regression_changes_lower_payload_invalidates_inherited_hash` |
