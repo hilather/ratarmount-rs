@@ -13,27 +13,27 @@
 //!
 //! * The validated overlay-database open registers the `(dev, ino)` it
 //!   opened ([`register_db_inode`]) for as long as its connection lives.
-//! * Every payload, sentinel, pack and commit open goes through
-//!   [`openat_admitted`] (or [`admit_fd`] for a descriptor it already holds),
-//!   which checks the inode of the descriptor it actually obtained against
-//!   that set and refuses an open database without closing a descriptor of
-//!   it. On Linux the check runs on an `O_PATH` descriptor (closing one does
-//!   not release fcntl locks) and the file is then reopened through
-//!   `/proc/self/fd` with the caller's flags, so the refused path leaks
-//!   nothing and `O_TRUNC` only ever applies to an admitted inode. Elsewhere
-//!   (or without `/proc`) the file is opened without `O_TRUNC`, checked, and a
-//!   refused descriptor is quarantined: kept open for the life of the process
-//!   (one descriptor per refused open; [`quarantined`] counts them).
+//! * Overlay payload opens, the ZIP and TAR commit readers, the seal and
+//!   pack sentinels and the pack lock and member reads (the checked sites in
+//!   docs/sandbox.md) go through [`openat_admitted`] (or [`admit_fd`]), which
+//!   checks the inode of the descriptor it obtained against that set and
+//!   refuses an open database without closing a descriptor of it. On Linux
+//!   the check runs on an `O_PATH` descriptor (closing one does not release
+//!   fcntl locks) and the file is reopened through `/proc/self/fd` with the
+//!   caller's flags, so a refusal leaks nothing and `O_TRUNC` only applies to
+//!   an admitted inode. Elsewhere (or without `/proc`) the file is opened
+//!   without `O_TRUNC`, checked, and a refused descriptor is quarantined: kept
+//!   open for the process's life (one per refused open; [`quarantined`]).
 //!
 //! The registry lock is only ever held to look up, insert or remove an entry:
 //! never across `open(2)`, `fstat(2)` or a SQLite open, so a payload FIFO that
 //! blocks its opener cannot stall a database open elsewhere in the process
 //! (R10-D). Lock order: innermost (no other lock is taken while it is held).
 //!
-//! Residual (documented in docs/sandbox.md): a payload descriptor opened
-//! BEFORE its inode is first opened as a database in this process (the
-//! reverse ordering), and descriptors obtained by generic folder sources and
-//! backing extents, are not tracked.
+//! Residual (docs/sandbox.md lists it): payload descriptors opened BEFORE the
+//! inode is first opened as a database here, generic folder sources, backing
+//! extents, and opens that never call this module (among them the commit
+//! path's archive opens and `overlay pack`/`unpack`'s bundle and lock files).
 
 use std::collections::BTreeMap;
 use std::io;
