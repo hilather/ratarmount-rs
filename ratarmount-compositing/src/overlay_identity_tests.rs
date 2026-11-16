@@ -5397,7 +5397,7 @@ fn regression_live_recovery_refuses_a_replaced_or_lost_database() {
 /// Regression: #166: a live commit whose recovery the #150 guard refused
 /// (nothing written: the mount's database replaced at its path, or removed
 /// while its marker stays, next to a stale prepare locator) poisoned the live
-/// base: intervals stopped and every read failed until a remount. The refusal
+/// base: intervals stopped and base reads failed until a remount. The refusal
 /// refuses that commit only (R6-2): reads go on, the locator is kept, and once
 /// the database is back the next commit clears the locator and goes through.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -5454,6 +5454,79 @@ fn regression_166_live_guard_refusal_refuses_one_commit() {
             b"one",
             "replaced={replaced}: committed"
         );
+    }
+}
+
+/// Regression: #166 exempts only a pre-write refusal from failing the base
+/// closed. A rollback failing after it writes, or a completed journal failing
+/// cleanup, must still invalidate cached base entries and stop interval commits.
+/// Overlay payloads stay available so the user can recover the pending edits.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_166_live_recovery_write_failures_refuse_base() {
+    for complete in [false, true] {
+        let fx = Fixture::new();
+        let ov = fx.open(BaseDigestRequest::Compute, false);
+        let cached = ov.lookup("/first", 0).unwrap();
+        let generation = ov.commit_generation();
+        let original = fs::read(&fx.archive).unwrap();
+        fs::write(ov.root().join("one"), b"pending edit").unwrap();
+        if complete {
+            interrupt_complete(&fx.archive);
+        } else {
+            interrupt_append(&fx.archive);
+        }
+        let crashed = fs::read(&fx.archive).unwrap();
+        assert_ne!(crashed, original);
+        let journal = journal_path(&fx.archive);
+        let journal_before = fs::read(&journal).unwrap();
+        let step_to_fail = if complete {
+            "rollback unlink"
+        } else {
+            "rollback mtime"
+        };
+        fault::install(move |step| {
+            if step == step_to_fail {
+                Err(std::io::Error::other("injected recovery write failure"))
+            } else {
+                Ok(())
+            }
+        });
+        let result = ov.commit_live(&fx.archive, |_| panic!("failed recovery reopened base"));
+        fault::clear();
+        let error = result.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected recovery write failure"));
+        if complete {
+            assert!(error.to_string().contains("committed bytes"), "{error}");
+            assert!(error.to_string().contains("remount required"), "{error}");
+        } else {
+            assert!(matches!(error, crate::OverlayError::Io(_)), "{error}");
+        }
+        assert_eq!(
+            fs::read(&fx.archive).unwrap(),
+            if complete { crashed } else { original },
+            "complete={complete}: recovery wrote before failing"
+        );
+        assert_eq!(fs::read(&journal).unwrap(), journal_before);
+        assert!(!locator(&fx.archive).is_empty());
+        assert!(ov.interval_disabled(), "complete={complete}");
+        assert!(
+            ov.commit_generation() > generation,
+            "cached entries invalidated"
+        );
+        assert!(ov.lookup("/first", 0).is_none(), "complete={complete}");
+        let error = ov.read(&cached, cached.size as usize, 0).unwrap_err();
+        assert!(error.to_string().contains("remount required"), "{error}");
+        assert_eq!(read_member(&ov, "/one"), b"pending edit");
+        let error = ov
+            .commit_live_idle(&fx.archive, std::time::Duration::ZERO, |_| {
+                panic!("disabled interval reopened base")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("remount required"), "{error}");
+        assert_eq!(fs::read(&journal).unwrap(), journal_before);
     }
 }
 
