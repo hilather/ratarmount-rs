@@ -24,6 +24,52 @@ fn require(sentences: &[&str]) {
     }
 }
 
+/// Regression: #180 claimed every pack/commit open used database-inode
+/// admission, hiding ordinary bundle reads and staging-lock acquisitions.
+#[test]
+fn regression_docs_db_inode_admission_scope() {
+    let module = read("ratarmount-core/src/db_inodes.rs").replace("//! ", "");
+    for sentence in [
+        "Overlay payload opens, the ZIP and TAR commit readers, the seal and pack sentinels and the pack lock and member reads",
+        "opens that never call this module",
+        "`overlay pack`/`unpack`'s bundle and lock files",
+    ] {
+        assert!(module.contains(sentence), "db_inodes module lost: {sentence}");
+    }
+    assert!(
+        !module.contains("Every payload, sentinel, pack and commit open goes through"),
+        "db_inodes must not claim universal admission coverage"
+    );
+    let docs = read("docs/sandbox.md");
+    for sentence in [
+        "Not every `overlay pack` / `unpack` open is checked either:",
+        "reads of a bundle file (`overlay unpack`, a bundle `--lower` and the sandbox supervisor's lower checks)",
+        "the `--lower` bundle cache's private copy of it",
+        "the `<staging directory>.lock` file",
+        "cache fill create (or reuse) beside their staging directory use ordinary opens.",
+    ] {
+        assert!(docs.contains(sentence), "docs/sandbox.md lost: {sentence}");
+    }
+}
+
+/// Regression: #180 described unpack finalization as opening only directories,
+/// although chmod_entry_at also opens regular-file O_PATH pins on Linux.
+#[test]
+fn regression_docs_db_inode_unpack_finalization() {
+    let docs = read("docs/sandbox.md");
+    assert!(
+        !docs.contains("unpack finalization opens only directories"),
+        "unpack finalization also opens regular-file O_PATH pins on Linux"
+    );
+    for sentence in [
+        "Unpack finalization opens directories for metadata updates; its regular-file mode pass uses the lock-preserving `O_PATH` pins on Linux and no data descriptor elsewhere, as described above (#149).",
+        "the unpack stage's mode pass change modes through an `O_PATH` pin on Linux",
+        "by name with `AT_SYMLINK_NOFOLLOW` elsewhere, where a swap of the name between the check and the change is not detected",
+    ] {
+        assert!(docs.contains(sentence), "docs/sandbox.md lost: {sentence}");
+    }
+}
+
 /// Decision 3: a forced kind change drops to kind-only; `none` accepts copies.
 #[test]
 fn regression_docs_state_forced_kind_only_and_none_accepts_copies() {
@@ -88,6 +134,34 @@ fn regression_docs_state_failed_replacement_and_locator_rules() {
     }
 }
 
+/// Regression: #168 omitted the unchecked operation-log writer from the
+/// overlay-database hard-link residuals, hiding its append and lock-release risks.
+#[test]
+fn regression_docs_168_operation_log_unchecked_open() {
+    let docs = read("docs/sandbox.md");
+    let hard_links = docs
+        .split_once("### Hard links of the overlay database ")
+        .expect("missing overlay-database hard-link section")
+        .1
+        .split("### ")
+        .next()
+        .unwrap();
+    for sentence in [
+        "The `--journal` operation log is not checked either",
+        "for appending (creating it if absent) after any overlay database is open",
+        "Its path must lie outside the mount point and the overlay directory",
+        "another hard link of the overlay database elsewhere is not refused",
+        "the journal's lines would be appended to the database file",
+        "closing the descriptor (when the journal is finished at unmount, when its writer fails, or when the journal open fails after the file was opened) would release this process's locks on the database",
+        "Do not point `--journal` at a link of an overlay database.",
+    ] {
+        assert!(
+            hard_links.contains(sentence),
+            "docs/sandbox.md lost the #168 residual: {sentence}"
+        );
+    }
+}
+
 /// Regression: R11-S5 (#151, #183): the lock guarantees are scoped to processes that keep
 /// the database open (a daemonized mount holds no lock after its fork), the
 /// platform table is present, and the swap-back exclusion closed by the
@@ -149,6 +223,17 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
     assert!(changelog
         .contains("still holds no kernel lock on its overlay database after it forks (#183)"));
     assert!(changelog.contains("now forks before it opens any database"));
+}
+
+/// Regression: #169 listed only the commit journal's archive opens, omitting
+/// the ZIP and TAR format probes from the unchecked-open inventory.
+#[test]
+fn regression_docs_169_names_unchecked_commit_probes() {
+    let docs = read("docs/sandbox.md");
+    assert!(
+        docs.contains("do not go through the check: the journal file `overlay pack --include-journal` reads (a JSON log, not a database) and the commit path's opens of the archive itself (the commit journal's, and the `is_zip_archive` and `is_uncompressed_tar` format probes that pick the commit method)."),
+        "docs/sandbox.md must name both commit format probes alongside the journal's unchecked archive opens"
+    );
 }
 
 /// Regression: unmount recipes ran offline verbs before the server released

@@ -508,6 +508,14 @@ fn regression_offline_classify_missing_commit_journal() {
             Ok(_) => panic!("a missing journal must refuse classification"),
         };
         assert!(error.contains("commit-journal locator"), "{step}: {error}");
+        // #223: the article agrees with the phase ("an active", "a complete").
+        // A crash at "archive truncate" leaves the active locator; one at
+        // "locator complete" has already written the complete locator.
+        let phrase = match step {
+            "archive truncate" => "carries an active commit-journal locator",
+            _ => "carries a complete commit-journal locator",
+        };
+        assert!(error.contains(phrase), "{step}: {error}");
         assert_eq!(std::fs::read(&base).unwrap(), bytes, "{step}: archive");
         assert!(!journal.exists(), "{step}: journal");
         assert_eq!(commit_locator(&base), locator, "{step}: locator");
