@@ -21,6 +21,7 @@
 
 ### Fixes
 
+- Offline verbs (`overlay seal`, `pack`, `verify`, `diff`, `import`) given a `file://` URL of their base now check the commit journal of the local file the URL names. They used to look for it at the URL as a path, find nothing, and read an archive left mid-commit; they now refuse it as they do for a plain path, leaving the archive and journal untouched. (#212)
 - `--help` no longer says a folder's default mount point is `<folder>.mounted`: the default is the first input's file name (the active numbered archive with `--roll-every`), minus a compression suffix and one more extension, in the current directory, and `.mounted` is appended only when that would be the folder itself. TAR shorthands such as `.tgz` count as `.tar.gz`, so `v1.2.tgz` mounts at `./v1.2` (#224).
 - The offline verbs' refusal of an archive whose active commit-journal locator has lost its journal now reads "carries an active commit-journal locator" instead of "carries a active" (#223).
 - #320 review: `find --xattr` also excludes ambiguous shared hashes; read-only searches refuse old FTS tables containing them until rebuilt. Warm 7z hash fills use exact persisted member-to-slot bindings, so skipped or failed hashes remain unverifiable. Cold, warm and durable opens reject pack offsets overlapping synthetic slots. Tests now cover compressed LZMA2 with interleaved directory, empty, anti and symlink entries without an external 7z tool; the Copy fixture builder is test-only.
