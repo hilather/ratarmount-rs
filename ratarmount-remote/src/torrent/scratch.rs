@@ -229,6 +229,8 @@ pub(super) fn sweep(dir: &Path, age: Duration) {
         if let Err(e) = std::fs::remove_dir_all(entry.path()) {
             log::debug!("torrent stale scratch cleanup: {e}");
         }
+        // Explicit (#187): a forked child may hold a copy of the descriptor.
+        ratarmount_core::held_lock::unlock_or_log(&file, "torrent scratch owner");
     }
 }
 

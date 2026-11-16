@@ -229,9 +229,9 @@ impl OpLog {
             ),
             std::fs::TryLockError::Error(error) => error,
         })?;
-        let mut output = BufWriter::new(file);
+        let mut output = BufWriter::new(LockedJournal(file));
         // Separate sessions in an append-only file, even after a killed writer.
-        if output.get_ref().metadata()?.len() != 0 {
+        if output.get_ref().0.metadata()?.len() != 0 {
             output.write_all(b"\n")?;
         }
         let start = Instant::now();
@@ -256,9 +256,9 @@ impl OpLog {
         let join = std::thread::Builder::new()
             .name("ratarmount-oplog".into())
             .spawn(move || {
-                let result = writer_loop(output, rx, start, &ended, |file: &File| {
+                let result = writer_loop(output, rx, start, &ended, |file: &LockedJournal| {
                     if sync {
-                        file.sync_all()?;
+                        file.0.sync_all()?;
                     }
                     Ok(())
                 });
@@ -598,6 +598,27 @@ pub fn path_field(record: &mut Value, path: &[u8]) {
                 .encode(path)
                 .into()
         }
+    }
+}
+
+/// The journal file while this writer holds its lock. Dropping it unlocks
+/// the file explicitly (#187): a child forked meanwhile holds a copy of the
+/// descriptor until it execs, so the close alone may not release the lock.
+struct LockedJournal(File);
+
+impl Write for LockedJournal {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Drop for LockedJournal {
+    fn drop(&mut self) {
+        ratarmount_core::held_lock::unlock_or_log(&self.0, "operation journal");
     }
 }
 

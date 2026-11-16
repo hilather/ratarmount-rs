@@ -526,7 +526,8 @@ pub fn pack(
         writer.finish().map_err(io::Error::other)?;
     }
     encoded.as_file().sync_all()?;
-    encoded.persist_noclobber(bundle).map_err(|e| e.error)?;
+    let published = encoded.persist_noclobber(bundle).map_err(|e| e.error)?;
+    unlock(&published, bundle);
     Ok(digest)
 }
 
@@ -908,6 +909,39 @@ fn try_flock(file: &File) -> bool {
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
 
+/// Releases a staging, copy or entry lock explicitly at the end of its
+/// critical section (#187). A child forked meanwhile by any thread holds a
+/// copy of the descriptor until it execs, so closing ours alone may not
+/// release the lock. A filesystem without `flock` has nothing to release.
+fn unlock(fd: impl std::os::fd::AsFd, path: &Path) {
+    match rustix::fs::flock(fd, rustix::fs::FlockOperation::Unlock) {
+        Ok(()) => {}
+        Err(error) if flock_unsupported(error) => {}
+        Err(error) => log::warn!("releasing the lock of {}: {error}", path.display()),
+    }
+}
+
+/// The locked private copy of a bundle. Dropping it removes the file and
+/// then unlocks it explicitly (#187).
+struct LockedCopy(Option<tempfile::NamedTempFile>);
+
+impl LockedCopy {
+    fn path(&self) -> &Path {
+        self.0.as_ref().expect("held until dropped").path()
+    }
+}
+
+impl Drop for LockedCopy {
+    fn drop(&mut self) {
+        if let Some(copy) = self.0.take() {
+            let (file, path) = copy.into_parts();
+            let name = path.to_path_buf();
+            drop(path);
+            unlock(&file, &name);
+        }
+    }
+}
+
 impl StageLock {
     fn beside(stage: &Path) -> io::Result<Self> {
         let path = lock_path(stage);
@@ -955,6 +989,7 @@ fn lock_names_current_inode(lock: &StageLock) -> io::Result<()> {
 impl Drop for StageLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+        unlock(&self._file, &self.path);
     }
 }
 
@@ -1110,6 +1145,10 @@ fn sweep_pack_temps_in(dir: &OwnedFd) {
                 unlink_if_same(dir, name, &file);
             }
         }
+        unlock(
+            &file,
+            Path::new(std::ffi::OsStr::from_bytes(name.to_bytes())),
+        );
     }
 }
 
@@ -1374,6 +1413,7 @@ fn sweep_stale_stages_in(dir: &OwnedFd, sweep_copies: bool) {
             };
             if try_flock(&file) {
                 unlink_if_same(dir, &name, &file);
+                unlock(&file, Path::new(&name));
             }
         } else if name.strip_suffix(".lock").is_some_and(is_stage_name) && kind == libc::S_IFREG {
             // Orphan lock whose stage is gone.
@@ -1382,6 +1422,7 @@ fn sweep_stale_stages_in(dir: &OwnedFd, sweep_copies: bool) {
                 if let Ok(file) = open_lock_at(dir, &name) {
                     if try_flock(&file) {
                         unlink_if_same(dir, &name, &file);
+                        unlock(&file, Path::new(&name));
                     }
                 }
             }
@@ -1418,6 +1459,7 @@ fn sweep_stale_stages_in(dir: &OwnedFd, sweep_copies: bool) {
             let _ = host::unlinkat(dir, name.as_str(), AtFlags::REMOVEDIR);
             if let Some(file) = held {
                 unlink_if_same(dir, &lock, &file);
+                unlock(&file, Path::new(&lock));
             }
         }
     }
@@ -1614,6 +1656,11 @@ pub(crate) fn lock_layer_entry(path: &Path, deadline: std::time::Instant) -> io:
             }
         }
     }
+}
+
+/// Releases the entry lock [`lock_layer_entry`] took, explicitly (#187).
+pub(crate) fn unlock_layer_entry(root: &OwnedFd, path: &Path) {
+    unlock(root, path);
 }
 
 /// What `sync_tree` checks on each descriptor before its fsync (R1c-1 §5.6,
@@ -2186,8 +2233,14 @@ fn publish_layer(layer: &Path, directory: &Path) -> io::Result<()> {
     )]
     let root = host::open(layer, directory_flags(), Mode::empty())?;
     lock_entry(&root, directory, EntryLock::Exclusive)?;
-    let sealed = ratarmount_compositing::host_stat::fstat_named(&root, layer)?.st_mode;
-    host::fchmod(&root, Mode::from_raw_mode(sealed | 0o200))?;
+    let published = publish_locked(&root, layer, directory);
+    unlock(&root, directory);
+    published
+}
+
+fn publish_locked(root: &OwnedFd, layer: &Path, directory: &Path) -> io::Result<()> {
+    let sealed = ratarmount_compositing::host_stat::fstat_named(root, layer)?.st_mode;
+    host::fchmod(root, Mode::from_raw_mode(sealed | 0o200))?;
     fs::rename(layer, directory)
         .map_err(|e| io::Error::new(e.kind(), format!("publish layer: {e}")))?;
     #[cfg(test)]
@@ -2202,13 +2255,13 @@ fn publish_layer(layer: &Path, directory: &Path) -> io::Result<()> {
             return Err(io::Error::other("injected mode restore failure"));
         }
     }
-    host::fchmod(&root, Mode::from_raw_mode(sealed))?;
+    host::fchmod(root, Mode::from_raw_mode(sealed))?;
     #[cfg(test)]
     {
         events::record("restore", directory);
         events::record("unlock", directory);
     }
-    // Closing `root` releases the entry lock.
+    // The caller unlocks `root` explicitly (#187).
     Ok(())
 }
 
@@ -2274,7 +2327,7 @@ fn run_extract_hook(hook: &'static std::thread::LocalKey<ExtractHook>, stage: &P
 
 /// Copy the bundle into a private file inside the cache while hashing it, so
 /// everything after reads exactly the hashed bytes and never the original path.
-fn private_copy(bundle: &Path, cache: &Path) -> io::Result<(tempfile::NamedTempFile, String)> {
+fn private_copy(bundle: &Path, cache: &Path) -> io::Result<(LockedCopy, String)> {
     use sha2::{Digest, Sha256};
     #[expect(
         clippy::disallowed_methods,
@@ -2285,14 +2338,16 @@ fn private_copy(bundle: &Path, cache: &Path) -> io::Result<(tempfile::NamedTempF
         clippy::disallowed_methods,
         reason = r###"internal-read:v1 {"id":"IR-B0082-M01","item":"ratarmount::overlay_pack::private_copy","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
-    let mut copy = tempfile::Builder::new()
+    let copy = tempfile::Builder::new()
         .prefix(COPY_PREFIX)
         .suffix(".tar.zst")
         .tempfile_in(cache)?;
-    // The flock lives as long as the copy's descriptor, i.e. until it is dropped.
+    // The flock lives until the copy is dropped, which unlocks it explicitly.
     if !try_flock(copy.as_file()) {
         return Err(io::Error::other("staging file is locked"));
     }
+    let mut copy = LockedCopy(Some(copy));
+    let file = copy.0.as_mut().expect("just created");
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 20];
     loop {
@@ -2303,9 +2358,9 @@ fn private_copy(bundle: &Path, cache: &Path) -> io::Result<(tempfile::NamedTempF
             Err(e) => return Err(e),
         };
         hasher.update(&buffer[..n]);
-        copy.write_all(&buffer[..n])?;
+        file.write_all(&buffer[..n])?;
     }
-    copy.flush()?;
+    file.flush()?;
     Ok((copy, format!("{:x}", hasher.finalize())))
 }
 
@@ -2443,7 +2498,10 @@ pub(crate) fn cached_lower_in(
     let hit = |destination: &Path| -> io::Result<PathBuf> {
         let entry = open_root(destination)?;
         lock_entry(&entry, destination, EntryLock::Shared)?;
-        check_published(&entry, destination)?;
+        if let Err(e) = check_published(&entry, destination) {
+            unlock(&entry, destination);
+            return Err(e);
+        }
         #[cfg(test)]
         AFTER_HIT_CHECK.with(|hook| {
             if let Some(hook) = hook.borrow().as_ref() {
@@ -2468,7 +2526,8 @@ pub(crate) fn cached_lower_in(
         })();
         #[cfg(test)]
         events::record("hit", destination);
-        // The entry lock is released when `entry` drops, after this.
+        // Unlocked explicitly (#187), after the checks.
+        unlock(&entry, destination);
         checked.map(|()| destination.into())
     };
     if destination.try_exists()? {

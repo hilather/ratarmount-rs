@@ -278,6 +278,8 @@ impl Drop for SocketGuard {
         {
             let _ = fs::remove_file(&self.path);
         }
+        // Explicit (#187): a forked child may hold a copy of the descriptor.
+        ratarmount_core::held_lock::unlock_or_log(&self._lock, "sandbox daemon state");
     }
 }
 

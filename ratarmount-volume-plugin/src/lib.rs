@@ -50,6 +50,19 @@ pub struct Driver<M: Mounter> {
     _lock: File,
 }
 
+impl<M: Mounter> Drop for Driver<M> {
+    fn drop(&mut self) {
+        // Explicit (#187): a mount helper forked meanwhile holds a copy of
+        // the descriptor until it execs, so the close alone may not release it.
+        if let Err(error) = self._lock.unlock() {
+            let _ = writeln!(
+                io::stderr(),
+                "ratarmount-volume-plugin: releasing the state lock: {error}"
+            );
+        }
+    }
+}
+
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct Request {

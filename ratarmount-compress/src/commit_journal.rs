@@ -699,8 +699,12 @@ mod unix {
     pub(crate) struct Lock(File);
     impl Drop for Lock {
         fn drop(&mut self) {
-            unsafe {
-                libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            // Explicit (#187): a forked child may hold a copy of the descriptor.
+            if unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } != 0 {
+                log::warn!(
+                    "releasing the archive commit lock: {}",
+                    io::Error::last_os_error()
+                );
             }
         }
     }
