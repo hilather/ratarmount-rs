@@ -207,6 +207,8 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
         "so it holds the overlay database's exclusive lock and the index's shared lock for its whole life (#183)",
         "is refused with \"in use\" and changes nothing; a reader can no longer roll back the mount's in-flight journal. Wait for the serving process to exit (or retry on \"in use\") before running them right after an unmount",
         "| Platform / host | Installation | Checked open |",
+        "labeled `LegacyUnverified`",
+        "external-alias epoch cap",
         "opening one database file through both at once in one process is unsupported (#154",
     ] {
         assert!(flat.contains(sentence), "docs/sandbox.md lost: {sentence}");
