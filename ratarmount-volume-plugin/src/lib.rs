@@ -47,7 +47,31 @@ pub struct Driver<M: Mounter> {
     definitions: BTreeMap<String, Definition>,
     runtime: BTreeMap<String, Runtime>,
     mounter: M,
-    _lock: File,
+    // Drop after the mounter has detached and reaped its children.
+    _lock: StateLock,
+}
+
+struct StateLock(File);
+
+#[cfg(test)]
+type StateLockHook = std::cell::RefCell<Option<Box<dyn FnOnce(&File)>>>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_STATE_LOCK: StateLockHook = const { std::cell::RefCell::new(None) };
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        // Explicit (#187): a mount helper forked meanwhile holds a copy of
+        // the descriptor until it execs, so the close alone may not release it.
+        if let Err(error) = self.0.unlock() {
+            let _ = writeln!(
+                io::stderr(),
+                "ratarmount-volume-plugin: releasing the state lock: {error}"
+            );
+        }
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -106,6 +130,13 @@ __inventory_value_2
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err("state directory is already in use".into());
         }
+        let lock = StateLock(lock);
+        #[cfg(test)]
+        AFTER_STATE_LOCK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook(&lock.0);
+            }
+        });
         #[expect(
             clippy::disallowed_methods,
             reason = r###"internal-read:v1 {"id":"IR-B0547-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"out-of-family","category":"structured-control-record","reason":"daemon state journal","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
@@ -360,5 +391,99 @@ fn validate_id(id: &str) -> Result<(), String> {
         Err("ID must be nonempty, at most 256 bytes, with no control characters".into())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct TeardownProbe {
+        path: PathBuf,
+        held_during_drop: Arc<Mutex<Option<bool>>>,
+        fail_reconcile: bool,
+    }
+
+    impl Mounter for TeardownProbe {
+        fn mount(&mut self, _: &Options, _: &Path) -> Result<(), String> {
+            unreachable!()
+        }
+        fn unmount(&mut self, _: &Path, _: bool) -> Result<(), String> {
+            unreachable!()
+        }
+        fn alive(&mut self, _: &Path) -> Result<bool, String> {
+            unreachable!()
+        }
+        fn reconcile(&mut self, _: &Path) -> Result<(), String> {
+            if self.fail_reconcile {
+                Err("injected reconcile failure".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Drop for TeardownProbe {
+        fn drop(&mut self) {
+            let held = matches!(
+                File::open(&self.path).unwrap().try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            );
+            *self.held_during_drop.lock().unwrap() = Some(held);
+        }
+    }
+
+    /// Regression: unlocking Driver before its fields dropped allowed another
+    /// driver to start while ProcessMounter still detached and reaped children.
+    #[test]
+    fn regression_187_state_lock_covers_mounter_teardown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("driver.lock");
+        let observed = Arc::new(Mutex::new(None));
+        let driver = Driver::open(
+            dir.path(),
+            TeardownProbe {
+                path: path.clone(),
+                held_during_drop: observed.clone(),
+                fail_reconcile: false,
+            },
+        )
+        .unwrap();
+        let inherited = driver._lock.0.try_clone().unwrap();
+        drop(driver);
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(true),
+            "mounter dropped under lock"
+        );
+        File::open(&path).unwrap().try_lock().unwrap();
+        drop(inherited);
+    }
+
+    /// Regression: failed driver initialization only closed the locked file,
+    /// leaving an inherited descriptor holding the state lock indefinitely.
+    #[test]
+    fn regression_187_state_lock_released_on_reconcile_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("driver.lock");
+        let inherited = Arc::new(Mutex::new(None));
+        let captured = inherited.clone();
+        AFTER_STATE_LOCK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |file| {
+                *captured.lock().unwrap() = Some(file.try_clone().unwrap());
+            }));
+        });
+        let result = Driver::open(
+            dir.path(),
+            TeardownProbe {
+                path: path.clone(),
+                held_during_drop: Arc::default(),
+                fail_reconcile: true,
+            },
+        );
+        assert!(matches!(result, Err(ref e) if e == "injected reconcile failure"));
+        assert!(inherited.lock().unwrap().is_some(), "lock hook ran");
+        File::open(&path).unwrap().try_lock().unwrap();
     }
 }
