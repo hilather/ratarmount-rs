@@ -101,6 +101,9 @@ fn scrub_inherited_fds() -> std::io::Result<()> {
 fn regression_server_socket_activation_and_environment_only_credentials() {
     for activated in [false, true] {
         let dir = tempfile::tempdir().unwrap();
+        // Regression #182: shared setgid parents and umask 0002 must work for
+        // both staged binds and systemd activation, including --state-dir.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o2775)).unwrap();
         let socket = dir.path().join("plugin.sock");
         let state = dir.path().join("state");
         let fake = dir.path().join("ratarmount");
@@ -114,7 +117,11 @@ fn regression_server_socket_activation_and_environment_only_credentials() {
             let descriptor = listener.as_raw_fd();
             let mut command = Command::new("/bin/sh");
             command
-                .args(["-c", "LISTEN_PID=$$; export LISTEN_PID; exec \"$@\"", "sh"])
+                .args([
+                    "-c",
+                    "umask 0002; LISTEN_PID=$$; export LISTEN_PID; exec \"$@\"",
+                    "sh",
+                ])
                 .arg(env!("CARGO_BIN_EXE_ratarmount-volume-plugin"))
                 .env("LISTEN_FDS", "1");
             // SAFETY: Linux-only pre_exec. `close_range` is not POSIX
@@ -133,7 +140,10 @@ fn regression_server_socket_activation_and_environment_only_credentials() {
             }
             command
         } else {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount-volume-plugin"));
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", "umask 0002; exec \"$@\"", "sh"])
+                .arg(env!("CARGO_BIN_EXE_ratarmount-volume-plugin"));
             // SAFETY: Linux-only pre_exec. `close_range` is not POSIX
             // async-signal-safe; `getrlimit` and `fcntl` are. `last_os_error`
             // only packages errno and must stay off the heap.

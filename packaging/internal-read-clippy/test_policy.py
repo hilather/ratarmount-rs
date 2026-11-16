@@ -368,6 +368,61 @@ class Contract(unittest.TestCase):
                 tokens = f"fs :: {function} ({argument.replace('&', '& ')}) ?;"
                 self.assertEqual(entry["leaf_digest"], policy.digest(tokens.encode()))
 
+    def test_regression_182_socket_reviews_match_source(self):
+        """Regression: moved socket expectations need exact, non-orphaned approvals.
+
+        This is a narrow source/manifest consistency check, not a substitute for
+        the pinned driver's compiler identity and fulfillment checks.
+        """
+        source = (policy.ROOT / "ratarmount-core/src/owner_socket.rs").read_text()
+        approved = json.loads((Path(__file__).parent / "manifest.json").read_text())
+        prefix = "ratarmount_core::owner_socket::"
+        expected = {
+            "IR-E0034-T01": "stage_dir", "IR-E0034-M01": "stage_dir",
+            "IR-E0035-M01": "stage_dir", "IR-B0289-T01": "bind_staged",
+            "IR-B0289-M01": "bind_staged", "IR-B0289-M02": "bind_staged",
+            "IR-E0036-M01": "rename_noreplace",
+        }
+        reasons = re.findall(r'r###"(internal-read:v1 .*?)"###', source)
+        self.assertEqual(len(reasons), len(expected))
+        self.assertEqual({policy.metadata_reason(r)["id"] for r in reasons}, set(expected))
+        entries = [e for e in approved["entries"] if e["item"].startswith(prefix)]
+        self.assertEqual(len(entries), len(expected))
+        for reason in reasons:
+            metadata = policy.metadata_reason(reason)
+            with self.subTest(identity=metadata["id"]):
+                matches = [e for e in approved["entries"]
+                           if e.get("metadata", {}).get("id") == metadata["id"]]
+                self.assertEqual(len(matches), 1)
+                self.assertEqual(matches[0]["reason"], reason)
+                self.assertEqual(matches[0]["metadata"], metadata)
+                self.assertEqual(matches[0]["item"], prefix + expected[metadata["id"]])
+        # No approvals for the removed duplicate helpers in either daemon.
+        removed = {f"{crate}::linux::{function}"
+                   for crate in ("ratarmount_csi", "ratarmount_volume_plugin")
+                   for function in ("stage_dir", "bind_staged", "rename_noreplace")}
+        self.assertFalse(removed & {e["item"] for e in approved["entries"]})
+        for filename in ("ratarmount-csi/src/linux.rs", "ratarmount-volume-plugin/src/main.rs"):
+            daemon = (policy.ROOT / filename).read_text()
+            for reason in re.findall(r'r###"(internal-read:v1 .*?)"###', daemon):
+                metadata = policy.metadata_reason(reason)
+                matches = [e for e in approved["entries"]
+                           if e.get("metadata", {}).get("id") == metadata["id"]]
+                self.assertEqual(len(matches), 1)
+                self.assertEqual(matches[0]["reason"], reason)
+                self.assertEqual(matches[0]["metadata"], metadata)
+                self.assertEqual(matches[0]["item"], metadata["item"])
+        # Reviewed renameat2 leaf now uses the held dirfd and constant `s`.
+        tokens = ('let rc = unsafe { libc :: syscall (libc :: SYS_renameat2 , '
+                  'from_dir_fd , c"s" . as_ptr () , libc :: AT_FDCWD , '
+                  'to . as_ptr () , libc :: RENAME_NOREPLACE ,) } ;')
+        rename = next(e for e in entries if e["metadata"]["id"] == "IR-E0036-M01")
+        leaf = re.search(r'let rc = unsafe \{.*?\n    \};', source, re.S).group()
+        self.assertEqual(re.sub(r"\s+", "", leaf), re.sub(r"\s+", "", tokens))
+        self.assertEqual(rename["leaf_digest"], policy.digest(tokens.encode()))
+        self.assertEqual(rename["configured_path"], "libc::syscall")
+        self.assertEqual(rename["resolved"], "libc::unix::linux_like::linux::syscall")
+
 
 if __name__ == "__main__":
     unittest.main()
