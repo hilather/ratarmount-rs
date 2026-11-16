@@ -1094,3 +1094,126 @@ fn regression_diff_recorded_lowers_default_and_copy_up() {
     assert_eq!(run(&args, &Default::default()), 1);
     assert_eq!(output(&args), b"D\tblib/x\n");
 }
+
+/// `(dev, ino)` of what descriptor `fd` refers to.
+fn fd_identity(fd: i32) -> (u64, u64) {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0, "fstat({fd})");
+    #[allow(clippy::unnecessary_cast)]
+    (st.st_dev as u64, st.st_ino as u64)
+}
+
+const PROGRESS_CHILD_DONE: &str = "#298 progress guards checked";
+
+/// Subprocess helper for `regression_298_overlapping_progress_guards_restore_stdout`:
+/// fd 1 and fd 2 are distinct capture files there.
+#[test]
+#[ignore = "subprocess helper for the #298 stdout redirect test"]
+fn progress_to_stderr_child() {
+    if !crate::child_helpers::spawned_by_parent(
+        crate::child_helpers::PROGRESS_TO_STDERR_CHILD,
+        "progress_to_stderr_child",
+        "regression_298_overlapping_progress_guards_restore_stdout",
+    ) {
+        return;
+    }
+    let stdout = fd_identity(libc::STDOUT_FILENO);
+    let stderr = fd_identity(libc::STDERR_FILENO);
+    assert_ne!(
+        stdout, stderr,
+        "the parent gives distinct stdout and stderr"
+    );
+    let raw = |text: &str| {
+        let mut out = io::stdout().lock();
+        out.write_all(text.as_bytes()).unwrap();
+        out.flush().unwrap();
+    };
+    // Overlapping guards released in creation order (two parallel tests).
+    let first = ProgressToStderr::new().unwrap();
+    let second = ProgressToStderr::new().unwrap();
+    assert_eq!(fd_identity(libc::STDOUT_FILENO), stderr);
+    drop(first);
+    raw("progress while the second guard lives\n");
+    assert_eq!(fd_identity(libc::STDOUT_FILENO), stderr);
+    drop(second);
+    assert_eq!(
+        fd_identity(libc::STDOUT_FILENO),
+        stdout,
+        "fd 1 must be the original stdout once every guard is gone"
+    );
+    // `find`'s `/dev/null` redirect ending while a progress guard taken inside
+    // it lives (a find test beside a diff test).
+    let guard = crate::find::silence_stdout(|| {
+        raw("silenced\n");
+        ProgressToStderr::new().unwrap()
+    });
+    assert_ne!(fd_identity(libc::STDOUT_FILENO), stdout);
+    drop(guard);
+    assert_eq!(
+        fd_identity(libc::STDOUT_FILENO),
+        stdout,
+        "fd 1 must not stay on /dev/null"
+    );
+    // A progress guard ending inside `find`'s redirect.
+    let guard = ProgressToStderr::new().unwrap();
+    crate::find::silence_stdout(|| drop(guard));
+    assert_eq!(fd_identity(libc::STDOUT_FILENO), stdout);
+    // Guards taken and released on parallel threads, as the test harness does.
+    let threads: Vec<_> = (0..4)
+        .map(|_| {
+            std::thread::spawn(|| {
+                for i in 0..500 {
+                    if i % 2 == 0 {
+                        let guard = ProgressToStderr::new().expect("no EBADF from a racing guard");
+                        drop(guard);
+                    } else {
+                        crate::find::silence_stdout(|| ());
+                    }
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert_eq!(fd_identity(libc::STDOUT_FILENO), stdout);
+    raw(&format!("{PROGRESS_CHILD_DONE}\n"));
+}
+
+/// Regression (#298): `roundtrip_crlf`/`roundtrip_binary_deleted` failed on
+/// macOS with `diff: Bad file descriptor (os error 9)` while another test's
+/// diff ran. Each `ProgressToStderr` (and `find`'s `/dev/null` redirect) saved
+/// and restored fd 1 on its own, so overlapping redirects released in creation
+/// order left fd 1 on stderr or `/dev/null`; racing `dup2`/`fcntl` calls on
+/// fd 1 are consistent with the macOS EBADF. Overlapping redirects share one.
+#[test]
+fn regression_298_overlapping_progress_guards_restore_stdout() {
+    let _processes = ratarmount_index::test_process::spawning();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "diff::tests::progress_to_stderr_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(crate::child_helpers::PROGRESS_TO_STDERR_CHILD, "1");
+    let output = crate::test_child::TestChild::spawn(&mut command)
+        .unwrap()
+        .output(std::time::Duration::from_secs(60))
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        !stderr.contains(crate::child_helpers::GUARD_SKIP),
+        "{stderr}"
+    );
+    assert!(stdout.contains(PROGRESS_CHILD_DONE), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("progress while the second guard lives"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("progress while"), "{stdout}");
+    assert!(!stdout.contains("silenced") && !stderr.contains("silenced"));
+}

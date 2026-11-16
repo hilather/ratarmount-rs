@@ -212,12 +212,68 @@ fn detect_renames(changes: &mut Vec<Change>) {
     changes.sort_by(|a, b| a.from.cmp(&b.from).then(a.to.cmp(&b.to)));
 }
 
-// Factory backends print cold-index progress to stdout. During the single-threaded
-// CLI open, send it to stderr so stdout remains a patch. Restore on all errors.
-pub(crate) struct ProgressToStderr(OwnedFd);
+// Factory backends print cold-index progress to stdout. During the CLI open,
+// send it to stderr so stdout remains a patch. Restore on all errors.
+//
+// Descriptor 1 is process-wide, but redirects may overlap: the unit tests run
+// diff/import/overlay verbs and `find` on parallel threads (#298). Each guard
+// used to save and restore fd 1 on its own, so overlapping redirects released
+// in creation order could leave fd 1 on the other one's target (stderr, or
+// `find`'s `/dev/null`), and concurrent `dup2`/`fcntl` calls on fd 1 are
+// consistent with the EBADF seen on macOS. Overlapping redirects now share
+// one: the first redirects, the last restores, and every syscall on fd 1 runs
+// under `STDOUT_REDIRECT`, which is held only for those calls.
+pub(crate) struct ProgressToStderr(());
+
+/// fd 1 as it was before the first live redirect.
+pub(crate) enum SavedStdout {
+    Owned(OwnedFd),
+    /// A `dup` of fd 1 that `find` made; closed on drop.
+    Raw(std::os::fd::RawFd),
+}
+
+impl SavedStdout {
+    pub(crate) fn raw(&self) -> std::os::fd::RawFd {
+        match self {
+            Self::Owned(fd) => fd.as_raw_fd(),
+            Self::Raw(fd) => *fd,
+        }
+    }
+}
+
+impl Drop for SavedStdout {
+    fn drop(&mut self) {
+        if let Self::Raw(fd) = self {
+            // SAFETY: a `dup` this redirect owns and nothing else closes.
+            unsafe { libc::close(*fd) };
+        }
+    }
+}
+
+/// Live redirects of fd 1 and what it was before the first of them.
+pub(crate) struct StdoutRedirect {
+    pub(crate) guards: usize,
+    pub(crate) saved: Option<SavedStdout>,
+}
+
+static STDOUT_REDIRECT: std::sync::Mutex<StdoutRedirect> = std::sync::Mutex::new(StdoutRedirect {
+    guards: 0,
+    saved: None,
+});
+
+/// Lock the shared fd 1 redirect state (a panic elsewhere does not poison it).
+pub(crate) fn stdout_redirect() -> std::sync::MutexGuard<'static, StdoutRedirect> {
+    STDOUT_REDIRECT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 impl ProgressToStderr {
     pub(crate) fn new() -> io::Result<Self> {
+        let mut state = stdout_redirect();
+        if let Some(guard) = Self::join(&mut state) {
+            return Ok(guard);
+        }
         io::stdout().flush()?;
         #[expect(
             clippy::disallowed_methods,
@@ -231,7 +287,7 @@ impl ProgressToStderr {
             clippy::disallowed_methods,
             reason = r###"internal-read:v1 {"id":"IR-B0003-M01","item":"<ratarmount::diff::ProgressToStderr>::new","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
-        let saved = Self(unsafe { OwnedFd::from_raw_fd(fd) });
+        let saved = unsafe { OwnedFd::from_raw_fd(fd) };
         if unsafe {
             {
                 #[expect(
@@ -245,19 +301,39 @@ impl ProgressToStderr {
         {
             return Err(io::Error::last_os_error());
         }
-        Ok(saved)
+        state.saved = Some(SavedStdout::Owned(saved));
+        state.guards = 1;
+        Ok(Self(()))
+    }
+
+    /// Share a redirect that is already live (fd 1 is away from the caller's
+    /// stdout already); `None` when there is none.
+    pub(crate) fn join(state: &mut StdoutRedirect) -> Option<Self> {
+        if state.guards == 0 {
+            return None;
+        }
+        state.guards += 1;
+        Some(Self(()))
     }
 }
 
 impl Drop for ProgressToStderr {
     fn drop(&mut self) {
+        let mut state = stdout_redirect();
+        state.guards -= 1;
+        if state.guards > 0 {
+            return;
+        }
+        let Some(saved) = state.saved.take() else {
+            return;
+        };
         let _ = io::stdout().flush();
         unsafe {
             #[expect(
                 clippy::disallowed_methods,
                 reason = r###"internal-read:v1 {"id":"IR-B0005-M01","item":"<ratarmount::diff::ProgressToStderr as core::ops::drop::Drop<ratarmount::diff::ProgressToStderr>>::drop","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
-            libc::dup2(self.0.as_raw_fd(), libc::STDOUT_FILENO);
+            libc::dup2(saved.raw(), libc::STDOUT_FILENO);
         }
     }
 }
