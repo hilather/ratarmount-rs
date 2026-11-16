@@ -2689,8 +2689,7 @@ fn main() {
         }
     }
 
-    // Members whose complete journal (or, #163, whose stale locator behind the
-    // top's hot rollback journal) waited for the gates: every gate accepted,
+    // Members whose complete journal waited for the gates: every gate accepted,
     // so each is recovered now (through the overlay's own connection when there
     // is one: it holds its database exclusively).
     for member in &deferred_journals {
@@ -5216,9 +5215,6 @@ mod overlay_recovery_exit_tests;
 /// left untouched until every gate decided. A torn deferred journal is refused
 /// (nothing can open on a half-written archive); a complete one is returned for
 /// recovery after the gates. The decision is taken again under the archive lock.
-/// A member with no pending journal whose recovery (a stale locator's clear)
-/// was refused only by the `-w` top's hot rollback journal is returned too: the
-/// `-w` open rolls that journal back first (#163).
 fn recover_mount_journals(
     args: &Args,
     inputs: &[PathBuf],
@@ -5291,27 +5287,14 @@ fn recover_mount_journals(
                 eprintln!("error: commit recovery for {}: {e}", member.display());
                 std::process::exit(overlay_recovery_exit_code(&e));
             }
-            Ok(class @ (MountJournal::None | MountJournal::Own)) => {
+            Ok(MountJournal::None | MountJournal::Own) => {
                 let owner = ratarmount_compositing::Owner::Mount {
                     records: &records,
                     member,
                 };
-                match recover_journal_at(member, top_db.as_deref(), owner) {
-                    Ok(_) => {}
-                    // #163: no commit journal is pending (a stale locator at
-                    // most) and only the `-w` top's hot rollback journal stood
-                    // in the way. The `-w` open rolls it back; the member is
-                    // recovered after the gates through the overlay.
-                    Err(e)
-                        if matches!(class, MountJournal::None)
-                            && ratarmount_compositing::waits_for_top_open(&e) =>
-                    {
-                        deferred.push(member.clone());
-                    }
-                    Err(e) => {
-                        eprintln!("error: commit recovery for {}: {e}", member.display());
-                        std::process::exit(overlay_recovery_exit_code(&e));
-                    }
+                if let Err(e) = recover_journal_at(member, top_db.as_deref(), owner) {
+                    eprintln!("error: commit recovery for {}: {e}", member.display());
+                    std::process::exit(overlay_recovery_exit_code(&e));
                 }
             }
             Ok(MountJournal::Deferred { complete: true, .. }) => deferred.push(member.clone()),

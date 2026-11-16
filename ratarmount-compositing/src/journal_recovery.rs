@@ -661,12 +661,6 @@ pub(crate) fn recover_journal_with_records(
     mut owner: Owner<'_>,
     admitted: Option<&MountRecords>,
 ) -> std::result::Result<Option<Applied>, RecoverError> {
-    // A mount's `-w` top: its hot journal is the typed refusal (#163).
-    let top = match &owner {
-        Owner::Mount { records, .. } => records.top.clone(),
-        _ => None,
-    };
-    let top = top.as_ref();
     let mut records: Vec<PathBuf> = match &owner {
         Owner::Mount { records, .. } | Owner::AdmittedMount { records } => records
             .top
@@ -714,7 +708,7 @@ pub(crate) fn recover_journal_with_records(
     let mut before_write = || {
         validate()?;
         for dir in &records {
-            read_record_or_hot(dir, top == Some(dir))?;
+            read_record(dir)?;
         }
         rows.guard()
     };
@@ -867,12 +861,6 @@ pub enum MountJournal {
 /// Read a record only after its database and every companion passed the
 /// strict named-state policy, including an otherwise unmarked raw directory.
 fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
-    read_record_or_hot(dir, false)
-}
-
-/// [`read_record`]; with `top`, a hot rollback journal on the database (an
-/// interrupted overlay write) is the typed [`TopHotJournal`] refusal (#163).
-fn read_record_or_hot(dir: &Path, top: bool) -> io::Result<Option<OverlayMeta>> {
     crate::overlay_db::validate_overlay_state(&dir.join(crate::HIDDEN_DB))?;
     let marked = match usable_entry(dir)? {
         DbEntry::Absent => return Ok(None),
@@ -881,8 +869,8 @@ fn read_record_or_hot(dir: &Path, top: bool) -> io::Result<Option<OverlayMeta>> 
     };
     OverlayMeta::read_no_recovery_required(dir, marked).map_err(|error| match error {
         OverlayError::Io(error) => error,
-        OverlayError::Sqlite(error) if top && crate::overlay_meta::is_hot_journal(&error) => {
-            io::Error::other(TopHotJournal {
+        OverlayError::Sqlite(error) if crate::overlay_meta::is_hot_journal(&error) => {
+            io::Error::other(HotOverlayJournal {
                 dir: dir.to_path_buf(),
                 source: error,
             })
@@ -891,42 +879,35 @@ fn read_record_or_hot(dir: &Path, top: bool) -> io::Result<Option<OverlayMeta>> 
     })
 }
 
-/// A mount's `-w` top database has a hot rollback journal: an overlay write
-/// was interrupted (one SIGKILL during a live commit can leave it beside a
-/// stale prepare locator). Recovery never rolls it back before the gates
-/// voted; the `-w` open does, so a mount whose member has no pending commit
-/// journal waits for that open instead of refusing every mount (#163).
+/// Recovery cannot read this record without writing its database. Deferring
+/// to a writable open would roll it back before sealing, durability and
+/// identity could be checked, so name the explicit recovery route (#163).
 #[derive(Debug)]
-struct TopHotJournal {
+struct HotOverlayJournal {
     dir: PathBuf,
     source: rusqlite::Error,
 }
 
-impl std::fmt::Display for TopHotJournal {
+impl std::fmt::Display for HotOverlayJournal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "the write overlay database in {} has an interrupted write (a hot rollback \
-             journal) that only its -w open rolls back; no recovery write was made: {}",
+            "the overlay database in {} has an interrupted write (a hot rollback journal); \
+             its identity, sealing and durability state cannot be checked without modifying \
+             it. Recovery stopped; the archive's commit journal or stale prepare \
+             locator is kept. Recover the archive separately with `ratarmount --no-mount \
+             ARCHIVE` (without -w or --lower), then inspect the overlay on a writable copy \
+             before retrying: {}",
             self.dir.display(),
             self.source
         )
     }
 }
 
-impl std::error::Error for TopHotJournal {
+impl std::error::Error for HotOverlayJournal {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }
-}
-
-/// `error` refused a mount's recovery ([`Owner::Mount`]) only because its
-/// `-w` top database has a hot rollback journal, before anything was written.
-/// The caller may let the `-w` open roll that journal back and recover the
-/// member after the gates (#163).
-pub fn waits_for_top_open(error: &RecoverError) -> bool {
-    matches!(error, RecoverError::Refused(e)
-        if e.get_ref().is_some_and(|inner| inner.is::<TopHotJournal>()))
 }
 
 /// The decision table on the journal header and the file's current identity.
@@ -951,31 +932,49 @@ fn decide(
         why,
         force_flag: flag,
     };
+    // A bundle or an earlier mismatching record may defer an otherwise usable
+    // journal, but must not hide a record whose writable open would mutate it
+    // before the gates. Read each directory once before deciding to defer.
+    let voters = records
+        .top
+        .iter()
+        .map(|d| (d, true))
+        .chain(records.lowers.iter().map(|d| (d, false)))
+        .map(|(dir, is_top)| {
+            let read = match read_record(dir) {
+                // Path policy and hot journals outrank deferral: force cannot
+                // turn either refusal into recovery authority.
+                Err(e)
+                    if crate::overlay_db::is_overlay_state_error(&e)
+                        || e.get_ref()
+                            .is_some_and(|inner| inner.is::<HotOverlayJournal>()) =>
+                {
+                    return Err(e);
+                }
+                other => other,
+            };
+            if let Ok(meta) = &read {
+                crate::relaxed_durability::refuse_unclean(meta.as_ref())
+                    .map_err(io::Error::other)?;
+            }
+            Ok((dir, is_top, read))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     if records.bundles {
         return Ok(defer(
             "a --lower bundle's record is read after unpacking".into(),
             "--force-stack-mismatch",
         ));
     }
-    let voters = records
-        .top
-        .iter()
-        .map(|d| (d, true))
-        .chain(records.lowers.iter().map(|d| (d, false)));
-    for (dir, is_top) in voters {
+    for (dir, is_top, read) in voters {
         let flag = if is_top {
             "--force-base-mismatch"
         } else {
             "--force-stack-mismatch"
         };
-        let meta = match read_record(dir) {
+        let meta = match read {
             Ok(meta) => meta,
             Err(e) => {
-                // Path policy outranks journal deferral: force cannot turn a
-                // typed acquisition/metadata refusal into recovery authority.
-                if crate::overlay_db::is_overlay_state_error(&e) {
-                    return Err(e);
-                }
                 return Ok(defer(
                     format!(
                         "has an overlay record ({}) that cannot be read: {e}",
@@ -986,11 +985,6 @@ fn decide(
             }
         };
         let Some(meta) = meta else { continue };
-        // #328: even an inode-owned archive journal cannot be recovered using
-        // a record left unclean by relaxed durability. Refuse before recovery
-        // writes, not later when the writable overlay is opened. Force may
-        // override a base mismatch, but cannot validate this database.
-        crate::relaxed_durability::refuse_unclean(Some(&meta)).map_err(io::Error::other)?;
         if is_top && meta.layer_sealed() {
             return Ok(defer("is guarded by a sealed overlay".into(), flag));
         }

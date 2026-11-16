@@ -6269,17 +6269,12 @@ fn regression_mount_symlinked_db_stale_prepare_names_next_step() {
     assert_eq!(fs::read(&target).unwrap(), target_before);
 }
 
-/// Regression: #163 (hot-journal route): a hot rollback `-journal` on the
-/// mount's `-w` top database beside a stale prepare locator refused the
-/// locator clear with a bare "attempt to write a readonly database", which
-/// `main` could not tell from any other refusal and exited 2 on every mount.
-/// The refusal is now typed ([`crate::waits_for_top_open`]) so the mount
-/// defers the member to after its `-w` open; nothing is written here. The same
-/// journal on a `--lower` record is not the top's and stays an ordinary
-/// refusal (no `-w` open would roll it back).
+/// Regression: #163 a hot overlay journal made stale-locator recovery fail
+/// without naming a remedy. A writable open cannot safely read the record
+/// before rollback, so both top and lower refuse with explicit recovery steps.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn regression_163_top_hot_journal_waits_for_the_open() {
+fn regression_163_hot_journal_refusal_names_recovery() {
     let _process_guard = ratarmount_index::test_process::spawning();
     for top in [true, false] {
         let fx = Fixture::new();
@@ -6305,6 +6300,7 @@ fn regression_163_top_hot_journal_waits_for_the_open() {
         let archive_before = fs::read(&fx.archive).unwrap();
         let locator_before = locator(&fx.archive);
         let journal_before = fs::read(&journal).unwrap();
+        let db_before = fs::read(&db).unwrap();
         let records = if top {
             records_of(&fx)
         } else {
@@ -6326,16 +6322,49 @@ fn regression_163_top_hot_journal_waits_for_the_open() {
             },
         )
         .unwrap_err();
-        assert_eq!(crate::waits_for_top_open(&error), top, "top={top}: {error}");
-        if top {
-            assert!(
-                error.to_string().contains("only its -w open rolls back"),
-                "{error}"
-            );
-        }
+        assert!(matches!(
+            error,
+            ratarmount_compress::commit_journal::RecoverError::Refused(_)
+        ));
+        let message = error.to_string();
+        assert!(
+            message.contains("stale prepare locator is kept"),
+            "{message}"
+        );
+        assert!(
+            message.contains("ratarmount --no-mount ARCHIVE"),
+            "{message}"
+        );
+        assert!(message.contains("without -w or --lower"), "{message}");
         assert_eq!(fs::read(&fx.archive).unwrap(), archive_before, "top={top}");
         assert_eq!(locator(&fx.archive), locator_before, "top={top}");
         assert_eq!(fs::read(&journal).unwrap(), journal_before, "top={top}");
+        assert_eq!(fs::read(&db).unwrap(), db_before, "top={top}");
+
+        // A real pending journal must not defer this unreadable record to a
+        // writable open either, even when its archive bytes are complete.
+        crate::recover_journal_at(&fx.archive, None, crate::Owner::Inode).unwrap();
+        interrupt_complete(&fx.archive);
+        let commit_journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+        let before = overlay_239_snapshot(&fx.archive, &fx.overlay, &commit_journal);
+        let error = classify_mount_journal(&records, &fx.archive).unwrap_err();
+        assert!(
+            error.to_string().contains("hot rollback journal"),
+            "{error}"
+        );
+        let with_bundle = MountRecords {
+            bundles: true,
+            ..records
+        };
+        let error = classify_mount_journal(&with_bundle, &fx.archive).unwrap_err();
+        assert!(
+            error.to_string().contains("hot rollback journal"),
+            "{error}"
+        );
+        assert_eq!(
+            overlay_239_snapshot(&fx.archive, &fx.overlay, &commit_journal),
+            before
+        );
     }
 }
 
