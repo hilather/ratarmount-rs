@@ -22,3 +22,6 @@ bzip2 = { version = "0.5", features = ["static"] }
 [dev-dependencies]
 tempfile.workspace = true
 fatfs = "0.3"
+
+[lints]
+workspace = true

@@ -13,36 +13,37 @@
 //!
 //! * The validated overlay-database open registers the `(dev, ino)` it
 //!   opened ([`register_db_inode`]) for as long as its connection lives.
-//! * Every payload, sentinel, pack and commit open goes through
-//!   [`openat_admitted`] (or [`admit_fd`] for a descriptor it already holds),
-//!   which checks the inode of the descriptor it actually obtained against
-//!   that set and refuses an open database without closing a descriptor of
-//!   it. On Linux the check runs on an `O_PATH` descriptor (closing one does
-//!   not release fcntl locks) and the file is then reopened through
-//!   `/proc/self/fd` with the caller's flags, so the refused path leaks
-//!   nothing and `O_TRUNC` only ever applies to an admitted inode. That path
-//!   does not count an external-alias epoch. Elsewhere (or without `/proc`)
-//!   the file is opened without `O_TRUNC`, checked, and the first refused
-//!   descriptor of an inode is quarantined: kept open for the life of the
-//!   process ([`quarantined`] counts them). Further generic opens of that
-//!   inode, including after its registration is dropped and created again,
-//!   are refused before `open` once the external-alias epoch cap (one) is reached
-//!   and quarantine nothing. `O_CREAT|O_EXCL` over an existing name is
-//!   `EEXIST` and does not open, including after the cap. An unidentified descriptor is still quarantined
-//!   and does not count. Two opens that both pass the pre-check before either
-//!   is recorded can each quarantine one descriptor. The registry and epoch
-//!   locks are never held across `open`. Descriptors are not pooled: pooling
-//!   would change what a later open is allowed to do with the file.
+//! * Overlay payload opens, the ZIP and TAR commit readers, the seal and
+//!   pack sentinels and the pack lock and member reads (the checked sites in
+//!   docs/sandbox.md) go through [`openat_admitted`] (or [`admit_fd`]), which
+//!   checks the inode of the descriptor it obtained against that set and
+//!   refuses an open database without closing a descriptor of it. On Linux
+//!   the check runs on an `O_PATH` descriptor (closing one does not release
+//!   fcntl locks) and the file is reopened through `/proc/self/fd` with the
+//!   caller's flags, so a refusal leaks nothing and `O_TRUNC` only applies to
+//!   an admitted inode. That path does not count an external-alias epoch.
+//!   Elsewhere (or without `/proc`) the file is opened without `O_TRUNC`,
+//!   checked, and the first refused descriptor of an inode is quarantined:
+//!   kept open for the process's life ([`quarantined`] counts them). Further
+//!   generic opens of that inode, including after its registration is dropped
+//!   and created again, are refused before `open` once the external-alias
+//!   epoch cap (one) is reached and quarantine nothing. `O_CREAT|O_EXCL` over
+//!   an existing name is `EEXIST` and does not open, including after the cap.
+//!   An unidentified descriptor is still quarantined and does not count. Two
+//!   opens that both pass the pre-check before either is recorded can each
+//!   quarantine one descriptor. The registry and epoch locks are never held
+//!   across `open`. Descriptors are not pooled: pooling would change what a
+//!   later open is allowed to do with the file.
 //!
 //! The registry lock is only ever held to look up, insert or remove an entry:
 //! never across `open(2)`, `fstat(2)` or a SQLite open, so a payload FIFO that
 //! blocks its opener cannot stall a database open elsewhere in the process
 //! (R10-D). Lock order: innermost (no other lock is taken while it is held).
 //!
-//! Residual (documented in docs/sandbox.md): a payload descriptor opened
-//! BEFORE its inode is first opened as a database in this process (the
-//! reverse ordering), and descriptors obtained by generic folder sources and
-//! backing extents, are not tracked.
+//! Residual (docs/sandbox.md lists it): payload descriptors opened BEFORE the
+//! inode is first opened as a database here, generic folder sources, backing
+//! extents, and opens that never call this module (among them the commit
+//! path's archive opens and `overlay pack`/`unpack`'s bundle and lock files).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -270,12 +271,25 @@ mod unix {
         mode: u32,
     ) -> io::Result<OwnedFd> {
         // Safety: `name` is NUL-terminated and outlives the call.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0282-M01","item":"ratarmount_core::db_inodes::unix::openat_raw","disposition":"residual","reason":"the admitted-open primitive itself; reverse-order payload retirement needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let fd = unsafe { libc::openat(dir, name.as_ptr(), flags, mode as libc::c_uint) };
         if fd < 0 {
             Err(io::Error::last_os_error())
         } else {
             // Safety: a new descriptor owned by this process.
-            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+            Ok(unsafe {
+                {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0283-M01","item":"ratarmount_core::db_inodes::unix::openat_raw","disposition":"residual","reason":"the admitted-open primitive itself; reverse-order payload retirement needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )]
+                    let __inventory_value_0 = OwnedFd::from_raw_fd(fd);
+                    __inventory_value_0
+                }
+            })
         }
     }
 
@@ -293,7 +307,14 @@ mod unix {
 
     /// [`openat_admitted`] relative to the current directory.
     pub fn open_admitted(path: &Path, flags: libc::c_int, mode: u32) -> io::Result<OwnedFd> {
-        openat_admitted(None, path, flags, mode)
+        {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0284-M01","item":"ratarmount_core::db_inodes::unix::open_admitted","disposition":"residual","reason":"the admitted-open primitive itself; reverse-order payload retirement needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
+            let __inventory_value_0 = openat_admitted(None, path, flags, mode);
+            __inventory_value_0
+        }
     }
 
     /// `openat(dir, name, flags, mode)` that never returns (and never closes)

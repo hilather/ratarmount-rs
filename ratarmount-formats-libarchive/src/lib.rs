@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! libarchive-backed archive mount (`backendName=LibarchiveMountSource`).
 //!
 //! Matches Python `LibarchiveMountSource` strategy: index entries with a sequential
@@ -121,6 +124,10 @@ impl ArchiveHandle {
             support_formats(h.ptr, allow_archives)?;
             let cpath = path_to_cstring(path)?;
             // block size 10k as python often uses st_blksize; 10240 is fine
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0327-M01","item":"<ratarmount_formats_libarchive::ArchiveHandle>::open_path_inner","disposition":"residual","reason":"libarchive opens and closes the archive by pathname with its own descriptor (the libarchive backend's reader is not a managed owner)","family":"foreign-library-or-caller-owned","issue":"#196","category":"foreign-library-or-caller-owned","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let r = archive_read_open_filename(h.ptr, cpath.as_ptr(), 10240);
             if r != ARCHIVE_OK && r != ARCHIVE_WARN {
                 let err = error_string(h.ptr);
@@ -251,6 +258,7 @@ impl LibarchiveMountSource {
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options) {
                         Ok(s) => return Ok(s),
+                        Err(e) if options.read_only_index => return Err(e),
                         Err(e) => {
                             eprintln!("info: could not load libarchive index ({e}); rebuilding")
                         }
@@ -271,7 +279,7 @@ impl LibarchiveMountSource {
         index_path: &Path,
         options: &OpenOptions,
     ) -> Result<Self> {
-        let index = SqliteIndex::open_read_only(index_path)?;
+        let index = SqliteIndex::open_read_only_for_open(index_path, options)?;
         index.check_backend_name(BACKEND_NAME)?;
         // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
         // Missing tarstats still Ok (legacy indexes).
@@ -651,7 +659,14 @@ pub fn looks_like_lrzip(path: &Path) -> bool {
     if name.ends_with(".lrz") || name.ends_with(".lrzip") {
         return true;
     }
-    if let Ok(mut f) = std::fs::File::open(path) {
+    if let Ok(mut f) = {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0328-M01","item":"ratarmount_formats_libarchive::looks_like_lrzip","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = std::fs::File::open(path);
+        __inventory_value_0
+    } {
         let mut magic = [0u8; 5];
         if f.read(&mut magic).ok() == Some(5) {
             return looks_like_lrzip_magic(&magic);
@@ -755,7 +770,14 @@ pub fn looks_like_libarchive(path: &Path) -> bool {
         "cab" | "iso" | "xar" | "warc" | "7z" | "rar" | "lha" | "lzh" | "rpm" | "deb"
     ) || {
         // Magic probes
-        if let Ok(mut f) = std::fs::File::open(path) {
+        if let Ok(mut f) = {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0329-M01","item":"ratarmount_formats_libarchive::looks_like_libarchive","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
+            let __inventory_value_0 = std::fs::File::open(path);
+            __inventory_value_0
+        } {
             let mut magic = [0u8; 8];
             if f.read(&mut magic).ok() == Some(8) {
                 // CAB: MSCF
@@ -821,6 +843,53 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn prepared_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect()
+    }
+
+    /// Regression: a strict warm worker must read members without changing its prepared sidecar.
+    #[test]
+    fn regression_prepared_index_warm_open_is_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.libarchive");
+        let index = dir.path().join("index.sqlite");
+        let fixture = synthetic_ar("hello.txt", b"worker base");
+        std::fs::write(&archive, &fixture).unwrap();
+        drop(
+            LibarchiveMountSource::open(
+                &archive,
+                Some(&index),
+                &OpenOptions::default(),
+                "test",
+                true,
+            )
+            .unwrap(),
+        );
+        SqliteIndex::finalize_prepared(&index).unwrap();
+        let before = prepared_snapshot(dir.path());
+        let options = OpenOptions {
+            read_only_index: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let source =
+            LibarchiveMountSource::open(&archive, Some(&index), &options, "test", false).unwrap();
+        let member = "/hello.txt".to_owned();
+        let info = source.lookup(&member, 0).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut source.open(&info, 0).unwrap(), &mut bytes).unwrap();
+        assert_eq!(bytes, b"worker base");
+        assert_eq!(prepared_snapshot(dir.path()), before);
+        drop(source);
+        assert_eq!(prepared_snapshot(dir.path()), before);
+    }
+
     use std::io::Write;
 
     fn py_test(name: &str) -> PathBuf {

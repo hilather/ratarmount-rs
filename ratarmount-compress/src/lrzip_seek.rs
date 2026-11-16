@@ -73,6 +73,10 @@ fn find_lrzip_bin() -> Option<&'static str> {
 pub fn materialize_lrzip(path: &Path) -> Result<(NamedTempFile, u64)> {
     let bin = find_lrzip_bin().ok_or_else(|| CompressError::Msg(LRZIP_CLI_MISSING_MSG.into()))?;
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0239-M01","item":"ratarmount_compress::lrzip_seek::materialize_lrzip","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let tmp = NamedTempFile::new()?;
     let out_path = tmp.path().to_path_buf();
 

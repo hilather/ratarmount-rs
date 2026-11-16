@@ -1,0 +1,43 @@
+{
+  "historical_first_match": {
+    "baseline": 553,
+    "matched": 540,
+    "clippy_only": 355,
+    "inactive_misses": 13
+  },
+  "revised_match": {
+    "baseline": 553,
+    "matched": 527,
+    "clippy_only": 142,
+    "scanner_only": 26
+  },
+  "revised_misses": {
+    "accepted_retyping": 13,
+    "inactive_target_cfg": 13,
+    "unexplained": 0
+  },
+  "revised_clippy_only_groups": 153,
+  "revised_clippy_only_classifications": {
+    "retained-prior-explanation": 123,
+    "admitted-wrapper-family-completion": 5,
+    "spooled-tempfile-creation-completion": 3,
+    "generic-syscall-compiler-boundary": 4,
+    "libc-directory-creation-completion": 2,
+    "reviewed-dynamic-loader-probe": 1,
+    "managed-read-wrapper-family-completion": 4
+  },
+  "raw_unique_diagnostics": 747,
+  "malformed": 0,
+  "ambiguous": 0,
+  "broad_conversion_groups_retired": 2296,
+  "file_type_support_config_retired": [
+    "std::fs::File",
+    "tokio::fs::File"
+  ],
+  "notes": [
+    "Old 540/260/13 evidence remains preserved; v3 first match had 355 Clippy-only keys due intentional creation coverage.",
+    "Revised matcher retains the original 553 denominator, with thirteen already-inventoried descriptor retypings now intentionally out of event scope.",
+    "One new libc::dlsym current production site is included in the revised 142 Clippy-only keys.",
+    "Clippy-only explanations remain pending per-site approval."
+  ]
+}

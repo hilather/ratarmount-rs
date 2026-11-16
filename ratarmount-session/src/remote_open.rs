@@ -534,6 +534,10 @@ fn materialize_fetched_index(path: PathBuf) -> std::result::Result<PathBuf, Stri
 /// may be a meta-v3 cache file another session of this process has open as
 /// its index. A read error is an error, not a mismatch.
 fn blob_matches_index_id(path: &Path, expected: &str) -> std::io::Result<bool> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0539-M01","item":"ratarmount_session::factory::remote_open::blob_matches_index_id","disposition":"managed-read","regression":"regression_remote_index_id_hash_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let got = ratarmount_index::managed_read::sha256_hex(path)?;
     Ok(got.eq_ignore_ascii_case(expected))
 }
@@ -721,10 +725,18 @@ fn try_install_remote_index(
         drop_fetched_sidecar(&fetched);
         return false;
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0540-M01","item":"ratarmount_session::factory::remote_open::try_install_remote_index","disposition":"managed-read","regression":"regression_remote_index_copy_keeps_cached_index_lock","mode_policy":"create-or-truncate with the source mode & !umask, exact source permissions through the handle before any write","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"create-or-truncate with the source mode & !umask, exact source permissions through the handle before any write","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let dest = match cache_dest {
         Some(d) if d != fetched.as_path() => {
             if let Some(parent) = d.parent() {
                 if !parent.as_os_str().is_empty() {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-E0097-M01","item":"ratarmount_session::factory::remote_open::try_install_remote_index","disposition":"output-owner","category":"remote-index-cache-directory","reason":"Best-effort create the cache destination parent before installing an already-validated remote index.","creation":{"policy":"recursive-directory","basis":"Parent creation failure keeps the fetched sidecar path usable; the managed-source copy owns its separate output."}}"###
+                    )]
                     let _ = std::fs::create_dir_all(parent);
                 }
             }
@@ -946,6 +958,8 @@ pub(super) struct RemoteOpened {
     /// The body was downloaded to a temporary local copy.
     pub fetched: bool,
     pub index: IndexUsed,
+    /// The persistent local artifact selected by a `file://` open.
+    pub actual_artifact: Option<PathBuf>,
 }
 
 impl RemoteOpened {
@@ -956,6 +970,7 @@ impl RemoteOpened {
             kind: ServedKind::Folder,
             local: false,
             fetched: false,
+            actual_artifact: None,
             index: IndexUsed {
                 location: ratarmount_index::IndexLocation::Memory,
                 discovered_from: None,
@@ -979,6 +994,7 @@ impl RemoteOpened {
             local,
             fetched: !local,
             index: opened.index,
+            actual_artifact: if local { opened.actual_artifact } else { None },
         }
     }
 }
@@ -1038,7 +1054,7 @@ fn open_hf_file(
     let mut rebuild = recreate;
     // An explicitly chosen cache path may span moving revisions or different mirrors.
     // Never reuse offsets just because a URL-labelled tarstats check is a no-op.
-    let (_, index_path) = super::remote_index_setup(Path::new(&label), opts, recreate);
+    let (_, index_path) = super::remote_index_setup(Path::new(&label), opts, recreate)?;
     if let Some(path) = index_path.as_ref().filter(|p| path_is_nonempty_file(p)) {
         let identity = SqliteIndex::open_read_only(path)
             .and_then(|i| i.metadata())
@@ -1076,7 +1092,7 @@ fn open_hf_file(
             (path, source)
         }
     };
-    let (_, index_path) = super::remote_index_setup(Path::new(&label), opts, false);
+    let (_, index_path) = super::remote_index_setup(Path::new(&label), opts, false)?;
     if !opts.read_only_index {
         if let Some(path) = index_path.filter(|p| path_is_nonempty_file(p)) {
             let index = SqliteIndex::open_writable(&path).map_err(|e| e.to_string())?;
@@ -1748,8 +1764,19 @@ pub(super) fn torrent_nested_reader_fn(
 #[cfg(feature = "bittorrent")]
 fn torrent_index_temp() -> std::io::Result<tempfile::NamedTempFile> {
     let cache_dir = ratarmount_index::platform_cache_root().join("torrent-v1/indexes");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0098-M01","item":"ratarmount_session::factory::remote_open::torrent_index_temp","disposition":"output-owner","category":"torrent-index-staging-directory","reason":"Create the torrent index cache directory before a named temporary sidecar is allocated.","creation":{"policy":"recursive-directory","basis":"The dedicated torrent-v1/indexes output tree and tempfile behavior keep current permission defaults."}}"###
+    )]
     std::fs::create_dir_all(&cache_dir)?;
-    tempfile::NamedTempFile::new_in(cache_dir)
+    {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0541-M01","item":"ratarmount_session::factory::remote_open::torrent_index_temp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
+        let __inventory_value_0 = tempfile::NamedTempFile::new_in(cache_dir);
+        __inventory_value_0
+    }
 }
 
 #[cfg(feature = "bittorrent")]
@@ -3538,6 +3565,8 @@ mod tests {
         addr: std::net::SocketAddr,
         gets: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         range_gets: Arc<std::sync::Mutex<Vec<String>>>,
+        headers_read: Arc<std::sync::atomic::AtomicUsize>,
+        drained: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
         stopped: Arc<std::sync::atomic::AtomicBool>,
         join: Option<std::thread::JoinHandle<()>>,
     }
@@ -3586,7 +3615,7 @@ mod tests {
         ignore_range: bool,
         require_bearer: Option<String>,
     ) -> IndexHttp {
-        use std::io::{BufRead, BufReader, Write as IoWrite};
+        use std::io::{self, BufRead, BufReader, Write as IoWrite};
         use std::net::TcpListener;
         use std::sync::{Arc, Mutex};
         use std::thread;
@@ -3597,6 +3626,10 @@ mod tests {
         let gets_c = Arc::clone(&gets);
         let range_gets = Arc::new(Mutex::new(Vec::new()));
         let ranges = range_gets.clone();
+        let headers_read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let headers_read_c = Arc::clone(&headers_read);
+        let drained = Arc::new(Mutex::new(Vec::new()));
+        let drained_c = Arc::clone(&drained);
         let archive_path = archive_path.to_string();
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = stopped.clone();
@@ -3615,24 +3648,46 @@ mod tests {
                 let mut range_hdr: Option<String> = None;
                 let mut cookie_hdr: Option<String> = None;
                 let mut bearer_hdr: Option<String> = None;
+                let mut content_len = 0u64;
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).is_err() {
                         break;
                     }
                     if line == "\r\n" || line == "\n" || line.is_empty() {
+                        headers_read_c.fetch_add(1, std::sync::atomic::Ordering::Release);
                         break;
                     }
-                    if let Some(v) = line.strip_prefix("Range:") {
-                        range_hdr = Some(v.trim().to_string());
-                    }
-                    if let Some(v) = line.strip_prefix("Authorization:") {
-                        bearer_hdr = Some(v.trim().to_string());
-                    }
-                    if let Some(v) = line.strip_prefix("Cookie:") {
-                        cookie_hdr = Some(v.trim().to_string());
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_len = value.trim().parse().unwrap_or(0);
+                        }
+                        if name.eq_ignore_ascii_case("range") {
+                            range_hdr = Some(value.trim().to_string());
+                        }
+                        if name.eq_ignore_ascii_case("authorization") {
+                            bearer_hdr = Some(value.trim().to_string());
+                        }
+                        if name.eq_ignore_ascii_case("cookie") {
+                            cookie_hdr = Some(value.trim().to_string());
+                        }
                     }
                 }
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .split('?')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                // #297: read the body before closing, including on 401 and 404.
+                let drained_bytes =
+                    io::copy(&mut (&mut reader).take(content_len), &mut io::sink()).unwrap_or(0);
+                drained_c
+                    .lock()
+                    .unwrap()
+                    .push((path.clone(), drained_bytes));
                 if let Some(ref want) = require_bearer {
                     assert_eq!(
                         bearer_hdr.as_deref(),
@@ -3652,14 +3707,6 @@ mod tests {
                         continue;
                     }
                 }
-                let path = request_line
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("")
-                    .split('?')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
                 {
                     gets_c.lock().unwrap().push(path.clone());
                 }
@@ -3740,8 +3787,72 @@ mod tests {
             addr,
             gets,
             range_gets,
+            headers_read,
+            drained,
             stopped,
             join: Some(join),
+        }
+    }
+
+    /// Regression: #297 must read PROPFIND bodies before answering and closing.
+    #[test]
+    fn regression_297_index_http_reads_request_body_before_answering() {
+        use std::io::Write;
+        use std::net::TcpStream;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        for (path, require_cookie, status) in [
+            ("/archive.tar", None, "200 OK"),
+            ("/missing", None, "404 Not Found"),
+            ("/archive.tar", Some("session=ok"), "401 Unauthorized"),
+        ] {
+            let http = spawn_index_http(
+                "/archive.tar",
+                b"archive".to_vec(),
+                Default::default(),
+                None,
+                require_cookie.map(str::to_string),
+            );
+            let mut stream = TcpStream::connect(http.addr).unwrap();
+            let timeout = Duration::from_secs(20);
+            stream.set_read_timeout(Some(timeout)).unwrap();
+            stream.set_write_timeout(Some(timeout)).unwrap();
+            let body = [b'x'; 64];
+            let headers_read = http.headers_read.load(Ordering::Acquire);
+            write!(
+                stream,
+                "PROPFIND {path} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                http.addr,
+                body.len()
+            )
+            .unwrap();
+            // No body byte can be buffered before the headers are read.
+            let start = Instant::now();
+            while http.headers_read.load(Ordering::Acquire) == headers_read {
+                assert!(start.elapsed() < timeout, "headers not read for {status}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let write_result = stream.write_all(&body);
+            let mut response = String::new();
+            let read_result = stream.read_to_string(&mut response);
+            let socket_error = stream.take_error();
+            drop(stream);
+
+            let start = Instant::now();
+            let drained = loop {
+                if let Some(record) = http.drained.lock().unwrap().first().cloned() {
+                    break record;
+                }
+                assert!(start.elapsed() < timeout, "no drain record for {status}");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            // Check the drain first so the old helper fails here, even on reset.
+            assert_eq!(drained, (path.to_string(), body.len() as u64), "{status}");
+            write_result.unwrap();
+            read_result.unwrap();
+            assert!(response.starts_with(&format!("HTTP/1.1 {status}\r\n")));
+            assert!(socket_error.unwrap().is_none(), "{status}");
         }
     }
 
@@ -4111,8 +4222,10 @@ mod tests {
                     if line == "\r\n" || line == "\n" || line.is_empty() {
                         break;
                     }
-                    if let Some(v) = line.strip_prefix("Range:") {
-                        range_hdr = Some(v.trim().to_string());
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("range") {
+                            range_hdr = Some(value.trim().to_string());
+                        }
                     }
                 }
                 let path = request_line.split_whitespace().nth(1).unwrap_or("");

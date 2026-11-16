@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! Compression backends (Phases 3–5 + stream codecs).
 //!
 //! * **gzip** — G3 Tier B seekable checkpoints + Tier C seek-index blob import/export (`gzip_seek`).
@@ -69,15 +72,16 @@ pub use gzip_rapidgzip::{
     RAPIDGZIP_SEEK_CACHE_CHUNKS, RAPIDGZIP_SEEK_PREFETCH_WINDOWS,
 };
 pub use gzip_seek::{
-    encode_gzip_seek_index_blob, encode_indexed_gzip_index_blob, import_seek_points,
-    import_seek_points_with_mode, open_seekable_gzip, open_seekable_gzip_from_reader,
-    open_seekable_gzip_with_imported_index, open_seekable_gzip_with_imported_index_from_reader,
-    open_seekable_gzip_with_threads, open_seekable_gzip_with_threads_from_reader,
-    parse_gzip_seek_index_blob, parse_indexed_gzip_index_blob, try_import_gzip_seek_blob,
-    try_parallel_multi_member_decode, GzipSeekBlobFormat, GzipSeekIndexBlob, SeekableGzip,
-    SeekableGzipReader, SharedSeekableGzip, DEFAULT_GZIP_SEEK_SPACING, G3_SEEK_CACHE_BYTES,
-    G3_SEEK_CACHE_CHUNKS, GZIP_SEEK_INDEX_MAGIC, GZIP_SEEK_INDEX_VERSION, INDEXED_GZIP_INDEX_MAGIC,
-    INDEXED_GZIP_INDEX_VERSION, INDEXED_GZIP_WINDOW_SIZE,
+    encode_gzip_seek_index_blob, encode_indexed_gzip_index_blob, gzip_seek_points_usable,
+    import_seek_points, import_seek_points_with_mode, open_seekable_gzip,
+    open_seekable_gzip_from_reader, open_seekable_gzip_with_imported_index,
+    open_seekable_gzip_with_imported_index_from_reader, open_seekable_gzip_with_threads,
+    open_seekable_gzip_with_threads_from_reader, parse_gzip_seek_index_blob,
+    parse_indexed_gzip_index_blob, try_import_gzip_seek_blob, try_parallel_multi_member_decode,
+    GzipSeekBlobFormat, GzipSeekIndexBlob, SeekableGzip, SeekableGzipReader, SharedSeekableGzip,
+    DEFAULT_GZIP_SEEK_SPACING, G3_SEEK_CACHE_BYTES, G3_SEEK_CACHE_CHUNKS, GZIP_SEEK_INDEX_MAGIC,
+    GZIP_SEEK_INDEX_VERSION, INDEXED_GZIP_INDEX_MAGIC, INDEXED_GZIP_INDEX_VERSION,
+    INDEXED_GZIP_WINDOW_SIZE,
 };
 pub use lrzip_seek::{
     looks_like_lrzip, lrzip_available, lrzip_cli_available, materialize_lrzip,
@@ -109,9 +113,16 @@ pub use zstd_seek::{
     open_seekable_zstd_with_zstd_blocks_from_reader, scan_zstd_frames, scan_zstd_frames_path,
     zstd_decode_stats, SeekableZstd, ZstdDecodeStats, ZstdFrameInfo, ZstdFrameMap, ZstdReadOptions,
 };
+#[cfg(any(test, feature = "test-hooks"))]
+pub use zstd_splice::with_splice_frame_size_limit;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use zstd_splice::zstd_splice_seek_table_limit_for_test;
 pub use zstd_splice::{
-    splice_zstd_last_frames, splice_zstd_last_frames_append, splice_zstd_last_frames_append_with,
-    splice_zstd_last_frames_replace, write_zstd_splice_suffix, SpliceStats,
+    splice_zstd_last_frames, splice_zstd_last_frames_append,
+    splice_zstd_last_frames_append_guarded, splice_zstd_last_frames_append_with,
+    splice_zstd_last_frames_replace, splice_zstd_last_frames_replace_guarded,
+    write_zstd_splice_suffix, SpliceStats,
 };
 
 use std::fs::File;
@@ -130,6 +141,9 @@ use xz2::read::XzDecoder;
 pub enum CompressError {
     #[error("io: {0}")]
     Io(#[from] io::Error),
+    /// Publication must stop when the staged archive cannot inherit metadata.
+    #[error("archive metadata: {0}")]
+    ArchiveMetadata(#[source] io::Error),
     #[error("unsupported: {0}")]
     Unsupported(&'static str),
     #[error("{0}")]
@@ -163,14 +177,142 @@ pub enum CompressionFormat {
 
 /// Detect compression from magic bytes, with extension fallback for ambiguous formats.
 pub fn detect_compression(path: &Path) -> Result<CompressionFormat> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0232-M01","item":"ratarmount_compress::detect_compression","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut f = File::open(path)?;
     let mut magic = [0u8; 16];
     let n = f.read(&mut magic)?;
-    let by_magic = detect_compression_magic(&magic[..n])?;
+    detect_compression_head(&magic[..n], &mut f, path)
+}
+
+/// Detect compression using an already-read head, refining skippable frames.
+pub fn detect_compression_head<R: Read + Seek>(
+    head: &[u8],
+    reader: &mut R,
+    path: &Path,
+) -> Result<CompressionFormat> {
+    let by_magic = detect_compression_magic(head)?;
+    let by_magic = refine_skippable_format(reader, by_magic, head)?;
     if by_magic != CompressionFormat::None {
         return Ok(by_magic);
     }
     Ok(detect_compression_extension(path).unwrap_or(CompressionFormat::None))
+}
+
+/// Open decoded content from an admitted reader, never opening `label`.
+///
+/// Decodes from byte 0 regardless of the reader's current position. Path-only
+/// codecs reopen only a private spool, retained until the returned reader drops.
+pub fn open_decompressed_reader<R>(
+    mut reader: R,
+    label: &Path,
+    format: CompressionFormat,
+) -> Result<Box<dyn SeekRead>>
+where
+    R: Read + Seek + Send + 'static,
+{
+    reader.seek(SeekFrom::Start(0))?;
+    use CompressionFormat::*;
+    match format {
+        None => Err(CompressError::Unsupported("uncompressed reader")),
+        Gzip => Ok(Box::new(open_seekable_gzip_from_reader(
+            reader,
+            DEFAULT_GZIP_SEEK_SPACING,
+            label,
+        )?)),
+        Bzip2 => Ok(open_seekable_bzip2_from_reader(reader, label)?.open_reader()?),
+        Xz => Ok(open_seekable_xz_from_reader(reader, label)?.open_reader()?),
+        Zstd => Ok(open_seekable_zstd_from_reader(reader, label)?.open_reader()?),
+        _ => {
+            let spool = DecodedBody::from_decoder(label, "spool", reader, 0)?;
+            let path = spool.temp_path().ok_or_else(|| {
+                CompressError::Msg(format!("empty or non-file spool for {format:?}"))
+            })?;
+            let inner = match format {
+                Lz4 => open_seekable_lz4(path)?.open_reader()?,
+                Lzip => open_seekable_lzip(path)?.open_reader()?,
+                Lzo => open_seekable_lzo(path)?.open_reader()?,
+                CompressZ => open_seekable_compress_z(path)?.open_reader()?,
+                Lzma => open_seekable_lzma(path)?.open_reader()?,
+                Zlib => open_seekable_zlib(path)?.open_reader()?,
+                Lrzip => Box::new(materialize_lrzip(path)?.0) as Box<dyn SeekRead>,
+                _ => unreachable!(),
+            };
+            Ok(Box::new(SpooledReader {
+                inner,
+                _spool: spool,
+            }))
+        }
+    }
+}
+
+struct SpooledReader {
+    inner: Box<dyn SeekRead>,
+    _spool: Arc<DecodedBody>,
+}
+
+impl Read for SpooledReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for SpooledReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+/// Zstd and LZ4 share skippable-frame magic; inspect the first data frame.
+pub(crate) fn refine_skippable_format<R: Read + Seek>(
+    reader: &mut R,
+    by_magic: CompressionFormat,
+    head: &[u8],
+) -> Result<CompressionFormat> {
+    if by_magic != CompressionFormat::Lz4
+        || head.len() < 4
+        || u32::from_le_bytes(head[..4].try_into().unwrap()) & 0xFFFF_FFF0 != 0x184D_2A50
+    {
+        return Ok(by_magic);
+    }
+
+    let len = reader.seek(SeekFrom::End(0))?;
+    let mut pos = 0u64;
+    while pos < len {
+        reader.seek(SeekFrom::Start(pos))?;
+        let mut magic = [0u8; 4];
+        match reader.read_exact(&mut magic) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        if magic == [0x28, 0xB5, 0x2F, 0xFD] {
+            return Ok(CompressionFormat::Zstd);
+        }
+        if u32::from_le_bytes(magic) & 0xFFFF_FFF0 != 0x184D_2A50 {
+            break;
+        }
+        let mut size = [0u8; 4];
+        match reader.read_exact(&mut size) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        let Some(next) = pos
+            .checked_add(8)
+            .and_then(|p| p.checked_add(u64::from(u32::from_le_bytes(size))))
+        else {
+            break;
+        };
+        if next >= len {
+            break;
+        }
+        pos = next;
+    }
+    // Keep the existing LZ4 classification/error path for ambiguous inputs.
+    Ok(by_magic)
 }
 
 pub fn detect_compression_magic(magic: &[u8]) -> Result<CompressionFormat> {
@@ -256,6 +398,10 @@ pub fn detect_compression_extension(path: &Path) -> Option<CompressionFormat> {
 
 /// TAR magic at offset 257: "ustar" or GNU.
 pub fn looks_like_tar(path: &Path) -> Result<bool> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0233-M01","item":"ratarmount_compress::looks_like_tar","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut f = File::open(path)?;
     if f.seek(SeekFrom::Start(257)).is_err() {
         return Ok(false);
@@ -280,6 +426,10 @@ fn materialize_from_reader(
     label: &str,
     path: &Path,
 ) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0234-M01","item":"ratarmount_compress::materialize_from_reader","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     let n = copy(&mut decoder, &mut tmp)?;
     tmp.flush()?;
@@ -296,6 +446,10 @@ fn materialize_from_reader(
 
 /// Decompress gzip into a persistent temp file; returns size.
 pub fn materialize_gzip(path: &Path) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0235-M01","item":"ratarmount_compress::materialize_gzip","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let input = File::open(path)?;
     let decoder = MultiGzDecoder::new(BufReader::new(input));
     materialize_from_reader(decoder, "gzip", path)
@@ -308,6 +462,10 @@ pub fn materialize_gzip(path: &Path) -> Result<(NamedTempFile, u64)> {
 /// which made `--commit-overlay` rewrite only the first TAR and drop later
 /// members.
 pub fn materialize_bzip2(path: &Path) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0236-M01","item":"ratarmount_compress::materialize_bzip2","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let input = File::open(path)?;
     let decoder = MultiBzDecoder::new(BufReader::new(input));
     materialize_from_reader(decoder, "bzip2", path)
@@ -319,6 +477,10 @@ pub fn materialize_bzip2(path: &Path) -> Result<(NamedTempFile, u64)> {
 /// (`cat a.xz b.xz`) are fully decoded. `XzDecoder::new` stops after the
 /// first stream footer, which made `--commit-overlay` drop later TAR members.
 pub fn materialize_xz(path: &Path) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0237-M01","item":"ratarmount_compress::materialize_xz","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let input = File::open(path)?;
     let decoder = XzDecoder::new_multi_decoder(BufReader::new(input));
     materialize_from_reader(decoder, "xz", path)
@@ -351,6 +513,10 @@ pub fn materialize_open(
 
 /// Decompress zstd into a persistent temp file.
 pub fn materialize_zstd(path: &Path) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0238-M01","item":"ratarmount_compress::materialize_zstd","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let input = File::open(path)?;
     let decoder = zstd::stream::read::Decoder::new(BufReader::new(input))?;
     materialize_from_reader(decoder, "zstd", path)
@@ -699,6 +865,75 @@ mod tests {
     use super::*;
     use std::io::{Cursor, Write};
 
+    /// Regression: detection/refinement must not leave decoder input advanced.
+    #[test]
+    fn regression_303_decoder_rewinds_advanced_cursor() {
+        use std::io::Cursor;
+        let mut tar = vec![0u8; 10_240];
+        tar[257..263].copy_from_slice(b"ustar\0");
+        tar[512..1212].fill(b'r');
+        for format in [
+            CompressionFormat::Gzip,
+            CompressionFormat::Zstd,
+            CompressionFormat::Lzma,
+            CompressionFormat::Zlib,
+        ] {
+            let bytes = match format {
+                CompressionFormat::Gzip => {
+                    let mut e =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                    e.write_all(&tar).unwrap();
+                    e.finish().unwrap()
+                }
+                CompressionFormat::Zstd => {
+                    let mut b = vec![0x50, 0x2a, 0x4d, 0x18, 80, 0, 0, 0];
+                    b.resize(88, 0);
+                    b.extend(zstd::encode_all(&tar[..], 1).unwrap());
+                    b
+                }
+                CompressionFormat::Lzma => {
+                    let stream = xz2::stream::Stream::new_lzma_encoder(
+                        &xz2::stream::LzmaOptions::new_preset(1).unwrap(),
+                    )
+                    .unwrap();
+                    let mut e = xz2::write::XzEncoder::new_stream(Vec::new(), stream);
+                    e.write_all(&tar).unwrap();
+                    e.finish().unwrap()
+                }
+                CompressionFormat::Zlib => {
+                    let mut e =
+                        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+                    e.write_all(&tar).unwrap();
+                    e.finish().unwrap()
+                }
+                _ => unreachable!(),
+            };
+            let mut cursor = Cursor::new(bytes);
+            let mut head = [0; 16];
+            cursor.read_exact(&mut head).unwrap();
+            let label = Path::new("never-open-this-archive.tar.lzma");
+            assert_eq!(
+                detect_compression_head(&head, &mut cursor, label).unwrap(),
+                format
+            );
+            if format == CompressionFormat::Zstd {
+                assert!(cursor.position() > 16);
+            }
+            let mut reader = open_decompressed_reader(cursor, label, format).unwrap();
+            let mut decoded = Vec::new();
+            reader.read_to_end(&mut decoded).unwrap();
+            assert_eq!(decoded, tar, "{format:?}");
+        }
+        let err = open_decompressed_reader(
+            Cursor::new(Vec::<u8>::new()),
+            Path::new("empty.lzma"),
+            CompressionFormat::Lzma,
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("empty or non-file spool"));
+    }
+
     #[test]
     fn stencil_concat() {
         let data = b"abcdefghij";
@@ -790,6 +1025,76 @@ mod tests {
             detect_compression_magic(b"LRZI\x00\x06").unwrap(),
             CompressionFormat::Lrzip
         );
+    }
+
+    /// Regression: #257 leading shared skippable magic routed zstd files to LZ4.
+    #[test]
+    fn regression_257_detect_skippable_zstd() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.bin");
+        let frame = encode_zstd_frame(b"zstd payload", 1).unwrap();
+        let skip = b"\x50\x2a\x4d\x18\x04\0\0\0\0\0\0\0";
+        let empty_skip = b"\x5f\x2a\x4d\x18\0\0\0\0";
+        for prefix in [skip.to_vec(), [empty_skip.as_slice(), skip].concat()] {
+            let bytes = [prefix.as_slice(), &frame].concat();
+            std::fs::write(&path, &bytes).unwrap();
+            // The slice-only API intentionally keeps its original classification.
+            assert_eq!(
+                detect_compression_magic(&bytes[..16]).unwrap(),
+                CompressionFormat::Lz4
+            );
+            assert_eq!(detect_compression(&path).unwrap(), CompressionFormat::Zstd);
+            let body = open_seekable_zstd(&path).unwrap();
+            let mut actual = Vec::new();
+            body.open_reader()
+                .unwrap()
+                .read_to_end(&mut actual)
+                .unwrap();
+            assert_eq!(actual, b"zstd payload");
+        }
+    }
+
+    /// Regression: #257 incomplete or ambiguous prefixes must keep the LZ4 error path.
+    #[test]
+    fn regression_257_skippable_detection_ambiguous_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.zst");
+        let skip = b"\x50\x2a\x4d\x18\x04\0\0\0\0\0\0\0";
+        let mut cases = vec![
+            skip.to_vec(),
+            [skip.as_slice(), skip].concat(),
+            [skip.as_slice(), b"junk"].concat(),
+            [skip.as_slice(), b"\x28\xb5\x2f"].concat(),
+            b"\x50\x2a\x4d\x18\xff\xff\xff\xff\x28\xb5\x2f\xfd".to_vec(),
+        ];
+        for len in 4..8 {
+            cases.push(skip[..len].to_vec());
+        }
+        for bytes in cases {
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(detect_compression(&path).unwrap(), CompressionFormat::Lz4);
+        }
+    }
+
+    /// Regression: #257 shared skippable magic must still admit actual LZ4 streams.
+    #[test]
+    fn regression_257_skippable_lz4_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.lz4");
+        let payload = b"an actual LZ4 payload";
+        let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+        encoder.write_all(payload).unwrap();
+        let mut bytes = b"\x50\x2a\x4d\x18\x04\0\0\0skip".to_vec();
+        bytes.extend(encoder.finish().unwrap());
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(detect_compression(&path).unwrap(), CompressionFormat::Lz4);
+        let body = open_seekable_lz4(&path).unwrap();
+        let mut actual = Vec::new();
+        body.open_reader()
+            .unwrap()
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(actual, payload);
     }
 
     #[test]

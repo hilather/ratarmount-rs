@@ -38,13 +38,17 @@ impl FolderMountSource {
 
     fn file_info_for(path: &Path, virtual_path: &str) -> io::Result<FileInfo> {
         let meta = fs::symlink_metadata(path)?;
+        let mut userdata = Vec::new();
         let linkname = if meta.file_type().is_symlink() {
-            fs::read_link(path)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
+            let target = fs::read_link(path)?;
+            userdata.push(UserData::SymlinkTarget(
+                target.as_os_str().as_encoded_bytes().to_vec(),
+            ));
+            target.to_string_lossy().into_owned()
         } else {
             String::new()
         };
+        userdata.push(UserData::Other(virtual_path.to_string()));
         Ok(FileInfo {
             size: meta.len(),
             mtime: metadata_mtime_secs(&meta) as f64,
@@ -52,7 +56,7 @@ impl FolderMountSource {
             linkname,
             uid: metadata_uid(&meta),
             gid: metadata_gid(&meta),
-            userdata: vec![UserData::Other(virtual_path.to_string())],
+            userdata,
         })
     }
 
@@ -234,7 +238,14 @@ impl MountSource for FolderMountSource {
             })
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing path userdata"))?;
         let real = self.realpath(vpath);
-        Ok(Box::new(File::open(real)?))
+        Ok(Box::new({
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0140-M01","item":"<ratarmount_compositing::folder::FolderMountSource as ratarmount_core::MountSource<ratarmount_compositing::folder::FolderMountSource>>::open","disposition":"residual","reason":"external folder payload; special-file/symlink semantics and backing-owner migration excluded","family":"generic-folder-reads","issue":"#196","category":"generic-folder-reads","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
+            let __inventory_value_0 = File::open(real);
+            __inventory_value_0
+        }?))
     }
 
     fn supports_backing_extents(&self) -> bool {
@@ -249,6 +260,10 @@ impl MountSource for FolderMountSource {
             UserData::Other(s) if s.starts_with('/') => Some(s.as_str()),
             _ => None,
         })?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0141-M01","item":"<ratarmount_compositing::folder::FolderMountSource as ratarmount_core::MountSource<ratarmount_compositing::folder::FolderMountSource>>::backing_extent","disposition":"residual","reason":"external folder payload; special-file/symlink semantics and backing-owner migration excluded","family":"generic-folder-reads","issue":"#196","category":"generic-folder-reads","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = File::open(self.realpath(path)).ok()?;
         let meta = file.metadata().ok()?;
         if !meta.is_file() {

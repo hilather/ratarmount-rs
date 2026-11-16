@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, SystemTime};
 
 use ratarmount_core::{ArchiveRead, CheapDirent, FileInfo, ListResult, MountSource, UserData};
+use ratarmount_index::http_client::{HttpError, HttpResponse};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -30,8 +31,8 @@ fn error(message: impl Into<String>) -> RemoteError {
     RemoteError::Hf(message.into())
 }
 
-pub(crate) fn map_http_error(repo: &str, err: ureq::Error) -> RemoteError {
-    let ureq::Error::Status(status, response) = err else {
+pub(crate) fn map_http_error(repo: &str, err: HttpError) -> RemoteError {
+    let HttpError::Status(status, response) = err else {
         return error(format!("Hub request failed for {repo}"));
     };
     let code = response.header("X-Error-Code").map(str::to_owned);
@@ -315,6 +316,10 @@ impl Config {
             .filter(|s| !s.is_empty())
             .or_else(|| env("HUGGING_FACE_HUB_TOKEN"))
             .and_then(clean_token);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0489-M01","item":"<ratarmount_remote::hf::Config>::from_values","disposition":"out-of-family","category":"configuration-or-credentials","reason":"HF token file","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let token = if token.is_some() {
             token
         } else {
@@ -632,15 +637,15 @@ impl HfRepo {
         )
     }
 
-    fn get_api(&self, url: &str) -> Result<ureq::Response> {
+    fn get_api(&self, url: &str) -> Result<HttpResponse> {
         self.get_with_retries(url, MAX_API_RETRIES)
     }
 
-    fn get(&self, url: &str) -> Result<ureq::Response> {
+    fn get(&self, url: &str) -> Result<HttpResponse> {
         self.get_with_retries(url, 0)
     }
 
-    fn get_with_retries(&self, url: &str, retries: usize) -> Result<ureq::Response> {
+    fn get_with_retries(&self, url: &str, retries: usize) -> Result<HttpResponse> {
         self.config.online()?;
         let parsed = Url::parse(url).map_err(|_| error("invalid Hub API URL"))?;
         if parsed.origin() != self.config.endpoint.origin()
@@ -662,7 +667,7 @@ impl HfRepo {
                 );
             }
             match req.call() {
-                Err(ureq::Error::Status(429, response)) if attempt < retries => {
+                Err(HttpError::Status(429, response)) if attempt < retries => {
                     let wait = retry_after(response.header("Retry-After"), SystemTime::now());
                     drop(response);
                     std::thread::sleep(wait);
@@ -688,6 +693,10 @@ impl HfRepo {
 
     /// Stream large index sidecars to disk without a second in-memory copy.
     pub fn fetch_to_temp(&self, url: &str, cap: u64) -> Result<tempfile::NamedTempFile> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0490-M01","item":"<ratarmount_remote::hf::HfRepo>::fetch_to_temp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
         let mut tmp = tempfile::NamedTempFile::new()?;
         let mut body = self.get(url)?.into_reader().take(cap.saturating_add(1));
         if io::copy(&mut body, &mut tmp)? > cap {
@@ -793,7 +802,7 @@ impl HfRepo {
         };
         // Some Hub/CDN HEAD responses omit Accept-Ranges.
         let response = match source.request("GET", Some((0, 0))) {
-            Err(ureq::Error::Status(416, response))
+            Err(HttpError::Status(416, response))
                 if response.header("Content-Range") == Some("bytes */0") =>
             {
                 let source = Arc::new(source);
@@ -880,6 +889,10 @@ impl HfRepo {
             );
             let memory = pool.reserve(MAX_BUFFER_BYTES).map(Arc::new);
             if memory.is_none() {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0491-M01","item":"<ratarmount_remote::hf::HfRepo>::probe_file","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )]
                 let mut file = tempfile::tempfile()?;
                 let size = io::copy(
                     &mut response.into_reader().take(MAX_BUFFER_BYTES + 1),
@@ -966,7 +979,14 @@ impl HfRepo {
         self.config.online()?;
         let identity = self.cache_identity();
         if let Some(path) = self.tree_cache_path() {
-            if let Ok(file) = std::fs::File::open(path) {
+            if let Ok(file) = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0492-M01","item":"<ratarmount_remote::hf::HfRepo>::tree","disposition":"residual","reason":"HF tree-listing cache JSON; a listing, not an index or metadata-cache blob","family":"remote-listing-and-torrent-caches","issue":"#196","category":"remote-listing-and-torrent-caches","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
+                let __inventory_value_0 = std::fs::File::open(path);
+                __inventory_value_0
+            } {
                 if let Ok(cached) = read_json(file) {
                     if cached["identity"] == identity && entries(&cached["entries"]).is_ok() {
                         return Ok(Some(cached["entries"].clone()));
@@ -1031,7 +1051,15 @@ impl HfRepo {
             if let Some(path) = self.tree_cache_path() {
                 let save = || -> io::Result<()> {
                     let parent = path.parent().unwrap();
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-E0083-M01","item":"<ratarmount_remote::hf::HfRepo>::tree","disposition":"output-owner","category":"hf-listing-cache-directory","reason":"Create the pinned Hub tree-listing cache parent before temporary JSON publication.","creation":{"policy":"recursive-directory","basis":"This is cache output under the selected listing path; existing directory defaults and atomic tempfile publication are retained."}}"###
+                    )]
                     std::fs::create_dir_all(parent)?;
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0493-M01","item":"<ratarmount_remote::hf::HfRepo>::tree","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                    )]
                     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
                     serde_json::to_writer(
                         &mut tmp,

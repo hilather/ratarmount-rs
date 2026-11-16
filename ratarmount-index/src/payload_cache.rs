@@ -4,6 +4,10 @@
 //! [`platform_cache_root()`]`/payload-v1/{hh}/{sha256}` plus `{sha256}.hdr`.
 //! Never writes `meta-v3/` or nests under `local-index-v1/`.
 
+#[expect(
+    clippy::disallowed_types,
+    reason = r###"internal-read:v1 {"id":"IR-E0078-T01","item":"ratarmount_index::payload_cache","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for exclusive payload-cache staging output.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+)]
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -122,6 +126,10 @@ impl PayloadCache {
         {
             return None;
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0458-M01","item":"<ratarmount_index::payload_cache::PayloadCache>::lookup","disposition":"residual","reason":"payload-cache blob owner / staging reopen; payload cache ownership and backing export are excluded","family":"payload-cache","issue":"#196","category":"payload-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = open_regular(&blob).ok()?;
         let meta = file.metadata().ok()?;
         if meta.len() != hdr.len || hdr.len == 0 {
@@ -192,7 +200,14 @@ impl PayloadCache {
                 "payload-v1 fail-closed: sha256 mismatch",
             ));
         }
-        if let Ok(f) = File::open(&tmp) {
+        if let Ok(f) = {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0459-M01","item":"<ratarmount_index::payload_cache::PayloadCache>::install_open","disposition":"residual","reason":"payload-cache sync reopen of its own staging file (payload_cache.rs:195); payload cache ownership is excluded","family":"payload-cache","issue":"#196","category":"payload-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
+            let __inventory_value_0 = File::open(&tmp);
+            __inventory_value_0
+        } {
             let _ = f.sync_all();
         }
         let now = timestamp();
@@ -207,6 +222,10 @@ impl PayloadCache {
             let _ = fs::remove_file(&tmp);
             return Err(e);
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0460-M01","item":"<ratarmount_index::payload_cache::PayloadCache>::install_open","disposition":"residual","reason":"payload-cache blob owner / staging reopen; payload cache ownership and backing export are excluded","family":"payload-cache","issue":"#196","category":"payload-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = match open_regular(&tmp) {
             Ok(file) => file,
             Err(e) => {
@@ -265,6 +284,10 @@ impl PayloadCache {
 
     fn read_header(&self, key: &str) -> io::Result<PayloadHeader> {
         let mut bytes = Vec::new();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0461-M01","item":"<ratarmount_index::payload_cache::PayloadCache>::read_header","disposition":"residual","reason":"payload-cache header read (payload_cache.rs:266-270): payload-v1 cache, not the meta-v3 metadata cache, so not mandatory","family":"payload-cache","issue":"#196","category":"payload-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         open_regular(&self.hdr_path(key))?
             .take(8192)
             .read_to_end(&mut bytes)?;
@@ -338,7 +361,28 @@ pub fn is_payload_cache_path(path: &Path) -> bool {
 }
 
 fn copy_hash_to_tmp<R: Read>(tmp: &Path, reader: &mut R, expected_len: u64) -> io::Result<String> {
-    let mut f = OpenOptions::new().write(true).create_new(true).open(tmp)?;
+    let mut f = {
+        #[expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-B0462-T01","item":"ratarmount_index::payload_cache::copy_hash_to_tmp","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0462-M01","item":"ratarmount_index::payload_cache::copy_hash_to_tmp","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
+        )]
+        let mut __inventory_value_0 = OpenOptions::new();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0079-M01","item":"ratarmount_index::payload_cache::copy_hash_to_tmp","disposition":"output-owner","category":"payload-cache-staging","reason":"Configure exclusive creation of the payload temporary file before hashing and length-checking streamed output.","creation":{"policy":"exclusive-new-file","basis":"create_new cannot replace an existing file; existing default/umask permissions are retained until cache publication."}}"###
+        )]
+        let __inventory_value_1 = __inventory_value_0.write(true).create_new(true);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0462-M02","item":"ratarmount_index::payload_cache::copy_hash_to_tmp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
+        let __inventory_value_2 = __inventory_value_1.open(tmp);
+        __inventory_value_2
+    }?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; HASH_STREAM_CHUNK];
     let mut written = 0u64;

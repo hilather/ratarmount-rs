@@ -545,8 +545,9 @@ fn pid_gone(pid: i32) -> bool {
 }
 
 /// Failure-path cleanup for a daemonized serving child: lazy unmount the unique mnt, SIGKILL the
-/// still-unreaped parent, then SIGKILL the serving pid (0 = not found yet; looked up by exact
-/// mountpoint argument on drop). Created before any readiness assertion so a startup failure or
+/// still-unreaped parent, then SIGKILL every process whose argv still carries the mnt (looked up
+/// on drop; the stored `pid` is never signalled there, since the serving child may have exited
+/// and its pid been reused). Created before any readiness assertion so a startup failure or
 /// timeout still cleans up.
 struct ServingChild {
     pid: i32,
@@ -569,12 +570,7 @@ impl Drop for ServingChild {
             kill_unreaped(parent);
             let _ = parent.wait();
         }
-        let pids = if self.pid > 0 {
-            vec![self.pid]
-        } else {
-            find_serving_pids(&self.mnt)
-        };
-        for pid in pids {
+        for pid in find_serving_pids(&self.mnt) {
             if !pid_gone(pid) {
                 let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
             }
@@ -632,6 +628,41 @@ fn wait_unmounted_and_gone(c: &ServingChild, what: &str) {
         pid_gone(c.pid),
         "{what}: serving child {} still running",
         c.pid
+    );
+}
+
+/// Regression: `ServingChild::drop` SIGKILLed the pid stored at mount time whenever some live
+/// process held it, so a pid reused after the serving child exited was killed. Drop signals only
+/// processes whose argv carries the test's unique mountpoint. Needs no FUSE.
+#[test]
+fn regression_serving_child_drop_never_signals_a_reused_pid() {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mnt = dir.path().join("mnt");
+    // A live process at the stored pid that is not the serving child: a reused pid.
+    let mut unrelated = Command::new("sleep").arg("60").spawn().unwrap();
+    // Carries the mountpoint in its argv, as the serving child does.
+    let mut serving = Command::new("sh")
+        .args(["-c", "read -r _", "sh"])
+        .arg(&mnt)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(ServingChild {
+        pid: i32::try_from(unrelated.id()).unwrap(),
+        mnt,
+        parent: None,
+    });
+    let alive = unrelated.try_wait().unwrap().is_none();
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+    assert!(
+        alive,
+        "drop signalled the stored pid of an unrelated process"
+    );
+    assert_eq!(
+        serving.wait().unwrap().signal(),
+        Some(Signal::SIGKILL as i32)
     );
 }
 

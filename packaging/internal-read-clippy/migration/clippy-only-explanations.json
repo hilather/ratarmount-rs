@@ -1,0 +1,3031 @@
+{
+  "totals": {
+    "keys": 142,
+    "diagnostic_groups": 153,
+    "unexplained": 0
+  },
+  "counts": {
+    "retained-prior-explanation": 123,
+    "admitted-wrapper-family-completion": 5,
+    "spooled-tempfile-creation-completion": 3,
+    "generic-syscall-compiler-boundary": 4,
+    "libc-directory-creation-completion": 2,
+    "reviewed-dynamic-loader-probe": 1,
+    "managed-read-wrapper-family-completion": 4
+  },
+  "entries": [
+    {
+      "file": "ratarmount-compositing/src/empty_archive.rs",
+      "line": 3,
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0004"
+      ],
+      "source": "use std::fs::{self, File, OpenOptions};",
+      "classification": "retained-prior-explanation",
+      "explanation": "The experimental OpenOptions type ban reports a type import or function return type; no file is opened at this source location.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/empty_archive.rs",
+      "line": 102,
+      "function": "create_new_empty_archive",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0007"
+      ],
+      "source": "    opts.write(true).create_new(true);",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/overlay_meta.rs",
+      "line": 939,
+      "function": "test_hash_seam",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0025",
+        "D0026",
+        "D0027",
+        "D0028"
+      ],
+      "source": "        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(log) {",
+      "classification": "retained-prior-explanation",
+      "explanation": "The all-features production lib/bin compilation enables test-hooks, so this operation is present in the selected non-test target. The old scanner deliberately omitted this feature; cfg(test) test targets still drop out structurally.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions",
+        "std::fs::OpenOptions::create",
+        "std::fs::OpenOptions::new",
+        "std::fs::OpenOptions::open"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods",
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 4,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/overlay_meta.rs",
+      "line": 982,
+      "function": "test_pack_hold",
+      "op": "fs::write",
+      "diagnostic_ids": [
+        "D0029"
+      ],
+      "source": "        let _ = fs::write(ready, b\"ready\");",
+      "classification": "retained-prior-explanation",
+      "explanation": "The all-features production lib/bin compilation enables test-hooks, so this operation is present in the selected non-test target. The old scanner deliberately omitted this feature; cfg(test) test targets still drop out structurally.",
+      "compiler_definition_paths": [
+        "std::fs::write"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 6,
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0035"
+      ],
+      "source": "use std::fs::{self, File, OpenOptions as FsOpenOptions};",
+      "classification": "retained-prior-explanation",
+      "explanation": "The experimental OpenOptions type ban reports a type import or function return type; no file is opened at this source location.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 1051,
+      "function": "WriteOverlay::write_at_inner",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0036"
+      ],
+      "source": "            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };",
+      "classification": "retained-prior-explanation",
+      "explanation": "The broad libc::fcntl ban needed for F_DUPFD_CLOEXEC also reports this non-dup descriptor flag/lock command.",
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 1222,
+      "function": "WriteOverlay::open_with_create_info",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0037"
+      ],
+      "source": "            fs::create_dir_all(&root)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 1740,
+      "function": "WriteOverlay::ensure_parent",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0039"
+      ],
+      "source": "            fs::create_dir_all(&real_parent)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 1803,
+      "function": "WriteOverlay::ensure_modifiable_inner",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0040"
+      ],
+      "source": "            fs::create_dir_all(&real)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 1813,
+      "function": "WriteOverlay::ensure_modifiable_inner",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0041"
+      ],
+      "source": "                fs::create_dir_all(parent)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 1872,
+      "function": "WriteOverlay::copy_with_reservation",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0042"
+      ],
+      "source": "                fs::create_dir_all(&real)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 2295,
+      "function": "WriteOverlay::create_file_inner",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0046"
+      ],
+      "source": "                fs::create_dir_all(parent)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 2308,
+      "function": "WriteOverlay::create_file_inner",
+      "op": "open_admitted",
+      "diagnostic_ids": [
+        "D0047"
+      ],
+      "source": "            let f = open_admitted_file(",
+      "classification": "admitted-wrapper-family-completion",
+      "explanation": "Configured existing repository open_admitted_file wrapper DefId now yields a call-site diagnostic. The old config only observed the wrapper body; current caller flags are not interpreted by the enforcing checker.",
+      "compiler_definition_paths": [
+        "ratarmount_compositing::write_overlay::open_admitted_file"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 2439,
+      "function": "WriteOverlay::mkdir",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0051"
+      ],
+      "source": "        fs::create_dir_all(&real)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 2559,
+      "function": "WriteOverlay::truncate",
+      "op": "open_admitted",
+      "diagnostic_ids": [
+        "D0052"
+      ],
+      "source": "        let f = open_admitted_file(&real, libc::O_WRONLY | libc::O_NOFOLLOW, 0)?;",
+      "classification": "admitted-wrapper-family-completion",
+      "explanation": "Configured existing repository open_admitted_file wrapper DefId now yields a call-site diagnostic. The old config only observed the wrapper body; current caller flags are not interpreted by the enforcing checker.",
+      "compiler_definition_paths": [
+        "ratarmount_compositing::write_overlay::open_admitted_file"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 2590,
+      "function": "WriteOverlay::create_symlink",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0053"
+      ],
+      "source": "            fs::create_dir_all(parent)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 2701,
+      "function": "WriteOverlay::rename_inner",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0054"
+      ],
+      "source": "            fs::create_dir_all(parent)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 3222,
+      "function": "WriteOverlay::test_hold_open_transaction",
+      "op": "fs::write",
+      "diagnostic_ids": [
+        "D0055"
+      ],
+      "source": "            std::fs::write(ready, b\"ready\").expect(\"ready file\");",
+      "classification": "retained-prior-explanation",
+      "explanation": "The all-features production lib/bin compilation enables test-hooks, so this operation is present in the selected non-test target. The old scanner deliberately omitted this feature; cfg(test) test targets still drop out structurally.",
+      "compiler_definition_paths": [
+        "std::fs::write"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 5608,
+      "function": "WriteOverlay::open",
+      "op": "open_admitted",
+      "diagnostic_ids": [
+        "D0061"
+      ],
+      "source": "                let opened = open_admitted_file(&real, libc::O_RDONLY | libc::O_NOFOLLOW, 0);",
+      "classification": "admitted-wrapper-family-completion",
+      "explanation": "Configured existing repository open_admitted_file wrapper DefId now yields a call-site diagnostic. The old config only observed the wrapper body; current caller flags are not interpreted by the enforcing checker.",
+      "compiler_definition_paths": [
+        "ratarmount_compositing::write_overlay::open_admitted_file"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 5761,
+      "function": "write_commit_manifest",
+      "op": "open_admitted",
+      "diagnostic_ids": [
+        "D0062"
+      ],
+      "source": "    let opened = open_admitted_file(&dest, libc::O_RDONLY | libc::O_NONBLOCK, 0);",
+      "classification": "admitted-wrapper-family-completion",
+      "explanation": "Configured existing repository open_admitted_file wrapper DefId now yields a call-site diagnostic. The old config only observed the wrapper body; current caller flags are not interpreted by the enforcing checker.",
+      "compiler_definition_paths": [
+        "ratarmount_compositing::write_overlay::open_admitted_file"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 6460,
+      "function": "create_overlay_marker",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0070"
+      ],
+      "source": "        .create_new(true)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 6487,
+      "function": "open_options_nofollow",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0073"
+      ],
+      "source": "pub(crate) fn open_options_nofollow() -> FsOpenOptions {",
+      "classification": "retained-prior-explanation",
+      "explanation": "The experimental OpenOptions type ban reports a type import or function return type; no file is opened at this source location.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 6509,
+      "function": "create_cow_staging",
+      "op": "tempfile",
+      "diagnostic_ids": [
+        "D0076"
+      ],
+      "source": "        .make_in(parent, |path| {",
+      "classification": "retained-prior-explanation",
+      "explanation": "The newly configured tempfile::Builder::make_in definition creates the COW staging temporary through its callback. The old scanner omitted this tempfile entry point even though it inventoried the inner OpenOptions helper/open.",
+      "compiler_definition_paths": [
+        "tempfile::Builder::make_in"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 6511,
+      "function": "create_cow_staging",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0078"
+      ],
+      "source": "            opts.write(true).create_new(true).open(path)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 7982,
+      "function": "rebuild_zip_with_overlay",
+      "op": "open_admitted",
+      "diagnostic_ids": [
+        "D0085"
+      ],
+      "source": "                let opened = open_admitted_file(&src_path, libc::O_RDONLY, 0);",
+      "classification": "admitted-wrapper-family-completion",
+      "explanation": "Configured existing repository open_admitted_file wrapper DefId now yields a call-site diagnostic. The old config only observed the wrapper body; current caller flags are not interpreted by the enforcing checker.",
+      "compiler_definition_paths": [
+        "ratarmount_compositing::write_overlay::open_admitted_file"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 8708,
+      "function": "find_last_n_tar_window",
+      "op": "tempfile",
+      "diagnostic_ids": [
+        "D0093"
+      ],
+      "source": "        let mut suffix = tempfile::spooled_tempfile(DEFAULT_MEMORY_CAP as usize);",
+      "classification": "spooled-tempfile-creation-completion",
+      "explanation": "Configured spooled tempfile constructor DefId now yields a call-site diagnostic. Locked tempfile may roll the spool to disk; construction and rollover policy needs a per-site creation review.",
+      "compiler_definition_paths": [
+        "tempfile::spooled_tempfile"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "line": 8839,
+      "function": "suffix_window_has_member_boundary",
+      "op": "tempfile",
+      "diagnostic_ids": [
+        "D0094"
+      ],
+      "source": "    let mut suffix = tempfile::spooled_tempfile(DEFAULT_MEMORY_CAP as usize);",
+      "classification": "spooled-tempfile-creation-completion",
+      "explanation": "Configured spooled tempfile constructor DefId now yields a call-site diagnostic. Locked tempfile may roll the spool to disk; construction and rollover policy needs a per-site creation review.",
+      "compiler_definition_paths": [
+        "tempfile::spooled_tempfile"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-compress/src/zstd_splice.rs",
+      "line": 276,
+      "function": "spill_sink",
+      "op": "tempfile",
+      "diagnostic_ids": [
+        "D0177"
+      ],
+      "source": "    tempfile::spooled_tempfile(DEFAULT_MEMORY_CAP as usize)",
+      "classification": "spooled-tempfile-creation-completion",
+      "explanation": "Configured spooled tempfile constructor DefId now yields a call-site diagnostic. Locked tempfile may roll the spool to disk; construction and rollover policy needs a per-site creation review.",
+      "compiler_definition_paths": [
+        "tempfile::spooled_tempfile"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-csi/src/lib.rs",
+      "line": 17,
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0181"
+      ],
+      "source": "use std::fs::{self, File, OpenOptions};",
+      "classification": "retained-prior-explanation",
+      "explanation": "The experimental OpenOptions type ban reports a type import or function return type; no file is opened at this source location.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-csi/src/lib.rs",
+      "line": 46,
+      "function": "Journal::open",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0182"
+      ],
+      "source": "        fs::create_dir_all(dir).map_err(|_| Status::internal(\"cannot create state directory\"))?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-csi/src/lib.rs",
+      "line": 52,
+      "function": "Journal::open",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0185"
+      ],
+      "source": "            .create(true)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-csi/src/lib.rs",
+      "line": 80,
+      "function": "Journal::save",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0190"
+      ],
+      "source": "                .create(true)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-csi/src/lib.rs",
+      "line": 198,
+      "function": "State::publish",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0193"
+      ],
+      "source": "        fs::create_dir_all(&spec.target)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-csi/src/linux.rs",
+      "line": 64,
+      "function": "stage_dir",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0194",
+        "D0195"
+      ],
+      "source": "        match fs::DirBuilder::new().mode(0o700).create(&dir) {",
+      "classification": "retained-prior-explanation",
+      "explanation": "The N1 DirBuilder constructor/type bans report this builder setup; directory acquisition is separately reported at DirBuilder::create. The setup reference itself need not create a directory.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods",
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 2,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-csi/src/linux.rs",
+      "line": 64,
+      "function": "stage_dir",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0196"
+      ],
+      "source": "        match fs::DirBuilder::new().mode(0o700).create(&dir) {",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-csi/src/linux.rs",
+      "line": 164,
+      "function": "rename_noreplace",
+      "op": "libc::syscall",
+      "diagnostic_ids": [
+        "D0200"
+      ],
+      "source": "        libc::syscall(",
+      "classification": "generic-syscall-compiler-boundary",
+      "explanation": "The complete syscall entry point is configured so foreign open-family operations cannot hide behind its generic ABI. No syscall number, symbol or flags are inferred by enforcement; every current generic syscall call needs explicit review.",
+      "compiler_definition_paths": [
+        "libc::syscall"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-csi/src/linux.rs",
+      "line": 244,
+      "function": "run",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0201"
+      ],
+      "source": "    std::fs::create_dir_all(path.parent().ok_or(\"socket has no parent\")?)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-csi/src/process.rs",
+      "line": 118,
+      "function": "ProcessMounter::mount",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0203"
+      ],
+      "source": "            fs::create_dir_all(&self.overlay_root)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-csi/src/process.rs",
+      "line": 124,
+      "function": "ProcessMounter::mount",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0204"
+      ],
+      "source": "            fs::create_dir(&overlay)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-formats-git/src/secure_cache.rs",
+      "line": 107,
+      "function": "Directory::mkdir",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0234"
+      ],
+      "source": "        if unsafe { libc::mkdirat(self.0.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {",
+      "classification": "libc-directory-creation-completion",
+      "explanation": "Configured libc directory constructor DefId now yields a call-site diagnostic, matching the existing Rust/rustix directory-creation policy. N2 cannot reject declarations supplied by the libc dependency.",
+      "compiler_definition_paths": [
+        "libc::mkdirat"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-formats-git/src/secure_cache.rs",
+      "line": 144,
+      "function": "Directory::staging",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0236"
+      ],
+      "source": "            if unsafe { libc::mkdirat(self.0.as_raw_fd(), c.as_ptr(), 0o700) } == 0 {",
+      "classification": "libc-directory-creation-completion",
+      "explanation": "Configured libc directory constructor DefId now yields a call-site diagnostic, matching the existing Rust/rustix directory-creation policy. N2 cannot reject declarations supplied by the libc dependency.",
+      "compiler_definition_paths": [
+        "libc::mkdirat"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-formats-restic/src/repo.rs",
+      "line": 667,
+      "function": "write_synthetic_repo_version",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0261"
+      ],
+      "source": "    fs::create_dir_all(dir.join(\"keys\"))?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-formats-restic/src/repo.rs",
+      "line": 668,
+      "function": "write_synthetic_repo_version",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0262"
+      ],
+      "source": "    fs::create_dir_all(dir.join(\"data\"))?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-formats-restic/src/repo.rs",
+      "line": 669,
+      "function": "write_synthetic_repo_version",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0263"
+      ],
+      "source": "    fs::create_dir_all(dir.join(\"index\"))?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-formats-restic/src/repo.rs",
+      "line": 670,
+      "function": "write_synthetic_repo_version",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0264"
+      ],
+      "source": "    fs::create_dir_all(dir.join(\"snapshots\"))?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-formats-restic/src/repo.rs",
+      "line": 671,
+      "function": "write_synthetic_repo_version",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0265"
+      ],
+      "source": "    fs::create_dir_all(dir.join(\"locks\"))?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-formats-restic/src/repo.rs",
+      "line": 768,
+      "function": "write_synthetic_repo_version",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0268"
+      ],
+      "source": "    fs::create_dir_all(&shard)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-fuse/src/lib.rs",
+      "line": 2574,
+      "function": "RatarmountFs::setattr_detached",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0326"
+      ],
+      "source": "            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };",
+      "classification": "retained-prior-explanation",
+      "explanation": "The broad libc::fcntl ban needed for F_DUPFD_CLOEXEC also reports this non-dup descriptor flag/lock command.",
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-fuse/src/oplog.rs",
+      "line": 5,
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0329"
+      ],
+      "source": "use std::fs::{File, OpenOptions};",
+      "classification": "retained-prior-explanation",
+      "explanation": "The experimental OpenOptions type ban reports a type import or function return type; no file is opened at this source location.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-fuse/src/oplog.rs",
+      "line": 167,
+      "function": "OpLog::open",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0332"
+      ],
+      "source": "            .create(true)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-fuse/src/passthrough.rs",
+      "line": 312,
+      "function": "cache_parent",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0337"
+      ],
+      "source": "        std::fs::create_dir_all(&root)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/checked_open/acquire.rs",
+      "line": 822,
+      "function": "set_cloexec",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0347"
+      ],
+      "source": "            let f = libc::fcntl(fd, libc::F_GETFD);",
+      "classification": "retained-prior-explanation",
+      "explanation": "The broad libc::fcntl ban needed for F_DUPFD_CLOEXEC also reports this non-dup descriptor flag/lock command.",
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/checked_open/acquire.rs",
+      "line": 824,
+      "function": "set_cloexec",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0348"
+      ],
+      "source": "                libc::fcntl(fd, libc::F_SETFD, f | libc::FD_CLOEXEC);",
+      "classification": "retained-prior-explanation",
+      "explanation": "The broad libc::fcntl ban needed for F_DUPFD_CLOEXEC also reports this non-dup descriptor flag/lock command.",
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/checked_open/acquire.rs",
+      "line": 978,
+      "function": "armed_open",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0352"
+      ],
+      "source": "            let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };",
+      "classification": "retained-prior-explanation",
+      "explanation": "The broad libc::fcntl ban needed for F_DUPFD_CLOEXEC also reports this non-dup descriptor flag/lock command.",
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/checked_open/acquire.rs",
+      "line": 979,
+      "function": "armed_open",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0353"
+      ],
+      "source": "            if fl < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK) } < 0 {",
+      "classification": "retained-prior-explanation",
+      "explanation": "The broad libc::fcntl ban needed for F_DUPFD_CLOEXEC also reports this non-dup descriptor flag/lock command.",
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/checked_open/host.rs",
+      "line": 178,
+      "function": "own_handle_symbol",
+      "op": "libc::dlsym",
+      "diagnostic_ids": [
+        "D0354"
+      ],
+      "source": "        let found = libc::dlsym(handle, name.as_ptr());",
+      "classification": "reviewed-dynamic-loader-probe",
+      "explanation": "Keystone sweep-4 ruling #4 adds the libc loader APIs by DefId. This existing own-image symbol probe is the single reviewed dlsym exception at checked_open/host.rs:178.",
+      "compiler_definition_paths": [
+        "libc::dlsym"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/digest_cache.rs",
+      "line": 325,
+      "function": "open_lock_file",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0360"
+      ],
+      "source": "        .create(true)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/lib.rs",
+      "line": 1115,
+      "function": "SqliteIndex::create_writable",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0367"
+      ],
+      "source": "                    std::fs::create_dir_all(parent)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/local_cache.rs",
+      "line": 147,
+      "function": "LocalIndexCache::ensure_dir",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0369"
+      ],
+      "source": "        fs::create_dir_all(&self.dir)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/location.rs",
+      "line": 229,
+      "function": "store_index_pointer_atomic",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0373"
+      ],
+      "source": "            std::fs::create_dir_all(parent)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/location.rs",
+      "line": 312,
+      "function": "snapshot_index_id",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0376"
+      ],
+      "source": "            std::fs::create_dir_all(parent)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/location.rs",
+      "line": 388,
+      "function": "atomic_copy_file",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0377"
+      ],
+      "source": "            std::fs::create_dir_all(parent)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/location.rs",
+      "line": 1095,
+      "function": "decompress_index_to_temp",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0384"
+      ],
+      "source": "        std::fs::create_dir_all(&dir)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/location.rs",
+      "line": 1174,
+      "function": "fetch_index_http_uncached",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0387"
+      ],
+      "source": "        std::fs::create_dir_all(&dir)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/location.rs",
+      "line": 1402,
+      "function": "path_can_create_index",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0390"
+      ],
+      "source": "        if !parent.exists() && std::fs::create_dir_all(parent).is_err() {",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/location.rs",
+      "line": 1415,
+      "function": "test_writable_dir",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0393"
+      ],
+      "source": "        .create_new(true)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/managed_read.rs",
+      "line": 66,
+      "function": "ManagedReadCursor::open",
+      "op": "managed-read-wrapper",
+      "diagnostic_ids": [
+        "D0395"
+      ],
+      "source": "        let file = imp::ByteFile::open(path)?;",
+      "classification": "managed-read-wrapper-family-completion",
+      "explanation": "Clippy now observes the current private ByteFile::open backend or all-features public lock-probe helper call through its configured DefId. test-hooks remains production in the locked all-features profile.",
+      "compiler_definition_paths": [
+        "ratarmount_index::managed_read::imp::ByteFile::open"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/managed_read.rs",
+      "line": 228,
+      "function": "read_to_string",
+      "op": "managed_read::read",
+      "diagnostic_ids": [
+        "D0397"
+      ],
+      "source": "    String::from_utf8(read(path)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))",
+      "classification": "retained-prior-explanation",
+      "explanation": "This is an unqualified same-module call to managed_read::read inside the helper implementation. Old regex only matched managed_read::<name>, so it is a real Clippy-only method site.",
+      "compiler_definition_paths": [
+        "ratarmount_index::managed_read::read"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/managed_read.rs",
+      "line": 319,
+      "function": "copy_exclusive_new",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0404"
+      ],
+      "source": "    opts.write(true).create_new(true);",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/managed_read.rs",
+      "line": 361,
+      "function": "copy_create_or_truncate",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0409"
+      ],
+      "source": "    opts.write(true).create(true).truncate(true);",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/managed_read.rs",
+      "line": 500,
+      "function": "occupied",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0411"
+      ],
+      "source": "        unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }",
+      "classification": "retained-prior-explanation",
+      "explanation": "The broad libc::fcntl ban needed for F_DUPFD_CLOEXEC also reports this non-dup descriptor flag/lock command.",
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/managed_read.rs",
+      "line": 900,
+      "function": "other_process_sees_lock",
+      "op": "libc::open",
+      "diagnostic_ids": [
+        "D0413"
+      ],
+      "source": "                let fd = libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);",
+      "classification": "retained-prior-explanation",
+      "explanation": "The all-features production lib/bin compilation enables test-hooks, so this operation is present in the selected non-test target. The old scanner deliberately omitted this feature; cfg(test) test targets still drop out structurally.",
+      "compiler_definition_paths": [
+        "libc::open"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/managed_read.rs",
+      "line": 909,
+      "function": "other_process_sees_lock",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0414"
+      ],
+      "source": "                if libc::fcntl(fd, libc::F_GETLK, &mut lk) != 0 {",
+      "classification": "retained-prior-explanation",
+      "explanation": "The all-features production lib/bin compilation enables test-hooks, so this operation is present in the selected non-test target. The old scanner deliberately omitted this feature; cfg(test) test targets still drop out structurally.",
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/managed_read.rs",
+      "line": 952,
+      "function": "with_close_probes",
+      "op": "managed-read-wrapper",
+      "diagnostic_ids": [
+        "D0415"
+      ],
+      "source": "                    if let Ok(lock) = VfsLockHolder::shared(&path) {",
+      "classification": "managed-read-wrapper-family-completion",
+      "explanation": "Clippy now observes the current private ByteFile::open backend or all-features public lock-probe helper call through its configured DefId. test-hooks remains production in the locked all-features profile.",
+      "compiler_definition_paths": [
+        "ratarmount_index::managed_read::VfsLockHolder::shared"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/managed_read.rs",
+      "line": 960,
+      "function": "with_close_probes",
+      "op": "managed-read-wrapper",
+      "diagnostic_ids": [
+        "D0416"
+      ],
+      "source": "                        let kept = lock_probe::other_process_sees_lock(&p);",
+      "classification": "managed-read-wrapper-family-completion",
+      "explanation": "Clippy now observes the current private ByteFile::open backend or all-features public lock-probe helper call through its configured DefId. test-hooks remains production in the locked all-features profile.",
+      "compiler_definition_paths": [
+        "ratarmount_index::managed_read::lock_probe::other_process_sees_lock"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/managed_read.rs",
+      "line": 1010,
+      "function": "VfsLockHolder::shared",
+      "op": "managed-read-wrapper",
+      "diagnostic_ids": [
+        "D0417"
+      ],
+      "source": "        let mut file = imp::ByteFile::open(path)?;",
+      "classification": "managed-read-wrapper-family-completion",
+      "explanation": "Clippy now observes the current private ByteFile::open backend or all-features public lock-probe helper call through its configured DefId. test-hooks remains production in the locked all-features profile.",
+      "compiler_definition_paths": [
+        "ratarmount_index::managed_read::imp::ByteFile::open"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/meta_cache.rs",
+      "line": 278,
+      "function": "MetaCache::ensure_dir",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0419"
+      ],
+      "source": "        fs::create_dir_all(&self.dir)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/payload_cache.rs",
+      "line": 7,
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0423"
+      ],
+      "source": "use std::fs::{self, File, OpenOptions};",
+      "classification": "retained-prior-explanation",
+      "explanation": "The experimental OpenOptions type ban reports a type import or function return type; no file is opened at this source location.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/payload_cache.rs",
+      "line": 341,
+      "function": "copy_hash_to_tmp",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0430"
+      ],
+      "source": "    let mut f = OpenOptions::new().write(true).create_new(true).open(tmp)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/range_cache.rs",
+      "line": 9,
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0432"
+      ],
+      "source": "use std::fs::{self, File, OpenOptions};",
+      "classification": "retained-prior-explanation",
+      "explanation": "The experimental OpenOptions type ban reports a type import or function return type; no file is opened at this source location.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/range_cache.rs",
+      "line": 674,
+      "function": "ensure_private_dir",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0435",
+        "D0436"
+      ],
+      "source": "    let mut builder = fs::DirBuilder::new();",
+      "classification": "retained-prior-explanation",
+      "explanation": "The N1 DirBuilder constructor/type bans report this builder setup; directory acquisition is separately reported at DirBuilder::create. The setup reference itself need not create a directory.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods",
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 2,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-index/src/range_cache.rs",
+      "line": 681,
+      "function": "ensure_private_dir",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0437"
+      ],
+      "source": "    builder.create(path)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-remote/src/hf.rs",
+      "line": 1034,
+      "function": "HfRepo::tree",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0463"
+      ],
+      "source": "                    std::fs::create_dir_all(parent)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-remote/src/hf_cache.rs",
+      "line": 4,
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0465"
+      ],
+      "source": "use std::fs::{self, File, OpenOptions};",
+      "classification": "retained-prior-explanation",
+      "explanation": "The experimental OpenOptions type ban reports a type import or function return type; no file is opened at this source location.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-remote/src/hf_cache.rs",
+      "line": 40,
+      "function": "directories",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0466"
+      ],
+      "source": "        fs::create_dir_all(root)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-remote/src/hf_cache.rs",
+      "line": 49,
+      "function": "directories",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0467"
+      ],
+      "source": "            match fs::create_dir(&current) {",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-remote/src/hf_cache.rs",
+      "line": 743,
+      "function": "HubCache::install_with",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0481"
+      ],
+      "source": "        options.read(true).write(true).create(true).truncate(false);",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-remote/src/torrent/checksums.rs",
+      "line": 98,
+      "function": "save",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0507"
+      ],
+      "source": "    std::fs::create_dir_all(dir)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-remote/src/torrent/metadata.rs",
+      "line": 141,
+      "function": "save",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0510"
+      ],
+      "source": "    std::fs::create_dir_all(dir)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-remote/src/torrent/scratch.rs",
+      "line": 141,
+      "function": "mark_owned",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0515"
+      ],
+      "source": "        .create_new(true)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-remote/src/torrent/swarm.rs",
+      "line": 310,
+      "function": "Swarm::with_cache",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0520"
+      ],
+      "source": "                    std::fs::create_dir_all(&cache_dir)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-session/src/extract.rs",
+      "line": 3,
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0524"
+      ],
+      "source": "use std::fs::OpenOptions;",
+      "classification": "retained-prior-explanation",
+      "explanation": "The experimental OpenOptions type ban reports a type import or function return type; no file is opened at this source location.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-session/src/extract.rs",
+      "line": 30,
+      "function": "Session::extract_to",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0525"
+      ],
+      "source": "        std::fs::create_dir_all(&req.dest_dir).map_err(|e| map_dest_io(e, &req.dest_dir))?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-session/src/extract.rs",
+      "line": 124,
+      "function": "Session::extract_one_named",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0526"
+      ],
+      "source": "            std::fs::create_dir_all(&dest).map_err(|e| map_dest_io(e, &dest))?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-session/src/extract.rs",
+      "line": 130,
+      "function": "Session::extract_one_named",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0527"
+      ],
+      "source": "            std::fs::create_dir_all(parent).map_err(|e| map_dest_io(e, parent))?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-session/src/extract.rs",
+      "line": 275,
+      "function": "create_extract_tmp",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0530"
+      ],
+      "source": "        match OpenOptions::new().write(true).create_new(true).open(&tmp) {",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-session/src/remote_open.rs",
+      "line": 728,
+      "function": "try_install_remote_index",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0534"
+      ],
+      "source": "                    let _ = std::fs::create_dir_all(parent);",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-session/src/remote_open.rs",
+      "line": 1751,
+      "function": "torrent_index_temp",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0536"
+      ],
+      "source": "    std::fs::create_dir_all(&cache_dir)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-session/src/resolve.rs",
+      "line": 55,
+      "function": "resolve_index",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0538"
+      ],
+      "source": "                std::fs::create_dir_all(parent).map_err(|e| Error::Internal(e.to_string()))?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-sftp/src/handler.rs",
+      "line": 164,
+      "function": "write_host_key",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0540"
+      ],
+      "source": "            std::fs::create_dir_all(dir)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "line": 12,
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0544"
+      ],
+      "source": "use std::fs::{self, File, OpenOptions};",
+      "classification": "retained-prior-explanation",
+      "explanation": "The experimental OpenOptions type ban reports a type import or function return type; no file is opened at this source location.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "line": 65,
+      "function": "Driver::open",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0545",
+        "D0546"
+      ],
+      "source": "        fs::DirBuilder::new()",
+      "classification": "retained-prior-explanation",
+      "explanation": "The N1 DirBuilder constructor/type bans report this builder setup; directory acquisition is separately reported at DirBuilder::create. The setup reference itself need not create a directory.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods",
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 2,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "line": 68,
+      "function": "Driver::open",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0547"
+      ],
+      "source": "            .create(state)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "line": 74,
+      "function": "Driver::open",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0550"
+      ],
+      "source": "            .create(true)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "line": 96,
+      "function": "Driver::open",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0553",
+        "D0554"
+      ],
+      "source": "        fs::DirBuilder::new()",
+      "classification": "retained-prior-explanation",
+      "explanation": "The N1 DirBuilder constructor/type bans report this builder setup; directory acquisition is separately reported at DirBuilder::create. The setup reference itself need not create a directory.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods",
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 2,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "line": 98,
+      "function": "Driver::open",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0555"
+      ],
+      "source": "            .create(&root)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "line": 134,
+      "function": "Driver::persist",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0558"
+      ],
+      "source": "                .create(true)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "line": 251,
+      "function": "Driver::dispatch",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0561"
+      ],
+      "source": "                            fs::create_dir(&path).map_err(|_| \"cannot create mountpoint\")?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-volume-plugin/src/main.rs",
+      "line": 85,
+      "function": "stage_dir",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0562",
+        "D0563"
+      ],
+      "source": "            match fs::DirBuilder::new().mode(0o700).create(&dir) {",
+      "classification": "retained-prior-explanation",
+      "explanation": "The N1 DirBuilder constructor/type bans report this builder setup; directory acquisition is separately reported at DirBuilder::create. The setup reference itself need not create a directory.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods",
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 2,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-volume-plugin/src/main.rs",
+      "line": 85,
+      "function": "stage_dir",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0564"
+      ],
+      "source": "            match fs::DirBuilder::new().mode(0o700).create(&dir) {",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-volume-plugin/src/main.rs",
+      "line": 185,
+      "function": "rename_noreplace",
+      "op": "libc::syscall",
+      "diagnostic_ids": [
+        "D0568"
+      ],
+      "source": "            libc::syscall(",
+      "classification": "generic-syscall-compiler-boundary",
+      "explanation": "The complete syscall entry point is configured so foreign open-family operations cannot hide behind its generic ABI. No syscall number, symbol or flags are inferred by enforcement; every current generic syscall call needs explicit review.",
+      "compiler_definition_paths": [
+        "libc::syscall"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-volume-plugin/src/main.rs",
+      "line": 243,
+      "function": "listener",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0570"
+      ],
+      "source": "            if unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {",
+      "classification": "retained-prior-explanation",
+      "explanation": "The broad libc::fcntl ban needed for F_DUPFD_CLOEXEC also reports this non-dup descriptor flag/lock command.",
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount-volume-plugin/src/main.rs",
+      "line": 250,
+      "function": "listener",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0571"
+      ],
+      "source": "            fs::create_dir_all(parent)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/main.rs",
+      "line": 2891,
+      "function": "main",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0603"
+      ],
+      "source": "            std::fs::create_dir_all(&plan.mp).ok();",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/main.rs",
+      "line": 4356,
+      "function": "init_logger",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0611"
+      ],
+      "source": "            .create(true)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/main.rs",
+      "line": 5007,
+      "function": "neutralize_dead_stdio",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0614"
+      ],
+      "source": "        let closed = unsafe { libc::fcntl(target, libc::F_GETFD) } == -1",
+      "classification": "retained-prior-explanation",
+      "explanation": "The broad libc::fcntl ban needed for F_DUPFD_CLOEXEC also reports this non-dup descriptor flag/lock command.",
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/main.rs",
+      "line": 5030,
+      "function": "neutralize_dead_stdio",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0617"
+      ],
+      "source": "                libc::fcntl(target, libc::F_SETFD, 0);",
+      "classification": "retained-prior-explanation",
+      "explanation": "The broad libc::fcntl ban needed for F_DUPFD_CLOEXEC also reports this non-dup descriptor flag/lock command.",
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/main.rs",
+      "line": 5043,
+      "function": "redirect_stdio_to_null",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0618"
+      ],
+      "source": "    use std::fs::OpenOptions;",
+      "classification": "retained-prior-explanation",
+      "explanation": "The experimental OpenOptions type ban reports a type import or function return type; no file is opened at this source location.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/mount_guard.rs",
+      "line": 140,
+      "function": "mount_id_statx",
+      "op": "libc::syscall",
+      "diagnostic_ids": [
+        "D0626"
+      ],
+      "source": "        libc::syscall(",
+      "classification": "generic-syscall-compiler-boundary",
+      "explanation": "The complete syscall entry point is configured so foreign open-family operations cannot hide behind its generic ABI. No syscall number, symbol or flags are inferred by enforcement; every current generic syscall call needs explicit review.",
+      "compiler_definition_paths": [
+        "libc::syscall"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/mount_guard.rs",
+      "line": 180,
+      "function": "mount_id_handle",
+      "op": "libc::syscall",
+      "diagnostic_ids": [
+        "D0627"
+      ],
+      "source": "        libc::syscall(",
+      "classification": "generic-syscall-compiler-boundary",
+      "explanation": "The complete syscall entry point is configured so foreign open-family operations cannot hide behind its generic ABI. No syscall number, symbol or flags are inferred by enforcement; every current generic syscall call needs explicit review.",
+      "compiler_definition_paths": [
+        "libc::syscall"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/mount_guard.rs",
+      "line": 973,
+      "function": "prepare_overlay_dir",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0628"
+      ],
+      "source": "        std::fs::create_dir_all(w)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/overlay_import.rs",
+      "line": 181,
+      "function": "import",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0637"
+      ],
+      "source": "        fs::create_dir(&args.directory)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/overlay_pack.rs",
+      "line": 88,
+      "function": "parent",
+      "op": "rustix::mkdirat",
+      "diagnostic_ids": [
+        "D0642"
+      ],
+      "source": "            match host::mkdirat(&fd, part, Mode::from_raw_mode(0o700)) {",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "rustix::fs::mkdirat"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/overlay_pack.rs",
+      "line": 712,
+      "function": "StageLock::beside",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0657"
+      ],
+      "source": "            .create(true)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/overlay_pack.rs",
+      "line": 1282,
+      "function": "extract_with_limits",
+      "op": "rustix::mkdirat",
+      "diagnostic_ids": [
+        "D0665"
+      ],
+      "source": "            match host::mkdirat(&fd, name.as_str(), Mode::from_raw_mode(0o700)) {",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "rustix::fs::mkdirat"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/overlay_pack.rs",
+      "line": 1619,
+      "function": "write_marker",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0673",
+        "D0674"
+      ],
+      "source": "    fs::DirBuilder::new()",
+      "classification": "retained-prior-explanation",
+      "explanation": "The N1 DirBuilder constructor/type bans report this builder setup; directory acquisition is separately reported at DirBuilder::create. The setup reference itself need not create a directory.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods",
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 2,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/overlay_pack.rs",
+      "line": 1622,
+      "function": "write_marker",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0675"
+      ],
+      "source": "        .create(&dir)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/overlay_pack.rs",
+      "line": 1625,
+      "function": "write_marker",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0677"
+      ],
+      "source": "        .create_new(true)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/overlay_pack.rs",
+      "line": 1641,
+      "function": "cached_lower_in",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0679",
+        "D0680"
+      ],
+      "source": "    fs::DirBuilder::new()",
+      "classification": "retained-prior-explanation",
+      "explanation": "The N1 DirBuilder constructor/type bans report this builder setup; directory acquisition is separately reported at DirBuilder::create. The setup reference itself need not create a directory.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods",
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 2,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/overlay_pack.rs",
+      "line": 1644,
+      "function": "cached_lower_in",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0681"
+      ],
+      "source": "        .create(cache)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/overlay_upperdir.rs",
+      "line": 75,
+      "function": "run",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0682"
+      ],
+      "source": "        fs::create_dir(&args.directory).map_err(|e| e.to_string())?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/publish_index.rs",
+      "line": 339,
+      "function": "atomic_copy",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0687"
+      ],
+      "source": "            fs::create_dir_all(parent)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/sandbox/daemon.rs",
+      "line": 39,
+      "function": "private_dir",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0691",
+        "D0692"
+      ],
+      "source": "    match fs::DirBuilder::new().mode(0o700).create(path) {",
+      "classification": "retained-prior-explanation",
+      "explanation": "The N1 DirBuilder constructor/type bans report this builder setup; directory acquisition is separately reported at DirBuilder::create. The setup reference itself need not create a directory.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods",
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 2,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/sandbox/daemon.rs",
+      "line": 39,
+      "function": "private_dir",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0693"
+      ],
+      "source": "    match fs::DirBuilder::new().mode(0o700).create(path) {",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/sandbox/daemon.rs",
+      "line": 61,
+      "function": "lock",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0696"
+      ],
+      "source": "        .create(true)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/sandbox/run.rs",
+      "line": 10,
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0708"
+      ],
+      "source": "use std::fs::{self, File, OpenOptions};",
+      "classification": "retained-prior-explanation",
+      "explanation": "The experimental OpenOptions type ban reports a type import or function return type; no file is opened at this source location.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_types"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/sandbox/run.rs",
+      "line": 169,
+      "function": "RunLock::acquire",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0713"
+      ],
+      "source": "            .create(true)",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 now bans the create/create_new method definition itself. The old inventory generally recorded builder construction/open, so this explicit creation-setting call is an additional review point; it does not prove a second file is created.",
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/sandbox/run.rs",
+      "line": 240,
+      "function": "absolute_top",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0715"
+      ],
+      "source": "    fs::create_dir_all(parent)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/sandbox/run.rs",
+      "line": 636,
+      "function": "copy_tree",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0721"
+      ],
+      "source": "    fs::create_dir_all(destination)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/sandbox/run.rs",
+      "line": 874,
+      "function": "pipeline",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0725"
+      ],
+      "source": "    fs::create_dir(&mountpoint)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/shard.rs",
+      "line": 457,
+      "function": "run",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0738"
+      ],
+      "source": "    fs::create_dir_all(&args.output)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    },
+    {
+      "file": "ratarmount/src/snapshot.rs",
+      "line": 422,
+      "function": "materialize_tree",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0745"
+      ],
+      "source": "                fs::create_dir(&target)?;",
+      "classification": "retained-prior-explanation",
+      "explanation": "N1 deliberately adds directory creation definitions omitted from the old 36-operation inventory. Clippy resolved this production creation call.",
+      "compiler_definition_paths": [
+        "std::fs::create_dir"
+      ],
+      "compiler_lints": [
+        "clippy::disallowed_methods"
+      ],
+      "expanded_diagnostic_instances": 1,
+      "review_status": "PENDING per-site migration review; accounting is not approval",
+      "handling": "Attach the smallest applicable reviewed expectation, keyed by item path and literal reason in the manifest. Native Clippy DefId supplies operation identity; source spans are diagnostic context only."
+    }
+  ]
+}

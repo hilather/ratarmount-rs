@@ -118,8 +118,72 @@ ratarmount sandbox destroy --socket "$SANDBOX_SOCKET" --base "$TASK_ID"
 ratarmount sandbox shutdown --socket "$SANDBOX_SOCKET"
 ```
 
-A supervisor restart discards all attempts. It retains bases and warmed
+A supervisor restart discards unretained attempts. It retains bases and warmed
 indexes. For large teacher passes (for example, 12,000 attempts), process tasks
 in bounded batches and destroy each batch after collecting its patches; the
-attempt limit includes crashed mounts. Do not blindly repeat `new` after a
-client timeout: list and reconcile first.
+attempt limit includes crashed mounts. After a client timeout, retry `new`
+with the same `--request-id` (Python: `request_id=`) and arguments, which
+never starts a second batch; without a request ID, list and reconcile first.
+
+## Finalize, retain or destroy
+
+`destroy`, and leaving a client or attempt context, discards an attempt: its
+mount, its overlay and everything in its `attempts/ID/` directory.
+[`finalize`](../sandbox.md#finalize) (protocol version 2; Python
+`attempt.finalize()`) instead stops the attempt, seals and hashes its layer,
+syncs it and everything it references to disk, and returns a report with
+`patch_hash`, `layer_digest`, `bytes_written`, `erofs_denied`, `manifest_path`
+and, with `pack=True`, a `bundle`. A finalized attempt that was not retained is
+still deleted by `destroy` or the context exit, together with its bundle,
+manifest and journal summary: copy them out first, or retain the attempt.
+
+With `new(..., retain=True)`, a successful finalize keeps the attempt in the
+daemon's `retained/ID/`. Retained attempts are never destroyed (the client
+hands them off instead), and their
+`report['attempt']['overlay_dir']` (`retained/ID/overlay`) can be passed in
+`lowers` of later attempts, which branch from that state. Valid retained
+attempts are served again after a supervisor restart. A cut-off finalize
+request ID stays `interrupted`; use a fresh request ID for its stored report.
+Finalize and retain run on Linux only and support local TAR, directory and Git bases;
+branching needs a TAR or Git base. Both refuse a base registered with
+`git_synthetic_head`, as in the example above, so register a separate base
+without it for attempts you finalize.
+
+Finalize an attempt only after its container has exited (the example's
+`subprocess.run` waits for it). With `docker run -v` the container has its own
+copy of the mount, so a premature finalize removes only the host mount and
+answers `writers_active` while the container keeps writing; a retry after the
+container stops seals those writes too. On `writers_active`, wait at least a
+second and back off, retrying with the same `request_id`:
+
+```python
+import time
+from ratarmount_sandbox import SandboxError
+
+def finalize(attempt, request_id, tries=8):
+    for n in range(tries):
+        try:
+            return attempt.finalize(pack=True, request_id=request_id)
+        except SandboxError as error:
+            if error.code != 'writers_active' or n == tries - 1:
+                raise
+            time.sleep(2 ** n)  # 1 s, then backing off
+```
+
+The hidden-tests layer is never routed through the supervisor: grade the
+exported patch with the SWE-bench evaluation harness, as above.
+
+## What ratarmount does not establish
+
+The attempt layer, its digests and the journal are inputs to an evaluation
+record, not the record itself. A
+[capability-gap review](../tasks/plans/swe-capability-gaps-plan.md) maps what a
+trustworthy SWE or CPAN evaluation needs to who provides it:
+
+| Requirement | Owner | What ratarmount provides |
+| --- | --- | --- |
+| Grader isolated from candidate code; hidden tests and the verdict under a separate authority | The verifier or runner | Nothing beyond the exported patch or sealed layer; never grade inside the agent's attempt |
+| Signed, verifiable record of who graded what | The trusted runner (its receipt and signatures) | Stable receipt inputs: `layer_digest`, the base digest in `patch_hash`, and the journal's `complete`/`reasons` |
+| Whole-run observation and negative evidence | Split | Journal coverage (see [Coverage and completeness](../sandbox.md#coverage-and-completeness)). `complete` is never evidence that a file was not read, and `journal_summary: null` means observation was disabled |
+| Per-phase network and leakage policy | The runner's broker, network policy and tool configuration | `sandbox run --network` selects a runtime network mode; it is not an allowlist |
+| Whether a task measures the right behaviour | The benchmark | Nothing |

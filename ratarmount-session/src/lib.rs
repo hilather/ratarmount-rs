@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! In-process [`Session`] API for ratarmount-rs embedders.
 //!
 //! This crate is the **supported embedder surface**. Do not import the

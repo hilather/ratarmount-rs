@@ -22,6 +22,7 @@ impl OpenBase for FixtureOpener {
             location: None,
             index: IndexProvenance::None,
             sidecar_candidate: None,
+            read_only_index: false,
             fetched: false,
             keep_alive: Box::new(()),
         })

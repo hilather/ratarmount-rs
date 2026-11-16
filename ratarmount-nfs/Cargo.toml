@@ -28,3 +28,6 @@ tempfile.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ratarmount-compress.workspace = true
 ratarmount-formats-tar.workspace = true
+
+[lints]
+workspace = true

@@ -17,3 +17,6 @@ encoding_rs = "0.8"
 
 [dev-dependencies]
 bzip2 = { version = "0.5", features = ["static"] }
+
+[lints]
+workspace = true

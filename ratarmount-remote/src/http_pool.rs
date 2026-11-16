@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use ratarmount_index::http_client::{self, HttpError, HttpResponse, Profile};
 use ratarmount_index::{ContentToken, RangeCache};
 use secrecy::ExposeSecret;
 
@@ -21,19 +22,6 @@ pub(crate) fn redacted_url(raw: &str) -> String {
     url.set_query(None);
     url.set_fragment(None);
     url.to_string()
-}
-
-pub(crate) fn agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .redirects(0)
-            .max_idle_connections(128)
-            .max_idle_connections_per_host(64)
-            // Never propagate origin Authorization or Cookie headers through a redirect.
-            .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
-            .build()
-    })
 }
 
 // A small request builder keeps one Agent/pool while following redirects explicitly.
@@ -66,7 +54,7 @@ pub(crate) fn post(url: &str) -> HttpRequest {
     request("POST", url)
 }
 
-// Preserve ureq's status/response error type for existing protocol callers.
+// Preserve the facade's status/response error type for existing protocol callers.
 #[allow(clippy::result_large_err)]
 impl HttpRequest {
     pub(crate) fn set(mut self, name: &str, value: &str) -> Self {
@@ -80,26 +68,26 @@ impl HttpRequest {
         self
     }
 
-    pub(crate) fn call(self) -> Result<ureq::Response, ureq::Error> {
+    pub(crate) fn call(self) -> Result<HttpResponse, HttpError> {
         self.send(None)
     }
 
-    pub(crate) fn send_bytes(self, body: &[u8]) -> Result<ureq::Response, ureq::Error> {
+    pub(crate) fn send_bytes(self, body: &[u8]) -> Result<HttpResponse, HttpError> {
         self.send(Some(body))
     }
 
     /// LFS action URLs are final storage URLs. Stream once; never replay an upload on redirect.
-    pub(crate) fn send_reader(self, body: impl Read) -> Result<ureq::Response, ureq::Error> {
-        let mut req = agent().request(&self.method, &self.url);
+    pub(crate) fn send_reader(self, body: impl Read) -> Result<HttpResponse, HttpError> {
+        let mut req = http_client::request(Profile::Pooled, &self.method, &self.url);
         for (name, value) in &self.headers {
             req = req.set(name, value);
         }
         if let Some(timeout) = self.timeout {
             req = req.timeout(timeout);
         }
-        let response = req.send(body).map_err(|e| match e {
-            ureq::Error::Transport(_) => {
-                ureq::Error::from(io::Error::other("HTTP upload transport failed"))
+        let response = req.send_reader(body).map_err(|e| match e {
+            HttpError::Transport(_) => {
+                HttpError::from(io::Error::other("HTTP upload transport failed"))
             }
             other => other,
         })?;
@@ -109,7 +97,7 @@ impl HttpRequest {
         Ok(response)
     }
 
-    pub(crate) fn send_string(mut self, body: &str) -> Result<ureq::Response, ureq::Error> {
+    pub(crate) fn send_string(mut self, body: &str) -> Result<HttpResponse, HttpError> {
         if !self
             .headers
             .iter()
@@ -120,12 +108,12 @@ impl HttpRequest {
         self.send_bytes(body.as_bytes())
     }
 
-    fn send(mut self, mut body: Option<&[u8]>) -> Result<ureq::Response, ureq::Error> {
+    fn send(mut self, mut body: Option<&[u8]>) -> Result<HttpResponse, HttpError> {
         let deadline = self
             .timeout
             .and_then(|timeout| Instant::now().checked_add(timeout));
         for hop in 0..=5 {
-            let mut req = agent().request(&self.method, &self.url);
+            let mut req = http_client::request(Profile::Pooled, &self.method, &self.url);
             for (name, value) in &self.headers {
                 req = req.set(name, value);
             }
@@ -145,7 +133,7 @@ impl HttpRequest {
             .map_err(|e| match e {
                 // Other protocol backends also display these errors directly. Drop
                 // the transport's URL-bearing source chain before it can be logged.
-                ureq::Error::Transport(err) => ureq::Error::from(io::Error::other(format!(
+                HttpError::Transport(err) => HttpError::from(io::Error::other(format!(
                     "HTTP {:?} for {}",
                     err.kind(),
                     redacted_url(&self.url)
@@ -303,7 +291,7 @@ impl HttpRangeSource {
         identity.token.clone().filter(|t| t.size() == size)
     }
 
-    pub(crate) fn observe_identity(&self, resp: &ureq::Response, size: u64) {
+    pub(crate) fn observe_identity(&self, resp: &HttpResponse, size: u64) {
         if !self.cache.as_ref().is_some_and(|cache| cache.is_enabled()) {
             return;
         }
@@ -473,7 +461,7 @@ impl HttpRangeSource {
         method: &str,
         range: Option<(u64, u64)>,
         timeout: Option<Duration>,
-    ) -> Result<ureq::Response, ureq::Error> {
+    ) -> Result<HttpResponse, HttpError> {
         let mut req = request(method, url)
             .set("User-Agent", USER_AGENT)
             .set("Accept-Encoding", "identity");
@@ -508,11 +496,11 @@ impl HttpRangeSource {
         method: &str,
         range: Option<(u64, u64)>,
         timeout: Option<Duration>,
-    ) -> Result<ureq::Response, ureq::Error> {
+    ) -> Result<HttpResponse, HttpError> {
         let result = self.call(self.url(), true, method, range, timeout);
         // A HEAD rejected by the final host still resolved Location for the GET probe.
         let response = match &result {
-            Ok(resp) | Err(ureq::Error::Status(_, resp)) => Some(resp),
+            Ok(resp) | Err(HttpError::Status(_, resp)) => Some(resp),
             Err(_) => None,
         };
         if let Some(resp) = response {
@@ -529,7 +517,7 @@ impl HttpRangeSource {
         &self,
         method: &str,
         range: Option<(u64, u64)>,
-    ) -> Result<ureq::Response, ureq::Error> {
+    ) -> Result<HttpResponse, HttpError> {
         let resp = self.request_with_timeout(method, range, None)?;
         if method == "HEAD" && resp.status() == 200 {
             if let Some(size) = resp.header("Content-Length").and_then(|v| v.parse().ok()) {
@@ -544,7 +532,7 @@ impl HttpRangeSource {
         method: &str,
         range: Option<(u64, u64)>,
         timeout: Option<Duration>,
-    ) -> Result<ureq::Response, ureq::Error> {
+    ) -> Result<HttpResponse, HttpError> {
         let target = {
             let mut guard = self.target.lock().unwrap_or_else(|e| e.into_inner());
             match &*guard {
@@ -553,8 +541,7 @@ impl HttpRangeSource {
             }
         };
         let result = self.call(&target.url, !target.redirected, method, range, timeout);
-        if target.redirected
-            && matches!(&result, Err(ureq::Error::Status(401 | 403 | 404 | 410, _)))
+        if target.redirected && matches!(&result, Err(HttpError::Status(401 | 403 | 404 | 410, _)))
         {
             // Single-flight refresh: parallel requests that failed against the same old
             // signed URL share one re-resolution, even if the new URL is identical.
@@ -593,7 +580,7 @@ impl HttpRangeSource {
             .map_err(|e| {
                 io::Error::other(match &self.hub_repo {
                     Some(repo) => crate::hf::map_http_error(repo, e),
-                    None => crate::map_ureq_http_error(e, self.url()),
+                    None => crate::map_http_client_error(e, self.url()),
                 })
             })?;
         let status = resp.status();
@@ -832,7 +819,7 @@ fn invalid_range() -> io::Error {
 /// Validate every 206 before exposing bytes, including the known object length.
 /// An unknown total (`*`) is only allowed for callers that do not know the length.
 pub(crate) fn validate_content_range(
-    resp: &ureq::Response,
+    resp: &HttpResponse,
     start: u64,
     end: u64,
     size: Option<u64>,

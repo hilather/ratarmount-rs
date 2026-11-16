@@ -5,7 +5,7 @@ use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
-use crate::{checked_add, elements, invalid, Parsed, Result, Tensor, MAX_HEADER_SIZE};
+use crate::{checked_add, elements, invalid, Layout, Parsed, Result, Tensor, MAX_HEADER_SIZE};
 
 #[derive(Deserialize)]
 struct Descriptor {
@@ -100,6 +100,7 @@ pub(crate) fn parse<R: Read + Seek>(reader: &mut R, size: u64) -> Result<Parsed>
         let offset = checked_add(start, begin)?;
         tensors.push(Tensor {
             name: name.clone(), offset, size:len,
+            layout: Layout::Safetensors { dtype: dtype.clone(), shape: shape.clone(), size_checked: bits.is_some() },
             sidecar:json!({"format":"safetensors", "dtype":dtype,"shape":shape,"data_offsets":[begin,end],
                 "byte_length":len,"absolute_file_offset":offset,"size_check": if bits.is_some() {"validated"} else {"skipped_unknown_dtype"}}),
         });

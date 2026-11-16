@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! SQLAR (SQLite Archiver) mount source — Python `SQLARMountSource` parity.
 //!
 //! Schema: <https://www.sqlite.org/sqlar.html>
@@ -158,7 +161,7 @@ impl SqlarMountSource {
     /// * passwords + `sqlcipher` → try each password; fail with [`SqlarError::WrongPassword`]
     pub fn open(path: impl AsRef<Path>, options: &OpenOptions) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if !looks_like_sqlar(&path) {
+        if !looks_like_sqlar_for_open(&path, options)? {
             return Err(SqlarError::Msg(format!(
                 "{} is not an SQLAR/SQLite file",
                 path.display()
@@ -166,8 +169,9 @@ impl SqlarMountSource {
         }
 
         let header = read_header(&path)?;
-        let conn = match open_plain(&path) {
+        let conn = match open_plain_for_open(&path, options) {
             Ok(c) => c,
+            Err(plain_err) if options.read_only_index => return Err(plain_err),
             Err(plain_err) => {
                 if header_is_sqlite_magic(&header) {
                     // Plain SQLite header but not a usable SQLAR (missing table / corrupt).
@@ -317,7 +321,14 @@ impl SqlarMountSource {
 /// The first 16 bytes (fewer for a shorter file). Managed (#151): the SQLAR
 /// may be open as a database in this process.
 fn read_header(path: &Path) -> Result<Vec<u8>> {
-    Ok(ratarmount_index::managed_read::read_prefix(path, 16)?)
+    Ok({
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0354-M01","item":"ratarmount_formats_sqlar::read_header","disposition":"managed-read","regression":"regression_sqlar_header_probes_keep_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = ratarmount_index::managed_read::read_prefix(path, 16);
+        __inventory_value_0
+    }?)
 }
 
 fn header_is_sqlite_magic(header: &[u8]) -> bool {
@@ -333,6 +344,16 @@ fn has_sqlar_extension(path: &Path) -> bool {
 /// Open unencrypted SQLAR and verify the `sqlar` table is readable.
 fn open_plain(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OPEN_FLAGS)?;
+    verify_sqlar_readable(&conn)?;
+    Ok(conn)
+}
+
+fn open_plain_for_open(path: &Path, options: &OpenOptions) -> Result<Connection> {
+    if !options.read_only_index {
+        return open_plain(path);
+    }
+    let conn = ratarmount_index::open_prepared_connection(path)
+        .map_err(|e| SqlarError::Msg(e.to_string()))?;
     verify_sqlar_readable(&conn)?;
     Ok(conn)
 }
@@ -587,6 +608,10 @@ fn build_name_map(conn: &Connection) -> Result<Option<BTreeMap<String, String>>>
 /// (encrypted sqlcipher archives omit the magic and store salt in the first 16 bytes).
 pub fn looks_like_sqlar(path: &Path) -> bool {
     // Managed (#151): the probe may hit an SQLAR open in this process.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0355-M01","item":"ratarmount_formats_sqlar::looks_like_sqlar","disposition":"managed-read","regression":"regression_sqlar_header_probes_keep_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let Ok(magic) = ratarmount_index::managed_read::read_prefix(path, 16) else {
         return false;
     };
@@ -613,6 +638,27 @@ pub fn looks_like_sqlar(path: &Path) -> bool {
         return has;
     }
     false
+}
+
+/// Policy-aware SQLAR probe. Strict SQLite probes never attach WAL/SHM or recover.
+pub fn looks_like_sqlar_for_open(path: &Path, options: &OpenOptions) -> Result<bool> {
+    if !options.read_only_index {
+        return Ok(looks_like_sqlar(path));
+    }
+    let header = read_header(path)?;
+    if header.len() < 16 {
+        return Ok(false);
+    }
+    if !header_is_sqlite_magic(&header) {
+        return Ok(has_sqlar_extension(path));
+    }
+    let conn = ratarmount_index::open_prepared_connection(path)
+        .map_err(|e| SqlarError::Msg(e.to_string()))?;
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlar')",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 /// True when the file does not have a SQLite header (likely sqlcipher-encrypted SQLAR).
@@ -857,6 +903,118 @@ impl MountSource for SqlarMountSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn prepared_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect()
+    }
+
+    /// Regression: strict SQLAR opens and negative SQLite probes cannot create companions.
+    #[test]
+    fn regression_prepared_index_sqlar_probe_never_touches_base_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.sqlar");
+        write_sample_sqlar(&path, &[("hello.txt", 0o100644, 12, Some(b"base payload"))]);
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(writer);
+        let plain = dir.path().join("plain.sqlite");
+        let writer = Connection::open(&plain).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE unrelated (value TEXT); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        drop(writer);
+        for base in [&path, &plain] {
+            std::fs::write(format!("{}-wal", base.display()), []).unwrap();
+            std::fs::write(format!("{}-shm", base.display()), b"unlocked leftover shm").unwrap();
+        }
+        let before = prepared_snapshot(dir.path());
+        let options = OpenOptions {
+            read_only_index: true,
+            ..Default::default()
+        };
+        let readers: Vec<_> = (0..3)
+            .map(|_| SqlarMountSource::open(&path, &options).unwrap())
+            .collect();
+        let path_ref = &path;
+        let plain_ref = &plain;
+        let options_ref = &options;
+        std::thread::scope(|scope| {
+            let jobs: Vec<_> = readers
+                .iter()
+                .map(|reader| {
+                    scope.spawn(move || {
+                        assert!(looks_like_sqlar_for_open(path_ref, options_ref).unwrap());
+                        assert!(!looks_like_sqlar_for_open(plain_ref, options_ref).unwrap());
+                        let info = reader.lookup("/hello.txt", 0).unwrap();
+                        let mut bytes = Vec::new();
+                        std::io::Read::read_to_end(&mut reader.open(&info, 0).unwrap(), &mut bytes)
+                            .unwrap();
+                        assert_eq!(bytes, b"base payload");
+                    })
+                })
+                .collect();
+            for job in jobs {
+                job.join().unwrap();
+            }
+        });
+        assert_eq!(prepared_snapshot(dir.path()), before);
+        drop(readers);
+        assert_eq!(prepared_snapshot(dir.path()), before);
+    }
+
+    /// Regression: unfinished SQLAR WAL/journal state is refused without recovery or fallback.
+    #[test]
+    fn regression_prepared_index_sqlar_refuses_unfinished_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let encrypted_candidate = dir.path().join("encrypted.sqlar");
+        std::fs::write(&encrypted_candidate, b"non-SQLite salt and payload").unwrap();
+        let strict = OpenOptions {
+            read_only_index: true,
+            passwords: vec!["password".into()],
+            ..Default::default()
+        };
+        let before = prepared_snapshot(dir.path());
+        let error = SqlarMountSource::open(&encrypted_candidate, &strict)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("--no-recreate-index"),
+            "strict SQLAR cannot fall back to an ordinary encrypted open: {error}"
+        );
+        assert_eq!(prepared_snapshot(dir.path()), before);
+        let path = dir.path().join("base.sqlar");
+        write_sample_sqlar(&path, &[("hello.txt", 0o100644, 12, Some(b"base payload"))]);
+        let options = OpenOptions {
+            read_only_index: true,
+            ..Default::default()
+        };
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; INSERT INTO sqlar VALUES ('pending',33188,0,0,NULL);").unwrap();
+        let before = prepared_snapshot(dir.path());
+        let error = SqlarMountSource::open(&path, &options)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("incomplete preparation"), "{error}");
+        assert!(looks_like_sqlar_for_open(&path, &options).is_err());
+        assert_eq!(prepared_snapshot(dir.path()), before);
+        drop(writer);
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN IMMEDIATE; DELETE FROM sqlar;")
+            .unwrap();
+        let before = prepared_snapshot(dir.path());
+        assert!(SqlarMountSource::open(&path, &options).is_err());
+        assert_eq!(prepared_snapshot(dir.path()), before);
+        drop(writer);
+    }
+
     use std::io::Read;
 
     /// Fixture root: `RATARMOUNT_PY_ROOT` (Python ratarmount checkout) or a local default.

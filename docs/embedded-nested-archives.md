@@ -97,6 +97,14 @@ Explicit top-level `--index-file :memory:` still uses SQLite in process for that
 
 ### Durable nested indexes (warm remount of embedded ZIP/TAR)
 
+With `--no-recreate-index`, the shared outer catalog and any prepared durable
+rows are read through immutable SQLite connections. A worker may still parse
+a nested member into a private compact table, or privately materialize it for
+an existing fallback opener; neither operation may persist into the outer
+index. Missing or invalid required top-level preparation is an error and is
+never rescued by an in-memory top-level rebuild. See the
+[prepared-worker limits](sandbox.md#prepare-once-n-writable-workers).
+
 When the **outer** archive has a **writable on-disk** SQLite index, a successful nested open of **uncompressed ZIP** or **uncompressed TAR** can **export** the compact nested file table into the outer index side table `nestedindexes`. The next open of the same nested member (same remount or new process) **imports** that blob after a fingerprint check, so nested list/lookup does not rebuild the nested file table from the member stream.
 
 | Piece | Behavior |

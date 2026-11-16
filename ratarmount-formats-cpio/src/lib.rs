@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! CPIO archive support: newc/crc (070701/070702), portable ASCII odc (070707),
 //! and old binary (0x71c7 LE/BE). Random access via [`StenciledFile`].
 //!
@@ -124,7 +127,14 @@ enum ContentBackend {
 impl ContentBackend {
     fn open_reader(&self) -> io::Result<ContentReader> {
         match self {
-            Self::Path(p) => Ok(ContentReader::File(File::open(p)?)),
+            Self::Path(p) => Ok(ContentReader::File({
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0301-M01","item":"<ratarmount_formats_cpio::ContentBackend>::open_reader","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
+                let __inventory_value_0 = File::open(p);
+                __inventory_value_0
+            }?)),
             Self::Shared(s) => Ok(ContentReader::Shared(s.open_reader())),
         }
     }
@@ -188,6 +198,7 @@ impl CpioMountSource {
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options) {
                         Ok(s) => return Ok(s),
+                        Err(e) if options.read_only_index => return Err(e),
                         Err(e) => eprintln!("info: could not load cpio index ({e}); rebuilding"),
                     }
                 }
@@ -323,7 +334,7 @@ impl CpioMountSource {
         index_path: &Path,
         options: &OpenOptions,
     ) -> Result<Self> {
-        let index = SqliteIndex::open_read_only(index_path)?;
+        let index = SqliteIndex::open_read_only_for_open(index_path, options)?;
         index.check_backend_name(BACKEND_NAME)?;
         // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
         // Missing tarstats still Ok (legacy indexes).
@@ -349,6 +360,10 @@ impl CpioMountSource {
         );
         let t0 = Instant::now();
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0302-M01","item":"<ratarmount_formats_cpio::CpioMountSource>::create_index","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut file = File::open(archive_path)?;
         let kind = detect_kind(&mut file)?;
         file.seek(SeekFrom::Start(0))?;
@@ -774,7 +789,14 @@ fn userdata(fi: &FileInfo) -> Option<&SQLiteIndexedTarUserData> {
 
 /// Detect any supported CPIO variant (newc/crc/odc/binary) by magic or extension.
 pub fn looks_like_cpio(path: &Path) -> bool {
-    if let Ok(mut f) = File::open(path) {
+    if let Ok(mut f) = {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0303-M01","item":"ratarmount_formats_cpio::looks_like_cpio","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = File::open(path);
+        __inventory_value_0
+    } {
         let mut magic = [0u8; 6];
         if let Ok(n) = f.read(&mut magic) {
             if n >= 6 && (&magic == NEWC_MAGIC || &magic == CRC_MAGIC || &magic == ODC_MAGIC) {
@@ -867,6 +889,53 @@ fn store_stats_for_label(index: &SqliteIndex, path: &Path, size: u64) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn prepared_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect()
+    }
+
+    /// Regression: a strict warm worker must read members without changing its prepared sidecar.
+    #[test]
+    fn regression_prepared_index_warm_open_is_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.cpio");
+        let index = dir.path().join("index.sqlite");
+        let fixture = build_newc_cpio("hello.txt", b"worker base", 0o100644);
+        std::fs::write(&archive, &fixture).unwrap();
+        drop(
+            CpioMountSource::open(
+                &archive,
+                Some(&index),
+                &OpenOptions::default(),
+                "test",
+                true,
+            )
+            .unwrap(),
+        );
+        SqliteIndex::finalize_prepared(&index).unwrap();
+        let before = prepared_snapshot(dir.path());
+        let options = OpenOptions {
+            read_only_index: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let source =
+            CpioMountSource::open(&archive, Some(&index), &options, "test", false).unwrap();
+        let member = "/hello.txt".to_owned();
+        let info = source.lookup(&member, 0).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut source.open(&info, 0).unwrap(), &mut bytes).unwrap();
+        assert_eq!(bytes, b"worker base");
+        assert_eq!(prepared_snapshot(dir.path()), before);
+        drop(source);
+        assert_eq!(prepared_snapshot(dir.path()), before);
+    }
+
     use std::io::Cursor;
 
     fn py_root() -> PathBuf {

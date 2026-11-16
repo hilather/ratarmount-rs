@@ -59,6 +59,7 @@ use ratarmount_core::{
     create_root_file_info, is_dir_mode, normpath, CheapDirent, FileInfo, ListResult, MountSource,
     UserData, S_IFDIR, S_IFMT, S_IFREG,
 };
+use ratarmount_index::http_client::HttpError;
 use tempfile::NamedTempFile;
 
 use crate::{
@@ -358,6 +359,10 @@ fn bytes_to_tempfile(
     token: &str,
     bytes: Vec<u8>,
 ) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0481-M01","item":"ratarmount_remote::dropbox::bytes_to_tempfile","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     tmp.write_all(&bytes).map_err(|e| {
         RemoteError::Dropbox(redact_token(
@@ -449,7 +454,7 @@ fn probe_dropbox_download(
         .send_bytes(&[])
     {
         Ok(r) => r,
-        Err(ureq::Error::Status(status, r)) => {
+        Err(HttpError::Status(status, r)) => {
             let body = r.into_string().unwrap_or_else(|_| String::new());
             let detail = redact_token(&body, token);
             let summary = extract_error_summary(&detail).unwrap_or(detail.as_str());
@@ -506,6 +511,10 @@ fn fetch_dropbox_via_ranges(
     api_url: &str,
     size: u64,
 ) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0482-M01","item":"ratarmount_remote::dropbox::fetch_dropbox_via_ranges","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     if size == 0 {
         tmp.flush()?;
@@ -589,7 +598,7 @@ fn fetch_dropbox_full_body(
         .send_bytes(&[])
     {
         Ok(r) => r,
-        Err(ureq::Error::Status(status, r)) => {
+        Err(HttpError::Status(status, r)) => {
             let body = r.into_string().unwrap_or_else(|_| String::new());
             let detail = redact_token(&body, token);
             let summary = extract_error_summary(&detail).unwrap_or(detail.as_str());
@@ -618,6 +627,10 @@ fn fetch_dropbox_full_body(
     }
 
     let mut reader = resp.into_reader();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0483-M01","item":"ratarmount_remote::dropbox::fetch_dropbox_full_body","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     let n = io::copy(&mut reader, &mut tmp).map_err(|e| {
         RemoteError::Dropbox(redact_token(
@@ -660,7 +673,7 @@ fn dropbox_download_request(
 
     let resp = match req.send_bytes(&[]) {
         Ok(r) => r,
-        Err(ureq::Error::Status(status, r)) => {
+        Err(HttpError::Status(status, r)) => {
             let body = r.into_string().unwrap_or_else(|_| String::new());
             let detail = redact_token(&body, token);
             let summary = extract_error_summary(&detail).unwrap_or(detail.as_str());
@@ -1230,7 +1243,14 @@ impl MountSource for DropboxMountSource {
                 .map_err(|_| io::Error::other("temp_files lock poisoned"))?;
             guard.push(kept.clone());
         }
-        Ok(Box::new(File::open(kept)?))
+        Ok(Box::new({
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0484-M01","item":"<ratarmount_remote::dropbox::DropboxMountSource as ratarmount_core::MountSource<ratarmount_remote::dropbox::DropboxMountSource>>::open","disposition":"residual","reason":"spooled remote payload body","family":"http-spool-cache","issue":"#196","category":"http-spool-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
+            let __inventory_value_0 = File::open(kept);
+            __inventory_value_0
+        }?))
     }
 
     fn is_immutable(&self) -> bool {
@@ -1396,16 +1416,18 @@ mod tests {
                         if line == "\r\n" || line == "\n" || line.is_empty() {
                             break;
                         }
-                        if let Some(v) = line.strip_prefix("Content-Length:") {
-                            content_length = v.trim().parse().unwrap_or(0);
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                            if name.eq_ignore_ascii_case("authorization") {
+                                auth_hdr = Some(value.trim().to_string());
+                            }
+                            if name.eq_ignore_ascii_case("range") {
+                                range_hdr = Some(value.trim().to_string());
+                            }
                         }
-                        if let Some(v) = line.strip_prefix("Authorization:") {
-                            auth_hdr = Some(v.trim().to_string());
-                        }
-                        if let Some(v) = line.strip_prefix("Range:") {
-                            range_hdr = Some(v.trim().to_string());
-                        }
-                        // Header name is case-sensitive in our client; accept common variants.
+                        // Accept any casing for the Dropbox-API-Arg header name.
                         let lower = line.to_ascii_lowercase();
                         if lower.starts_with("dropbox-api-arg:") {
                             api_arg = Some(line.split_once(':').unwrap().1.trim().to_string());
@@ -1662,14 +1684,16 @@ mod tests {
                         if line == "\r\n" || line == "\n" || line.is_empty() {
                             break;
                         }
-                        if let Some(v) = line.strip_prefix("Content-Length:") {
-                            content_length = v.trim().parse().unwrap_or(0);
-                        }
-                        if let Some(v) = line.strip_prefix("Authorization:") {
-                            auth_hdr = Some(v.trim().to_string());
-                        }
-                        if let Some(v) = line.strip_prefix("Range:") {
-                            range_hdr = Some(v.trim().to_string());
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                            if name.eq_ignore_ascii_case("authorization") {
+                                auth_hdr = Some(value.trim().to_string());
+                            }
+                            if name.eq_ignore_ascii_case("range") {
+                                range_hdr = Some(value.trim().to_string());
+                            }
                         }
                         let lower = line.to_ascii_lowercase();
                         if lower.starts_with("dropbox-api-arg:") {

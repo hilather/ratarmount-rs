@@ -1,0 +1,390 @@
+{
+  "totals": {
+    "baseline": 553,
+    "matched": 527,
+    "clippy_only": 142,
+    "scanner_only": 26
+  },
+  "raw_unique_diagnostics": 747,
+  "expanded_diagnostic_instances": 747,
+  "clippy_only_diagnostic_groups": 153,
+  "clippy_only_expanded_diagnostics": 153,
+  "per_op": {
+    "DirBuilder": {
+      "baseline": 0,
+      "matched": 0,
+      "clippy_only": 8,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 16,
+      "clippy_only_expanded_diagnostics": 16
+    },
+    "F_DUPFD_CLOEXEC": {
+      "baseline": 5,
+      "matched": 4,
+      "clippy_only": 0,
+      "scanner_only": 1,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "File::create": {
+      "baseline": 8,
+      "matched": 8,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "File::from": {
+      "baseline": 13,
+      "matched": 0,
+      "clippy_only": 0,
+      "scanner_only": 13,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "File::open": {
+      "baseline": 168,
+      "matched": 165,
+      "clippy_only": 0,
+      "scanner_only": 3,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "ManagedReadCursor::open": {
+      "baseline": 25,
+      "matched": 25,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "OpenOptions": {
+      "baseline": 42,
+      "matched": 37,
+      "clippy_only": 34,
+      "scanner_only": 5,
+      "clippy_only_diagnostic_groups": 37,
+      "clippy_only_expanded_diagnostics": 37
+    },
+    "dup": {
+      "baseline": 1,
+      "matched": 1,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "dup2": {
+      "baseline": 10,
+      "matched": 10,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "fcntl-other": {
+      "baseline": 0,
+      "matched": 0,
+      "clippy_only": 11,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 11,
+      "clippy_only_expanded_diagnostics": 11
+    },
+    "from_raw_fd": {
+      "baseline": 18,
+      "matched": 18,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "fs::copy": {
+      "baseline": 1,
+      "matched": 1,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "fs::create_dir": {
+      "baseline": 0,
+      "matched": 0,
+      "clippy_only": 17,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 17,
+      "clippy_only_expanded_diagnostics": 17
+    },
+    "fs::create_dir_all": {
+      "baseline": 0,
+      "matched": 0,
+      "clippy_only": 48,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 48,
+      "clippy_only_expanded_diagnostics": 48
+    },
+    "fs::read": {
+      "baseline": 15,
+      "matched": 15,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "fs::read_to_string": {
+      "baseline": 14,
+      "matched": 14,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "fs::write": {
+      "baseline": 15,
+      "matched": 15,
+      "clippy_only": 2,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 2,
+      "clippy_only_expanded_diagnostics": 2
+    },
+    "git2::Repository::open": {
+      "baseline": 1,
+      "matched": 1,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "into_raw_fd": {
+      "baseline": 3,
+      "matched": 3,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "libarchive::archive_read_open_filename": {
+      "baseline": 1,
+      "matched": 1,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "libc::dlsym": {
+      "baseline": 0,
+      "matched": 0,
+      "clippy_only": 1,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 1,
+      "clippy_only_expanded_diagnostics": 1
+    },
+    "libc::open": {
+      "baseline": 7,
+      "matched": 7,
+      "clippy_only": 1,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 1,
+      "clippy_only_expanded_diagnostics": 1
+    },
+    "libc::openat": {
+      "baseline": 4,
+      "matched": 4,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "libc::syscall": {
+      "baseline": 0,
+      "matched": 0,
+      "clippy_only": 4,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 4,
+      "clippy_only_expanded_diagnostics": 4
+    },
+    "lopdf::Document::load": {
+      "baseline": 1,
+      "matched": 1,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "managed-read-wrapper": {
+      "baseline": 0,
+      "matched": 0,
+      "clippy_only": 4,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 4,
+      "clippy_only_expanded_diagnostics": 4
+    },
+    "managed_read::copy_create_or_truncate": {
+      "baseline": 1,
+      "matched": 1,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "managed_read::copy_exclusive_new": {
+      "baseline": 2,
+      "matched": 2,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "managed_read::copy_into": {
+      "baseline": 2,
+      "matched": 2,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "managed_read::read": {
+      "baseline": 6,
+      "matched": 6,
+      "clippy_only": 1,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 1,
+      "clippy_only_expanded_diagnostics": 1
+    },
+    "managed_read::read_prefix": {
+      "baseline": 4,
+      "matched": 4,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "managed_read::read_to_string": {
+      "baseline": 1,
+      "matched": 1,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "managed_read::sha256_hex": {
+      "baseline": 7,
+      "matched": 7,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "open_admitted": {
+      "baseline": 6,
+      "matched": 5,
+      "clippy_only": 5,
+      "scanner_only": 1,
+      "clippy_only_diagnostic_groups": 5,
+      "clippy_only_expanded_diagnostics": 5
+    },
+    "open_regular": {
+      "baseline": 15,
+      "matched": 15,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "openat_admitted": {
+      "baseline": 9,
+      "matched": 9,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "rustix::mkdirat": {
+      "baseline": 0,
+      "matched": 0,
+      "clippy_only": 2,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 2,
+      "clippy_only_expanded_diagnostics": 2
+    },
+    "rustix::open": {
+      "baseline": 6,
+      "matched": 6,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "rustix::openat": {
+      "baseline": 17,
+      "matched": 17,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "tempdir": {
+      "baseline": 17,
+      "matched": 16,
+      "clippy_only": 0,
+      "scanner_only": 1,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "tempfile": {
+      "baseline": 92,
+      "matched": 91,
+      "clippy_only": 4,
+      "scanner_only": 1,
+      "clippy_only_diagnostic_groups": 4,
+      "clippy_only_expanded_diagnostics": 4
+    },
+    "tempfile::reopen": {
+      "baseline": 3,
+      "matched": 3,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "try_clone": {
+      "baseline": 12,
+      "matched": 11,
+      "clippy_only": 0,
+      "scanner_only": 1,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    },
+    "try_clone_to_owned": {
+      "baseline": 1,
+      "matched": 1,
+      "clippy_only": 0,
+      "scanner_only": 0,
+      "clippy_only_diagnostic_groups": 0,
+      "clippy_only_expanded_diagnostics": 0
+    }
+  },
+  "logs": [
+    "/home/brewerm/git/muse-worktrees/plans/rrs-201/clippy2/sweep-4/n1/match/workspace-all-features.jsonl",
+    "/home/brewerm/git/muse-worktrees/plans/rrs-201/clippy2/sweep-4/n1/match/workspace-default.jsonl",
+    "/home/brewerm/git/muse-worktrees/plans/rrs-201/clippy2/sweep-4/n1/match/workspace-python-embedding.jsonl",
+    "/home/brewerm/git/muse-worktrees/plans/rrs-201/clippy2/sweep-4/n1/match/workspace-python-extension.jsonl",
+    "/home/brewerm/git/muse-worktrees/plans/rrs-201/clippy2/sweep-4/n1/match/workspace-nfsv4.jsonl",
+    "/home/brewerm/git/muse-worktrees/plans/rrs-201/clippy2/sweep-4/n1/match/workspace-cli-nfsv4.jsonl",
+    "/home/brewerm/git/muse-worktrees/plans/rrs-201/clippy2/sweep-4/n1/match/workspace-session-no-default.jsonl",
+    "/home/brewerm/git/muse-worktrees/plans/rrs-201/clippy2/sweep-4/n1/match/workspace-cli-no-default.jsonl"
+  ],
+  "source_root": "/tmp/rrs201-clippy2-match",
+  "other_messages": {
+    "unrelated-disallowed:ratarmount_compress::commit_journal::recover_with": 8,
+    "unrelated-disallowed:ratarmount_compress::commit_journal::authorize_forced": 16,
+    "unrelated-disallowed:ratarmount_compress::commit_journal::recover_guarded": 16,
+    "unrelated-disallowed:ratarmount_compress::commit_journal::guard_copy": 24,
+    "unrelated-disallowed:ratarmount_compress::splice_zstd_last_frames_append_with": 16,
+    "unrelated-disallowed:ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with": 16,
+    "unrelated-disallowed:ratarmount_compress::commit_journal::authorize_owned": 8,
+    "unrelated-disallowed:ratarmount_compress::splice_zstd_last_frames_replace": 8
+  },
+  "malformed_jsonl_lines": [],
+  "ambiguous": [],
+  "method": "Exact primary/expansion source line, then explicit OpenOptions duplicate lint forms in the same source statement or through a named builder variable, then unfilled unique file/function/op. Ordinary sites have one-to-one capacity; only demonstrated OpenOptions lint-form duplicates corroborate an already matched row."
+}

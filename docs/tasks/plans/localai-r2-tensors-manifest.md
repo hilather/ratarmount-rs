@@ -1,0 +1,196 @@
+# Local AI R2: `ratarmount tensors manifest` (expert manifest with per-tensor format)
+
+**Status:** plan, not started (2026-11-01). Baseline `main` at `b84f8839527f546112ffc281146edcd8e0b1dbb5`. Branch `plan/localai-r2-tensors-manifest`.
+**Source:** Matt's local-AI plan §5 "R2. Expert manifest with per-tensor format" (handoff copy `/workspace/handoffs/ratarmount-r2-tensors-manifest-spec.md`). Matt OK'd the work 2026-11-01 6:07 PM ET (relayed by Keystone, 6:08 PM ET).
+**Dependencies:** none. R2 does not depend on R1a/R1b/R1c.
+**Hands off:** R2 does **not** touch sandbox, supervisor or journal code: nothing under `ratarmount/src/sandbox/`, not `ratarmount/src/journal_cmd.rs`, not `ratarmount-fuse/src/oplog*`, not the compositing journal (`classify_mount_journal`, `recover_journal_at`), not `ratarmount/tests/sandbox.rs` or `fuse_journal.rs`, not `clients/python/ratarmount_sandbox.py`. Mud Turtle is working on R1c there. The only shared file is `ratarmount/src/main.rs` (three additive blocks shaped like the journal verb's, §5.6); if R1c edits the same hunk, whichever lands second rebases its own branch, no edits to R1c's lines.
+**Gate:** every `AGENTS.md` CI command (fmt, clippy `-D warnings`, `cargo test --workspace`, both internal-read policy scripts) before every commit; an `AGENTS.md` regression-catalog row for each new test filter.
+**Effort:** 3 to 4 days (spec).
+
+## Files touched
+
+New:
+- `ratarmount-formats-tensors/src/manifest.rs` (library: types, `build_manifest`, JSONL writer).
+- `ratarmount-formats-tensors/src/manifest_tests.rs` (unit tests, `#[cfg(test)]`, acceptance tests 1–5 plus refusals).
+- `ratarmount/src/tensors_cmd.rs` (CLI verb).
+- `ratarmount/tests/tensors_manifest.rs` (CLI integration test; acceptance test 6 and the CLI paths of 2 and 5).
+
+Modified:
+- `ratarmount-formats-tensors/src/lib.rs`: `mod manifest;` and `pub use` of its public items; `manifest.rs` calls `crate::parse` and `crate::gguf::ggml_layout` directly (`ggml_layout` is already `pub(crate)`, and a private module at the crate root is visible to every module in the crate, so no re-export is needed); `#[cfg(test)] mod manifest_tests;` (it reaches the builders as `crate::tests::...`); add typed layout info to the private `Tensor` struct (§5.1); no behaviour change for mounts (sidecar bytes identical).
+- `ratarmount-formats-tensors/src/gguf.rs`, `src/safetensors.rs`: fill the new typed field where `Tensor` is built (`dtype`/`shape`/`dims` are cloned before they move into the sidecar `json!`). Parsing, validation and sidecar bytes are unchanged.
+- `ratarmount-formats-tensors/src/tests.rs`: existing fixture builders (`safetensors`, `tensor`, `gguf`, `GgTensor` and its fields, `string`) become `pub(crate)` so `manifest_tests.rs` reuses them. No test changes.
+- `ratarmount-formats-tensors/Cargo.toml`: add `regex = "1"`, `sha2 = "0.10"` and `same-file = "1"` (all already in `Cargo.lock`: regex 1.13.1, sha2 0.10.9, same-file 1.0.6 via walkdir; no new crates downloaded).
+- `Cargo.lock`: dependency-list edges only (no new packages).
+- `ratarmount/Cargo.toml`: add `ratarmount-formats-tensors.workspace = true` (workspace entry exists at root `Cargo.toml:72`).
+- `ratarmount/src/main.rs`: `mod tensors_cmd;`, one `#[arg(skip)] tensors_command: Option<tensors_cmd::TensorsArgs>` field, one `raw[1] == "tensors"` pre-parse branch and one dispatch block, copied from the `journal` pattern (`main.rs:598`, `:835-843`, `:1612-1618`). Journal lines themselves are not edited.
+- `packaging/internal-read-clippy/manifest.json`: reviewed entries for the new `#[expect(clippy::disallowed_methods)]` sites (§5.7). Generated as a candidate by the existing generator, then reviewed; CI never refreshes approvals.
+- `docs/formats-tensors.md`: new "Expert manifest" section with the JSONL format and the v1 refusals (remote paths, shard names that are not a single component, no GGUF split index, overlap refusal, unknown ggml types not split, duplicate files, non-regular files, zero-byte merged tensors); the "Sharded checkpoints" paragraph gains one sentence saying the manifest (not the mount) follows `weight_map`.
+- `README.md` (subcommand table, ~lines 251-262: one `tensors manifest` row), `docs/getting-started.md` (command tour: one example, per the `AGENTS.md` living-docs table), `docs/formats.md` (tensors row/Known limits: one line pointing at the manifest and its v1 limits).
+- `CHANGELOG.md` (Unreleased), `AGENTS.md` (regression catalog rows). `docs/tasks/plans/local-ai-roadmap.md` is untouched (it has no row for this R2; its tensors row AI-ST is already done).
+
+Not touched: `ratarmount-session/**` (no Session hook, §3), any other crate.
+
+## 1. Goal
+
+Give an inference engine (and the training-side R7 loader) a byte map of a local checkpoint: for every tensor, and for every expert inside a merged expert tensor, the file, absolute offset, length, storage format and logical shape, so the engine reads plain files itself. Two conversions of one checkpoint compare with `diff`/`jq`.
+
+## 2. Scope (v1, locked)
+
+- `ratarmount tensors manifest PATH... [-o FILE] [--hash] [--expert-pattern REGEX]`.
+- Inputs: a local `.safetensors` file, a local `model.safetensors.index.json` (every shard it names), or a local `.gguf` file. Several PATHs may be mixed.
+- Library: `ratarmount_formats_tensors::build_manifest(inputs, &ManifestOptions) -> Result<Manifest>` and `write_jsonl`.
+- GGUF merged experts split per expert; safetensors per-expert names classified; safetensors fused `experts.gate_up_proj` split into per-expert `GateUp` rows; shards follow `weight_map`.
+- JSONL output with a header line; every tensor byte covered exactly once.
+
+## 3. Non-goals (refused or simply absent)
+
+No reads at inference time, no prefetch, no FUSE expert serving, no dequantizing, no checkpoint writing, no `compare` command. No remote inputs: `hf://`, `http(s)://`, `file://` and any `scheme://` PATH is refused with `remote inputs are not supported`; PATHs inside archives or mounts-of-archives are not resolved (a PATH must be a regular file on the host). No `.index.json` for GGUF splits (`*-00001-of-0000N.gguf` are accepted only as individual files). **Session API hook skipped:** `Session` holds a type-erased `dyn MountSource` built by the factory; `TensorsMountSource` keeps only `Backend::Path` (one path) or `Backend::Shared` (a nested reader with no host path) plus a SQLite index whose sidecars carry per-tensor dtype/shape/offset but no per-expert slices and never an index JSON's shard set; adding `Session::tensor_manifest()` would need a downcast or a factory change. The spec allows skipping it; the CLI and library are the deliverable. No new mount behaviour: mounts, indexes and sidecar JSON are byte-identical.
+
+## 4. Output format (documented in `docs/formats-tensors.md`)
+
+Line 1 (header):
+`{"manifest":1,"inputs":["<PATH as given>",...],"generator":"ratarmount <CARGO_PKG_VERSION>"}`
+
+Each following line is one `ManifestRow`, serialized with serde in this key order:
+`file, tensor, layer, expert, role, format, shape, offset, length, aligned_4k, sha256`.
+- `file`: the shard path as given on the command line, or for index inputs `<index dir>/<weight_map value>` joined without canonicalization. Non-UTF-8 paths are refused (JSON needs strings).
+- `layer`, `expert`: integers or `null`. `role`: one of `"Gate","Up","Down","GateUp","Router","SharedExpert","Other"`.
+- `format`: safetensors dtype string verbatim; GGUF `ggml_layout` name, or `"UNKNOWN(<id>)"` for an unknown ggml type id.
+- `shape`: logical shape of this row's slice. Safetensors: row-major, as in the header (per-expert slice drops the leading expert axis). GGUF: `ne` order as stored (`ne0` innermost), per-expert slice drops the outermost `ne2`. The doc states both conventions.
+- `offset`: absolute file offset (already absolute in the parser: safetensors `8 + header_len + begin`, GGUF `data_start + info.offset`). `length` in bytes. `aligned_4k = offset % 4096 == 0`.
+- `sha256`: lowercase hex with `--hash`, otherwise `null` (key always present so `jq` paths are stable).
+- Sort key: `(layer, expert, role, file, offset, tensor)` with `Option` ordering `None < Some` (global tensors such as embeddings first) and `Role` in declaration order. Fully deterministic; no timestamps.
+- Lines end in `\n`; output to stdout unless `-o`.
+
+## 5. Design
+
+### 5.1 Reuse the existing parser (no second parser)
+
+`parse` (`lib.rs:78`) already dispatches to `gguf::parse` / `safetensors::parse`, validates every header and returns `Parsed { tensors: Vec<Tensor>, .. }` with absolute `offset` and `size`. Today the dtype/shape live only in the untyped `sidecar` JSON. Add one typed field to the private struct:
+
+```rust
+pub(crate) enum Layout {
+    Safetensors { dtype: String, shape: Vec<u64>, size_checked: bool },
+    Gguf { ty: u32, dims: Vec<u64> },
+}
+struct Tensor { name, offset, size, sidecar, layout: Layout }
+```
+
+`gguf::parse` and `safetensors::parse` set it from values they already hold. Mount code ignores the field. The manifest calls `crate::parse` and `gguf::ggml_layout` (`gguf.rs:248`) directly; it never reparses bytes.
+
+Before anything else, `build_manifest` refuses any PATH whose string contains `://` (`remote inputs are not supported`), so `hf://x` never becomes a missing-file error. Opening sequence for every input, index file and shard: (1) `std::fs::metadata(path)` (follows symlinks, opens nothing); refuse unless `is_file()` (`<path>: not a regular file`), so a directory, FIFO, socket or device is refused before any `open`, which would block on a writerless FIFO; (2) `File::open`; (3) re-check the opened handle's `metadata().is_file()` and that its length equals step 1's (refuse otherwise). A swap to a FIFO between (1) and (2) by another local process could still block the open; O_NONBLOCK would need a target `cfg` that N4 refuses in this restricted crate, and the input is a user-chosen local path, so this residual race is documented, not closed. Every error message names the path (`io::Error` text does not). Each file is parsed once.
+
+### 5.2 Public API
+
+```rust
+pub enum Role { Gate, Up, Down, GateUp, Router, SharedExpert, Other }  // serde: variant names
+pub struct ManifestRow { file: PathBuf, tensor: String, layer: Option<u32>, expert: Option<u32>,
+    role: Role, format: String, shape: Vec<u64>, offset: u64, length: u64,
+    aligned_4k: bool, sha256: Option<String> }           // fields pub, as in the spec
+pub struct ExpertPattern(regex::Regex);   // private field: only constructible via compile_expert_pattern
+pub struct ManifestOptions { pub hash: bool, pub expert_pattern: Option<ExpertPattern> }
+pub struct Manifest { pub inputs: Vec<PathBuf>, pub rows: Vec<ManifestRow> }
+pub fn build_manifest(inputs: &[PathBuf], opts: &ManifestOptions) -> Result<Manifest>;
+pub fn write_jsonl(m: &Manifest, generator: &str, out: &mut dyn Write) -> Result<()>;
+pub fn compile_expert_pattern(s: &str) -> Result<ExpertPattern>;  // wraps as ^(?:s)$, requires named groups layer/expert/role
+```
+
+Errors are `TensorsError::Invalid` with a message naming the file and tensor. The spec's `Result<Vec<ManifestRow>>` becomes `Result<Manifest>` so the header's input list travels with the rows; `rows` is exactly the spec's `Vec<ManifestRow>`.
+
+### 5.3 Input classification
+
+- Name ends in `.index.json` (case-sensitive, e.g. `model.safetensors.index.json`): safetensors index (§5.5).
+- Otherwise call `parse`, which sniffs GGUF magic vs safetensors header, as the mount does. Anything that fails is refused with the parser's error.
+- A file reached twice (via two PATHs, a hard link, a symlink, or an index plus a direct PATH) is refused (`<file> given more than once`) so no byte is counted twice. Identity uses `same_file::Handle::from_file(opened_file)` (`(dev, ino)` on Unix, volume serial + file index on Windows; the crate owns the platform split, so this source has no target `cfg`, which N4 refuses here). The `Handle` is kept for the whole build and its `as_file_mut()` is the reader used for parsing and hashing, so the compared identity is the descriptor actually read (no reopen, no `try_clone`).
+
+### 5.4 Classification rules
+
+Full-name patterns (GGUF `*_exps.weight`, `ffn_gate_inp.weight`, the fused rule, the default per-expert pattern, the safetensors Router, and any `--expert-pattern`, which is wrapped as `^(?:PATTERN)$`) are anchored with `^...$`. Substring searches (`_shexp`, `\.shared_experts?\.`, and the layer extractors `(?:^|\.)blk\.(\d+)\.` / `(?:^|\.)layers\.(\d+)\.`) are unanchored `find`s. Each tensor gets exactly one classification, by the first rule that matches in the order listed (fused/merged, per-expert, Router, SharedExpert, Other), so a custom `--expert-pattern` that also matches a fused name cannot emit a second copy.
+
+GGUF (fixed rules):
+- `blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight` → merged experts, split per expert (§5.4.1), role Gate/Up/Down.
+- `blk\.(\d+)\.ffn_gate_inp\.weight` → `Router`, layer set.
+- name containing `_shexp` → `SharedExpert`, layer from `blk\.(\d+)\.` if present.
+- everything else → `Other`, `expert: null`, layer from `blk\.(\d+)\.` if present.
+
+Safetensors:
+- Default per-expert pattern (anchored; replaced entirely by `--expert-pattern`):
+  `(?:.*\.)?layers\.(?P<layer>\d+)\.(?:mlp|block_sparse_moe)\.experts\.(?P<expert>\d+)\.(?P<role>gate_proj|up_proj|down_proj|w1|w3|w2)\.weight`
+  Role map (used for custom patterns too): `gate_proj|w1|gate`→Gate, `up_proj|w3|up`→Up, `down_proj|w2|down`→Down, `gate_up_proj|gate_up`→GateUp (the short aliases let a custom pattern capture GGUF-style names; documented). The default pattern deliberately omits `gate_up_proj`: a per-expert `experts.<E>.gate_up_proj.weight` (one expert, gate and up rows fused) is not in the spec's default list and stays `Other` unless a custom pattern maps it; a custom pattern that captures `role=gate_up_proj` yields a `GateUp` row. A custom pattern must have groups `layer`, `expert`, `role` (checked by `compile_expert_pattern`; missing group = CLI error, exit 2); on an individual match, a required group that did not participate (alternation) is refused naming the tensor; a `role` capture outside the map is refused naming the tensor; `layer`/`expert` must parse as `u32`.
+- Fused rule (always on, not overridden, checked first): `^(?:.*\.)?experts\.gate_up_proj(?:\.weight)?$` (so `gate_up_proj.weight_scale` etc. do not match); the layer is extracted separately by the unanchored `(?:^|\.)layers\.(\d+)\.` search (None if absent). This covers `model.layers.0.mlp.experts.gate_up_proj`, `model.layers.0.block_sparse_moe.experts.gate_up_proj` and a bare `experts.gate_up_proj`. → split per expert along axis 0, role `GateUp`. Only `gate_up_proj` is split, per the spec; a merged `experts.down_proj` stays one `Other` row (non-blocking follow-up if R7 needs it).
+- Router: `^(?:.*\.)?layers\.(\d+)\.(?:mlp|block_sparse_moe)\.gate\.weight$` → `Router` (matches `model.layers.0.mlp.gate.weight`). Shared experts: `\.shared_experts?\.` → `SharedExpert`.
+- Unmatched → `Other`, `expert: null`, layer from `layers\.(\d+)\.` if present.
+- The regexes are compiled once (`std::sync::LazyLock`).
+
+#### 5.4.1 Splitting a merged tensor into experts
+
+GGUF `*_exps.weight`: require exactly 3 dims `[ne0, ne1, n_expert]` (else refuse naming tensor). Known type: `(_, block, bytes) = ggml_layout(ty)`; `row_bytes = (ne0 / block) * bytes` (parser already guarantees `ne0 % block == 0`); `slice_bytes = ne1 * row_bytes`, all `checked_mul`. Refuse if `length != n_expert * slice_bytes`. Unknown type (`ggml_layout` is `None`, size inferred from the next offset and possibly including alignment padding): refuse (`cannot split merged expert tensor <name>: unknown ggml type <id>`). Expert `e` row: `offset + e*slice_bytes`, `length = slice_bytes`, shape `[ne0, ne1]`.
+
+Every `(\d+)` capture (fixed rules and custom patterns) is parsed with `u32::from_str` and an overflow is `TensorsError::Invalid` naming the tensor (no `unwrap`). Expansion bound (both formats, checked before any allocation or loop): `n_expert` must be `1..=u32::MAX` (it becomes `Option<u32>`), the merged tensor must be non-empty (`length > 0`; a zero-byte merged tensor is refused naming it, since it has no expert bytes to map), and `slice_bytes > 0`; hence `n_expert <= length`, so rows never exceed the file's payload bytes. v1 accepts O(payload bytes) rows for a consistent file (a pathological file with 1-byte experts yields one row per byte); real MoE checkpoints have 10^5–10^6 rows (risk 5). GGUF dims are already positive (`gguf.rs` rejects 0). Regression `manifest_merged_expert_expansion_bound`: a tiny safetensors header declaring `model.layers.0.mlp.experts.gate_up_proj` (the same name test 3 splits) BF16 `[4294967297, 0, 1]` with offsets `[0,0]` is refused naming the tensor, in well under a second, without expanding rows.
+
+Safetensors fused `gate_up_proj`: require exactly 3 dims (expert axis first, as the spec states; a 2-D matrix is refused naming the tensor) and `shape[0] = n_expert`. For every dtype, known or unknown, refuse unless `length % n_expert == 0` (error: `merged expert tensor <name>: length <L> is not a multiple of n_expert <N>`); the parser validates only the whole tensor's bit count, so packed `F4`/`F6_*` slices can be fractional bytes (e.g. F6 `[2,2,1]` = 3 bytes). Then `slice_bytes = length / n_expert`; for known dtypes also check `slice_bytes * 8 == elements(shape[1..]) * bits`. Shape per row: `shape[1..]`.
+
+Defensive invariant for both: `sum(rows.length) == tensor.size` and rows are contiguous; asserted in code (error, not panic).
+
+### 5.5 Sharded safetensors
+
+Read the index JSON with a 100 MiB cap (`MAX_HEADER_SIZE`) into `{"weight_map": {tensor: shard}}` (other keys ignored; `weight_map` missing or not a string map is refused). For each distinct shard name:
+- the name must be a single normal path component: no `/`, `\`, `..`, `.`, empty, absolute, or NUL; otherwise refused (`weight_map shard <s> is not a plain file name`). Shards resolve in the index file's directory only. Symlinked shard files are followed (local, user-chosen input, same as the mount).
+- parse once with `crate::parse`; must be safetensors (GGUF shard refused).
+For each `weight_map` entry, the named shard must contain the tensor, else refused (spec). For every tensor parsed from shard `s`, `weight_map[tensor]` must exist and equal `s`; otherwise refused (`tensor <t> in <s> is mapped to <other>` / `is not in weight_map`). Together these make the mapping a bijection between weight_map entries and shard tensors, so a second copy of a tensor in a wrong shard is refused rather than emitted or silently skipped; tensor names in `weight_map` are unique by JSON object semantics (duplicate keys refused by reading with the same duplicate-rejecting map visitor pattern as `safetensors.rs`).
+
+### 5.6 CLI (`ratarmount/src/tensors_cmd.rs`)
+
+clap derive, same shape as `journal_cmd.rs`: `TensorsArgs { #[command(subcommand)] command: TensorsCommand }`, `TensorsCommand::Manifest { #[arg(required = true)] paths: Vec<PathBuf>, #[arg(short = 'o', long)] output: Option<PathBuf>, #[arg(long)] hash: bool, #[arg(long)] expert_pattern: Option<String> }`, with `after_help` example and exit status (0 success; 2 invalid arguments, input or I/O error). `main.rs` pre-parses `raw[1] == "tensors"` exactly like `journal` and dispatches `tensors_cmd::run`, printing `tensors: <error>` and exiting 2. Each `main.rs` site is a block the size of the journal one (field, pre-parse branch, dispatch).
+- stdout: buffered `BufWriter` on locked stdout; output uses `writeln!` into a `BufWriter` over locked stdout followed by an explicit `flush()?` before returning success (a `BufWriter` drop ignores flush errors; `export_index.rs:327` propagates `flush()` the same way), never `println!` (panics on `EPIPE`). Inherited exception, documented: `main()` calls `neutralize_dead_stdio()` before parsing (`main.rs:1557`, helper ~`:4981`), which redirects a stdout that is already broken at launch to `/dev/null`; the verb then succeeds without output, the same as every other verb. Changing that startup behaviour is out of scope (it is shared CLI code). A subprocess test with the pipe's read end closed before launch asserts the documented behaviour (exit 0, no panic); any write or flush error, including a broken pipe, returns an error that `main.rs` prints as `tensors: <error>` with exit 2, the same path `journal summarize` takes today (`journal_cmd.rs` returns the write error; `main.rs:1612-1616`).
+- `-o FILE`: `OpenOptions::new().write(true).create_new(true)` (refuses an existing file; no clobber), written fully, then `sync_all`; on any error after creation the partial file is removed. The whole manifest is built before the file is created, so input errors never leave a file.
+- The `generator` string is `ratarmount <env!("CARGO_PKG_VERSION")>`.
+
+### 5.7 Internal-read inventory
+
+New disallowed operations each get a direct `#[expect(clippy::disallowed_methods, reason = r#"internal-read:v1 {...}"#)]` with a new unique id and a reviewed manifest entry:
+- `manifest.rs`: `File::open` of each input/shard (category `factory-and-format-readers`, disposition matching the existing tensors sites, creation `none`); `File::open` + read of the index JSON (creation `none`); hashing reuses the already-open handle (no new open).
+- `tensors_cmd.rs` `-o`: the builder chain is split into individual leaves, each with its own expectation and manifest entry, as existing writers do (e.g. `empty_archive::create_new_empty_archive`): `std::fs::OpenOptions::new` (`disallowed_methods`), `OpenOptions::create_new` (`disallowed_methods`, creation policy `exclusive-new-file`), `OpenOptions::open` (`disallowed_methods`), and the `std::fs::OpenOptions` type (`disallowed_types`). `std::fs::remove_file` and `std::fs::metadata` are not disallowed items (`clippy.toml`); test-only file writes carry no inventory obligation.
+Exact ids/categories are taken from `packaging/internal-read-clippy/README.md` and `policy.json` at implementation time; the generator produces the candidate and the diff is reviewed. Both `test_policy.py` and `policy.py` must pass.
+
+### 5.8 Hashing (`--hash`)
+
+Per row, seek to `offset` and stream `length` bytes through `sha2::Sha256` with a 1 MiB buffer using the file handle opened for parsing (one handle per file). Reading stops with an error on short read. Without `--hash`, no payload byte is read (header-only cost, same as mounting).
+
+## 6. Acceptance tests (all six from the spec)
+
+Unit tests in `ratarmount-formats-tensors/src/manifest_tests.rs` (filter prefix `manifest_`), fixtures written to `tempfile` dirs with the existing builders:
+
+1. `manifest_gguf_experts_match_independent_slices`: synthetic GGUF, 2 layers × 4 experts, `ffn_{gate,up,down}_exps.weight` in Q4_K (`ne0 = 256`) and F16, plus a dense F32 tensor `blk.0.attn_q.weight`, `blk.0.ffn_gate_inp.weight`, `blk.1.ffn_up_shexp.weight` and a global `token_embd.weight`; the test also asserts every row's `(layer, expert, role)` (Gate/Up/Down per expert, Router, SharedExpert with layer 1, Other with layer 0, Other with layer null). Payload bytes are a deterministic pattern unique per expert. Each expert row's `(offset, length)` range, read with `seek` + `read_exact` (the spec's `pread`; no Unix-only API so no target `cfg`), equals the slice the test computes independently from its own builder inputs (`data_start` computed in the test from the builder inputs as `header_len.next_multiple_of(alignment)` via a new test helper `gguf_with_start()` that returns `(bytes, data_start)` while the existing `gguf()` wrapper keeps its signature; never taken from the parser's sidecar; `e * ne1 * (ne0/256*144)` written out literally, not via `ggml_layout`).
+2. `manifest_sharded_safetensors_follow_weight_map`: two shards + index JSON, per-expert names split across shards (one shard in `model.layers.L.mlp.experts.E.{gate,up,down}_proj.weight` spelling, the other in `block_sparse_moe.experts.E.w1|w3|w2`, plus a Router `mlp.gate.weight`, a `shared_expert` tensor and a dense embedding); the test asserts the complete expected `(tensor, file, layer, expert, role)` set for every row; every row's `file` is the shard that holds it; `sum(length)` equals the sum of `data_offsets` spans in both headers; additionally rows sorted by `(file, offset)` tile each shard's data section without gap or overlap.
+3. `manifest_fused_gate_up_proj_splits_per_expert`: `model.layers.0.mlp.experts.gate_up_proj` `[4, 2*I, H]` BF16 → 4 `GateUp` rows, expert 0..3, shape `[2*I, H]`, contiguous, bytes equal the independent slices.
+4. `manifest_merged_expert_bad_length_refused`: (a) safetensors fused `gate_up_proj` with an unknown dtype (`"X9"`, so the parser skips the size check) whose length is not a multiple of `shape[0]` → error contains the tensor name; (b) GGUF `blk.0.ffn_up_exps.weight` with an unknown ggml type id → error contains the tensor name; (c) unit test of the splitter function that `build_manifest` actually calls, with a hand-built `length != n_expert * slice_bytes` → error with the name. (With known types the parser already ties length to shape, so (a)/(b) are the reachable cases; noted in the docs.)
+5. `manifest_hash_matches_sha256_of_ranges`: `--hash` values equal `sha2::Sha256` computed in the test over the byte ranges sliced from the in-memory fixture buffer (independent of the manifest's reader).
+
+CLI integration test `ratarmount/tests/tensors_manifest.rs` (filter `tensors_manifest`), running the built binary (`env!("CARGO_BIN_EXE_ratarmount")`):
+
+6. `tensors_manifest_dtype_change_diff`: two safetensors fixtures that differ only in one tensor's dtype (F32 vs F16, same shape `[2048]`, so the size delta is 4096 bytes and `aligned_4k` of later rows is unchanged), with headers padded with trailing spaces (allowed by the safetensors format and our parser) to the same total length, so every absolute offset before the edited tensor is identical; the test asserts both properties of the fixtures before diffing; written as `model.safetensors` in two temp dirs; the CLI runs with `current_dir` set to each dir and relative PATH `model.safetensors`, so headers and `file` fields are identical. A line diff of the two outputs shows exactly that tensor's row (changed `format`, `length`, `aligned_4k` if affected) and the rows of tensors stored after it (changed `offset` only); all other lines, including the header, are identical.
+
+Plus CLI coverage in the same file: the binary on the two-shard index fixture asserts each row's shard `file` and total coverage (test 2 via CLI); `--hash` digests compared with `sha2` computed in the test over the fixture's ranges (test 5 via CLI); one fixture's full JSONL row order is asserted literally (locks the sort contract: derived `Ord` on `Role` in declaration order, not string order); library tests of `compile_expert_pattern` for a missing group and a non-participating group; a successful `--expert-pattern` override (custom naming `ffn.L.ex.E.(gate|up|down).weight` captured as `(?P<layer>\d+)`, `(?P<expert>\d+)`, `(?P<role>gate|up|down)` and mapped through the documented short aliases) yields the expected layer/expert/role rows; `-o` writes the same bytes as stdout and refuses an existing file; `--hash` emits 64-hex strings; `--expert-pattern` without a `role` group exits 2; an `hf://x` PATH exits 2 with `remote inputs are not supported`; the same file given twice exits 2. Stdout redirected to `/dev/full` (opened with `OpenOptions` in the test; a small manifest fits the buffer, so the error only surfaces at the final `flush`) makes the CLI exit 2 with `tensors:` on stderr; skipped with a printed reason only if `/dev/full` does not exist.
+
+Refusal unit tests (same `manifest_` prefix): shard name with `../`, absolute path or `/`; weight_map entry whose shard lacks the tensor; shard tensor missing from weight_map; a tensor present in both shards with weight_map naming one (different payloads; the copy in the other shard is refused); GGUF `_exps` tensor with 2 dims; directory PATH; overlapping tensor ranges in a safetensors file and in a GGUF file (two merged expert tensors at one offset); packed `F6_E2M3` fused `gate_up_proj` `[2,2,1]` refused naming the tensor; the same file reached by a direct PATH and a hard link, and by an index plus a direct PATH, refused.
+
+FIFO (CLI integration test, `mkfifo` via `std::process::Command` as `overlay_meta.rs:365` does): a writerless FIFO given as PATH, and as a shard named by an index, makes the CLI exit 2 with `not a regular file`; the child is polled with `try_wait` and killed after 20 s, which fails the test (proves no hang).
+
+## 7. Risks and decisions
+
+1. **Coverage definition.** "Every byte covered exactly once" means every byte of every tensor's data range, not header or alignment padding bytes. Test 2 checks totals and tiling.
+2. **Overlapping tensors (both formats).** The mount accepts overlaps and marks them (`overlapping` sidecar flag, sweep at `lib.rs:312-331`). GGUF also permits them (two merged expert tensors can share an offset). A manifest with overlaps would count bytes twice, so `build_manifest` runs one format-independent sweep per file over the parsed tensors (sorted by offset, same algorithm as the mount's) and refuses any overlapping non-empty ranges, naming both tensors. This is a manifest-only rule, stated in the docs. Zero-length tensors are emitted with `length: 0`.
+3. **Unknown types** cannot be split (GGUF) or are split only on exact divisibility (safetensors); dense unknown-type tensors are emitted with inferred length and `format: "UNKNOWN(<id>)"`.
+4. **`main.rs` conflict with R1c**: additive lines only; see the header.
+5. **Memory**: rows are built in memory (`Vec`); a 1-trillion-parameter MoE has ~10^5–10^6 rows, a few hundred MB at worst. Acceptable for v1; streaming is a non-goal.
+
+## 8. Steps
+
+1. Add `Layout` to `Tensor`; set it in both parsers; `cargo test -p ratarmount-formats-tensors` unchanged and green.
+2. `manifest.rs` + `manifest_tests.rs` (tests 1–5, refusals); make fixture builders `pub(crate)`; Cargo deps.
+3. `tensors_cmd.rs`, `main.rs` wiring, `ratarmount/Cargo.toml`; `ratarmount/tests/tensors_manifest.rs` (test 6 and CLI cases).
+4. Internal-read expectations and manifest entries; run the generator, review the diff, both policy scripts.
+5. Docs (`docs/formats-tensors.md`), CHANGELOG, AGENTS.md catalog rows:
+   `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount-formats-tensors --lib manifest_` · `TMPDIR=/var/tmp CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --test tensors_manifest`.
+6. Full AGENTS.md gate; code review + skeptic (cap 3); PR signed "— Muse"; CI green; full head SHA to Keystone. No merge.

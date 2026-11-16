@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! ISO 9660 MountSource with random access via extent LBAs (`backendName=ISO9660MountSource`).
 //!
 //! # Nested archives (AutoMount / `open_from_reader`)
@@ -153,6 +156,7 @@ impl Iso9660MountSource {
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options) {
                         Ok(s) => return Ok(s),
+                        Err(e) if options.read_only_index => return Err(e),
                         Err(e) => eprintln!("info: could not load iso9660 index ({e}); rebuilding"),
                     }
                 }
@@ -234,7 +238,7 @@ impl Iso9660MountSource {
     ) -> Result<Self> {
         // Index + fingerprint first (same order as TAR/ZIP/7z): reject a sibling
         // index for a replaced archive before trusting files rows / extent opens.
-        let index = SqliteIndex::open_read_only(index_path)?;
+        let index = SqliteIndex::open_read_only_for_open(index_path, options)?;
         index.check_backend_name(BACKEND_NAME)?;
         if index
             .metadata()?
@@ -268,6 +272,10 @@ impl Iso9660MountSource {
         );
         let t0 = Instant::now();
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0324-M01","item":"<ratarmount_formats_iso9660::Iso9660MountSource>::create_index","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut file = File::open(archive_path)?;
         let index = build_iso_index(
             &mut file,
@@ -350,6 +358,10 @@ impl MountSource for Iso9660MountSource {
         })?;
         match &self.backend {
             IsoBackend::Path(path) => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0325-M01","item":"<ratarmount_formats_iso9660::Iso9660MountSource as ratarmount_core::MountSource<ratarmount_formats_iso9660::Iso9660MountSource>>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
                 let file = File::open(path)?;
                 Ok(Box::new(StenciledFile::new(
                     file,
@@ -449,7 +461,14 @@ fn userdata(fi: &FileInfo) -> Option<&SQLiteIndexedTarUserData> {
 }
 
 pub fn looks_like_iso9660(path: &Path) -> bool {
-    if let Ok(mut f) = File::open(path) {
+    if let Ok(mut f) = {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0326-M01","item":"ratarmount_formats_iso9660::looks_like_iso9660","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = File::open(path);
+        __inventory_value_0
+    } {
         if f.seek(SeekFrom::Start(0x8001)).is_ok() {
             let mut cd = [0u8; 5];
             if f.read(&mut cd).ok() == Some(5) && &cd == b"CD001" {
@@ -500,6 +519,53 @@ mod regression_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn prepared_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect()
+    }
+
+    /// Regression: a strict warm worker must read members without changing its prepared sidecar.
+    #[test]
+    fn regression_prepared_index_warm_open_is_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.iso9660");
+        let index = dir.path().join("index.sqlite");
+        let fixture = synthetic_iso("HELLO.TXT;1", b"worker base");
+        std::fs::write(&archive, &fixture).unwrap();
+        drop(
+            Iso9660MountSource::open(
+                &archive,
+                Some(&index),
+                &OpenOptions::default(),
+                "test",
+                true,
+            )
+            .unwrap(),
+        );
+        SqliteIndex::finalize_prepared(&index).unwrap();
+        let before = prepared_snapshot(dir.path());
+        let options = OpenOptions {
+            read_only_index: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let source =
+            Iso9660MountSource::open(&archive, Some(&index), &options, "test", false).unwrap();
+        let member = "/HELLO.TXT".to_owned();
+        let info = source.lookup(&member, 0).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut source.open(&info, 0).unwrap(), &mut bytes).unwrap();
+        assert_eq!(bytes, b"worker base");
+        assert_eq!(prepared_snapshot(dir.path()), before);
+        drop(source);
+        assert_eq!(prepared_snapshot(dir.path()), before);
+    }
+
     use std::io::{Cursor, Write};
 
     /// Minimal single-file ISO 9660 (PVD + root dir + one data extent). Always-on.

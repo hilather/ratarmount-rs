@@ -1,5 +1,6 @@
 use super::*;
 use crate::{HttpRangeFile, SecretString};
+use ratarmount_index::http_client::{profile_summary, TransportKind};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::AtomicUsize;
@@ -233,6 +234,129 @@ fn options() -> HttpAuthOptions {
     HttpAuthOptions {
         bearer_token: Some(SecretString::new("private-bearer-token".into())),
     }
+}
+
+/// Regression: duplicate header sets must reach each hop and streamed upload only once.
+#[test]
+fn regression_http_pool_duplicate_header_set_is_sent_once() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let requests = Arc::clone(&captured);
+    let server = Server::spawn(move |req| {
+        let response = if req.path == "/a" {
+            Response::redirect("/b".into())
+        } else {
+            Response::empty(200)
+        };
+        requests.lock().unwrap().push(req);
+        response
+    });
+    get(&format!("{}/a", server.url))
+        .set("X-Dup", "1")
+        .set("x-dup", "2")
+        .set("Authorization", "a")
+        .set("AUTHORIZATION", "b")
+        .timeout(Duration::from_secs(5))
+        .call()
+        .unwrap();
+    request("PUT", &format!("{}/c", server.url))
+        .set("Content-Length", "3")
+        .set("content-length", "3")
+        .timeout(Duration::from_secs(5))
+        .send_reader(&b"abc"[..])
+        .unwrap();
+    drop(server);
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    let values = |index: usize, name: &str| {
+        requests[index]
+            .headers
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(requests[0].path, "/a");
+    assert_eq!(values(0, "x-dup"), ["2"]);
+    assert_eq!(values(0, "authorization"), ["b"]);
+    assert_eq!(requests[1].path, "/b");
+    assert_eq!(values(1, "x-dup"), ["2"]);
+    assert!(values(1, "authorization").is_empty());
+    assert_eq!(requests[2].path, "/c");
+    assert_eq!(requests[2].method, "PUT");
+    assert_eq!(values(2, "content-length"), ["3"]);
+    assert_eq!(requests[2].body, b"abc");
+}
+
+/// Regression: transport errors must discard credentials and signed URL components.
+#[test]
+fn regression_http_pool_transport_error_is_redacted_facade_error() {
+    // Header validation fails before connecting, so no released-port race is possible.
+    let err = get("http://user:pw@127.0.0.1:9/x?Signature=s#t")
+        .set("X Bad", "v")
+        .timeout(Duration::from_secs(5))
+        .call()
+        .unwrap_err();
+    let HttpError::Transport(transport) = &err else {
+        panic!("expected transport error: {err:?}");
+    };
+    assert_eq!(transport.kind(), TransportKind::Io);
+    let display = err.to_string();
+    assert_eq!(
+        display,
+        "Network Error: HTTP BadHeader for http://127.0.0.1:9/x"
+    );
+    for secret in ["user", "pw", "Signature", "#t"] {
+        assert!(!display.contains(secret), "{display}");
+    }
+}
+
+/// Regression: status errors must retain readable bodies, headers and mapped diagnostics.
+#[test]
+fn regression_http_pool_status_keeps_readable_response() {
+    let server = Server::spawn(|req| Response {
+        status: if req.path == "/unauthorized" {
+            401
+        } else {
+            404
+        },
+        headers: vec![
+            ("Content-Length".into(), "4".into()),
+            ("X-Error-Code".into(), "EntryNotFound".into()),
+        ],
+        body: b"nope".to_vec(),
+        fragmented: false,
+        body_gate: None,
+    });
+    let url = format!("{}/missing", server.url);
+    let err = get(&url)
+        .timeout(Duration::from_secs(5))
+        .call()
+        .unwrap_err();
+    assert_eq!(err.to_string(), format!("{url}: status code 404"));
+    let HttpError::Status(404, response) = err else {
+        panic!("expected 404 status error: {err:?}");
+    };
+    assert_eq!(response.header("x-error-code"), Some("EntryNotFound"));
+    assert_eq!(response.into_string().unwrap(), "nope");
+    let err = get(&url)
+        .timeout(Duration::from_secs(5))
+        .call()
+        .unwrap_err();
+    assert_eq!(
+        crate::map_http_client_error(err, &url).to_string(),
+        crate::http_status_err(404, &url).to_string()
+    );
+    let url = format!("{}/unauthorized", server.url);
+    let err = get(&url)
+        .timeout(Duration::from_secs(5))
+        .call()
+        .unwrap_err();
+    assert_eq!(
+        crate::map_http_client_error(err, &url).to_string(),
+        crate::http_unauthorized(&url).to_string()
+    );
+    drop(server);
 }
 
 /// Regression: each sequential HTTP read used to create another TCP connection.
@@ -490,11 +614,12 @@ fn regression_http_content_range_validation_unit() {
         ("bytes 0-31/31", 0, 31, None, false),
         ("bytes 0-18446744073709551615/*", 0, u64::MAX, None, false),
     ] {
-        let resp: ureq::Response = format!(
-            "HTTP/1.1 206 Partial Content\r\nContent-Range: {header}\r\nContent-Length: 32\r\n\r\n"
-        )
-        .parse()
-        .unwrap();
+        let resp = HttpResponse::for_test(
+            206,
+            "",
+            &[("Content-Range", header), ("Content-Length", "32")],
+            Vec::new(),
+        );
         let result = validate_content_range(&resp, start, end, size);
         assert_eq!(result.is_ok(), good, "{header}");
     }
@@ -1038,11 +1163,16 @@ fn regression_http_completed_prefetch_payload_retains_budget_permit() {
 /// Regression: shared HTTP defaults imposed new timeouts on slow gateways and full downloads.
 #[test]
 fn regression_http_shared_agent_preserves_ureq_default_timeouts() {
-    let config = format!("{:?}", agent());
-    assert!(config.contains("timeout_connect: Some(30s)"), "{config}");
-    assert!(config.contains("timeout_read: None"), "{config}");
-    assert!(config.contains("timeout_write: None"), "{config}");
-    assert!(config.contains("timeout: None"), "{config}");
+    let config = profile_summary(&Profile::Pooled);
+    assert_eq!(config.connect_timeout, Some(Duration::from_secs(30)));
+    assert_eq!(config.read_timeout, None);
+    assert_eq!(config.write_timeout, None);
+    assert_eq!(config.overall_timeout, None);
+    assert_eq!(config.redirects, 0);
+    assert!(config.reuse);
+    assert_eq!(config.max_idle_connections, Some(128));
+    assert_eq!(config.max_idle_connections_per_host, Some(64));
+    assert!(!config.env_proxy);
 }
 
 /// Regression: an invalid process cap must not remove the default bound.

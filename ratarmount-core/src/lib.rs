@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! Core types and the `MountSource` trait (mirrors Python `ratarmountcore.mountsource`).
 
 mod atomic_update;
@@ -332,6 +335,35 @@ pub fn metadata_mode(meta: &std::fs::Metadata) -> u32 {
     }
 }
 
+/// Device and inode identity on Unix; unavailable on other platforms.
+pub fn metadata_file_id(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+/// Set exactly the Unix permission bits. Returns false off Unix.
+pub fn set_file_mode(path: &std::path::Path, mode: u32) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(false)
+    }
+}
+
 #[inline]
 pub fn is_dir_mode(mode: u32) -> bool {
     mode & S_IFMT == S_IFDIR
@@ -369,6 +401,9 @@ pub struct SQLiteIndexedTarUserData {
 #[derive(Clone, Debug)]
 pub enum UserData {
     Tar(SQLiteIndexedTarUserData),
+    /// Native symlink target bytes for integrity checks. Kept separately
+    /// from FileInfo::linkname's historical lossy UTF-8 representation.
+    SymlinkTarget(Vec<u8>),
     /// Opaque payload for other backends until typed.
     Other(String),
 }
@@ -571,7 +606,9 @@ pub struct OpenOptions {
     pub passwords: Vec<String>,
     /// Preferred backends (Python `--use-backend`); last has highest priority.
     pub use_backends: Vec<String>,
-    /// Never create/modify indexes (`--no-recreate-index`).
+    /// Require prepared immutable shared indexes (`--no-recreate-index`): no
+    /// persistent rebuild or top-level memory fallback. Private nested indexing
+    /// must first remove shared paths and disable persistent writes.
     pub read_only_index: bool,
     /// Force folder index usage (`--force-folder-index`); folders still bind-mount live.
     pub force_folder_index: bool,
@@ -1182,6 +1219,35 @@ mod tests {
             assert_eq!(metadata_gid(&meta), 0);
             assert_eq!(metadata_mode(&meta) & S_IFMT, S_IFREG);
         }
+        let link = p.with_extension("alias");
+        let other = p.with_extension("other");
+        std::fs::hard_link(&p, &link).unwrap();
+        std::fs::write(&other, b"other").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(metadata_file_id(&meta), Some((meta.dev(), meta.ino())));
+            assert_eq!(
+                metadata_file_id(&meta),
+                metadata_file_id(&std::fs::metadata(&link).unwrap())
+            );
+            assert_ne!(
+                metadata_file_id(&meta),
+                metadata_file_id(&std::fs::metadata(&other).unwrap())
+            );
+            assert!(set_file_mode(&p, 0o440).unwrap());
+            assert_eq!(
+                metadata_mode(&std::fs::metadata(&p).unwrap()) & 0o777,
+                0o440
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(metadata_file_id(&meta), None);
+            assert!(!set_file_mode(&p, 0o440).unwrap());
+        }
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_file(other).unwrap();
         assert_eq!(meta.len(), 2);
         let _ = std::fs::remove_file(&p);
     }

@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! ratarmount CLI (Phases 0–11 + CLI flag parity).
 
 use std::ffi::OsString;
@@ -8,7 +11,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{ArgAction, Parser};
-use nix::unistd::{fork, setsid, ForkResult};
 pub(crate) use ratarmount_compositing::lower_stack::MountLowerStack;
 use ratarmount_compositing::{
     maybe_wrap_payload_cache, CommitOverlayOptions, ControlFolderMountSource, ControlFolderOptions,
@@ -37,7 +39,10 @@ mod quiet_print;
 
 mod base_digest;
 mod base_identity;
+#[cfg(test)]
+mod child_helpers;
 mod corpus;
+mod daemon;
 mod diff;
 mod export_index;
 mod find;
@@ -53,6 +58,10 @@ mod publish_index;
 mod sandbox;
 mod shard;
 mod snapshot;
+mod tensors_cmd;
+#[cfg(test)]
+#[path = "../../test-harness/child_process.rs"]
+mod test_child;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -100,7 +109,7 @@ struct Args {
     #[arg(short = 'c', long = "recreate-index", action = ArgAction::SetTrue)]
     recreate_index: bool,
 
-    /// Never create or modify indexes; only use existing ones
+    /// Use only complete prepared indexes; never rebuild, recover, or modify shared state
     #[arg(long = "no-recreate-index", action = ArgAction::SetTrue)]
     no_recreate_index: bool,
 
@@ -572,6 +581,15 @@ struct Args {
     #[arg(long, requires = "overlay_target", conflicts_with = "commit_overlay")]
     overlay_quota_files: Option<u64>,
 
+    /// Overlay database durability: `full` waits for the disk on every create/unlink/rename;
+    /// `relaxed` does not (about 58x faster in the measured create/unlink workload) and is meant
+    /// for throwaway overlays: an OS crash or power loss can then corrupt the overlay
+    /// (a killed process cannot), and the next use
+    /// refuses until `overlay fsck --repair`. Requires -w/--overlay-tmpfs/--sandbox; relaxed conflicts
+    /// with archive commits (--commit-overlay*, --roll-every); exit 2 otherwise.
+    #[arg(long, value_parser = ["full", "relaxed"], default_value = "full", requires = "overlay_target")]
+    overlay_durability: String,
+
     #[arg(skip)]
     overlay_stats: Option<overlay_stats::StatsArgs>,
 
@@ -595,6 +613,9 @@ struct Args {
     journal_command: Option<journal_cmd::JournalArgs>,
 
     #[arg(skip)]
+    tensors_command: Option<tensors_cmd::TensorsArgs>,
+
+    #[arg(skip)]
     overlay: Option<overlay_cmd::OverlayArgs>,
 
     #[arg(skip)]
@@ -605,6 +626,10 @@ struct Args {
 
     #[arg(long, hide = true, requires_all = ["write_overlay", "foreground"])]
     sandbox_inspection_socket: Option<PathBuf>,
+
+    // The supervisor's preflighted bundle cache for a retained attempt.
+    #[arg(long, hide = true, requires = "sandbox_inspection_socket")]
+    sandbox_bundle_cache: Option<PathBuf>,
 
     /// Commit write-overlay changes into a TAR (uncompressed / gzip / bzip2 / xz via GNU tar,
     /// or `.tar.zst` via frame splice) or ZIP (full rebuild). Does not mount; requires
@@ -693,7 +718,7 @@ struct Args {
     #[arg(short = 'd', long = "debug", default_value_t = 1)]
     debug: u8,
 
-    /// Redirect log output to this file (after mount setup; useful without -f)
+    /// Write diagnostic logs to this file (also after daemonizing)
     #[arg(long = "log-file")]
     log_file: Option<PathBuf>,
 
@@ -706,8 +731,12 @@ struct Args {
     print_features: bool,
 
     /// Input archives/folders/URLs and optional mountpoint. A mountpoint may not be, lie
-    /// inside, or contain a folder being mounted (refused, exit 2); a folder defaults to
-    /// `<folder>.mounted`.
+    /// inside, or contain a folder being mounted (refused, exit 2). Without one, the
+    /// mount point is the first input's file name (the active numbered archive with
+    /// --roll-every), minus a compression suffix and one more extension, in the current
+    /// directory (`dir/base` and `dir/base.tar.gz` both mount at `./base`); only when
+    /// that would be the input folder itself is `.mounted` appended (`base.mounted`).
+    /// TAR shorthands such as `.tgz` count as `.tar.gz`.
     #[arg(required = false)]
     paths: Vec<PathBuf>,
 
@@ -754,6 +783,39 @@ fn base_flag_needs_target_or_lower(args: &Args) -> Result<(), clap::Error> {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::MissingRequiredArgument,
                 format!("{flag} requires -w/--overlay-tmpfs/--sandbox or --lower"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `--overlay-durability=relaxed` is for throwaway overlays: it never feeds
+/// an archive commit (#328). Clap's `conflicts_with` would also refuse an
+/// explicit `full`, so the value is checked here.
+fn relaxed_durability_has_no_commit(args: &Args) -> Result<(), clap::Error> {
+    if args.overlay_durability != "relaxed" {
+        return Ok(());
+    }
+    for (given, flag) in [
+        (args.commit_overlay, "--commit-overlay"),
+        (args.commit_overlay_on_exit, "--commit-overlay-on-exit"),
+        (
+            overlay_commit::parse_interval(&args.commit_overlay_interval)
+                .map_err(|message| {
+                    clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
+                })?
+                .is_some(),
+            "--commit-overlay-interval",
+        ),
+        (args.roll_every.is_some(), "--roll-every"),
+    ] {
+        if given {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!(
+                    "--overlay-durability=relaxed cannot be used with {flag}: a relaxed overlay \
+                     is throwaway and is never committed into an archive\n"
+                ),
             ));
         }
     }
@@ -836,6 +898,15 @@ where
         )?;
         let mut args = Args::try_parse_from(&raw[..1])?;
         args.journal_command = Some(journal);
+        return Ok(args);
+    }
+    if raw.get(1).is_some_and(|s| s == "tensors") {
+        let tensors = tensors_cmd::TensorsArgs::try_parse_from(
+            std::iter::once(OsString::from("ratarmount tensors"))
+                .chain(raw.iter().skip(2).cloned()),
+        )?;
+        let mut args = Args::try_parse_from(&raw[..1])?;
+        args.tensors_command = Some(tensors);
         return Ok(args);
     }
     if raw.get(1).is_some_and(|s| s == "overlay") {
@@ -932,6 +1003,7 @@ where
         ));
     }
     base_flag_needs_target_or_lower(&args)?;
+    relaxed_durability_has_no_commit(&args)?;
     expand_sandbox(&mut args, caller_ids())
         .map_err(|message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message))?;
     ratarmount_compositing::ReadOnlyGlobs::new(&args.journal_exclude)
@@ -1070,13 +1142,22 @@ fn create_tmpfs_overlay_in(
             ));
             continue;
         }
-        match tempfile::Builder::new()
-            .prefix("ratarmount-write-overlay.")
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir_in(parent)
         {
-            Ok(directory) => return Ok(directory),
-            Err(error) => last_error = Some(error),
+            let __inventory_condition_44740 = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0021-M01","item":"ratarmount::create_tmpfs_overlay_in","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )]
+                let __inventory_value_0 = tempfile::Builder::new()
+                    .prefix("ratarmount-write-overlay.")
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir_in(parent);
+                __inventory_value_0
+            };
+            match __inventory_condition_44740 {
+                Ok(directory) => return Ok(directory),
+                Err(error) => last_error = Some(error),
+            }
         }
     }
     Err(std::io::Error::other(format!(
@@ -1285,6 +1366,42 @@ fn run_repack_seekable_cli(args: &Args) -> Result<(), (i32, String)> {
     }
 }
 
+fn prepared_index_cli_error(args: &Args) -> Option<String> {
+    if !args.no_recreate_index {
+        return None;
+    }
+    let incompatible = if args.recreate_index {
+        Some("-c / --recreate-index")
+    } else if args.hashes.is_some() {
+        Some("--hashes")
+    } else if args.commit_overlay {
+        Some("--commit-overlay")
+    } else if args.roll_every.is_some() {
+        Some("--roll-every")
+    } else if args.commit_overlay_on_exit {
+        Some("--commit-overlay-on-exit")
+    } else if overlay_commit::parse_interval(&args.commit_overlay_interval)
+        .map_or(true, |interval| interval.is_some())
+    {
+        Some("--commit-overlay-interval")
+    } else if args.publish_index {
+        Some("--publish-index")
+    } else if args.publish_index_to.is_some() {
+        Some("--publish-index-to")
+    } else if args.repack_seekable {
+        Some("--repack-seekable")
+    } else if args
+        .index_file
+        .as_deref()
+        .is_some_and(|s| s.trim() == MEMORY_INDEX)
+    {
+        Some("--index-file :memory:")
+    } else {
+        None
+    };
+    incompatible.map(|flag| format!("--no-recreate-index cannot be combined with {flag}; stop workers and prepare the base/index separately"))
+}
+
 fn index_id_cli_error(args: &Args) -> Option<&'static str> {
     args.index_id.as_ref()?;
     if args.recreate_index {
@@ -1308,22 +1425,39 @@ fn index_id_cli_error(args: &Args) -> Option<&'static str> {
 /// the listing options of [`mounted_view_key`] are appended to the digest so a
 /// check made under one listing never serves another.
 /// Computed only when a `--lower` bundle needs it.
+#[cfg(test)]
 fn lower_base_key(
     bases: &[PathBuf],
     index: Option<&Path>,
     lowers: &[PathBuf],
     view_key: &str,
 ) -> Option<String> {
-    let [base] = bases else {
-        return None;
-    };
-    if !lowers.iter().any(|p| p.is_file()) || !base.is_file() {
-        return None;
-    }
-    let digest = ratarmount_index::peek_archive_digest(base, index)
+    lower_base_key_for_open(bases, index, lowers, view_key, false)
         .ok()
-        .flatten()?;
-    Some(format!("{digest}.{view_key}"))
+        .flatten()
+}
+
+fn lower_base_key_for_open(
+    bases: &[PathBuf],
+    index: Option<&Path>,
+    lowers: &[PathBuf],
+    view_key: &str,
+    read_only_index: bool,
+) -> Result<Option<String>, String> {
+    let [base] = bases else { return Ok(None) };
+    if !lowers.iter().any(|p| p.is_file())
+        || !base.is_file()
+        || (read_only_index && index.is_none())
+    {
+        return Ok(None);
+    }
+    let peek = ratarmount_index::peek_archive_digest_for_open(base, index, read_only_index);
+    let digest = if read_only_index {
+        peek.map_err(|e| e.to_string())?
+    } else {
+        peek.ok().flatten()
+    };
+    Ok(digest.map(|digest| format!("{digest}.{view_key}")))
 }
 
 /// The verification marker key for this invocation: `None` unless the mount
@@ -1334,10 +1468,18 @@ fn lower_key_for(
     rolling: bool,
     inputs: &[PathBuf],
     index: Option<&Path>,
-) -> Option<String> {
-    mounted_view_is_default(args, rolling)
-        .then(|| lower_base_key(inputs, index, &args.lower, &mounted_view_key(args)))
-        .flatten()
+    read_only_index: bool,
+) -> Result<Option<String>, String> {
+    if !mounted_view_is_default(args, rolling) {
+        return Ok(None);
+    }
+    lower_base_key_for_open(
+        inputs,
+        index,
+        &args.lower,
+        &mounted_view_key(args),
+        read_only_index,
+    )
 }
 
 /// The options that change which members an archive lists or how their paths
@@ -1494,11 +1636,14 @@ fn main() {
     }
 
     if let Some(command) = &args.sandbox_api {
-        if let Err(error) = sandbox::run(command) {
-            eprintln!("sandbox: {error}");
-            std::process::exit(sandbox::error_exit_code(command));
+        match sandbox::run_cli(command) {
+            Ok(0) => return,
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("sandbox: {error}");
+                std::process::exit(sandbox::error_exit_code(command));
+            }
         }
-        return;
     }
 
     if let Some(snapshot) = &args.snapshot {
@@ -1539,6 +1684,13 @@ fn main() {
     if let Some(journal) = &args.journal_command {
         if let Err(error) = journal_cmd::run(journal) {
             eprintln!("journal: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if let Some(tensors) = &args.tensors_command {
+        if let Err(error) = tensors_cmd::run(tensors) {
+            eprintln!("tensors: {error}");
             std::process::exit(2);
         }
         return;
@@ -1603,6 +1755,10 @@ fn main() {
         eprintln!("error: {msg}");
         std::process::exit(2);
     }
+    if let Some(msg) = prepared_index_cli_error(&args) {
+        eprintln!("error: {msg}");
+        std::process::exit(2);
+    }
     if let Some(msg) = index_id_cli_error(&args) {
         eprintln!("error: {msg}");
         std::process::exit(2);
@@ -1612,26 +1768,10 @@ fn main() {
         std::process::exit(2);
     }
 
-    let write_style = resolve_color_style(args.color, args.no_color);
-    init_logger(args.debug, args.log_file.as_deref(), write_style);
-    if args.sandbox {
-        log::info!(
-            "sandbox: -o {} overlay={} quota={:?} passthrough={:?}",
-            args.fuse,
-            if args.overlay_tmpfs.is_some() {
-                "tmpfs".into()
-            } else {
-                args.write_overlay
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default()
-            },
-            args.overlay_quota,
-            args.passthrough
-        );
-    }
-    if args.overlay_tmpfs.is_some() && args.overlay_quota.is_none() {
-        eprintln!("warning: --overlay-tmpfs has no size cap; RAM usage is unbounded (set --overlay-tmpfs=SIZE or --overlay-quota)");
+    // These modes return before mount planning and never fork.
+    let offline = args.repack_seekable || args.unmount || args.commit_overlay;
+    if offline {
+        init_startup_logging(&args);
     }
 
     if args.repack_seekable {
@@ -1700,14 +1840,20 @@ fn main() {
             _ => archive.clone(),
         };
         let archive = &resolved_archive;
+        if let Err(error) = ratarmount_compositing::overlay_db::validate_overlay_state(
+            &overlay.join(ratarmount_compositing::HIDDEN_DB),
+        ) {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
         // A database overlay recovers a pending commit journal only after its
         // base identity gate (inside the commit): recovery rewrites the archive,
         // and it must not do that to an archive the overlay does not describe.
         // Only a missing entry without a marker is "no database" (R7-E2,
-        // R10-B): a dangling symlink, a directory or anything else there takes
-        // the database path below; a lost record (marker kept, database gone)
-        // or an entry that cannot be classified refuses before any recovery.
-        let has_db = match ratarmount_compositing::overlay_db_entry(overlay) {
+        // R10-B). Named-state policy was checked above; a lost regular record
+        // (marker kept, database gone or empty) still refuses with exit 2
+        // before any recovery.
+        let classify_overlay = || match ratarmount_compositing::overlay_db_entry(overlay) {
             Ok(ratarmount_compositing::DbEntry::Absent) => false,
             Ok(ratarmount_compositing::DbEntry::Present { .. }) => true,
             Ok(ratarmount_compositing::DbEntry::Lost { markers, .. }) => {
@@ -1722,6 +1868,25 @@ fn main() {
                 std::process::exit(2);
             }
         };
+        // Preserve classification's existing usage-error status, then make
+        // the authoritative decision again under the operation lock.
+        classify_overlay();
+        // Cover creation and recovery too: they may write before publication.
+        let commit_guard = match ratarmount_compositing::OverlayCommitGuard::acquire(overlay) {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+        let has_db = classify_overlay();
+        if has_db {
+            // Refuse sealed layers before creating or initializing a base (#238).
+            if let Err(e) = ratarmount_compositing::ensure_overlay_unsealed(overlay) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         if !has_db {
             // No recorded base to compare, but a journal started for another
             // file (a copy of the interrupted bytes) must not be rolled in.
@@ -1746,7 +1911,7 @@ fn main() {
             );
             if let Err(e) = recovered {
                 eprintln!("error: commit recovery for {}: {e}", archive.display());
-                std::process::exit(2);
+                std::process::exit(overlay_recovery_exit_code(&e));
             }
         }
         if let Err(e) = overlay_commit::maybe_create_missing_write_base(
@@ -1775,9 +1940,9 @@ fn main() {
                 &overlay_run_context(args.index_folders.as_deref()),
             )
             .map_err(OverlayError::Msg)
-            .and_then(|base| ratarmount_compositing::commit_overlay(overlay, archive, &base, &opts))
+            .and_then(|base| commit_guard.commit(archive, &base, &opts))
         } else {
-            ratarmount_compositing::commit_overlay_raw_dir(overlay, archive, &opts).map(|done| {
+            commit_guard.commit_raw_dir(archive, &opts).map(|done| {
                 if !done.identity_checked {
                     println!(
                         "note: no base identity was checked (overlay directory has no database)"
@@ -1860,12 +2025,32 @@ fn main() {
         }
     };
 
+    if guard.is_some() {
+        if let Err(e) = ratarmount_fuse::preflight_mount_backend() {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // A daemonized FUSE mount forks here, before it opens any database it
+    // must keep locked while it serves (#183): fcntl locks are not inherited
+    // by a fork child. The child does the rest of startup with this
+    // process's stdio and detaches right before serving; this process only
+    // relays its status and waits for the mount. Exactly the runs that reach
+    // a daemonized `run_*` branch (a guarded FUSE mount without `-f`).
+    if let Some((_, plan)) = guard.as_ref().filter(|_| !args.foreground) {
+        daemon::fork_launcher(&plan.mp);
+    }
+    // The serving process alone opens the log, as well as every database.
+    init_startup_logging(&args);
+
     // Classify every local member's commit journal against the records that
     // vote on it BEFORE any recovery write; members a record does not own wait
     // for the identity gates (recovered below, after the overlay opened).
-    let deferred_journals = recover_mount_journals(&args, &inputs);
+    let (deferred_journals, deferred_records) = recover_mount_journals(&args, &inputs);
 
-    if args.roll_every.is_none()
+    if !args.no_recreate_index
+        && args.roll_every.is_none()
         && args.write_overlay.is_some()
         && inputs.len() == 1
         && args.source_binds.is_empty()
@@ -1908,18 +2093,28 @@ fn main() {
 
     let mut passwords = args.passwords.clone();
     if let Some(ref pf) = args.password_file {
-        match std::fs::read_to_string(pf) {
-            Ok(s) => {
-                for line in s.lines() {
-                    let line = line.trim_end_matches(['\r', '\n']);
-                    if !line.is_empty() {
-                        passwords.push(line.to_string());
+        {
+            let __inventory_condition_87856 = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0022-M01","item":"ratarmount::main","disposition":"out-of-family","category":"configuration-or-credentials","reason":"password file named on the command line","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
+                let __inventory_value_0 = std::fs::read_to_string(pf);
+                __inventory_value_0
+            };
+            match __inventory_condition_87856 {
+                Ok(s) => {
+                    for line in s.lines() {
+                        let line = line.trim_end_matches(['\r', '\n']);
+                        if !line.is_empty() {
+                            passwords.push(line.to_string());
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("error reading --password-file: {e}");
-                std::process::exit(2);
+                Err(e) => {
+                    eprintln!("error reading --password-file: {e}");
+                    std::process::exit(2);
+                }
             }
         }
     }
@@ -1953,7 +2148,7 @@ fn main() {
         torrent_seed_upload_limit: args.seed_upload_limit,
         torrent_listen_port: args.torrent_listen_port,
         direct_io: args.direct_io,
-        zstd_readahead_bytes: if readahead_flag_on_argv(std::env::args()) {
+        zstd_readahead_bytes: if readahead_flag_on_argv(std::env::args_os()) {
             clamp_readahead(parse_byte_size(&args.readahead).unwrap_or_else(|e| {
                 eprintln!("error: invalid --readahead: {e}");
                 std::process::exit(2);
@@ -2105,6 +2300,18 @@ fn main() {
     } else {
         source_paths.clone()
     };
+    if args.no_mount && !open_opts.read_only_index && !open_opts.index_in_memory {
+        for path in factory_paths.iter().cloned().chain(
+            args.source_binds
+                .iter()
+                .map(|bind| PathBuf::from(&bind.source)),
+        ) {
+            if let Err(error) = factory::validate_worker_preparation(&path) {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     let factory_comp = factory::CompositingOptions {
         recursive: args.recursive || args.recursion_depth != 0,
         lazy: args.lazy,
@@ -2140,6 +2347,7 @@ fn main() {
         parallel_nested_threads: args.parallel_nested,
     };
     let recreate_index = args.recreate_index && !args.no_recreate_index;
+    let prepared_artifacts;
     let (mut bundle, classified) = if wants_identity {
         let mut opener = base_identity::FactoryOpener::new(
             inputs
@@ -2154,13 +2362,16 @@ fn main() {
             args.source_binds.is_empty(),
         );
         match ratarmount_compositing::ClassifiedBase::open(&mut opener) {
-            Ok(base) => (
-                base_identity::MountedSource {
-                    source: base.source(),
-                    _keep_alive: Box::new(()),
-                },
-                Some(base),
-            ),
+            Ok(base) => {
+                prepared_artifacts = opener.prepared_artifacts().to_vec();
+                (
+                    base_identity::MountedSource {
+                        source: base.source(),
+                        _keep_alive: Box::new(()),
+                    },
+                    Some(base),
+                )
+            }
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -2174,13 +2385,16 @@ fn main() {
             factory_comp,
             bindings,
         ) {
-            Ok(built) => (
-                base_identity::MountedSource {
-                    source: built.source.clone(),
-                    _keep_alive: built.into_keep_alive(),
-                },
-                None,
-            ),
+            Ok(built) => {
+                prepared_artifacts = built.prepared_artifacts.clone();
+                (
+                    base_identity::MountedSource {
+                        source: built.source.clone(),
+                        _keep_alive: built.into_keep_alive(),
+                    },
+                    None,
+                )
+            }
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -2214,8 +2428,8 @@ fn main() {
 
     // Content-hash xattrs foundation: after a successful mount build, for each
     // path-backed local archive with an on-disk index, open the index writable and
-    // fill user.hash.* xattrs. Does not go through factory (TODO: hook during index
-    // finalization so compressed/nested sources hash via MountSource::open).
+    // fill missing user.hash.* keys from decoded content. Stored ZIP/7z build-time
+    // digests are kept unchanged; late ZIP fills require verified Stored members.
     if !open_opts.hashes.is_empty() {
         if open_opts.index_in_memory {
             log::warn!(
@@ -2255,21 +2469,19 @@ fn main() {
                     continue;
                 }
                 match SqliteIndex::open_writable(idx_path) {
-                    Ok(idx) => {
-                        if let Err(e) = fill_content_hashes(&idx, input, &open_opts.hashes) {
-                            log::warn!(
-                                "failed to fill content hashes for {} (index {}): {e}",
-                                input.display(),
-                                idx_path.display()
-                            );
-                        } else {
-                            log::info!(
-                                "stored content hashes {:?} in {}",
-                                open_opts.hashes,
-                                idx_path.display()
-                            );
-                        }
-                    }
+                    Ok(idx) => match fill_content_hashes(&idx, input, &open_opts.hashes) {
+                        Err(e) => log::warn!(
+                            "failed to fill content hashes for {} (index {}): {e}",
+                            input.display(),
+                            idx_path.display()
+                        ),
+                        Ok(report) if report.filled > 0 => log::info!(
+                            "stored content hashes {:?} in {}",
+                            open_opts.hashes,
+                            idx_path.display()
+                        ),
+                        Ok(_) => {}
+                    },
                     Err(e) => {
                         log::warn!("cannot open index {} for --hashes: {e}", idx_path.display());
                     }
@@ -2316,7 +2528,24 @@ fn main() {
     // Under WriteOverlay so overlay files never hit payload-v1.
     bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
 
-    let lower_key = lower_key_for(&args, rolling.is_some(), &inputs, index_sidecar.as_deref());
+    let peek_index = if open_opts.read_only_index {
+        classified
+            .as_ref()
+            .and_then(|base| base.actual().index_for_peek())
+    } else {
+        index_sidecar.as_deref()
+    };
+    let lower_key = lower_key_for(
+        &args,
+        rolling.is_some(),
+        &inputs,
+        peek_index,
+        open_opts.read_only_index,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("error: prepared lower-key identity: {error}");
+        std::process::exit(2);
+    });
     let lower_identity = BaseIdentity::Enforce {
         base: MountedBase {
             extra_excludes: lower_extra_excludes(
@@ -2345,7 +2574,7 @@ fn main() {
         lower_key.as_deref(),
         &args.lower,
         args.allow_unsealed_lower,
-        None,
+        args.sandbox_bundle_cache.as_deref(),
         &bottom_identity(&lower_identity),
         &lower_stack_services(),
     )
@@ -2469,11 +2698,15 @@ fn main() {
     // is one: it holds its database exclusively).
     for member in &deferred_journals {
         let recovered = match overlay_arc.as_ref() {
-            Some(ov) => ov.recover_member_journal(member).map_err(|e| e.to_string()),
+            Some(ov) => ov
+                .recover_member_journal_with_records(member, &deferred_records)
+                .map_err(|e| e.to_string()),
             None => ratarmount_compositing::recover_journal_at(
                 member,
                 None,
-                ratarmount_compositing::Owner::Inode,
+                ratarmount_compositing::Owner::AdmittedMount {
+                    records: &deferred_records,
+                },
             )
             .map(|_| ())
             .map_err(|e| e.to_string()),
@@ -2485,12 +2718,31 @@ fn main() {
         }
     }
 
+    // #328: recovery must restamp the base under FULL before unlinking its
+    // archive journal. Only subsequent mount writes may use relaxed durability.
+    if args.overlay_durability == "relaxed" {
+        if let Err(e) = overlay_arc
+            .as_ref()
+            .expect("validated write overlay")
+            .set_durability(ratarmount_compositing::OverlayDurability::Relaxed)
+        {
+            eprintln!("error enabling --overlay-durability=relaxed: {e}");
+            drop(bundle);
+            drop(overlay_arc);
+            std::process::exit(1);
+        }
+    }
+
     let _sandbox_inspector = args.sandbox_inspection_socket.as_ref().map(|path| {
-        sandbox::start_inspection(path, overlay_arc.as_ref().expect("validated write overlay"))
-            .unwrap_or_else(|error| {
-                eprintln!("sandbox inspection: {error}");
-                std::process::exit(1);
-            })
+        sandbox::start_inspection(
+            path,
+            overlay_arc.as_ref().expect("validated write overlay"),
+            overlay_quota.clone(),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("sandbox inspection: {error}");
+            std::process::exit(1);
+        })
     });
 
     let commit_interval = match overlay_commit::parse_interval(&args.commit_overlay_interval) {
@@ -2538,6 +2790,26 @@ fn main() {
             eprintln!("error: {flag} cannot be combined with --no-mount");
             std::process::exit(2);
         }
+        // Only the exclusive preparer finishes publication. Release every
+        // source owner before reopening the actual artifacts for checkpointing.
+        drop(_sandbox_inspector);
+        drop(bundle);
+        drop(classified);
+        drop(lower_identity);
+        drop(overlay_arc);
+        drop(rolling);
+        drop(lower_stack);
+        if !open_opts.read_only_index {
+            for path in &prepared_artifacts {
+                if let Err(error) = SqliteIndex::finalize_prepared(path) {
+                    eprintln!(
+                        "error: incomplete preparation for {}: {error}",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
         return;
     }
     if (args.sftp || args.sftp_subsystem) && !ratarmount_sftp::sftp_russh_compiled() {
@@ -2555,7 +2827,7 @@ fn main() {
         eprintln!("warning: --sftp-subsystem ignores --sftp-bind and --sftp-authorized-keys");
     }
 
-    let readahead_on_argv = readahead_flag_on_argv(std::env::args());
+    let readahead_on_argv = readahead_flag_on_argv(std::env::args_os());
     #[cfg(feature = "gzip-rapidgzip")]
     let prefer_rapidgzip =
         ratarmount_compress::prefer_rapidgzip_gzip_backend(&open_opts.use_backends);
@@ -2633,6 +2905,10 @@ fn main() {
         None => None,
         Some((_, plan)) => {
             // First durable creation of the accepted mount point.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0114-M01","item":"ratarmount::main","disposition":"output-owner","category":"mountpoint-directory","reason":"Create the accepted FUSE mountpoint after the guard has validated the mount plan.","creation":{"policy":"recursive-directory","basis":"Only the explicit guarded FUSE path is created; export-only operation supplies no mountpoint and does not reach this leaf."}}"###
+            )]
             std::fs::create_dir_all(&plan.mp).ok();
             Some(plan.mp.clone())
         }
@@ -2808,7 +3084,6 @@ fn main() {
                     readahead,
                     nfs_opts,
                     args.foreground,
-                    args.log_file.is_some(),
                     live_commit_archive,
                     args.commit_overlay_on_exit,
                     commit_interval,
@@ -2831,7 +3106,6 @@ fn main() {
             Some(nfs_opts),
             plan,
             args.foreground,
-            args.log_file.is_some(),
             live_commit_archive,
             args.commit_overlay_on_exit,
             commit_interval,
@@ -2855,7 +3129,6 @@ fn main() {
             None,
             plan,
             args.foreground,
-            args.log_file.is_some(),
             live_commit_archive,
             args.commit_overlay_on_exit,
             commit_interval,
@@ -2876,7 +3149,6 @@ fn main() {
         activity,
         readahead,
         args.foreground,
-        args.log_file.is_some(),
         live_commit_archive,
         args.commit_overlay_on_exit,
         commit_interval,
@@ -2889,6 +3161,10 @@ fn main() {
 /// (disk-backed or tmpfs) for `:temp:`.
 fn overlay_dir_for(args: &Args, w: &Path) -> PathBuf {
     if w.as_os_str() == ":temp:" {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0023-M01","item":"ratarmount::overlay_dir_for","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
         let td = if args.overlay_tmpfs.is_some() {
             create_tmpfs_overlay()
         } else {
@@ -3424,7 +3700,9 @@ fn spawn_interval_if(
     stop: Option<ratarmount_nfs::NfsStop>,
     open_opts: &OpenOptions,
 ) -> Option<thread::JoinHandle<()>> {
-    base_digest::spawn_if_pending(overlay);
+    if !open_opts.read_only_index {
+        base_digest::spawn_if_pending(overlay);
+    }
     match (overlay, live_archive, commit_interval) {
         (Some(ov), Some(archive), Some(dur)) => Some(overlay_commit::spawn_interval_commits(
             Arc::clone(ov),
@@ -3446,9 +3724,8 @@ fn spawn_interval_if(
 /// [`overlay_commit::request_shutdown`]. `commit` (on-exit persist) runs
 /// while this process still holds the overlay.
 ///
-/// The forked parent must not call this. The child owns the SQLite
-/// connection; dropping here would replay into that connection. The parent's
-/// `process::exit` skips Drop on purpose.
+/// A daemonized mount's launcher never opens the overlay (it forks before
+/// any database is opened, #183), so only the serving process calls this.
 fn finish_overlay_serve(
     overlay: Option<Arc<WriteOverlay>>,
     source: Option<Arc<dyn MountSource>>,
@@ -3485,7 +3762,6 @@ fn run_exports(
     mut nfs_opts: Option<ratarmount_nfs::NfsOptions>,
     mut plan: ExportPlan,
     foreground: bool,
-    has_log_file: bool,
     live_archive: Option<PathBuf>,
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
@@ -3626,82 +3902,62 @@ fn run_exports(
                 finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
                 std::process::exit(1);
             }
-            match unsafe { fork() } {
-                Ok(ForkResult::Parent { child }) => {
-                    relinquish_temp_overlay();
-                    // The child owns the overlay database. Dropping it here
-                    // would replay pending rows into the child's connection.
-                    // process::exit skips Drop on purpose. The interval thread
-                    // starts in the child, not in this process.
-                    if !wait_until_mounted(&mp, Duration::from_secs(30)) {
-                        eprintln!(
-                            "error: timed out waiting for mount at {} (child pid {child})",
-                            mp.display()
-                        );
-                        let _ = unmount(&mp);
-                        std::process::exit(1);
-                    }
-                    std::process::exit(0);
-                }
-                Ok(ForkResult::Child) => {
-                    let _ = setsid();
-                    if !has_log_file {
-                        let _ = redirect_stdio_to_null();
-                    }
-                    overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-                    let control = control.map(ControlListener::serve);
-                    let interval = spawn_interval_if(
-                        &overlay_arc,
-                        &live_archive,
-                        commit_interval,
-                        Some(nfs_stop.clone()),
-                        &open_opts,
-                    );
-                    let BoundExports {
-                        handles,
-                        source,
-                        overlay: overlay_arc,
-                        interval,
-                    } = spawn_export_threads_or_exit(
-                        source,
-                        nfs_opts,
-                        plan,
-                        overlay_arc,
-                        interval,
-                        exit_with_code,
-                    );
-                    let mount_err = mount_blocking(
-                        source,
-                        &mp,
-                        true,
-                        writable,
-                        overlay_arc.clone(),
-                        fuse_opts,
-                        readahead,
-                        passthrough,
-                        open_opts.direct_io,
-                        activity,
-                    );
-                    wait_control_reply(&control);
-                    nfs_stop.request_stop();
-                    export_stop.request_stop();
-                    join_export_handles(handles);
-                    finish_overlay_serve(overlay_arc, None, interval, commit_exit);
-                    if let Err(e) = mount_err {
-                        let _ = std::fs::write(
-                            "/tmp/ratarmount-rs-fuse-error.log",
-                            format!("mount error: {e}\n"),
-                        );
-                        std::process::exit(1);
-                    }
-                    std::process::exit(0);
-                }
-                Err(e) => {
-                    eprintln!("error: fork failed: {e}");
-                    finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
-                    std::process::exit(1);
-                }
+            // Forked in `main` before any database was opened (#183).
+            daemon::detach();
+            if let Some(ov) = &overlay_arc {
+                ov.spawn_test_hold_open_transaction();
             }
+            overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+            let control = control.map(ControlListener::serve);
+            let interval = spawn_interval_if(
+                &overlay_arc,
+                &live_archive,
+                commit_interval,
+                Some(nfs_stop.clone()),
+                &open_opts,
+            );
+            let BoundExports {
+                handles,
+                source,
+                overlay: overlay_arc,
+                interval,
+            } = spawn_export_threads_or_exit(
+                source,
+                nfs_opts,
+                plan,
+                overlay_arc,
+                interval,
+                exit_with_code,
+            );
+            let mount_err = mount_blocking(
+                source,
+                &mp,
+                true,
+                writable,
+                overlay_arc.clone(),
+                fuse_opts,
+                readahead,
+                passthrough,
+                open_opts.direct_io,
+                activity,
+            );
+            wait_control_reply(&control);
+            nfs_stop.request_stop();
+            export_stop.request_stop();
+            join_export_handles(handles);
+            finish_overlay_serve(overlay_arc, None, interval, commit_exit);
+            if let Err(e) = mount_err {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0024-M01","item":"ratarmount::run_exports","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )]
+                let _ = std::fs::write(
+                    "/tmp/ratarmount-rs-fuse-error.log",
+                    format!("mount error: {e}\n"),
+                );
+                std::process::exit(1);
+            }
+            std::process::exit(0);
         }
     }
 }
@@ -3793,7 +4049,6 @@ fn run_fuse_and_nfs(
     readahead: u64,
     mut nfs_opts: ratarmount_nfs::NfsOptions,
     foreground: bool,
-    has_log_file: bool,
     live_archive: Option<PathBuf>,
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
@@ -3855,88 +4110,73 @@ fn run_fuse_and_nfs(
         return;
     }
 
-    // Daemonize: probe NFS bind in the parent so a dead port is not silent.
+    // Probe NFS before detaching so a dead port is not silent.
     // No client has been served. Drop the overlay before exit anyway.
     if let Err(e) = std::net::TcpListener::bind(nfs_opts.bind) {
         eprintln!("error: cannot bind NFS on {}: {e}", nfs_opts.bind);
         finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
         std::process::exit(1);
     }
-    match unsafe { fork() } {
-        Ok(ForkResult::Parent { child }) => {
-            relinquish_temp_overlay();
-            // The child owns the overlay database. Dropping it here would
-            // replay pending rows into the child's connection. process::exit
-            // skips Drop on purpose. The interval thread starts in the child.
-            if !wait_until_mounted(&mp, Duration::from_secs(30)) {
-                eprintln!(
-                    "error: timed out waiting for mount at {} (child pid {child})",
-                    mp.display()
-                );
-                let _ = unmount(&mp);
-                std::process::exit(1);
-            }
-            std::process::exit(0);
-        }
-        Ok(ForkResult::Child) => {
-            let _ = setsid();
-            if !has_log_file {
-                let _ = redirect_stdio_to_null();
-            }
-            let stop = ratarmount_nfs::NfsStop::new();
-            nfs_opts.stop = Some(stop.clone());
-            overlay_commit::spawn_signal_nfs_stop(stop.clone());
-            overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-            let control = control.map(ControlListener::serve);
-            let interval = spawn_interval_if(
-                &overlay_arc,
-                &live_archive,
-                commit_interval,
-                Some(stop.clone()),
-                &open_opts,
-            );
-            let handle = match spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
-                Ok(h) => h,
-                Err(e) => {
-                    let _ = std::fs::write(
-                        "/tmp/ratarmount-rs-nfs-error.log",
-                        format!("NFS bind error: {e}\n"),
-                    );
-                    finish_overlay_serve(overlay_arc, Some(source), interval, |_| {});
-                    std::process::exit(1);
-                }
-            };
-            let mount_err = mount_blocking(
-                source,
-                &mp,
-                true,
-                writable,
-                overlay_arc.clone(),
-                fuse_opts,
-                readahead,
-                passthrough,
-                open_opts.direct_io,
-                activity,
-            );
-            wait_control_reply(&control);
-            stop.request_stop();
-            let _ = handle.join();
-            finish_overlay_serve(overlay_arc, None, interval, commit_exit);
-            if let Err(e) = mount_err {
-                let _ = std::fs::write(
-                    "/tmp/ratarmount-rs-fuse-error.log",
-                    format!("mount error: {e}\n"),
-                );
-                std::process::exit(1);
-            }
-            std::process::exit(0);
-        }
+    // Forked in `main` before any database was opened (#183).
+    daemon::detach();
+    if let Some(ov) = &overlay_arc {
+        ov.spawn_test_hold_open_transaction();
+    }
+    let stop = ratarmount_nfs::NfsStop::new();
+    nfs_opts.stop = Some(stop.clone());
+    overlay_commit::spawn_signal_nfs_stop(stop.clone());
+    overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+    let control = control.map(ControlListener::serve);
+    let interval = spawn_interval_if(
+        &overlay_arc,
+        &live_archive,
+        commit_interval,
+        Some(stop.clone()),
+        &open_opts,
+    );
+    let handle = match spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
+        Ok(h) => h,
         Err(e) => {
-            eprintln!("error: fork failed: {e}");
-            finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0025-M01","item":"ratarmount::run_fuse_and_nfs","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let _ = std::fs::write(
+                "/tmp/ratarmount-rs-nfs-error.log",
+                format!("NFS bind error: {e}\n"),
+            );
+            finish_overlay_serve(overlay_arc, Some(source), interval, |_| {});
             std::process::exit(1);
         }
+    };
+    let mount_err = mount_blocking(
+        source,
+        &mp,
+        true,
+        writable,
+        overlay_arc.clone(),
+        fuse_opts,
+        readahead,
+        passthrough,
+        open_opts.direct_io,
+        activity,
+    );
+    wait_control_reply(&control);
+    stop.request_stop();
+    let _ = handle.join();
+    finish_overlay_serve(overlay_arc, None, interval, commit_exit);
+    if let Err(e) = mount_err {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0026-M01","item":"ratarmount::run_fuse_and_nfs","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
+        let _ = std::fs::write(
+            "/tmp/ratarmount-rs-fuse-error.log",
+            format!("mount error: {e}\n"),
+        );
+        std::process::exit(1);
     }
+    std::process::exit(0);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3950,7 +4190,6 @@ fn run_fuse_only(
     activity: ratarmount_fuse::oplog::MountActivity,
     readahead: u64,
     foreground: bool,
-    has_log_file: bool,
     live_archive: Option<PathBuf>,
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
@@ -3998,65 +4237,46 @@ fn run_fuse_only(
         return;
     }
 
-    match unsafe { fork() } {
-        Ok(ForkResult::Parent { child }) => {
-            relinquish_temp_overlay();
-            // The child owns the overlay database. Dropping it here would
-            // replay pending rows into the child's connection. process::exit
-            // skips Drop on purpose. The interval thread starts in the child.
-            if !wait_until_mounted(&mp, Duration::from_secs(30)) {
-                eprintln!(
-                    "error: timed out waiting for mount at {} (child pid {child})",
-                    mp.display()
-                );
-                let _ = unmount(&mp);
-                std::process::exit(1);
-            }
-            std::process::exit(0);
-        }
-        Ok(ForkResult::Child) => {
-            let _ = setsid();
-            if !has_log_file {
-                let _ = redirect_stdio_to_null();
-            }
-            overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-            let control = control.map(ControlListener::serve);
-            let interval = spawn_interval_if(
-                &overlay_arc,
-                &live_archive,
-                commit_interval,
-                None,
-                &open_opts,
-            );
-            let mount_err = mount_blocking(
-                source,
-                &mp,
-                true,
-                writable,
-                overlay_arc.clone(),
-                fuse_opts,
-                readahead,
-                passthrough,
-                open_opts.direct_io,
-                activity,
-            );
-            wait_control_reply(&control);
-            finish_overlay_serve(overlay_arc, None, interval, commit_exit);
-            if let Err(e) = mount_err {
-                let _ = std::fs::write(
-                    "/tmp/ratarmount-rs-fuse-error.log",
-                    format!("mount error: {e}\n"),
-                );
-                std::process::exit(1);
-            }
-            std::process::exit(0);
-        }
-        Err(e) => {
-            eprintln!("error: fork failed: {e}");
-            finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
-            std::process::exit(1);
-        }
+    // Forked in `main` before any database was opened (#183).
+    daemon::detach();
+    if let Some(ov) = &overlay_arc {
+        ov.spawn_test_hold_open_transaction();
     }
+    overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+    let control = control.map(ControlListener::serve);
+    let interval = spawn_interval_if(
+        &overlay_arc,
+        &live_archive,
+        commit_interval,
+        None,
+        &open_opts,
+    );
+    let mount_err = mount_blocking(
+        source,
+        &mp,
+        true,
+        writable,
+        overlay_arc.clone(),
+        fuse_opts,
+        readahead,
+        passthrough,
+        open_opts.direct_io,
+        activity,
+    );
+    wait_control_reply(&control);
+    finish_overlay_serve(overlay_arc, None, interval, commit_exit);
+    if let Err(e) = mount_err {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0027-M01","item":"ratarmount::run_fuse_only","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
+        let _ = std::fs::write(
+            "/tmp/ratarmount-rs-fuse-error.log",
+            format!("mount error: {e}\n"),
+        );
+        std::process::exit(1);
+    }
+    std::process::exit(0);
 }
 
 /// Resolve log color style from CLI flags and environment.
@@ -4092,22 +4312,66 @@ fn resolve_color_style(force_color: bool, force_no_color: bool) -> env_logger::W
     env_logger::WriteStyle::Auto
 }
 
+fn init_startup_logging(args: &Args) {
+    let write_style = resolve_color_style(args.color, args.no_color);
+    init_logger(args.debug, args.log_file.as_deref(), write_style);
+    if args.sandbox {
+        log::info!(
+            "sandbox: -o {} overlay={} quota={:?} passthrough={:?}",
+            args.fuse,
+            if args.overlay_tmpfs.is_some() {
+                "tmpfs".into()
+            } else {
+                args.write_overlay
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            },
+            args.overlay_quota,
+            args.passthrough
+        );
+    }
+    if args.overlay_tmpfs.is_some() && args.overlay_quota.is_none() {
+        eprintln!("warning: --overlay-tmpfs has no size cap; RAM usage is unbounded (set --overlay-tmpfs=SIZE or --overlay-quota)");
+    }
+}
+
 fn init_logger(debug: u8, log_file: Option<&Path>, write_style: env_logger::WriteStyle) {
     let rust_log = std::env::var("RUST_LOG").ok();
     let mut builder = logger_filter_builder(debug, rust_log.as_deref());
     builder.write_style(write_style);
     if let Some(path) = log_file {
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
         {
-            Ok(file) => {
-                let file = std::sync::Mutex::new(file);
-                builder.target(env_logger::Target::Pipe(Box::new(WriteAdapter(file))));
-            }
-            Err(e) => {
-                eprintln!("warning: could not open log file {}: {e}", path.display());
+            let __inventory_condition_172220 = {
+                #[expect(
+                    clippy::disallowed_types,
+                    reason = r###"internal-read:v1 {"id":"IR-B0028-T01","item":"ratarmount::init_logger","disposition":"support","category":"builder-type-support","reason":"Builder type support: logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+                )]
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0028-M01","item":"ratarmount::init_logger","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"logger output or standard descriptor setup"}"###
+                )]
+                let mut __inventory_value_0 = std::fs::OpenOptions::new();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0115-M01","item":"ratarmount::init_logger","disposition":"output-owner","category":"diagnostic-log","reason":"Configure append-or-create logging for the explicit CLI log file.","creation":{"policy":"append-or-create","basis":"The log file is diagnostic output, preserves existing data, and retains default/umask file permissions."}}"###
+                )]
+                let __inventory_value_1 = __inventory_value_0.create(true);
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0028-M02","item":"ratarmount::init_logger","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )]
+                let __inventory_value_2 = __inventory_value_1.append(true).open(path);
+                __inventory_value_2
+            };
+            match __inventory_condition_172220 {
+                Ok(file) => {
+                    let file = std::sync::Mutex::new(file);
+                    builder.target(env_logger::Target::Pipe(Box::new(WriteAdapter(file))));
+                }
+                Err(e) => {
+                    eprintln!("warning: could not open log file {}: {e}", path.display());
+                }
             }
         }
     }
@@ -4373,8 +4637,9 @@ fn remove_registered_control_socket() {
 }
 
 /// A bound control socket that is not yet served. Binding (and printing the path) happens
-/// before any fork so errors reach the user; [`ControlListener::serve`] runs in the process
-/// that serves the mount, because a thread started before `fork` does not exist in the child.
+/// before the serving process detaches from the caller's stdio, so errors reach the user;
+/// [`ControlListener::serve`] runs once serving starts. A daemonized mount forks before any
+/// of this (`daemon::fork_launcher`), so the socket carries the serving process's pid.
 struct ControlListener {
     listener: UnixListener,
     sock: PathBuf,
@@ -4596,17 +4861,6 @@ fn no_unmount(_: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn wait_until_mounted(path: &Path, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if is_fuse_mount(path) {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
-
 /// True when `path` appears to be a live FUSE (or FUSE-T) mount.
 fn is_fuse_mount(path: &Path) -> bool {
     if mount_table_lists(path) {
@@ -4626,7 +4880,14 @@ fn is_fuse_mount(path: &Path) -> bool {
 fn mount_table_lists(path: &Path) -> bool {
     let candidates = path_mount_candidates(path);
 
-    if let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") {
+    if let Ok(text) = {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0029-M01","item":"ratarmount::mount_table_lists","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = std::fs::read_to_string("/proc/self/mountinfo");
+        __inventory_value_0
+    } {
         if text
             .lines()
             .any(|l| candidates.iter().any(|c| l.contains(c.as_str())))
@@ -4692,27 +4953,12 @@ fn mount_output_lists_path(mount_text: &str, candidates: &[String]) -> bool {
 /// Linux-only: `statfs` FUSE_SUPER_MAGIC (`0x65735546`).
 #[cfg(target_os = "linux")]
 fn path_is_fuse_superblock(path: &Path) -> bool {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    #[repr(C)]
-    struct Statfs {
-        f_type: i64,
-        _pad: [u8; 128],
-    }
-    const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
-    extern "C" {
-        fn statfs(path: *const libc::c_char, buf: *mut Statfs) -> i32;
-    }
-    let c = match CString::new(path.as_os_str().as_bytes()) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let mut buf = Statfs {
-        f_type: 0,
-        _pad: [0; 128],
-    };
-    let r = unsafe { statfs(c.as_ptr(), &mut buf) };
-    r == 0 && buf.f_type == FUSE_SUPER_MAGIC
+    rustix::fs::statfs(path).is_ok_and(|stat| fuse_superblock_type(stat.f_type))
+}
+
+#[cfg(target_os = "linux")]
+fn fuse_superblock_type(fs_type: rustix::fs::FsWord) -> bool {
+    fs_type == 0x6573_5546
 }
 
 /// Startup message for a failed `WriteOverlay::new`. Every `Sqlite` error there
@@ -4769,6 +5015,10 @@ pub(crate) fn lower_stack_services(
 /// fails: on any error the fd is left as it was.
 fn neutralize_dead_stdio() {
     for target in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0116-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"standard-descriptor-control","reason":"Determine whether stdin/stdout/stderr is closed before filling vacant standard slots.","creation":{"policy":"none","basis":"F_GETFD queries the standard slot only; no descriptor is opened or duplicated by this operation."}}"###
+        )]
         let closed = unsafe { libc::fcntl(target, libc::F_GETFD) } == -1
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
         let dead = !closed && {
@@ -4783,15 +5033,27 @@ fn neutralize_dead_stdio() {
         if !(closed || dead) {
             continue;
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0030-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"logger output or standard descriptor setup","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
         if null < 0 {
             continue;
         }
         unsafe {
             if null != target {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0031-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
                 libc::dup2(null, target);
             } else {
                 // `open` reused the closed target; drop O_CLOEXEC like dup2 would.
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0117-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"standard-descriptor-control","reason":"Clear descriptor flags when preparing the already-filled standard slot for process handoff.","creation":{"policy":"none","basis":"F_SETFD updates an existing descriptor; /dev/null acquisition and redirection have their own events."}}"###
+                )]
                 libc::fcntl(target, libc::F_SETFD, 0);
             }
         }
@@ -4805,16 +5067,45 @@ fn neutralize_dead_stdio() {
 }
 
 fn redirect_stdio_to_null() -> std::io::Result<()> {
+    #[expect(
+        clippy::disallowed_types,
+        reason = r###"internal-read:v1 {"id":"IR-E0118-T01","item":"ratarmount::redirect_stdio_to_null","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions locally for standard-stream redirection to /dev/null.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+    )]
     use std::fs::OpenOptions;
     use std::os::unix::io::AsRawFd;
-    let devnull = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/null")?;
+    let devnull = {
+        #[expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-B0032-T01","item":"ratarmount::redirect_stdio_to_null","disposition":"support","category":"builder-type-support","reason":"Builder type support: logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0032-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"logger output or standard descriptor setup"}"###
+        )]
+        let mut __inventory_value_0 = OpenOptions::new();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0032-M02","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
+        let __inventory_value_1 = __inventory_value_0.read(true).write(true).open("/dev/null");
+        __inventory_value_1
+    }?;
     let fd = devnull.as_raw_fd();
     unsafe {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0033-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         libc::dup2(fd, 0);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0034-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         libc::dup2(fd, 1);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0035-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         libc::dup2(fd, 2);
     }
     Ok(())
@@ -4885,6 +5176,42 @@ fn lower_extra_excludes(
     out
 }
 
+fn mount_recovery_records(args: &Args) -> ratarmount_compositing::MountRecords {
+    let mut records = ratarmount_compositing::MountRecords {
+        top: args
+            .write_overlay
+            .as_ref()
+            .filter(|path| path.as_os_str() != ":temp:")
+            .cloned(),
+        ..Default::default()
+    };
+    for lower in &args.lower {
+        if lower.is_dir() {
+            records.lowers.push(lower.clone());
+        } else {
+            records.bundles = true;
+        }
+    }
+    records
+}
+
+fn overlay_recovery_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
+    if ratarmount_compositing::overlay_db::is_overlay_state_error(error) {
+        1
+    } else {
+        2
+    }
+}
+
+#[cfg(all(
+    test,
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
+    any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+))]
+mod overlay_recovery_exit_tests;
+
 /// The mount-time journal rule: before any recovery write, compare each
 /// member's journal against every readable overlay record (`-w` top, `--lower`
 /// directories). A journal every record agrees with (or abstains on) is
@@ -4892,10 +5219,32 @@ fn lower_extra_excludes(
 /// left untouched until every gate decided. A torn deferred journal is refused
 /// (nothing can open on a half-written archive); a complete one is returned for
 /// recovery after the gates. The decision is taken again under the archive lock.
-fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
-    use ratarmount_compositing::{
-        classify_mount_journal, recover_journal_at, MountJournal, MountRecords,
-    };
+fn recover_mount_journals(
+    args: &Args,
+    inputs: &[PathBuf],
+) -> (Vec<PathBuf>, ratarmount_compositing::MountRecords) {
+    use ratarmount_compositing::{classify_mount_journal, recover_journal_at, MountJournal};
+    let records = mount_recovery_records(args);
+    for dir in records.top.iter().chain(&records.lowers) {
+        if dir.is_file() {
+            eprintln!(
+                "error creating write overlay: overlay path must be a folder: {}",
+                dir.display()
+            );
+            std::process::exit(1);
+        }
+        let resolved = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if let Err(error) = ratarmount_compositing::overlay_db::validate_overlay_state(
+            &resolved.join(ratarmount_compositing::HIDDEN_DB),
+        ) {
+            if records.top.as_ref() == Some(dir) {
+                eprintln!("error creating write overlay: {error}; then retry the writable mount");
+            } else {
+                eprintln!("error: {error}");
+            }
+            std::process::exit(1);
+        }
+    }
     let mut members: Vec<PathBuf> = Vec::new();
     for input in inputs {
         let typed = input.to_string_lossy();
@@ -4920,20 +5269,16 @@ fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
             members.push(PathBuf::from(&bind.source));
         }
     }
-    let mut records = MountRecords::default();
-    if let Some(top) = args
-        .write_overlay
-        .as_ref()
-        .filter(|w| w.as_os_str() != ":temp:")
-    {
-        records.top = Some(top.clone());
-    }
-    for lower in &args.lower {
-        if lower.is_dir() {
-            records.lowers.push(lower.clone());
-        } else {
-            records.bundles = true;
+    if args.no_recreate_index || args.index_id.is_some() {
+        for member in &members {
+            if let Err(error) =
+                ratarmount_compositing::journal_recovery::check_offline_journal(member)
+            {
+                eprintln!("error: --no-recreate-index forbids commit recovery for {}: {error}; stop workers and finish preparation first", member.display());
+                std::process::exit(2);
+            }
         }
+        return (Vec::new(), records);
     }
     let top_db = records
         .top
@@ -4944,7 +5289,7 @@ fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
         match classify_mount_journal(&records, member) {
             Err(e) => {
                 eprintln!("error: commit recovery for {}: {e}", member.display());
-                std::process::exit(2);
+                std::process::exit(overlay_recovery_exit_code(&e));
             }
             Ok(MountJournal::None | MountJournal::Own) => {
                 let owner = ratarmount_compositing::Owner::Mount {
@@ -4953,7 +5298,7 @@ fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
                 };
                 if let Err(e) = recover_journal_at(member, top_db.as_deref(), owner) {
                     eprintln!("error: commit recovery for {}: {e}", member.display());
-                    std::process::exit(2);
+                    std::process::exit(overlay_recovery_exit_code(&e));
                 }
             }
             Ok(MountJournal::Deferred { complete: true, .. }) => deferred.push(member.clone()),
@@ -4974,7 +5319,7 @@ fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
             }
         }
     }
-    deferred
+    (deferred, records)
 }
 
 /// `--journal` files that exist already and lie inside a directory base under a
@@ -5049,11 +5394,11 @@ fn default_cli_parallelization() -> String {
 fn readahead_flag_on_argv<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<str>,
+    S: AsRef<std::ffi::OsStr>,
 {
     args.into_iter().any(|a| {
-        let a = a.as_ref();
-        a == "--readahead" || a.starts_with("--readahead=")
+        let a = a.as_ref().as_encoded_bytes();
+        a == b"--readahead" || a.starts_with(b"--readahead=")
     })
 }
 
@@ -5114,6 +5459,28 @@ fn should_auto_readahead(
 mod mount_probe_tests {
     use super::{mount_output_lists_path, path_mount_candidates};
     use std::path::Path;
+
+    /// Regression: replacing the handwritten statfs ABI must preserve success/error
+    /// handling and distinguish the FUSE superblock from other filesystem types.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_typed_statfs_fuse_detection() {
+        use super::{fuse_superblock_type, path_is_fuse_superblock};
+        use std::os::unix::ffi::OsStrExt;
+
+        assert!(fuse_superblock_type(0x6573_5546));
+        assert!(!fuse_superblock_type(0));
+        assert!(!fuse_superblock_type(0x0102_1994)); // tmpfs
+        let dir = tempfile::tempdir().unwrap();
+        let stat = rustix::fs::statfs(dir.path()).unwrap();
+        assert_eq!(
+            path_is_fuse_superblock(dir.path()),
+            fuse_superblock_type(stat.f_type)
+        );
+        assert!(!path_is_fuse_superblock(&dir.path().join("missing")));
+        let nul = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/invalid\0path"));
+        assert!(!path_is_fuse_superblock(nul));
+    }
 
     #[test]
     fn mount_output_linux_fuse_line() {
@@ -5256,6 +5623,18 @@ mod readahead_auto_cli_tests {
         assert!(!path_looks_like_gzip_archive(Path::new("a.zip")));
         assert!(!path_looks_like_gzip_archive(Path::new("notgz")));
         assert!(!name_looks_like_gzip("archive.tar.gzz"));
+    }
+
+    /// Regression: scanning a non-UTF-8 publication path must not panic before publication.
+    #[test]
+    fn regression_readahead_flag_on_non_utf8_argv() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = std::ffi::OsString::from_vec(b"out-\xff/a.index.sqlite".to_vec());
+        assert!(!readahead_flag_on_argv([path.clone()]));
+        assert!(readahead_flag_on_argv([
+            path,
+            std::ffi::OsString::from("--readahead=1M")
+        ]));
     }
 
     #[test]
@@ -6506,6 +6885,7 @@ mod create_missing_cli_tests {
     }
 
     fn run_cli(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
+        let _processes = ratarmount_index::test_process::spawning();
         let bin = ratarmount_bin().expect("ratarmount binary next to test exe");
         Command::new(bin)
             .args(args)
@@ -6523,6 +6903,7 @@ mod create_missing_cli_tests {
     }
 
     fn skip_no_gnu_tar() -> bool {
+        let _processes = ratarmount_index::test_process::spawning();
         let out = Command::new("tar").arg("--version").output();
         match out {
             Ok(o) => !String::from_utf8_lossy(&o.stdout).contains("GNU tar"),
@@ -6539,6 +6920,7 @@ mod create_missing_cli_tests {
     }
 
     fn write_tiny_targz(dir: &std::path::Path) -> Option<PathBuf> {
+        let _processes = ratarmount_index::test_process::spawning();
         let tree = dir.join("gztree");
         fs::create_dir_all(&tree).unwrap();
         fs::write(tree.join("a.txt"), b"gz\n").unwrap();
@@ -6986,6 +7368,7 @@ mod create_missing_cli_tests {
         assert!(archive.is_file());
         let extract = dir.path().join("ex");
         fs::create_dir_all(&extract).unwrap();
+        let _processes = ratarmount_index::test_process::spawning();
         assert!(Command::new("tar")
             .args(["-xf"])
             .arg(&archive)
@@ -7123,6 +7506,79 @@ mod create_missing_cli_tests {
         }
         let u = find("unmount");
         assert!(u.contains("fusermount3 -u"), "--unmount long help: {u}");
+    }
+
+    /// Regression: #224 the positional help said "a folder defaults to
+    /// `<folder>.mounted`", but the default is the input's name in the current
+    /// directory; `.mounted` is appended only when that would be the folder itself.
+    /// TAR shorthands preserve preceding dots, and rolling uses the active archive.
+    #[test]
+    fn regression_help_states_default_mount_point() {
+        use clap::CommandFactory;
+        let help = Args::command()
+            .get_positionals()
+            .find(|a| a.get_id() == "paths")
+            .and_then(|a| a.get_long_help().or(a.get_help()))
+            .map(|h| h.to_string())
+            .expect("paths help");
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !flat.contains("a folder defaults to `<folder>.mounted`"),
+            "{flat}"
+        );
+        for needle in [
+            "the first input's file name (the active numbered archive with --roll-every), minus a compression suffix and one more extension, in the current directory",
+            "(`dir/base` and `dir/base.tar.gz` both mount at `./base`)",
+            "TAR shorthands such as `.tgz` count as `.tar.gz`",
+            "only when that would be the input folder itself is `.mounted` appended",
+        ] {
+            assert!(flat.contains(needle), "paths help lacks {needle:?}: {flat}");
+        }
+        // The examples in the text are what the code derives.
+        for (input, expected) in [
+            ("dir/base", "base"),
+            ("dir/base.tar.gz", "base"),
+            ("dir/base.d", "base"),
+            ("dir/v1.2.tar.gz", "v1.2"),
+            ("dir/v1.2.tgz", "v1.2"),
+            ("dir/v1.2.txz", "v1.2"),
+        ] {
+            assert_eq!(
+                default_mountpoint(Path::new(input)),
+                PathBuf::from(expected),
+                "{input}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let folder = root.join("base");
+        let other = root.join("other");
+        fs::create_dir(&folder).unwrap();
+        fs::create_dir(&other).unwrap();
+        // Run from another directory: `<cwd>/base`, not `<folder>.mounted`.
+        assert_eq!(
+            mount_guard::default_for_input(&mount_guard::RealFs::with_cwd(other), &folder),
+            PathBuf::from("base")
+        );
+        // Run from the folder's parent: `base` is the folder itself.
+        assert_eq!(
+            mount_guard::default_for_input(
+                &mount_guard::RealFs::with_cwd(root.clone()),
+                Path::new("base")
+            ),
+            PathBuf::from("base.mounted")
+        );
+        let args =
+            Args::try_parse_from(["ratarmount", "--roll-every", "1d", "-w", "ov", "logs.tar"])
+                .unwrap();
+        let fs = mount_guard::RealFs::with_cwd(root.clone());
+        let inputs = [root.join("logs.tar")];
+        let plan = mount_guard::plan_mount_point(&fs, &args, None, &inputs).unwrap();
+        assert_eq!(plan.mp, PathBuf::from("logs.000001"));
+        // An existing series resumes its latest generation, not the series stem.
+        fs::write(root.join("logs.000003.tar"), b"").unwrap();
+        let plan = mount_guard::plan_mount_point(&fs, &args, None, &inputs).unwrap();
+        assert_eq!(plan.mp, PathBuf::from("logs.000003"));
     }
 
     #[test]
@@ -7405,6 +7861,7 @@ mod repack_seekable_cli_tests {
     /// Temp-dir gzip → `.tar.zst` using the in-tree decoder, not an external `zstd`.
     #[test]
     fn repack_seekable_gzip_round_trip_without_external_zstd() {
+        let _processes = ratarmount_index::test_process::spawning();
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.gz");
         let output = dir.path().join("out.tar.zst");
@@ -7582,6 +8039,80 @@ mod overlay_unmount_drop_tests {
             weak.upgrade().is_none(),
             "overlay Arc still alive after finish"
         );
+    }
+
+    /// Regression: reopening a pending overlay must not launch shared-index cache writes.
+    #[test]
+    fn regression_prepared_index_worker_leaves_pending_digest_cache_untouched() {
+        let _guard = lock_term_flag();
+        let _reset = ResetTerm;
+        crate::overlay_commit::set_term_flag_for_test(false);
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        let index = dir.path().join("index.sqlite");
+        std::fs::write(&archive, b"archive bytes").unwrap();
+        rusqlite::Connection::open(&index)
+            .unwrap()
+            .execute_batch("CREATE TABLE files(name TEXT)")
+            .unwrap();
+        let overlay = dir.path().join("overlay");
+        let source = Arc::new(EmptyBase) as Arc<dyn MountSource>;
+        let ov = crate::base_identity::fixtures::overlay_over(
+            source.clone(),
+            &overlay,
+            archive.to_str().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        ov.set_meta("base_index_path", index.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            ov.pending_base().unwrap().unwrap().index.as_deref(),
+            Some(index.as_path())
+        );
+        drop(ov);
+        let ov = Arc::new(
+            crate::base_identity::fixtures::overlay_over(
+                source,
+                &overlay,
+                archive.to_str().unwrap(),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let snapshot = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| {
+                    let p = e.unwrap().path();
+                    p.is_file().then(|| {
+                        (
+                            p.file_name().unwrap().to_owned(),
+                            std::fs::read(&p).unwrap(),
+                        )
+                    })
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        let overlay = Some(ov);
+        assert!(super::spawn_interval_if(
+            &overlay,
+            &None,
+            None,
+            None,
+            &OpenOptions {
+                read_only_index: true,
+                write_index: false,
+                ..Default::default()
+            }
+        )
+        .is_none());
+        crate::base_digest::join();
+        assert!(overlay.as_ref().unwrap().pending_base().unwrap().is_some());
+        assert_eq!(snapshot(), before);
+        drop(overlay);
+        assert_eq!(snapshot(), before);
     }
 
     /// Regression: the lazy base-digest thread must be joined before the
@@ -8027,6 +8558,123 @@ mod sandbox_cli_tests {
         ])
         .is_err());
     }
+    /// Regression (#328): `--overlay-durability` must not steal the archive or
+    /// mount point, needs a write-overlay target (clap exit 2 without one),
+    /// conflicts with `--commit-overlay`, and accepts only `full` / `relaxed`.
+    #[test]
+    fn regression_overlay_durability_clap() {
+        for target in [vec!["-w", "ov"], vec!["--overlay-tmpfs"], vec!["--sandbox"]] {
+            for form in [
+                vec!["--overlay-durability", "relaxed"],
+                vec!["--overlay-durability=relaxed"],
+            ] {
+                let args = parse_args_from(
+                    ["ratarmount"]
+                        .into_iter()
+                        .chain(target.clone())
+                        .chain(form)
+                        .chain(["a.tar", "mnt"]),
+                )
+                .unwrap();
+                assert_eq!(args.overlay_durability, "relaxed");
+                assert_eq!(args.paths, [PathBuf::from("a.tar"), PathBuf::from("mnt")]);
+            }
+        }
+        let args = parse_args_from(["ratarmount", "-w", "ov", "a.tar", "mnt"]).unwrap();
+        assert_eq!(args.overlay_durability, "full");
+        let args = parse_args_from(["ratarmount", "a.tar", "mnt"]).unwrap();
+        assert_eq!(args.overlay_durability, "full");
+        for value in ["full", "relaxed"] {
+            let error = parse_args_from(["ratarmount", "--overlay-durability", value, "a.tar"])
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{error}"
+            );
+            assert_eq!(error.exit_code(), 2);
+        }
+        assert!(parse_args_from([
+            "ratarmount",
+            "--commit-overlay",
+            "-w",
+            "ov",
+            "--overlay-durability=relaxed",
+            "a.tar"
+        ])
+        .is_err());
+        let error = parse_args_from([
+            "ratarmount",
+            "-w",
+            "ov",
+            "--overlay-durability=off",
+            "a.tar",
+        ])
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        // A relaxed overlay is throwaway: it never feeds an archive commit.
+        for commit in [
+            vec!["--commit-overlay-on-exit"],
+            vec!["--commit-overlay-interval", "60"],
+            vec!["--roll-every", "1h"],
+        ] {
+            let error = parse_args_from(
+                ["ratarmount", "-w", "ov", "--overlay-durability=relaxed"]
+                    .into_iter()
+                    .chain(commit.clone())
+                    .chain(["a.tar", "mnt"]),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{commit:?}: {error}"
+            );
+            assert!(
+                parse_args_from(
+                    ["ratarmount", "-w", "ov", "--overlay-durability=full"]
+                        .into_iter()
+                        .chain(commit.clone())
+                        .chain(["a.tar", "mnt"]),
+                )
+                .is_ok(),
+                "{commit:?}"
+            );
+        }
+    }
+
+    /// Regression (#328): explicit FULL must accept offline commits, and a
+    /// disabled interval must not turn a relaxed mount into an archive writer.
+    #[test]
+    fn regression_overlay_durability_full_offline_and_disabled_interval() {
+        let args = parse_args_from([
+            "ratarmount",
+            "--commit-overlay",
+            "-w",
+            "ov",
+            "--overlay-durability=full",
+            "a.tar",
+        ])
+        .unwrap();
+        assert!(args.commit_overlay);
+        for interval in ["0", "00", "0s", "0m", "0h"] {
+            let args = parse_args_from([
+                "ratarmount",
+                "-w",
+                "ov",
+                "--overlay-durability=relaxed",
+                "--commit-overlay-interval",
+                interval,
+                "a.tar",
+                "mnt",
+            ])
+            .unwrap();
+            assert_eq!(
+                overlay_commit::parse_interval(&args.commit_overlay_interval),
+                Ok(None)
+            );
+        }
+    }
     /// Regression: a single allow value must not consume the archive positional,
     /// and exceptions require read-only rules and a writable overlay target.
     #[test]
@@ -8197,6 +8845,7 @@ mod sandbox_cli_tests {
 #[cfg(test)]
 mod sandbox_preset_tests {
     use super::*;
+    use nix::unistd::{fork, ForkResult};
 
     /// Regression: sandbox defaults must respect explicit overlay, ownership and passthrough settings.
     #[test]
@@ -8292,6 +8941,7 @@ mod sandbox_preset_tests {
     /// Regression: the daemon parent must relinquish cleanup while the serving child retains it.
     #[test]
     fn regression_temp_overlay_daemon_parent_preserves_child_directory() {
+        let _processes = ratarmount_index::test_process::spawning();
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("child-owned");
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -8317,6 +8967,7 @@ mod sandbox_preset_tests {
 
     #[test]
     fn temp_overlay_daemon_cleanup_child() {
+        let _processes = ratarmount_index::test_process::spawning();
         let Some(marker) = std::env::var_os("RATARMOUNT_SB3_CLEANUP_TEST").map(PathBuf::from)
         else {
             return;
@@ -9118,6 +9769,72 @@ mod lower_marker_key_tests {
             .unwrap();
         let digest = ratarmount_index::cached_archive_digest(&archive, Some(&index)).unwrap();
         (archive, index, digest)
+    }
+
+    /// Regression: lower-bundle identity peeks must preserve prepared WAL companions.
+    #[test]
+    fn regression_prepared_index_lower_key_peek_is_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (archive, index, digest) = cached_archive(dir.path(), "a.tar", b"archive");
+        let bundle = dir.path().join("lower.tar.zst");
+        std::fs::write(&bundle, b"bundle").unwrap();
+        let db = rusqlite::Connection::open(&index).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(db);
+        let wal = PathBuf::from(format!("{}-wal", index.display()));
+        let shm = PathBuf::from(format!("{}-shm", index.display()));
+        std::fs::write(&wal, b"").unwrap();
+        std::fs::write(&shm, vec![0x5a; 32768]).unwrap();
+        let snapshot = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| {
+                    let p = e.unwrap().path();
+                    (
+                        p.file_name().unwrap().to_owned(),
+                        std::fs::read(&p).unwrap(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        let reader = ratarmount_index::open_prepared_connection(&index).unwrap();
+        let key = || {
+            lower_base_key_for_open(
+                std::slice::from_ref(&archive),
+                Some(&index),
+                std::slice::from_ref(&bundle),
+                "view",
+                true,
+            )
+        };
+        assert_eq!(key().unwrap(), Some(format!("{digest}.view")));
+        assert_eq!(snapshot(), before);
+        drop(reader);
+        assert_eq!(snapshot(), before);
+        std::fs::write(&wal, b"pending WAL").unwrap();
+        let bad = snapshot();
+        assert!(key().unwrap_err().contains("prepar"));
+        assert_eq!(snapshot(), bad);
+        assert_eq!(
+            lower_base_key_for_open(
+                std::slice::from_ref(&archive),
+                None,
+                std::slice::from_ref(&bundle),
+                "view",
+                true
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(snapshot(), bad);
+        std::fs::remove_file(&wal).unwrap();
+        std::fs::remove_file(&shm).unwrap();
+        let db = rusqlite::Connection::open(&index).unwrap();
+        db.execute_batch("DROP TABLE overlay_base_digests").unwrap();
+        drop(db);
+        assert_eq!(key().unwrap(), None);
     }
 
     /// Regression: `A.tar B --lower bundle` keyed the verification marker by A's

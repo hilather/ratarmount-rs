@@ -7,8 +7,10 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 struct Env {
     root: tempfile::TempDir,
@@ -659,6 +661,93 @@ fn regression_mount_roll_forward_restamps_then_remount_accepts() {
     }
 }
 
+/// Regression (#328): startup must reject an unclean relaxed overlay before
+/// archive recovery, even with force. Preserve both torn and complete journals.
+#[cfg(unix)]
+#[test]
+fn regression_relaxed_unclean_mount_refuses_before_archive_recovery() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    for complete in [false, true] {
+        let env = Env::new();
+        let archive = regression_238_tar(&env);
+        let overlay = regression_238_overlay(&env, &archive);
+        let db = overlay.join(ratarmount_compositing::HIDDEN_DB);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES ('relaxed_durability','unknown:42')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        if complete {
+            interrupt_complete(&archive);
+        } else {
+            interrupt_append(&archive);
+        }
+        let journal = ratarmount_compress::commit_journal::journal_path(&archive);
+        let before: Vec<_> = [&archive, &db, &journal]
+            .map(|p| fs::read(p).unwrap())
+            .into();
+        for force in [false, true] {
+            for command in ["--no-mount", "--commit-overlay"] {
+                let mut args = vec![command, "-w", s(&overlay), s(&archive)];
+                if force {
+                    args.push("--force-base-mismatch");
+                }
+                let out = env.run(&args);
+                assert!(!out.status.success(), "{}", text(&out));
+                assert!(text(&out).contains("fsck --repair"), "{}", text(&out));
+                for (path, bytes) in [&archive, &db, &journal].into_iter().zip(&before) {
+                    assert!(
+                        fs::read(path).unwrap() == *bytes,
+                        "{} modified",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Regression (#328): deferred recovery must durably restamp the overlay
+/// before removing the archive journal, then enable relaxed serving.
+#[cfg(unix)]
+#[test]
+fn regression_relaxed_deferred_recovery_restamps_under_full() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    let env = Env::new();
+    let archive = regression_238_tar(&env);
+    let overlay = directory_overlay(&env);
+    interrupt_complete(&archive);
+    let journal = ratarmount_compress::commit_journal::journal_path(&archive);
+    use sha2::{Digest, Sha256};
+    let digest = format!("sha256:{:x}", Sha256::digest(fs::read(&archive).unwrap()));
+    let conn = rusqlite::Connection::open(overlay.join(ratarmount_compositing::HIDDEN_DB)).unwrap();
+    // Observe the actual connection doing the restamp, including the recovery
+    // transaction. Setup writes are FULL already; the premature OFF switch
+    // used to make deferred recovery fail this trigger.
+    conn.execute_batch(
+        "CREATE TRIGGER recovery_requires_full BEFORE INSERT ON meta
+         WHEN NEW.key IN ('base_size','base_mtime_ns')
+              AND (SELECT synchronous FROM pragma_synchronous) != 2
+         BEGIN SELECT RAISE(ABORT, 'archive recovery requires FULL'); END;",
+    )
+    .unwrap();
+    drop(conn);
+    env.ok(&[
+        "--no-mount",
+        "-w",
+        s(&overlay),
+        "--force-base-mismatch",
+        "--base-digest",
+        &digest,
+        "--overlay-durability=relaxed",
+        s(&archive),
+    ]);
+    assert!(!journal.exists(), "recovery must finish");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+}
+
 /// Regression (R7-A2): offline `--commit-overlay` recovered a complete journal
 /// at the start of the commit and then ended on an empty plan (or a declined
 /// confirmation) without restamping, so the next commit failed with "changed
@@ -819,17 +908,18 @@ fn regression_mount_union_member_journal_waits_for_the_gate() {
     assert!(!journal.exists(), "recovered alone");
 }
 
-/// Regression (r17 skeptic #2, R7-E2 B1/B2): A's overlay database is replaced
+/// Regression: #239 (r17 skeptic #2, R7-E2 B1/B2): A's overlay database is replaced
 /// by a dangling symlink, then B with its own journal (torn or complete) is
 /// renamed over A. `overlay.join(DB).exists()` read the dangling symlink as
 /// "no database", so `--commit-overlay -w ov --yes A` ran the inode-only
 /// recovery before any recorded-base gate: B was rolled back (or forward) and
-/// its journal removed. The database path is `lstat`ed: anything there is an
-/// existing database, the commit goes through the database path and is
-/// refused with B, its journal and the symlink target untouched.
+/// its journal removed. Strict admission now `lstat`s the final database
+/// component and refuses the link with exit 1 before classification or recovery,
+/// with B, its journal and the symlink target untouched.
 #[cfg(unix)]
 #[test]
 fn regression_offline_commit_dangling_db_symlink_leaves_b_untouched() {
+    let _spawning = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -846,9 +936,15 @@ fn regression_offline_commit_dangling_db_symlink_leaves_b_untouched() {
         std::os::unix::fs::symlink(&target, &db).unwrap();
         let (bytes, journal, journal_bytes) = rename_b_over_a(&env, &archive, complete);
         let out = env.run(&["--commit-overlay", "--yes", "-w", s(&overlay), s(&archive)]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "complete={complete}: {}",
+            text(&out)
+        );
         assert!(
-            !out.status.success(),
-            "complete={complete}: must refuse: {}",
+            text(&out).contains("is a symlink; it must be a regular file"),
+            "{}",
             text(&out)
         );
         assert!(
@@ -868,24 +964,23 @@ fn regression_offline_commit_dangling_db_symlink_leaves_b_untouched() {
     }
 }
 
-/// Regression (R10-B, #150, v4 T6): `--commit-overlay` with the overlay used
+/// Regression: #239 (R10-B, #150, v4 T6): `--commit-overlay` with the overlay used
 /// (marker kept) and its database deleted, replaced by a symlink to a 0-byte
 /// file, or by a symlink that cannot be resolved
 /// (`plain-file/missing.sqlite`: `ENOTDIR`), with B
 /// (its own torn or complete journal) renamed over A. A deleted database read
 /// as "no database" and the raw-directory branch ran inode-only recovery on B;
-/// the unresolvable one could read as a record. Both exit 2 before any
-/// recovery and B and its journal stay byte-identical.
+/// the unresolvable one could read as a record. Symlinks exit 1; deleted or
+/// empty regular records exit 2. B and its journal stay byte-identical.
 #[cfg(unix)]
 #[test]
 fn regression_offline_commit_lost_or_unresolved_db_leaves_b_untouched() {
+    let _spawning = ratarmount_index::test_process::spawning();
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
     }
-    // R10-FIX2 (v4 T6): a symlink to a 0-byte file is as lost as a deleted
-    // database.
-    for shape in ["deleted", "symlink to empty", "unresolved"] {
+    for shape in ["deleted", "empty", "symlink to empty", "unresolved"] {
         for complete in [false, true] {
             let unresolved = shape == "unresolved";
             let env = Env::new();
@@ -898,6 +993,8 @@ fn regression_offline_commit_lost_or_unresolved_db_leaves_b_untouched() {
                 let plain = env.path("plain-file");
                 fs::write(&plain, b"plain").unwrap();
                 std::os::unix::fs::symlink(plain.join("missing.sqlite"), &db).unwrap();
+            } else if shape == "empty" {
+                fs::write(&db, b"").unwrap();
             } else if shape == "symlink to empty" {
                 let empty = env.path("empty.sqlite");
                 fs::write(&empty, b"").unwrap();
@@ -906,9 +1003,15 @@ fn regression_offline_commit_lost_or_unresolved_db_leaves_b_untouched() {
             let (bytes, journal, journal_bytes) = rename_b_over_a(&env, &archive, complete);
             let out = env.run(&["--commit-overlay", "--yes", "-w", s(&overlay), s(&archive)]);
             let row = format!("{shape} complete={complete}");
-            assert_eq!(out.status.code(), Some(2), "{row}: {}", text(&out));
-            let expect = if unresolved {
-                "cannot resolve the overlay database"
+            let is_link = unresolved || shape == "symlink to empty";
+            assert_eq!(
+                out.status.code(),
+                Some(if is_link { 1 } else { 2 }),
+                "{row}: {}",
+                text(&out)
+            );
+            let expect = if is_link {
+                "is a symlink; it must be a regular file"
             } else {
                 "was used before but its database"
             };
@@ -924,5 +1027,1133 @@ fn regression_offline_commit_lost_or_unresolved_db_leaves_b_untouched() {
                 "{row}: journal modified or removed"
             );
         }
+    }
+}
+
+/// Regression (#234): `--commit-overlay` on a sealed overlay rewrote the
+/// archive and then failed on the read-only database, breaking the seal. It
+/// must refuse with the `-w` sealed message before touching the archive, also
+/// under `--force-base-mismatch`. The fixture needs no GNU tar: the refusal
+/// comes before any commit backend.
+#[test]
+fn regression_commit_overlay_refuses_sealed_overlay() {
+    let env = Env::new();
+    let archive = env.path("base.tar");
+    {
+        let mut builder = tar::Builder::new(fs::File::create(&archive).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(2);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "a.txt", &b"a\n"[..])
+            .unwrap();
+        builder.finish().unwrap();
+    }
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    fs::write(overlay.join("new.txt"), b"new\n").unwrap();
+    env.ok(&["overlay", "seal", s(&overlay), s(&archive)]);
+    let before = fs::read(&archive).unwrap();
+    let expected = format!(
+        "error: overlay {} is sealed; mount it with --lower, or `overlay unseal`",
+        overlay.display()
+    );
+    for extra in [None, Some("--force-base-mismatch")] {
+        let mut args = vec!["--commit-overlay", "-w", s(&overlay), "--yes"];
+        args.extend(extra);
+        args.push(s(&archive));
+        let out = env.run(&args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", text(&out));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.lines().any(|line| line == expected), "{err}");
+        assert!(fs::read(&archive).unwrap() == before, "archive modified");
+    }
+    env.ok(&["overlay", "verify", s(&overlay), s(&archive)]);
+    // Restore write bits so the temporary directory can be removed.
+    env.ok(&["overlay", "unseal", s(&overlay), "--i-know"]);
+}
+
+/// Regression: #239 deferred journal recovery must not override a sealed top
+/// overlay under --force-base-mismatch. Both CLI recovery routes preserve a
+/// pending journal and the archive, whether replacement was torn or complete.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_239_sealed_pending_journal_force_cli_preserves_bytes() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    for complete in [false, true] {
+        for offline in [false, true] {
+            let env = Env::new();
+            let archive = regression_238_tar(&env);
+            let overlay = regression_238_overlay(&env, &archive);
+            env.ok(&["overlay", "seal", s(&overlay), s(&archive)]);
+            if complete {
+                interrupt_complete(&archive);
+            } else {
+                interrupt_append(&archive);
+            }
+            let journal = ratarmount_compress::commit_journal::journal_path(&archive);
+            let archive_before = fs::read(&archive).unwrap();
+            let journal_before = fs::read(&journal).unwrap();
+            let mut args = vec![
+                if offline {
+                    "--commit-overlay"
+                } else {
+                    "--no-mount"
+                },
+                "-w",
+                s(&overlay),
+                "--force-base-mismatch",
+                s(&archive),
+            ];
+            if offline {
+                args.push("--yes");
+            }
+            let out = env.run(&args);
+            assert!(!out.status.success(), "{args:?}: {}", text(&out));
+            let error = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                error.contains("is sealed") || error.contains("sealed overlay"),
+                "complete={complete}, offline={offline}: {error}"
+            );
+            assert_eq!(
+                fs::read(&archive).unwrap(),
+                archive_before,
+                "complete={complete}, offline={offline}: archive modified"
+            );
+            assert!(
+                fs::read(&journal).is_ok_and(|bytes| bytes == journal_before),
+                "complete={complete}, offline={offline}: journal modified or removed"
+            );
+            env.ok(&["overlay", "unseal", s(&overlay), "--i-know"]);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn symlink_policy_fixture() -> (Env, PathBuf, PathBuf) {
+    let env = Env::new();
+    let archive = env.path("base.tar");
+    let mut builder = tar::Builder::new(fs::File::create(&archive).unwrap());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(5);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "base.txt", &b"base\n"[..])
+        .unwrap();
+    builder.finish().unwrap();
+    drop(builder);
+    let overlay = env.path("overlay");
+    env.ok(&[
+        "--no-mount",
+        "--index-file",
+        ":memory:",
+        "--base-digest",
+        "none",
+        "-w",
+        s(&overlay),
+        s(&archive),
+    ]);
+    fs::write(overlay.join("added.txt"), b"addition\n").unwrap();
+    (env, archive, overlay)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn policy_locator(archive: &Path) -> Vec<u8> {
+    let mut bytes = vec![0; 4096];
+    match rustix::fs::getxattr(archive, "user.ratarmount.commit-journal", &mut bytes) {
+        Ok(n) => bytes[..n].to_vec(),
+        Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOENT) => Vec::new(),
+        #[cfg(target_os = "macos")]
+        Err(rustix::io::Errno::NOATTR) => Vec::new(),
+        Err(e) => panic!("locator {}: {e}", archive.display()),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn policy_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, (String, Vec<u8>)> {
+    fn visit(
+        root: &Path,
+        dir: &Path,
+        out: &mut std::collections::BTreeMap<PathBuf, (String, Vec<u8>)>,
+    ) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path == root.join(".cache") {
+                continue;
+            }
+            let meta = fs::symlink_metadata(&path).unwrap();
+            let (kind, bytes) = if meta.is_symlink() {
+                (
+                    "link",
+                    fs::read_link(&path)
+                        .unwrap()
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .to_vec(),
+                )
+            } else if meta.is_file() {
+                ("file", fs::read(&path).unwrap())
+            } else {
+                ("dir", Vec::new())
+            };
+            out.insert(
+                path.strip_prefix(root).unwrap().to_owned(),
+                (kind.to_owned(), bytes),
+            );
+            if meta.is_dir() {
+                visit(root, &path, out);
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    visit(root, root, &mut out);
+    out
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn policy_link(env: &Env, overlay: &Path, suffix: &str, shape: &str) -> PathBuf {
+    let db = overlay.join(ratarmount_compositing::HIDDEN_DB);
+    let mut name = db.as_os_str().to_owned();
+    name.push(suffix);
+    let link = PathBuf::from(name);
+    let target = env.path("external-target");
+    if suffix.is_empty() {
+        fs::rename(&db, env.path("saved-db")).unwrap();
+    }
+    match shape {
+        "regular" if suffix.is_empty() => {
+            fs::copy(env.path("saved-db"), &target).unwrap();
+        }
+        "regular" => {
+            fs::write(&target, b"external target\n").unwrap();
+        }
+        "empty" => {
+            fs::write(&target, b"").unwrap();
+        }
+        "dangling" => {}
+        "loop" => {
+            std::os::unix::fs::symlink(&link, &target).unwrap();
+        }
+        _ => panic!("unknown link shape"),
+    }
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    link
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_policy_refusal(env: &Env, archive: &Path, link: &Path, args: &[&str]) {
+    let before = policy_snapshot(env.root.path());
+    let locator = policy_locator(archive);
+    let out = env.run(args);
+    assert_eq!(out.status.code(), Some(1), "{args:?}: {}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    let canonical_link = link
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join(link.file_name().unwrap());
+    assert!(
+        err.contains(&link.display().to_string())
+            || err.contains(&canonical_link.display().to_string()),
+        "{err}"
+    );
+    assert!(
+        err.contains("is a symlink; it must be a regular file"),
+        "{err}"
+    );
+    assert_eq!(
+        policy_snapshot(env.root.path()),
+        before,
+        "{args:?}: state changed: {}",
+        text(&out)
+    );
+    assert_eq!(policy_locator(archive), locator, "locator changed");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn offline_symlink_cases(suffix: &str) {
+    for shape in ["regular", "empty", "dangling", "loop"] {
+        for mode in [None, Some("copy"), Some("append"), Some("auto")] {
+            for force in [false, true] {
+                let (env, archive, overlay) = symlink_policy_fixture();
+                let link = policy_link(&env, &overlay, suffix, shape);
+                let mut args = vec![
+                    "--commit-overlay",
+                    "--yes",
+                    "--index-file",
+                    ":memory:",
+                    "-w",
+                    s(&overlay),
+                ];
+                if let Some(mode) = mode {
+                    args.extend(["--commit-overlay-mode", mode]);
+                }
+                if force {
+                    args.push("--force-base-mismatch");
+                }
+                args.push(s(&archive));
+                assert_policy_refusal(&env, &archive, &link, &args);
+            }
+        }
+    }
+    for missing in [false, true] {
+        for force in [false, true] {
+            let (env, archive, overlay) = symlink_policy_fixture();
+            if missing {
+                fs::remove_file(&archive).unwrap();
+            }
+            let link = policy_link(&env, &overlay, suffix, "regular");
+            let file_url = format!("file://{}", archive.display());
+            let mut args = vec!["--commit-overlay", "--yes", "-w", s(&overlay)];
+            if force {
+                args.push("--force-base-mismatch");
+            }
+            args.push(&file_url);
+            assert_policy_refusal(&env, &archive, &link, &args);
+        }
+    }
+}
+
+/// Regression: #239 offline DB links must refuse before any write, including force and missing bases.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_commit_refuses_symlinked_db() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    offline_symlink_cases("");
+}
+
+/// Regression: #239 offline WAL links must refuse before archive publication or SQLite recovery.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_commit_refuses_symlinked_wal() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    offline_symlink_cases("-wal");
+}
+
+/// Regression: #239 offline journal links must refuse before archive publication or SQLite recovery.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_commit_refuses_symlinked_journal() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    offline_symlink_cases("-journal");
+}
+
+/// Regression: #239 offline SHM links must refuse before archive publication or SQLite recovery.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_commit_refuses_symlinked_shm() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    offline_symlink_cases("-shm");
+}
+
+/// Regression: #239 no-mount recovery validates top/lower state before no-journal,
+/// stale locator, torn/complete journal and prepared-index early-return paths.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_no_mount_refuses_symlinked_overlay_state() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    for suffix in ["", "-wal", "-journal", "-shm"] {
+        for journal in ["none", "prepare", "torn", "complete", "missing", "prepared"] {
+            for lower in [false, true] {
+                for force in [false, true] {
+                    let (env, archive, overlay) = symlink_policy_fixture();
+                    match journal {
+                        "prepare" => {
+                            let len = fs::metadata(&archive).unwrap().len();
+                            let mut suffix = tempfile::tempfile().unwrap();
+                            std::io::Write::write_all(&mut suffix, &[0; 1536]).unwrap();
+                            let out = ratarmount_compress::commit_journal::replace_suffix_with_hook(
+                                &archive,
+                                len - 1024,
+                                &mut suffix,
+                                &mut |step| {
+                                    if step == "locator prepare" {
+                                        Err(std::io::Error::other("crash"))
+                                    } else {
+                                        Ok(())
+                                    }
+                                },
+                            );
+                            assert!(out.is_err());
+                            let _ = fs::remove_file(
+                                ratarmount_compress::commit_journal::journal_path(&archive),
+                            );
+                            assert_eq!(policy_locator(&archive).get(4), Some(&b'P'));
+                        }
+                        "torn" => interrupt_append(&archive),
+                        "complete" => interrupt_complete(&archive),
+                        "missing" => fs::remove_file(&archive).unwrap(),
+                        _ => {}
+                    }
+                    let link = policy_link(&env, &overlay, suffix, "regular");
+                    let mut args = vec!["--no-mount"];
+                    if journal != "prepared" {
+                        args.extend(["--index-file", ":memory:"]);
+                    }
+                    if lower {
+                        args.extend(["--lower", s(&overlay), "--allow-unsealed-lower"]);
+                    } else {
+                        args.extend(["-w", s(&overlay)]);
+                    }
+                    if force {
+                        args.push(if lower {
+                            "--force-stack-mismatch"
+                        } else {
+                            "--force-base-mismatch"
+                        });
+                    }
+                    if journal == "prepared" {
+                        args.push("--no-recreate-index");
+                    }
+                    args.push(s(&archive));
+                    assert_policy_refusal(&env, &archive, &link, &args);
+                }
+            }
+        }
+    }
+}
+
+/// Regression: #239 regular database and raw-directory commits retain their successful behavior.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_commit_regular_and_raw_controls() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    for raw in [false, true] {
+        let (env, archive, overlay) = symlink_policy_fixture();
+        let overlay = if raw {
+            let dir = env.path("raw");
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("added.txt"), b"addition\n").unwrap();
+            dir
+        } else {
+            overlay
+        };
+        env.ok(&[
+            "--commit-overlay",
+            "--commit-overlay-mode",
+            "append",
+            "--yes",
+            "-w",
+            s(&overlay),
+            s(&archive),
+        ]);
+        let mut reader = tar::Archive::new(fs::File::open(&archive).unwrap());
+        assert!(reader
+            .entries()
+            .unwrap()
+            .any(|entry| entry.unwrap().path().unwrap() == Path::new("added.txt")));
+    }
+}
+
+fn regression_238_tar(env: &Env) -> PathBuf {
+    let archive = env.path("base.tar");
+    let mut builder = tar::Builder::new(fs::File::create(&archive).unwrap());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(2);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "a.txt", &b"a\n"[..])
+        .unwrap();
+    builder.finish().unwrap();
+    archive
+}
+
+fn regression_238_overlay(env: &Env, archive: &Path) -> PathBuf {
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(archive)]);
+    fs::write(overlay.join("new.txt"), b"new\n").unwrap();
+    overlay
+}
+
+fn regression_238_refusal_errors(overlay: &Path, out: &Output) -> Vec<String> {
+    let expected = format!(
+        "error: overlay {} is sealed; mount it with --lower, or `overlay unseal`",
+        overlay.display()
+    );
+    let mut errors = Vec::new();
+    if out.status.code() != Some(1) {
+        errors.push(format!("expected exit 1: {}", text(out)));
+    }
+    if !String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .any(|line| line == expected)
+    {
+        errors.push(format!("missing exact sealed refusal: {}", text(out)));
+    }
+    if [
+        "created empty archive",
+        "initialized empty archive",
+        "Committed successfully",
+        "Committed .tar.zst",
+    ]
+    .iter()
+    .any(|message| text(out).contains(message))
+    {
+        errors.push(format!("unexpected mutation success output: {}", text(out)));
+    }
+    errors
+}
+
+/// Regression: #238 sealed commits created a missing base before refusing,
+/// including when --force-base-mismatch was supplied.
+#[test]
+fn regression_238_sealed_missing_archive_not_created() {
+    let env = Env::new();
+    let archive = regression_238_tar(&env);
+    let overlay = regression_238_overlay(&env, &archive);
+    env.ok(&["overlay", "seal", s(&overlay), s(&archive)]);
+    let mut errors = Vec::new();
+    for extra in [None, Some("--force-base-mismatch")] {
+        if archive.exists() {
+            fs::remove_file(&archive).unwrap();
+        }
+        let mut args = vec!["--commit-overlay", "-w", s(&overlay), "--yes"];
+        args.extend(extra);
+        args.push(s(&archive));
+        let out = env.run(&args);
+        errors.extend(regression_238_refusal_errors(&overlay, &out));
+        if archive.exists() {
+            errors.push(format!(
+                "{extra:?}: sealed commit created the missing archive"
+            ));
+        }
+    }
+    env.ok(&["overlay", "unseal", s(&overlay), "--i-know"]);
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+/// Regression: #238 sealed commits initialized a zero-byte base before refusing.
+#[test]
+fn regression_238_sealed_empty_archive_not_initialized() {
+    let env = Env::new();
+    let archive = regression_238_tar(&env);
+    let overlay = regression_238_overlay(&env, &archive);
+    env.ok(&["overlay", "seal", s(&overlay), s(&archive)]);
+    let mut errors = Vec::new();
+    for extra in [None, Some("--force-base-mismatch")] {
+        fs::write(&archive, []).unwrap();
+        let mut args = vec!["--commit-overlay", "-w", s(&overlay), "--yes"];
+        args.extend(extra);
+        args.push(s(&archive));
+        let out = env.run(&args);
+        errors.extend(regression_238_refusal_errors(&overlay, &out));
+        if !archive.is_file() || !fs::read(&archive).unwrap().is_empty() {
+            errors.push(format!(
+                "{extra:?}: sealed commit initialized the empty archive"
+            ));
+        }
+    }
+    env.ok(&["overlay", "unseal", s(&overlay), "--i-know"]);
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+/// Reap each owned subprocess even if a readiness assertion or seal fails.
+struct Regression238Child(Option<Child>);
+
+impl Drop for Regression238Child {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Regression: #238 a seal starting during confirmation must wait for each
+/// persistence route to finish, then seal its new base digest or refuse.
+#[test]
+fn regression_238_seal_after_confirmation_waits_for_commit() {
+    let mut errors = Vec::new();
+    for (route, mode, yes) in [
+        ("tar-append", "append", false),
+        ("tar-auto", "auto", false),
+        ("tar-copy", "copy", false),
+        ("zip-copy", "copy", false),
+        ("zstd-append", "append", false),
+        ("zstd-copy", "copy", false),
+        ("metadata-append", "append", false),
+        ("metadata-copy", "copy", false),
+        ("gzip-copy", "copy", false),
+        ("tar-yes", "append", true),
+    ] {
+        if matches!(route, "tar-copy" | "gzip-copy") && !have_gnu_tar() {
+            eprintln!("skip: {route} publication requires GNU tar");
+            continue;
+        }
+        if mode != "copy" && !cfg!(any(target_os = "linux", target_os = "macos")) {
+            eprintln!("skip: {route} journaled append requires Linux/macOS inode xattrs");
+            continue;
+        }
+        let env = Env::new();
+        let tar = regression_238_tar(&env);
+        let archive = if route.starts_with("zstd") {
+            let plain = fs::read(&tar).unwrap();
+            let mut frame = ratarmount_compress::encode_zstd_frame(&plain, 3).unwrap();
+            let table = ratarmount_compress::build_seek_table_skippable(&[(
+                u32::try_from(frame.len()).unwrap(),
+                u32::try_from(plain.len()).unwrap(),
+            )]);
+            frame.extend(table);
+            let archive = env.path("base.tar.zst");
+            fs::write(&archive, frame).unwrap();
+            let map = ratarmount_compress::scan_zstd_frames_path(&archive).unwrap();
+            assert!(
+                map.seek_table.is_some(),
+                "zstd append fixture must be eligible"
+            );
+            assert_eq!(map.frames.len(), 1);
+            archive
+        } else if route.starts_with("gzip") {
+            let archive = env.path("base.tar.gz");
+            let mut encoder = flate2::write::GzEncoder::new(
+                fs::File::create(&archive).unwrap(),
+                flate2::Compression::default(),
+            );
+            encoder.write_all(&fs::read(&tar).unwrap()).unwrap();
+            encoder.finish().unwrap();
+            archive
+        } else if route.starts_with("zip") {
+            // The valid empty ZIP EOCD needs no external producer or new dependency.
+            let archive = env.path("base.zip");
+            let mut eocd = vec![0; 22];
+            eocd[..4].copy_from_slice(b"PK\x05\x06");
+            fs::write(&archive, eocd).unwrap();
+            archive
+        } else {
+            tar
+        };
+        let overlay = regression_238_overlay(&env, &archive);
+        if route.starts_with("metadata") {
+            let metadata_path = if mode == "append" {
+                // Metadata on a new member has no base header to delete, so
+                // provenance persistence remains eligible for append.
+                "/new.txt"
+            } else {
+                fs::remove_file(overlay.join("new.txt")).unwrap();
+                "/a.txt"
+            };
+            let conn = rusqlite::Connection::open(overlay.join(ratarmount_compositing::HIDDEN_DB))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO overlay_metadata(path,mode) VALUES (?1,384)",
+                [metadata_path],
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM overlay_metadata", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        // Adds-only TAR/zstd plans and a singly linked base make append/Auto
+        // eligible. The explicit mode pins copy rows to their publishers.
+        assert!(!overlay.join("a.txt").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&archive).unwrap().nlink(), 1);
+        }
+        let before = fs::read(&archive).unwrap();
+        let ready = env.path("commit-ready");
+        let release = env.path("commit-release");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+        command
+            .env("HOME", env.root.path())
+            .env("XDG_CACHE_HOME", env.path(".cache"))
+            .env("RATARMOUNT_TEST_COMMIT_READY", &ready)
+            .env("RATARMOUNT_TEST_COMMIT_RELEASE", &release)
+            .args([
+                "--commit-overlay",
+                "-w",
+                s(&overlay),
+                "--commit-overlay-mode",
+                mode,
+                s(&archive),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if yes {
+            command.arg("--yes");
+        }
+        let mut child = Regression238Child(Some(command.spawn().unwrap()));
+        child
+            .0
+            .as_mut()
+            .unwrap()
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"commit\n")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{route}: confirmation hook timed out"
+            );
+            if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+                let out = child.0.take().unwrap().wait_with_output().unwrap();
+                panic!("{route}: commit exited before READY: {}", text(&out));
+            }
+            // File readiness, rather than an elapsed delay, orders the seal.
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let contended = env.path("seal-contended");
+        let mut seal = Regression238Child::spawn(
+            &env,
+            &["overlay", "seal", s(&overlay), s(&archive)],
+            &[("RATARMOUNT_TEST_OVERLAY_CONTENDED", &contended)],
+        );
+        let blocked = seal.marker_or_exit(&contended);
+        fs::write(&release, b"release").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while child.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "{route}: commit did not finish after RELEASE"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let out = child.0.take().unwrap().wait_with_output().unwrap();
+        let sealed = seal.finish();
+        if !blocked {
+            errors.push(format!(
+                "{route}: seal did not wait for commit's overlay lock: {}",
+                text(&sealed)
+            ));
+        }
+        if !out.status.success() {
+            errors.push(format!("{route}: commit failed: {}", text(&out)));
+        }
+        let after = fs::read(&archive).unwrap();
+        if after == before {
+            errors.push(format!("{route}: commit did not change archive bytes"));
+        }
+        if !sealed.status.success() {
+            assert!(
+                !ratarmount_compositing::OverlayMeta::read(&overlay)
+                    .unwrap()
+                    .unwrap()
+                    .layer_sealed(),
+                "{route}: failed seal published metadata"
+            );
+            env.ok(&["overlay", "seal", s(&overlay), s(&archive)]);
+        }
+        assert_eq!(
+            regression_238_recorded_archive_digest(&overlay),
+            format!("sha256:{}", ratarmount_index::sha256_hex(&after)),
+            "{route}: seal must bind the completed commit"
+        );
+        let verify = env.run(&["overlay", "verify", s(&overlay), s(&archive)]);
+        if !verify.status.success() {
+            errors.push(format!(
+                "{route}: sealed overlay verification failed: {}",
+                text(&verify)
+            ));
+        }
+        env.ok(&["overlay", "unseal", s(&overlay), "--i-know"]);
+    }
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+impl Regression238Child {
+    fn spawn(env: &Env, args: &[&str], hooks: &[(&str, &Path)]) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+        command
+            .env("HOME", env.root.path())
+            .env("XDG_CACHE_HOME", env.path(".cache"))
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, path) in hooks {
+            command.env(key, path);
+        }
+        Self(Some(command.spawn().unwrap()))
+    }
+
+    /// An explicit hook or process exit orders the next action; elapsed time
+    /// never establishes that the other process reached the overlay lock.
+    fn marker_or_exit(&mut self, marker: &Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if marker.is_file() {
+                return true;
+            }
+            if self.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+                return false;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "waiting for {}",
+                marker.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn finish(mut self) -> Output {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while self.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "child did not finish after release"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.0.take().unwrap().wait_with_output().unwrap()
+    }
+}
+
+fn regression_238_recorded_archive_digest(overlay: &Path) -> String {
+    ratarmount_compositing::OverlayMeta::read(overlay)
+        .unwrap()
+        .unwrap()
+        .base_digest()
+        .unwrap()
+        .to_owned()
+}
+
+/// Regression: #238 a seal starting after before_write hashed the old
+/// archive while commit wrote it, leaving a stale sealed base digest.
+/// Both inode-preserving replacement and copy publication must exclude seal.
+#[test]
+fn regression_238_seal_during_write_waits_for_overlay_lock() {
+    let mut errors = Vec::new();
+    for mode in ["append", "copy"] {
+        if mode == "copy" && !have_gnu_tar() {
+            eprintln!("skip: copy publication requires GNU tar; append still tests the core race");
+            continue;
+        }
+        if mode == "append" && !cfg!(any(target_os = "linux", target_os = "macos")) {
+            eprintln!("skip: append requires Linux/macOS inode xattrs");
+            continue;
+        }
+        let env = Env::new();
+        let archive = regression_238_tar(&env);
+        let overlay = regression_238_overlay(&env, &archive);
+        let before = fs::read(&archive).unwrap();
+        let ready = env.path("prewrite-ready");
+        let release = env.path("prewrite-release");
+        let contended = env.path("seal-contended");
+        let mut commit = Regression238Child::spawn(
+            &env,
+            &[
+                "--commit-overlay",
+                "-w",
+                s(&overlay),
+                s(&archive),
+                "--commit-overlay-mode",
+                mode,
+                "--yes",
+            ],
+            &[
+                ("RATARMOUNT_TEST_PREWRITE_READY", &ready),
+                ("RATARMOUNT_TEST_PREWRITE_RELEASE", &release),
+            ],
+        );
+        assert!(
+            commit.marker_or_exit(&ready),
+            "{mode}: commit exited before its write hook: {}",
+            text(&commit.finish())
+        );
+        assert_eq!(
+            fs::read(&archive).unwrap(),
+            before,
+            "{mode}: prewrite hook ran after archive mutation"
+        );
+        let mut seal = Regression238Child::spawn(
+            &env,
+            &["overlay", "seal", s(&overlay), s(&archive)],
+            &[("RATARMOUNT_TEST_OVERLAY_CONTENDED", &contended)],
+        );
+        let blocked = seal.marker_or_exit(&contended);
+        fs::write(&release, b"release").unwrap();
+        let committed = commit.finish();
+        let sealed = seal.finish();
+        let after = fs::read(&archive).unwrap();
+        if !blocked {
+            errors.push(format!(
+                "{mode}: seal finished while commit held its overlay lock: {}",
+                text(&sealed)
+            ));
+        }
+        if !committed.status.success() {
+            errors.push(format!("{mode}: commit failed: {}", text(&committed)));
+        }
+        if before == after {
+            errors.push(format!(
+                "{mode}: commit fixture did not change archive bytes"
+            ));
+        }
+        let expected = format!("sha256:{}", ratarmount_index::sha256_hex(&after));
+        if sealed.status.success() {
+            let recorded = regression_238_recorded_archive_digest(&overlay);
+            if recorded != expected {
+                errors.push(format!(
+                    "{mode}: seal recorded {recorded}, post-commit archive digest is {expected}"
+                ));
+            }
+        } else {
+            assert!(
+                !ratarmount_compositing::OverlayMeta::read(&overlay)
+                    .unwrap()
+                    .unwrap()
+                    .layer_sealed(),
+                "{mode}: refused seal must not leave seal metadata: {}",
+                text(&sealed)
+            );
+            // A retry against the completed commit must record precisely the
+            // post-commit bytes, including after a copy changed the inode.
+            env.ok(&["overlay", "seal", s(&overlay), s(&archive)]);
+            assert_eq!(regression_238_recorded_archive_digest(&overlay), expected);
+        }
+        let verified = env.run(&["overlay", "verify", s(&overlay), s(&archive)]);
+        if !verified.status.success() {
+            errors.push(format!(
+                "{mode}: post-commit seal failed verification: {}",
+                text(&verified)
+            ));
+        }
+        env.ok(&["overlay", "unseal", s(&overlay), "--i-know"]);
+    }
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+/// Regression: #238 a seal's DB reservation did not stop a concurrent commit.
+/// Seal owns the overlay lock first; a waiting commit must recheck sealing
+/// after taking that lock and preserve every archive byte.
+#[test]
+fn regression_238_commit_waits_for_seal_then_refuses() {
+    let mut errors = Vec::new();
+    for mode in ["append", "copy"] {
+        if mode == "copy" && !have_gnu_tar() {
+            eprintln!("skip: copy publication requires GNU tar; append still tests the core race");
+            continue;
+        }
+        if mode == "append" && !cfg!(any(target_os = "linux", target_os = "macos")) {
+            eprintln!("skip: append requires Linux/macOS inode xattrs");
+            continue;
+        }
+        let env = Env::new();
+        let archive = regression_238_tar(&env);
+        let overlay = regression_238_overlay(&env, &archive);
+        let before = fs::read(&archive).unwrap();
+        let seal_ready = env.path("seal-lock-ready");
+        let seal_release = env.path("seal-lock-release");
+        let contended = env.path("commit-contended");
+        let mut seal = Regression238Child::spawn(
+            &env,
+            &["overlay", "seal", s(&overlay), s(&archive)],
+            &[
+                ("RATARMOUNT_TEST_SEAL_LOCK_READY", &seal_ready),
+                ("RATARMOUNT_TEST_SEAL_LOCK_RELEASE", &seal_release),
+            ],
+        );
+        assert!(
+            seal.marker_or_exit(&seal_ready),
+            "{mode}: seal exited before overlay-lock hook: {}",
+            text(&seal.finish())
+        );
+        let mut commit = Regression238Child::spawn(
+            &env,
+            &[
+                "--commit-overlay",
+                "-w",
+                s(&overlay),
+                s(&archive),
+                "--commit-overlay-mode",
+                mode,
+                "--yes",
+            ],
+            &[("RATARMOUNT_TEST_OVERLAY_CONTENDED", &contended)],
+        );
+        let blocked = commit.marker_or_exit(&contended);
+        fs::write(&seal_release, b"release").unwrap();
+        let sealed = seal.finish();
+        let committed = commit.finish();
+        if !blocked {
+            errors.push(format!(
+                "{mode}: commit finished while seal held its overlay lock: {}",
+                text(&committed)
+            ));
+        }
+        if !sealed.status.success() {
+            errors.push(format!("{mode}: seal failed: {}", text(&sealed)));
+        }
+        errors.extend(
+            regression_238_refusal_errors(&overlay, &committed)
+                .into_iter()
+                .map(|e| format!("{mode}: {e}")),
+        );
+        if fs::read(&archive).unwrap() != before {
+            errors.push(format!(
+                "{mode}: archive changed while sealing won the overlay lock"
+            ));
+        }
+        if sealed.status.success() {
+            let expected = format!("sha256:{}", ratarmount_index::sha256_hex(&before));
+            let recorded = regression_238_recorded_archive_digest(&overlay);
+            if recorded != expected {
+                errors.push(format!(
+                    "{mode}: seal recorded {recorded}, unchanged archive digest must be {expected}"
+                ));
+            }
+            let verified = env.run(&["overlay", "verify", s(&overlay), s(&archive)]);
+            if !verified.status.success() {
+                errors.push(format!(
+                    "{mode}: seal failed verification: {}",
+                    text(&verified)
+                ));
+            }
+            env.ok(&["overlay", "unseal", s(&overlay), "--i-know"]);
+        }
+    }
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+/// Regression: #240 CLI archive creation/initialization ran before the overlay
+/// lock. A seal against an accepted second base copy must block that work, then
+/// make the waiting commit refuse without creating or filling its own target.
+#[test]
+fn regression_240_seal_blocks_cli_archive_initialization() {
+    for empty in [false, true] {
+        let env = Env::new();
+        let archive = regression_238_tar(&env);
+        let seal_base = env.path("seal-base.tar");
+        fs::copy(&archive, &seal_base).unwrap();
+        let overlay = env.path("overlay");
+        env.ok(&[
+            "--no-mount",
+            "-w",
+            s(&overlay),
+            "--base-digest",
+            "none",
+            s(&archive),
+        ]);
+        fs::write(overlay.join("new.txt"), b"new\n").unwrap();
+        if empty {
+            fs::write(&archive, b"").unwrap();
+        } else {
+            fs::remove_file(&archive).unwrap();
+        }
+        let state = || match fs::read(&archive) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("read target: {error}"),
+        };
+        let before = state();
+        let seal_ready = env.path("seal-ready");
+        let seal_release = env.path("seal-release");
+        let contended = env.path("commit-contended");
+        let mut seal = Regression238Child::spawn(
+            &env,
+            &["overlay", "seal", s(&overlay), s(&seal_base)],
+            &[
+                ("RATARMOUNT_TEST_SEAL_LOCK_READY", &seal_ready),
+                ("RATARMOUNT_TEST_SEAL_LOCK_RELEASE", &seal_release),
+            ],
+        );
+        assert!(
+            seal.marker_or_exit(&seal_ready),
+            "empty={empty}: seal did not reach its overlay lock: {}",
+            text(&seal.finish())
+        );
+        let mut commit = Regression238Child::spawn(
+            &env,
+            &[
+                "--commit-overlay",
+                "-w",
+                s(&overlay),
+                s(&archive),
+                "--force-base-mismatch",
+                "--yes",
+            ],
+            &[("RATARMOUNT_TEST_OVERLAY_CONTENDED", &contended)],
+        );
+        let blocked = commit.marker_or_exit(&contended);
+        let while_sealing = state();
+        fs::write(&seal_release, b"release").unwrap();
+        let sealed = seal.finish();
+        let committed = commit.finish();
+        assert!(
+            blocked,
+            "empty={empty}: commit did not wait: {}",
+            text(&committed)
+        );
+        assert!(sealed.status.success(), "empty={empty}: {}", text(&sealed));
+        assert_eq!(
+            while_sealing, before,
+            "empty={empty}: target changed before the overlay lock"
+        );
+        assert_eq!(
+            state(),
+            before,
+            "empty={empty}: refused commit changed target"
+        );
+        assert!(
+            regression_238_refusal_errors(&overlay, &committed).is_empty(),
+            "empty={empty}: {}",
+            text(&committed)
+        );
+        env.ok(&["overlay", "unseal", s(&overlay), "--i-know"]);
+    }
+}
+
+/// Regression: #239 symlink policy takes precedence over #240 seal refusal,
+/// and both checks must run before a missing base can be created.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_239_240_sealed_symlink_policy_precedes_base_creation() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    use std::os::unix::fs::PermissionsExt;
+
+    for suffix in ["", "-wal"] {
+        let (env, archive, overlay) = symlink_policy_fixture();
+        env.ok(&["overlay", "seal", s(&overlay), s(&archive)]);
+        // Plant the invalid state without changing the recorded seal metadata.
+        let mode = fs::metadata(&overlay).unwrap().permissions().mode();
+        fs::set_permissions(&overlay, fs::Permissions::from_mode(mode | 0o200)).unwrap();
+        let link = policy_link(&env, &overlay, suffix, "regular");
+        fs::remove_file(&archive).unwrap();
+        let before = policy_snapshot(env.root.path());
+        for force in [false, true] {
+            let mut args = vec!["--commit-overlay", "--yes", "-w", s(&overlay)];
+            if force {
+                args.push("--force-base-mismatch");
+            }
+            args.push(s(&archive));
+            let out = env.run(&args);
+            assert_eq!(out.status.code(), Some(1), "{args:?}: {}", text(&out));
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                err.contains("is a symlink; it must be a regular file"),
+                "{err}"
+            );
+            assert!(!err.contains("is sealed"), "{err}");
+            assert!(!err.contains("--force"), "{err}");
+            assert!(!archive.exists(), "{args:?}: missing base was created");
+            assert_eq!(
+                policy_snapshot(env.root.path()),
+                before,
+                "{args:?}: state changed: {}",
+                text(&out)
+            );
+        }
+        fs::remove_file(link).unwrap();
+        if suffix.is_empty() {
+            fs::rename(
+                env.path("saved-db"),
+                overlay.join(ratarmount_compositing::HIDDEN_DB),
+            )
+            .unwrap();
+        }
+        env.ok(&["overlay", "unseal", s(&overlay), "--i-know"]);
     }
 }

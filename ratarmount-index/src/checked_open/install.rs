@@ -386,6 +386,10 @@ pub(crate) fn thread_count() -> Option<u32> {
 fn os_thread_count() -> Option<u32> {
     let mut buf = [0u8; 1024];
     // SAFETY: plain syscalls on a local buffer and our own descriptor.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0474-M01","item":"ratarmount_index::checked_open::install::os_thread_count","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let fd = unsafe {
         libc::open(
             c"/proc/self/stat".as_ptr(),
@@ -963,11 +967,14 @@ mod imp {
         });
     }
 
-    /// Registers [`constructor`] with the loader. [`ctor_anchor`] references
-    /// it by address so that any caller of `installed()` links the object
-    /// that carries it. Never read its value: at a macOS deployment target of
-    /// 14.0 Apple's linker rewrites `__mod_init_func` into `__init_offsets`
-    /// (32-bit image offsets), so the stored word is not an address.
+    /// Registers [`constructor`] with the loader. On Linux [`ctor_anchor`]
+    /// references it by address so that any caller of `installed()` links the
+    /// object that carries it. Never read its value: at a macOS deployment
+    /// target of 14.0 Apple's linker rewrites `__mod_init_func` into
+    /// `__init_offsets` (32-bit image offsets), so the stored word is not an
+    /// address. On macOS the link root is rustc's `symbols.o` absolute
+    /// `__DATA,__data` relocation for this `#[used]` static: it pulls the rlib
+    /// member, whose `S_MOD_INIT_FUNC_POINTERS` section is a dead-strip root.
     #[used]
     #[cfg_attr(target_os = "linux", link_section = ".init_array")]
     #[cfg_attr(
@@ -978,8 +985,12 @@ mod imp {
 
     /// The constructor's code address (the loader proof's first anchor).
     pub(super) fn ctor_anchor() -> usize {
-        // Address only, never the value (see `CTOR_ANCHOR`): this reference
-        // keeps the init-section entry linked. Do not remove it as dead code.
+        // Linux: address only, never the value (see `CTOR_ANCHOR`): this
+        // reference keeps the init-section entry linked. Do not remove it as
+        // dead code. Not on macOS: once the linker rewrites the section into
+        // `__init_offsets` the init atom's symbol is address 0, and Xcode 16's
+        // ld rejects this ADRP to it ("ADRP out of range") at target 14.0.
+        #[cfg(not(target_os = "macos"))]
         std::hint::black_box(std::ptr::addr_of!(CTOR_ANCHOR));
         std::hint::black_box(constructor as extern "C" fn()) as *const () as usize
     }

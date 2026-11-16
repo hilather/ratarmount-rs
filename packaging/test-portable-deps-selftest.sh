@@ -30,7 +30,6 @@ ALLOWLIST=(
   libanl.so.1
   libgcc_s.so.1
   ld-linux-x86-64.so.2
-  libfuse3.so.3
   libarchive.so.13
   libz.so.1
   libbz2.so.1.0
@@ -48,6 +47,9 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 sonames = sys.argv[2:]
+runtime_candidates = not sonames or sonames[0] != "--omit-candidates"
+if not runtime_candidates:
+    sonames = sonames[1:]
 
 def write_elf(path, sonames):
     strs = b"\x00"
@@ -71,7 +73,8 @@ def write_elf(path, sonames):
     dyn += struct.pack("<QQ", 5, str_off)
     dyn += struct.pack("<QQ", 10, len(strs))
     dyn += struct.pack("<QQ", 0, 0)
-    path.write_bytes(ehdr + ph_load + ph_dyn + dyn + strs)
+    candidates = b"libfuse3.so.4\x00libfuse3.so.3\x00" if runtime_candidates else b""
+    path.write_bytes(ehdr + ph_load + ph_dyn + dyn + strs + candidates)
 
 write_elf(path, sonames)
 PY
@@ -208,5 +211,23 @@ printf 'hello\n' > "${WORK}/hello.txt"
 run "${WORK}/hello.txt"
 expect_exit 11 1
 expect_out_lacks 11 "OK:"
+
+# Regression: either linked libfuse SONAME prevents portable startup on other hosts.
+for soname in libfuse3.so.3 libfuse3.so.4; do
+  write_elf "${WORK}/fuse.elf" "${ALLOWLIST[@]}" "$soname"
+  run "${WORK}/fuse.elf"
+  expect_exit "$soname" 1
+  expect_err_has "$soname" "FAIL: portable binary must not link libfuse at load time: $soname"
+  expect_err_has "$soname" "libfuse3 is loaded at runtime: libfuse3.so.4, then libfuse3.so.3"
+  expect_err_lacks "$soname" "vendor OpenSSL"
+done
+
+# Regression: removing the runtime loader must fail even with an approved NEEDED list.
+write_elf "${WORK}/no-candidates.elf" --omit-candidates "${ALLOWLIST[@]}"
+run "${WORK}/no-candidates.elf"
+expect_exit no-candidates 1
+expect_err_has no-candidates "FAIL: missing runtime libfuse3 candidate libfuse3.so.4"
+expect_err_has no-candidates "FAIL: missing runtime libfuse3 candidate libfuse3.so.3"
+expect_err_lacks no-candidates "vendor OpenSSL"
 
 echo "OK: portable dependency allowlist self-test"

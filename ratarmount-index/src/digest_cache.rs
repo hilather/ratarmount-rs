@@ -16,27 +16,35 @@ use crate::{sha256_hex_stream, IndexError, Result};
 pub struct ArchiveDigestStamp {
     pub size: u64,
     pub mtime_ns: i128,
+    pub device: u64,
     pub inode: u64,
 }
 
 impl ArchiveDigestStamp {
     pub fn read(path: &Path) -> std::io::Result<Self> {
         let metadata = fs::metadata(path)?;
+        Self::from_metadata(&metadata)
+    }
+
+    /// Construct the cache identity from an already acquired descriptor's
+    /// metadata, without substituting a later pathname observation.
+    pub fn from_metadata(metadata: &fs::Metadata) -> std::io::Result<Self> {
         let modified = metadata.modified()?;
         let mtime_ns = match modified.duration_since(UNIX_EPOCH) {
             Ok(d) => d.as_nanos() as i128,
             Err(e) => -(e.duration().as_nanos() as i128),
         };
         #[cfg(unix)]
-        let inode = {
+        let (device, inode) = {
             use std::os::unix::fs::MetadataExt;
-            metadata.ino()
+            (metadata.dev(), metadata.ino())
         };
         #[cfg(not(unix))]
-        let inode = 0;
+        let (device, inode) = (0, 0);
         Ok(Self {
             size: metadata.len(),
             mtime_ns,
+            device,
             inode,
         })
     }
@@ -133,7 +141,14 @@ fn never_cancelled() -> std::io::Result<()> {
 pub fn cached_archive_digest(path: &Path, index: Option<&Path>) -> Result<String> {
     cached_with(path, index, false, &never_cancelled, |path| {
         // Managed (#151): the archive may be a database open in this process.
-        Ok(sha256_hex_stream(&mut ManagedReadCursor::open(path)?)?)
+        Ok(sha256_hex_stream(&mut {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0419-M01","item":"ratarmount_index::digest_cache::cached_archive_digest","disposition":"managed-read","regression":"regression_archive_digest_and_refresh_keep_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
+            let __inventory_value_0 = ManagedReadCursor::open(path);
+            __inventory_value_0
+        }?)?)
     })
 }
 
@@ -152,6 +167,47 @@ pub fn peek_archive_digest(path: &Path, index: Option<&Path>) -> Result<Option<S
         return Ok(None);
     };
     Ok(lookup(&cache, path.as_os_str().as_encoded_bytes(), &stamp))
+}
+
+/// A digest peek honoring the prepared-worker policy. Selected-artifact errors
+/// propagate; an absent optional digest table/row remains a cache miss.
+pub fn peek_archive_digest_for_open(
+    path: &Path,
+    index: Option<&Path>,
+    read_only_index: bool,
+) -> Result<Option<String>> {
+    if !read_only_index {
+        return peek_archive_digest(path, index);
+    }
+    let Some(index) = index else {
+        return Ok(None);
+    };
+    let conn = crate::open_prepared_connection(index)?;
+    conn.busy_timeout(Duration::ZERO)?;
+    let has_cache: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='overlay_base_digests')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_cache {
+        return Ok(None);
+    }
+    let path = path.canonicalize()?;
+    let stamp = ArchiveDigestStamp::read(&path)?;
+    lookup_checked(
+        &Cache {
+            conn,
+            index: index.to_path_buf(),
+        },
+        path.as_os_str().as_encoded_bytes(),
+        &stamp,
+    )
+    .map_err(|e| {
+        IndexError::Invalid(format!(
+            "prepared index {} digest lookup failed: {e}; --no-recreate-index requires preparation",
+            index.display()
+        ))
+    })
 }
 
 /// Like [`cached_archive_digest`], but the caller supplies the hashing (for
@@ -176,12 +232,34 @@ pub fn cached_archive_digest_cancellable(
     cached_with(path, index, false, check, |path| Ok(hash(path)?))
 }
 
+/// Cache a hash of the exact acquisition snapshot supplied by a locked caller.
+/// `path` is the caller's stable, canonical name: it is not resolved again to
+/// choose the cache key or identity. The hash closure must read the descriptor
+/// described by `stamp`; the caller must retain its lock and validate that
+/// descriptor and pathname before and after this operation, including hits.
+pub fn cached_archive_digest_cancellable_for_snapshot(
+    path: &Path,
+    index: Option<&Path>,
+    stamp: &ArchiveDigestStamp,
+    check: &dyn Fn() -> std::io::Result<()>,
+    hash: impl FnOnce(&Path) -> std::io::Result<String>,
+) -> Result<String> {
+    cached_for_stamp(path, index, stamp, false, check, |path| Ok(hash(path)?))
+}
+
 /// Rehash after an intentional archive commit and replace its cached identity.
 /// Unlike `cached_archive_digest`, this never trusts a pre-commit cache hit.
 pub fn refresh_archive_digest(path: &Path, index: Option<&Path>) -> Result<String> {
     cached_with(path, index, true, &never_cancelled, |path| {
         // Managed (#151): the archive may be a database open in this process.
-        Ok(sha256_hex_stream(&mut ManagedReadCursor::open(path)?)?)
+        Ok(sha256_hex_stream(&mut {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0420-M01","item":"ratarmount_index::digest_cache::refresh_archive_digest","disposition":"managed-read","regression":"regression_archive_digest_and_refresh_keep_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
+            let __inventory_value_0 = ManagedReadCursor::open(path);
+            __inventory_value_0
+        }?)?)
     })
 }
 
@@ -204,6 +282,9 @@ struct Cache {
 /// depends only on this one.
 fn cache_target(index: Option<&Path>) -> Option<PathBuf> {
     let index = index?;
+    if crate::location::index_pin_refusal(index).is_some() {
+        return None;
+    }
     let metadata = fs::metadata(index).ok()?;
     if !metadata.is_file() || metadata.permissions().readonly() {
         return None;
@@ -216,16 +297,9 @@ fn cache_target(index: Option<&Path>) -> Option<PathBuf> {
         }
     }
     let index = index.canonicalize().ok()?;
-    let snapshot = index
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_suffix(".sqlite"))
-        .and_then(|name| name.rsplit_once(".index."))
-        .is_some_and(|(_, id)| crate::parse_index_id(id).is_ok());
     // Never add cache tables to published immutable snapshots or remote caches.
     if crate::is_meta_cache_path(&index)
         || crate::index_pointer_path_for_index_file(&index).is_file()
-        || snapshot
     {
         return None;
     }
@@ -308,10 +382,25 @@ fn open_cache_at(index: PathBuf, create_table: bool) -> Option<Cache> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS overlay_base_digests (
                 path BLOB PRIMARY KEY, size TEXT NOT NULL, mtime_ns TEXT NOT NULL,
-                inode TEXT NOT NULL, sha256 TEXT NOT NULL
+                inode TEXT NOT NULL, sha256 TEXT NOT NULL, device TEXT NOT NULL
             );",
         )
         .ok()?;
+    }
+    if !has_device_column(&conn).ok()? {
+        if !create_table {
+            return None;
+        }
+        conn.prepare(
+            "SELECT path, size, mtime_ns, inode, sha256 FROM overlay_base_digests LIMIT 0",
+        )
+        .ok()?;
+        // Existing rows have no device proof and must miss. Another opener
+        // may win this migration; only the resulting schema matters.
+        let _ = conn.execute_batch("ALTER TABLE overlay_base_digests ADD COLUMN device TEXT;");
+        if !has_device_column(&conn).ok()? {
+            return None;
+        }
     }
     // Lookups stay instant on a busy index; only the write waits (below).
     conn.busy_timeout(Duration::ZERO).ok()?;
@@ -321,11 +410,20 @@ fn open_cache_at(index: PathBuf, create_table: bool) -> Option<Cache> {
 fn open_lock_file(index: &Path) -> Option<fs::File> {
     let mut name = index.as_os_str().to_owned();
     name.push(DIGEST_LOCK_SUFFIX);
-    fs::OpenOptions::new()
-        .create(true)
+    {
+#[expect(clippy::disallowed_types, reason = r###"internal-read:v1 {"id":"IR-B0421-T01","item":"ratarmount_index::digest_cache::open_lock_file","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###)]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0421-M01","item":"ratarmount_index::digest_cache::open_lock_file","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###)]
+let mut __inventory_value_0 = fs::OpenOptions::new();
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0057-M01","item":"ratarmount_index::digest_cache::open_lock_file","disposition":"output-owner","category":"runtime-lock","reason":"Permit creating the per-index digest-hashing advisory lock without truncating an existing lock.","creation":{"policy":"create-or-open","basis":"The lock file uses write/create with truncate(false) and existing default/umask file permissions."}}"###)]
+let __inventory_value_1 = __inventory_value_0
+        .create(true);
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0421-M02","item":"ratarmount_index::digest_cache::open_lock_file","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###)]
+let __inventory_value_2 = __inventory_value_1
         .truncate(false)
         .write(true)
-        .open(name)
+        .open(name);
+__inventory_value_2
+}
         .ok()
 }
 
@@ -414,24 +512,44 @@ fn try_flock(_file: &fs::File) -> std::io::Result<bool> {
 }
 
 fn lookup(cache: &Cache, key: &[u8], stamp: &ArchiveDigestStamp) -> Option<String> {
-    let digest: String = cache
+    lookup_checked(cache, key, stamp).ok().flatten()
+}
+
+fn lookup_checked(cache: &Cache, key: &[u8], stamp: &ArchiveDigestStamp) -> Result<Option<String>> {
+    if !has_device_column(&cache.conn)? {
+        // A valid legacy schema is an optional cache miss, including prepared
+        // read-only indexes. A malformed selected table remains an error.
+        cache.conn.prepare(
+            "SELECT path, size, mtime_ns, inode, sha256 FROM overlay_base_digests LIMIT 0",
+        )?;
+        return Ok(None);
+    }
+    let digest: Option<String> = cache
         .conn
         .query_row(
             "SELECT sha256 FROM overlay_base_digests
-             WHERE path=?1 AND size=?2 AND mtime_ns=?3 AND inode=?4",
+             WHERE path=?1 AND size=?2 AND mtime_ns=?3 AND inode=?4 AND device=?5",
             params![
                 key,
                 stamp.size.to_string(),
                 stamp.mtime_ns.to_string(),
-                stamp.inode.to_string()
+                stamp.inode.to_string(),
+                stamp.device.to_string()
             ],
             |row| row.get(0),
         )
-        .optional()
-        .ok()
-        .flatten()?;
-    (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then(|| format!("sha256:{digest}"))
+        .optional()?;
+    Ok(digest
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|digest| format!("sha256:{digest}")))
+}
+
+fn has_device_column(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('overlay_base_digests') WHERE name='device')",
+        [],
+        |row| row.get(0),
+    )
 }
 
 /// Double-checked: read the cache, and on a miss take the per-archive lock,
@@ -446,12 +564,23 @@ fn cached_with(
 ) -> Result<String> {
     let path = path.canonicalize()?;
     let stamp = ArchiveDigestStamp::read(&path)?;
+    cached_for_stamp(&path, index, &stamp, refresh, check, hash)
+}
+
+fn cached_for_stamp(
+    path: &Path,
+    index: Option<&Path>,
+    stamp: &ArchiveDigestStamp,
+    refresh: bool,
+    check: &dyn Fn() -> std::io::Result<()>,
+    hash: impl FnOnce(&Path) -> Result<String>,
+) -> Result<String> {
     // Keep raw OS bytes: two non-UTF-8 paths must not share a lossy cache key.
     let key = path.as_os_str().as_encoded_bytes();
     let target = cache_target(index);
     let mut cache = target.clone().and_then(|t| open_cache_at(t, true));
     if let (Some(cache), false) = (&cache, refresh) {
-        if let Some(hit) = lookup(cache, key, &stamp) {
+        if let Some(hit) = lookup(cache, key, stamp) {
             return Ok(hit);
         }
     }
@@ -459,7 +588,7 @@ fn cached_with(
     // another mount's long write lock must not let this one hash unserialized.
     let _guard = match &target {
         Some(target) => {
-            let guard = HashGuard::acquire(&path, target, check)?;
+            let guard = HashGuard::acquire(path, target, check)?;
             if cache.is_none() {
                 // Busy earlier; the holder may be gone by now.
                 cache = open_cache_at(target.clone(), true);
@@ -467,7 +596,7 @@ fn cached_with(
             if let (Some(cache), false) = (&cache, refresh) {
                 // The hash we waited for just committed; a busy moment is not a miss.
                 let _ = set_write_busy(&cache.conn);
-                if let Some(hit) = lookup(cache, key, &stamp) {
+                if let Some(hit) = lookup(cache, key, stamp) {
                     return Ok(hit);
                 }
             }
@@ -475,8 +604,8 @@ fn cached_with(
         }
         None => None,
     };
-    let digest = hash(&path)?;
-    if ArchiveDigestStamp::read(&path)? != stamp {
+    let digest = hash(path)?;
+    if &ArchiveDigestStamp::read(path)? != stamp {
         return Err(IndexError::Io(std::io::Error::other(
             "base changed while hashing",
         )));
@@ -484,13 +613,15 @@ fn cached_with(
     if let Some(cache) = &cache {
         let stored = set_write_busy(&cache.conn).and_then(|()| {
             cache.conn.execute(
-                "INSERT OR REPLACE INTO overlay_base_digests VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT OR REPLACE INTO overlay_base_digests
+                 (path, size, mtime_ns, inode, sha256, device) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     key,
                     stamp.size.to_string(),
                     stamp.mtime_ns.to_string(),
                     stamp.inode.to_string(),
-                    digest
+                    digest,
+                    stamp.device.to_string()
                 ],
             )
         });
@@ -508,6 +639,147 @@ fn cached_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: #240 a pathname briefly naming B must not select B's
+    /// cached digest for a caller holding A's acquisition snapshot.
+    #[cfg(unix)]
+    #[test]
+    fn regression_240_snapshot_cache_ignores_substituted_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("current");
+        let substitute = dir.path().join("substitute");
+        let held = dir.path().join("held");
+        fs::create_dir(&current).unwrap();
+        fs::create_dir(&substitute).unwrap();
+        let archive = current.join("a.tar");
+        fs::write(&archive, b"original").unwrap();
+        fs::write(substitute.join("a.tar"), b"impostor").unwrap();
+        let descriptor = fs::File::open(&archive).unwrap();
+        let snapshot = ArchiveDigestStamp::from_metadata(&descriptor.metadata().unwrap()).unwrap();
+        let index = index_with_files(dir.path());
+        let archive = archive.canonicalize().unwrap();
+        fs::rename(&current, &held).unwrap();
+        fs::rename(&substitute, &current).unwrap();
+        let impostor = cached_archive_digest(&archive, Some(&index)).unwrap();
+        // Negative control: a pathname-derived snapshot hits B's cached row.
+        assert_eq!(
+            cached_archive_digest_with(&archive, Some(&index), |_| panic!("expected B cache hit"))
+                .unwrap(),
+            impostor
+        );
+        let hashed = std::cell::Cell::new(false);
+        let result = cached_archive_digest_cancellable_for_snapshot(
+            &archive,
+            Some(&index),
+            &snapshot,
+            &never_cancelled,
+            |_| {
+                hashed.set(true);
+                Err(std::io::Error::other("snapshot cache miss"))
+            },
+        );
+        // Restore A before the locked caller's final pathname check. Renaming
+        // only the parent leaves the acquired file's own identity unchanged.
+        fs::rename(&current, &substitute).unwrap();
+        fs::rename(&held, &current).unwrap();
+        assert_eq!(ArchiveDigestStamp::read(&archive).unwrap(), snapshot);
+        assert!(
+            hashed.get(),
+            "B's cached digest must not answer A's snapshot"
+        );
+        assert!(matches!(result, Err(IndexError::Io(e)) if e.to_string() == "snapshot cache miss"));
+        let original = cached_archive_digest_cancellable_for_snapshot(
+            &archive,
+            Some(&index),
+            &snapshot,
+            &never_cancelled,
+            |_| sha256_hex_stream(&mut &descriptor),
+        )
+        .unwrap();
+        assert_ne!(original, impostor);
+        assert_eq!(
+            cached_archive_digest_cancellable_for_snapshot(
+                &archive,
+                Some(&index),
+                &snapshot,
+                &never_cancelled,
+                |_| panic!("expected A cache hit"),
+            )
+            .unwrap(),
+            original
+        );
+    }
+
+    /// Regression: #240 device is part of a descriptor snapshot's identity;
+    /// equal inode, size and mtime on another filesystem cannot hit the cache.
+    #[test]
+    fn regression_240_snapshot_cache_compares_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        fs::write(&archive, b"original").unwrap();
+        let archive = archive.canonicalize().unwrap();
+        let index = index_with_files(dir.path());
+        cached_archive_digest(&archive, Some(&index)).unwrap();
+        let mut snapshot = ArchiveDigestStamp::read(&archive).unwrap();
+        snapshot.device ^= 1;
+        let result = cached_archive_digest_cancellable_for_snapshot(
+            &archive,
+            Some(&index),
+            &snapshot,
+            &never_cancelled,
+            |_| Err(std::io::Error::other("other device cache miss")),
+        );
+        assert!(
+            matches!(result, Err(IndexError::Io(e)) if e.to_string() == "other device cache miss")
+        );
+    }
+
+    /// Regression: #240 legacy rows without a device are cache misses until
+    /// a writable open migrates the schema and rehashes the archive.
+    #[test]
+    fn regression_240_legacy_cache_without_device_rehashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        fs::write(&archive, b"original").unwrap();
+        let archive = archive.canonicalize().unwrap();
+        let index = index_with_files(dir.path());
+        let conn = Connection::open(&index).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE overlay_base_digests (
+                path BLOB PRIMARY KEY, size TEXT NOT NULL, mtime_ns TEXT NOT NULL,
+                inode TEXT NOT NULL, sha256 TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        let stamp = ArchiveDigestStamp::read(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO overlay_base_digests VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                archive.as_os_str().as_encoded_bytes(),
+                stamp.size.to_string(),
+                stamp.mtime_ns.to_string(),
+                stamp.inode.to_string(),
+                "0".repeat(64)
+            ],
+        )
+        .unwrap();
+        assert_eq!(peek_archive_digest(&archive, Some(&index)).unwrap(), None);
+        assert_eq!(
+            peek_archive_digest_for_open(&archive, Some(&index), true).unwrap(),
+            None
+        );
+        assert!(
+            !has_device_column(&conn).unwrap(),
+            "read-only peeks never migrate"
+        );
+        let digest = cached_archive_digest(&archive, Some(&index)).unwrap();
+        assert_ne!(digest, format!("sha256:{}", "0".repeat(64)));
+        assert!(has_device_column(&conn).unwrap());
+        assert_eq!(
+            peek_archive_digest_for_open(&archive, Some(&index), true).unwrap(),
+            Some(digest)
+        );
+    }
 
     /// Regression: a second overlay rehashed the same archive instead of using its index.
     #[test]

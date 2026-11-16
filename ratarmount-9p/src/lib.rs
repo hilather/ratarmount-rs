@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! Userspace 9P2000.L TCP export of a [`ratarmount_core::MountSource`].
 //!
 //! Listen on `127.0.0.1:20493` (unprivileged; well-known 564 is residual).

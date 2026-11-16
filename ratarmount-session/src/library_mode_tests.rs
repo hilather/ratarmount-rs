@@ -456,6 +456,10 @@ fn iter_by_offset_page_recreate_never_keeps_sidecar_unindexed() {
 /// Regression: auxiliary DDL must not invalidate a published snapshot's SHA-256 pointer.
 #[test]
 fn iter_by_offset_page_published_snapshot_keeps_sha256_valid() {
+    if !cfg!(unix) {
+        eprintln!("skip: local index publication is Unix-only");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("published.tar");
     std::fs::write(&archive, tar_bytes(&[member("z", b"a"), member("a", b"b")])).unwrap();
@@ -604,6 +608,13 @@ fn regression_parallelization_one_and_four_reads_multiframe_zstd_tar() {
             assert_eq!(read_member(&session, "big", data.len() as u64), data);
             assert_eq!(read_member(&session, "last", 100), b"last frame");
             assert_eq!(session.member_extent("big").unwrap(), None);
+            let location = session.into_index_location();
+            if recreate == Recreate::IfInvalid {
+                // Hand the next strict reader completed preparation after the
+                // ordinary session has released its catalog/source readers.
+                ratarmount_index::SqliteIndex::finalize_prepared(location.as_path().unwrap())
+                    .unwrap();
+            }
         }
     }
 }

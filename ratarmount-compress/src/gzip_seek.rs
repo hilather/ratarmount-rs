@@ -659,6 +659,10 @@ impl SeekableGzip {
                                               // Resolve for -P 0 parity / future concurrent index builders; index path
                                               // does not currently fan out workers.
         let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0229-M01","item":"<ratarmount_compress::gzip_seek::SeekableGzip>::open_with_threads","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut file = File::open(&path)?;
         let index = build_index(&mut file, spacing)?;
         Ok(Arc::new(Self {
@@ -691,6 +695,10 @@ impl SeekableGzip {
         let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
         let parsed = try_import_gzip_seek_blob(index_blob)?;
         let spacing = effective_import_spacing(spacing, parsed.spacing);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0230-M01","item":"<ratarmount_compress::gzip_seek::SeekableGzip>::open_with_imported_index","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut file = File::open(&path)?;
         let index = import_gzip_seek_blob_index(&mut file, &parsed, spacing)?;
         Ok(Arc::new(Self {
@@ -1012,6 +1020,10 @@ pub struct SeekableGzipReader {
 
 impl SeekableGzipReader {
     fn open(gzip: Arc<SeekableGzip>) -> io::Result<Self> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0231-M01","item":"<ratarmount_compress::gzip_seek::SeekableGzipReader>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = match &gzip.backend {
             GzipBackend::Path(p) => CompressedHandle::File(File::open(p)?),
             GzipBackend::Shared(shared) => CompressedHandle::Shared {
@@ -1587,6 +1599,14 @@ pub fn import_seek_points<R: Read + Seek>(
     import_seek_points_with_mode(file, points, spacing, expected_uncompressed_size, true)
 }
 
+/// Whether imported G3 checkpoints cover the start without inventing seek state.
+pub fn gzip_seek_points_usable(points: &[(u64, u64)]) -> bool {
+    points.first().is_some_and(|p| p.1 == 0)
+        && points
+            .windows(2)
+            .all(|w| w[0].0 <= w[1].0 && w[0].1 <= w[1].1)
+}
+
 /// Like [`import_seek_points`], with control over compressed-offset verification.
 ///
 /// * `strict_compressed_match == true` (`RGZI`): rehydrated compressed cursor must
@@ -1612,6 +1632,12 @@ pub fn import_seek_points_with_mode<R: Read + Seek>(
             )));
         }
         return Ok(index);
+    }
+
+    if !gzip_seek_points_usable(points) {
+        return Err(CompressError::Msg(
+            "gzip seek-index requires an initial checkpoint at uncompressed offset 0 and ordered points".into(),
+        ));
     }
 
     // Snapshot whenever we land on an imported uncompressed offset (post-inflate
@@ -4011,5 +4037,43 @@ mod tests {
         let mut all = Vec::new();
         r.read_to_end(&mut all).unwrap();
         assert_eq!(all, raw);
+    }
+
+    /// Regression: prepared G3 checkpoints must include initial coverage, never a suffix.
+    #[test]
+    fn regression_prepared_index_g3_usable_state_requires_initial_checkpoint() {
+        let data = vec![b'q'; 200_000];
+        let compressed = encode_gz(&data);
+        let mut source = Cursor::new(compressed.clone());
+        let built = build_index(&mut source, 64 * 1024).unwrap();
+        let points: Vec<_> = built
+            .checkpoints
+            .iter()
+            .map(|p| (p.compressed_offset, p.uncompressed_offset))
+            .collect();
+        assert!(points.len() > 1);
+        assert!(gzip_seek_points_usable(&points));
+        assert!(!gzip_seek_points_usable(&[]));
+        assert!(!gzip_seek_points_usable(&points[1..]));
+        assert!(!gzip_seek_points_usable(&[(10, 0), (0, 1)]));
+        assert!(!gzip_seek_points_usable(&[(0, 0), (2, 3), (3, 1)]));
+        import_seek_points_with_mode(
+            &mut Cursor::new(compressed.clone()),
+            &points,
+            64 * 1024,
+            data.len() as u64,
+            true,
+        )
+        .unwrap();
+        let err = import_seek_points_with_mode(
+            &mut Cursor::new(compressed),
+            &points[1..],
+            64 * 1024,
+            data.len() as u64,
+            true,
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("initial checkpoint"));
     }
 }

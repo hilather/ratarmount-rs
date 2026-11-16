@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! QCOW2 virtual-disk mount source.
 //!
 //! Guest clusters are mapped in-process (QCOW2 v2/v3, uncompressed + zlib

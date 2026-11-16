@@ -445,6 +445,10 @@ fn fetch_adc_token() -> Result<CachedToken> {
 fn fetch_adc_token_with_scope(scope: &str) -> Result<CachedToken> {
     let path = non_empty_env("GOOGLE_APPLICATION_CREDENTIALS")
         .ok_or_else(|| gcs_err("GOOGLE_APPLICATION_CREDENTIALS unset"))?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0486-M01","item":"ratarmount_remote::gcs::fetch_adc_token_with_scope","disposition":"out-of-family","category":"configuration-or-credentials","reason":"credentials or client configuration file","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let text = std::fs::read_to_string(&path)
         .map_err(|e| gcs_err(format!("reading ADC file {path}: {e}")))?;
     let sa: serde_json::Value = serde_json::from_str(&text)
@@ -663,6 +667,10 @@ fn content_md5_path(
 )> {
     // Managed (#151): the staged file may be an index open in this process.
     // The MD5 pass and the body are independent cursors of one owner.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0487-M01","item":"ratarmount_remote::gcs::content_md5_path","disposition":"managed-read","regression":"regression_gcs_hash_and_upload_keep_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let owner = ratarmount_index::managed_read::ManagedReadCursor::open(path)
         .map_err(|e| gcs_err(format!("reading {} for Content-MD5: {e}", path.display())))?;
     let mut file = owner.independent_cursor();
@@ -1084,6 +1092,10 @@ pub fn fetch_gcs_to_temp(url_str: &str) -> Result<(NamedTempFile, u64)> {
 }
 
 fn gcs_spool_file() -> Result<NamedTempFile> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0488-M01","item":"ratarmount_remote::gcs::gcs_spool_file","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let tmp = NamedTempFile::new()?;
     #[cfg(unix)]
     {

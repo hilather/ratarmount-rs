@@ -263,6 +263,10 @@ where
                 .into(),
         ));
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0524-M01","item":"ratarmount_remote::smb::fetch_smb_location_to_temp_with","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let tmp = NamedTempFile::new()?;
     let dest = tmp.path().to_path_buf();
     // Runner writes via a separate open of `dest` (smbclient does the same).

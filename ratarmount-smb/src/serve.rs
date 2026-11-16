@@ -886,7 +886,22 @@ impl Session {
             return Err(smb2::STATUS_ACCESS_DENIED);
         }
         let (id, fi) = if dir_opt {
-            self.fs.mkdir(&unix, 0o755)?
+            match self.fs.mkdir(&unix, 0o755) {
+                Ok(created) => created,
+                Err(smb2::STATUS_OBJECT_NAME_COLLISION) if disp == smb2::FILE_OPEN_IF => {
+                    // Another request can create the directory after lookup.
+                    // OPEN_IF opens that winner; FILE_CREATE remains exclusive.
+                    let (id, fi) = self.fs.lookup_path(&unix)?;
+                    if !is_dir_mode(fi.mode) {
+                        return Err(smb2::STATUS_NOT_A_DIRECTORY);
+                    }
+                    self.break_leases_for(id, except_key, new_write);
+                    let meta = self.fs.meta_for(id)?;
+                    let fid = self.alloc_fid(Self::open_from_req(req, id, true));
+                    return Ok((fid, smb2::FILE_OPENED, meta));
+                }
+                Err(status) => return Err(status),
+            }
         } else {
             self.fs.create_file(&unix, 0o644)?
         };

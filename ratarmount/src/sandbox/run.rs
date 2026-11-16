@@ -2,13 +2,16 @@
 
 use crate::control_socket_path;
 use clap::Args;
-use ratarmount_compositing::overlay_changes::{self, ChangeOptions, Normalize};
-use ratarmount_compositing::{overlay_fsck, overlay_seal, OverlayMeta};
+use ratarmount_compositing::OverlayMeta;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::ffi::OsString;
+#[expect(
+    clippy::disallowed_types,
+    reason = r###"internal-read:v1 {"id":"IR-E0136-T01","item":"ratarmount::sandbox::run","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for sandbox run locking and state output.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+)]
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Seek, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -61,6 +64,10 @@ pub struct RunArgs {
     allow: Vec<String>,
     #[arg(long, value_parser = ratarmount_compositing::parse_overlay_size)]
     quota: Option<u64>,
+    /// Overlay database durability of the mount (`relaxed`: no fsyncs; an OS crash can
+    /// corrupt --top, see the mount's `--overlay-durability`).
+    #[arg(long, value_parser = ["full", "relaxed"], default_value = "full")]
+    overlay_durability: String,
     #[arg(long)]
     timeout: Option<u64>,
     #[arg(long, value_parser = ["docker", "podman"])]
@@ -100,7 +107,7 @@ impl ProcessIdentity {
     fn new(pid: u32) -> Self {
         Self {
             pid,
-            start: process_start(pid),
+            start: process_start(pid).ok().flatten(),
         }
     }
 
@@ -109,7 +116,8 @@ impl ProcessIdentity {
             return false;
         }
         if let Some(start) = &self.start {
-            return process_start(self.pid).as_ref() == Some(start);
+            // An unreadable stat is not proof of exit: report busy.
+            return process_start(self.pid).map_or(true, |now| now.as_ref() == Some(start));
         }
         // On platforms without /proc, conservatively treat a live PID as busy.
         unsafe { libc::kill(self.pid as i32, 0) == 0 }
@@ -121,6 +129,10 @@ fn is_runner(pid: u32) -> bool {
     {
         let same_exe =
             fs::read_link(format!("/proc/{pid}/exe")).ok() == std::env::current_exe().ok();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0117-M01","item":"ratarmount::sandbox::run::is_runner","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let argv = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
         let words: Vec<_> = argv.split(|b| *b == 0).collect();
         same_exe
@@ -135,14 +147,219 @@ fn is_runner(pid: u32) -> bool {
     }
 }
 
-fn process_start(pid: u32) -> Option<String> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+/// The start time of a live, non-zombie `pid`. `Ok(None)` means the process
+/// is gone (or a zombie); any other read failure (EMFILE, EIO, ...) is an
+/// error, never evidence that the process exited.
+fn process_start(pid: u32) -> io::Result<Option<String>> {
+    #[cfg(all(test, target_os = "linux"))]
+    cleanup_test_hooks::stat(pid)?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0118-M01","item":"ratarmount::sandbox::run::process_start","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    };
     // comm can contain spaces and ')'; starttime is field 22.
-    let fields = stat.rsplit_once(") ")?.1;
+    let malformed = || io::Error::other(format!("malformed /proc/{pid}/stat"));
+    let fields = stat.rsplit_once(") ").ok_or_else(malformed)?.1;
     if fields.starts_with("Z ") {
-        return None;
+        return Ok(None);
     }
-    Some(fields.split_whitespace().nth(19)?.into())
+    Ok(Some(
+        fields
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(malformed)?
+            .into(),
+    ))
+}
+
+/// Send `signal` to the recorded process; returns whether it was sent. On Linux
+/// with pidfds (5.3+), open the pidfd before comparing start times and signal
+/// through it, so a reused PID cannot receive the signal. On ENOSYS (older
+/// kernels), compare then kill(2), narrowing but not closing the reuse race.
+/// Without a usable recorded or current start time (e.g. no /proc, macOS),
+/// never signal the recorded PID.
+fn signal_recorded(identity: &ProcessIdentity, signal: libc::c_int) -> io::Result<bool> {
+    #[cfg(all(test, target_os = "linux"))]
+    cleanup_test_hooks::signal(identity.pid, signal)?;
+    let (Some(start), Ok(pid @ 1..)) = (identity.start.as_deref(), i32::try_from(identity.pid))
+    else {
+        return Ok(false);
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::io::Errno;
+        use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
+        let named = Signal::from_named_raw(signal)
+            .ok_or_else(|| io::Error::other(format!("unnamed signal {signal}")))?;
+        let Some(pid) = Pid::from_raw(pid) else {
+            return Ok(false);
+        };
+        match pidfd_open(pid, PidfdFlags::empty()) {
+            // A stat read error (e.g. EMFILE while the pidfd is held) is
+            // returned, so the caller keeps the record and retries.
+            Ok(pidfd) if process_start(identity.pid)?.as_deref() == Some(start) => {
+                return match pidfd_send_signal(&pidfd, named) {
+                    Ok(()) => Ok(true),
+                    Err(Errno::SRCH) => Ok(false),
+                    Err(error) => Err(error.into()),
+                };
+            }
+            // Another process has the PID now, or the recorded one exited. EINVAL
+            // (before Linux 6.9) means the PID names a thread, never a recorded
+            // process: records hold process IDs (`Child::id()`).
+            Ok(_) | Err(Errno::SRCH | Errno::INVAL) => return Ok(false),
+            // No pidfds before Linux 5.3: compare and signal by number below.
+            Err(Errno::NOSYS) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if process_start(identity.pid)?.as_deref() != Some(start) {
+        return Ok(false);
+    }
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        return Ok(true);
+    }
+    match io::Error::last_os_error() {
+        error if error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        error => Err(error),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod cleanup_test_hooks {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum Event {
+        StopEntry,
+        Runtime(String),
+        Signal {
+            pid: u32,
+            signal: i32,
+            injected: bool,
+        },
+        Unmount {
+            path: PathBuf,
+            occurrence: usize,
+            injected: bool,
+        },
+        Warning(String),
+    }
+
+    struct State {
+        signal: (u32, i32),
+        unmount_fault: Option<usize>,
+        unmount_count: usize,
+        events: Vec<Event>,
+    }
+
+    thread_local! {
+        static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+        static STAT_FAULT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Fail `/proc/<pid>/stat` reads for `pid` with EMFILE on this thread.
+    pub struct StatFault;
+    impl StatFault {
+        pub fn arm(pid: u32) -> Self {
+            STAT_FAULT.set(Some(pid));
+            Self
+        }
+    }
+    impl Drop for StatFault {
+        fn drop(&mut self) {
+            STAT_FAULT.set(None);
+        }
+    }
+
+    pub fn stat(pid: u32) -> io::Result<()> {
+        if STAT_FAULT.get() == Some(pid) {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        Ok(())
+    }
+
+    pub struct Guard;
+    impl Guard {
+        pub fn arm(pid: u32, signal: i32, unmount_fault: Option<usize>) -> Self {
+            STATE.with_borrow_mut(|state| {
+                assert!(state.is_none(), "cleanup fault guards must not nest");
+                *state = Some(State {
+                    signal: (pid, signal),
+                    unmount_fault,
+                    unmount_count: 0,
+                    events: Vec::new(),
+                });
+            });
+            Self
+        }
+
+        pub fn events(&self) -> Vec<Event> {
+            STATE.with_borrow(|state| state.as_ref().unwrap().events.clone())
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            STATE.with_borrow_mut(|state| *state = None);
+        }
+    }
+
+    pub fn record(event: Event) {
+        STATE.with_borrow_mut(|state| {
+            if let Some(state) = state {
+                if event == Event::StopEntry {
+                    state.unmount_count = 0;
+                }
+                state.events.push(event);
+            }
+        });
+    }
+
+    pub fn signal(pid: u32, signal: i32) -> io::Result<()> {
+        STATE.with_borrow_mut(|state| {
+            if let Some(state) = state {
+                let injected = state.signal == (pid, signal);
+                state.events.push(Event::Signal {
+                    pid,
+                    signal,
+                    injected,
+                });
+                if injected {
+                    return Err(io::Error::other("injected-signal"));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn unmount(path: &Path) -> io::Result<()> {
+        STATE.with_borrow_mut(|state| {
+            if let Some(state) = state {
+                state.unmount_count += 1;
+                let injected = state.unmount_fault == Some(state.unmount_count);
+                state.events.push(Event::Unmount {
+                    path: path.into(),
+                    occurrence: state.unmount_count,
+                    injected,
+                });
+                if injected {
+                    return Err(io::Error::other("injected-unmount"));
+                }
+            }
+            Ok(())
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -163,14 +380,32 @@ struct PidRecord {
 struct RunLock(File);
 impl RunLock {
     fn acquire(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
+        let file = {
+            #[expect(
+                clippy::disallowed_types,
+                reason = r###"internal-read:v1 {"id":"IR-B0119-T01","item":"<ratarmount::sandbox::run::RunLock>::acquire","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+            )]
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0119-M01","item":"<ratarmount::sandbox::run::RunLock>::acquire","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
+            )]
+            let mut __inventory_value_0 = OpenOptions::new();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0137-M01","item":"<ratarmount::sandbox::run::RunLock>::acquire","disposition":"output-owner","category":"runtime-lock","reason":"Permit creating the sandbox run coordination lock without truncating its inode.","creation":{"policy":"create-or-open","basis":"The lock uses mode 0600 and NOFOLLOW/CLOEXEC, truncate(false), and a nonblocking exclusive flock retained in RunLock."}}"###
+            )]
+            let __inventory_value_1 = __inventory_value_0.read(true).write(true).create(true);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0119-M02","item":"<ratarmount::sandbox::run::RunLock>::acquire","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_2 = __inventory_value_1
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path);
+            __inventory_value_2
+        }?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::other("another sandbox run owns this top"));
         }
@@ -237,6 +472,10 @@ fn absolute_top(top: &Path) -> io::Result<PathBuf> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("--top needs a parent"))?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0138-M01","item":"ratarmount::sandbox::run::absolute_top","disposition":"output-owner","category":"sandbox-parent-directory","reason":"Create the parent of the requested absolute sandbox top before canonicalizing it.","creation":{"policy":"recursive-directory","basis":"The top name must identify a child rather than /; its parent is canonicalized and an existing top is checked against symlink/non-directory substitution."}}"###
+    )]
     fs::create_dir_all(parent)?;
     let path = parent.canonicalize()?.join(name);
     if let Ok(meta) = fs::symlink_metadata(&path) {
@@ -355,12 +594,22 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> 
     }
 }
 fn runtime_control(record: &PidRecord, verb: &str) -> io::Result<()> {
+    #[cfg(all(test, target_os = "linux"))]
+    cleanup_test_hooks::record(cleanup_test_hooks::Event::Runtime(verb.into()));
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0120-M01","item":"ratarmount::sandbox::run::runtime_control","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut diagnostic = tempfile::tempfile()?;
     let mut command = Command::new(&record.runtime);
     command.arg(verb);
     if verb == "rm" {
         command.arg("-f");
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0121-M01","item":"ratarmount::sandbox::run::runtime_control","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"child stdio setup","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut child = command
         .arg(&record.container)
         .stdin(Stdio::null())
@@ -392,6 +641,8 @@ fn mounted(path: &Path) -> io::Result<bool> {
     Ok(super::process::mountpoints()?.iter().any(|p| p == path))
 }
 fn unmount(path: &Path) -> io::Result<()> {
+    #[cfg(all(test, target_os = "linux"))]
+    cleanup_test_hooks::unmount(path)?;
     if !mounted(path)? {
         return Ok(());
     }
@@ -470,9 +721,24 @@ fn create_run_dir_in(default: &Path) -> io::Result<PathBuf> {
         // `/tmp` is a symlink to `/private/tmp` on macOS; the directory is
         // judged (and later canonicalized) at its resolved, longer path.
         let tmp = Path::new("/tmp");
-        builder.tempdir_in(tmp.canonicalize().as_deref().unwrap_or(tmp))?
+        {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0122-M01","item":"ratarmount::sandbox::run::create_run_dir_in","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_0 =
+                builder.tempdir_in(tmp.canonicalize().as_deref().unwrap_or(tmp));
+            __inventory_value_0
+        }?
     } else {
-        builder.tempdir_in(default)?
+        {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0123-M01","item":"ratarmount::sandbox::run::create_run_dir_in","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_0 = builder.tempdir_in(default);
+            __inventory_value_0
+        }?
     };
     // Created with the umask's mode: restrict it before anything is placed
     // inside (the mode is asserted, not assumed).
@@ -523,6 +789,10 @@ struct Cleanup {
 }
 impl Cleanup {
     fn save(&self) -> io::Result<()> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0124-M01","item":"<ratarmount::sandbox::run::Cleanup>::save","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
         let mut file = tempfile::NamedTempFile::new_in(self.pid_file.parent().unwrap())?;
         serde_json::to_writer(&mut file, &self.record)?;
         file.as_file().sync_all()?;
@@ -531,6 +801,14 @@ impl Cleanup {
     }
 
     fn stop_runtime(&mut self) -> io::Result<()> {
+        let mut signal_error = None;
+        let result = self.stop_runtime_steps(&mut signal_error);
+        signal_error.map_or(result, Err)
+    }
+
+    // Keep signal errors separate so stop() can prefer the first one even if
+    // another cleanup step fails. A failed signal leaves runtime_stopped false.
+    fn stop_runtime_steps(&mut self, signal_error: &mut Option<io::Error>) -> io::Result<()> {
         if self.runtime_stopped {
             return Ok(());
         }
@@ -540,11 +818,7 @@ impl Cleanup {
         if let Some(mut child) = self.runtime_child.take() {
             let _ = wait_bounded(&mut child, CLEANUP_TIMEOUT);
         } else if let Some(child) = &self.record.runtime_child {
-            if child.start.is_some() && child.alive() {
-                unsafe {
-                    libc::kill(child.pid as i32, libc::SIGKILL);
-                }
-            }
+            *signal_error = signal_recorded(child, libc::SIGKILL).err();
         }
         if had_client {
             // A timeout can fire before `run` has created the container. Reap
@@ -554,39 +828,51 @@ impl Cleanup {
         } else {
             kill_result.and(rm_result)?;
         }
-        self.runtime_stopped = true;
+        if signal_error.is_none() {
+            self.runtime_stopped = true;
+        }
         Ok(())
     }
 
     fn stop(&mut self) -> io::Result<()> {
+        #[cfg(all(test, target_os = "linux"))]
+        cleanup_test_hooks::record(cleanup_test_hooks::Event::StopEntry);
         if self.stopped {
             return Ok(());
         }
         // Attempt all cleanup steps even if the runtime is broken.
-        let runtime_result = self.stop_runtime();
+        let mut signal_error = None;
+        let runtime_result = self.stop_runtime_steps(&mut signal_error);
         let unmount_result = unmount(&self.record.mountpoint);
         if let Some(mut child) = self.mount_child.take() {
             let _ = wait_bounded(&mut child, CLEANUP_TIMEOUT);
         } else if let Some(child) = &self.record.mount_child {
-            // A stale foreground child may still be initializing. Never signal a reused PID.
-            if child.start.is_some() && child.alive() {
-                unsafe {
-                    libc::kill(child.pid as i32, libc::SIGTERM);
-                }
-                let start = Instant::now();
-                while child.alive() && start.elapsed() < CLEANUP_TIMEOUT {
-                    std::thread::sleep(POLL);
-                }
-                if child.alive() {
-                    unsafe {
-                        libc::kill(child.pid as i32, libc::SIGKILL);
+            // A stale foreground child may still be initializing.
+            match signal_recorded(child, libc::SIGTERM) {
+                Ok(true) => {
+                    let start = Instant::now();
+                    while child.alive() && start.elapsed() < CLEANUP_TIMEOUT {
+                        std::thread::sleep(POLL);
                     }
+                    if let Err(error) = signal_recorded(child, libc::SIGKILL) {
+                        signal_error.get_or_insert(error);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    signal_error.get_or_insert(error);
                 }
             }
         }
         // Catch a mount that completed while the stale child was being stopped.
+        let second_unmount_result = unmount(&self.record.mountpoint);
+        // Return the first signal failure after the remaining stop steps, and
+        // before marking success, so Drop retries and retains the PID record.
+        if let Some(error) = signal_error {
+            return Err(error);
+        }
         unmount_result?;
-        unmount(&self.record.mountpoint)?;
+        second_unmount_result?;
         runtime_result?;
         let source = self.record.ram_top.as_deref().unwrap_or(&self.top);
         wait_database(source)?;
@@ -617,7 +903,12 @@ impl Drop for Cleanup {
             Ok(()) => {
                 let _ = fs::remove_file(&self.pid_file);
             }
-            Err(error) => eprintln!("{}", cleanup_warning(&error, &self.pid_file)),
+            Err(error) => {
+                let warning = cleanup_warning(&error, &self.pid_file);
+                #[cfg(all(test, target_os = "linux"))]
+                cleanup_test_hooks::record(cleanup_test_hooks::Event::Warning(warning.clone()));
+                eprintln!("{warning}");
+            }
         }
     }
 }
@@ -633,6 +924,10 @@ fn cleanup_warning(error: &io::Error, pid_file: &Path) -> String {
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0139-M01","item":"ratarmount::sandbox::run::copy_tree","disposition":"output-owner","category":"sandbox-recovery-directory","reason":"Create the recovery-copy destination before recursively copying the sandbox tree.","creation":{"policy":"recursive-directory","basis":"The recovery copier checks and removes incompatible existing destinations without following their symlinks; directory defaults remain unchanged."}}"###
+    )]
     fs::create_dir_all(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
@@ -650,7 +945,15 @@ fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
         } else if meta.is_dir() {
             copy_tree(&entry.path(), &target)?;
         } else if meta.is_file() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0125-M01","item":"ratarmount::sandbox::run::copy_tree","disposition":"out-of-family","category":"patch-or-bundle-input","reason":"copy of the run's result tree for the report","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
             fs::copy(entry.path(), &target)?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0126-M01","item":"ratarmount::sandbox::run::copy_tree","disposition":"out-of-family","category":"patch-or-bundle-input","reason":"copy of the run's result tree for the report","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             File::open(&target)?
                 .set_times(std::fs::FileTimes::new().set_modified(meta.modified()?))?;
         } else {
@@ -664,6 +967,10 @@ fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 fn recover(pid_file: &Path, top: &Path) -> io::Result<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0127-M01","item":"ratarmount::sandbox::run::recover","disposition":"out-of-family","category":"structured-control-record","reason":"sandbox supervisor/run state or attempt log","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let bytes = match fs::read(pid_file) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -712,6 +1019,10 @@ fn mount_argv(args: &RunArgs, top: &Path, mount: &Path, journal: &Path) -> Vec<O
     }
     if args.journal {
         argv.extend(["--journal".into(), journal.into()]);
+    }
+    // Only when chosen: a `full` run keeps its historical argv (#328).
+    if args.overlay_durability == "relaxed" {
+        argv.push("--overlay-durability=relaxed".into());
     }
     // Before `--`: after it clap would read the flag as a positional input.
     match &args.base_digest {
@@ -871,6 +1182,10 @@ fn pipeline(args: &RunArgs) -> io::Result<Value> {
         .to_string_lossy()
         .into_owned();
     let mountpoint = control_dir.join("mnt");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0140-M01","item":"ratarmount::sandbox::run::pipeline","disposition":"output-owner","category":"sandbox-mountpoint","reason":"Create the pipeline mountpoint beneath its fresh canonical control directory.","creation":{"policy":"exclusive-directory","basis":"create_dir starts a new child and set_permissions immediately applies 0700 before mount/runtime publication."}}"###
+    )]
     fs::create_dir(&mountpoint)?;
     fs::set_permissions(
         &mountpoint,
@@ -898,6 +1213,10 @@ fn pipeline(args: &RunArgs) -> io::Result<Value> {
     cleanup.save()?;
     let journal = sidecar(&top, ".journal.jsonl");
     let overlay = cleanup.record.ram_top.as_deref().unwrap_or(&top);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0128-M01","item":"ratarmount::sandbox::run::pipeline","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut mount_stderr = tempfile::tempfile()?;
     if !args.json {
         eprintln!(
@@ -914,8 +1233,16 @@ fn pipeline(args: &RunArgs) -> io::Result<Value> {
         ))
         .env("TMPDIR", &control_dir)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(mount_stderr.try_clone()?))
-        .stderr(Stdio::from(mount_stderr.try_clone()?))
+        .stdout(Stdio::from({
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0129-M01","item":"ratarmount::sandbox::run::pipeline","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"child stdio setup","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
+let __inventory_value_0 = mount_stderr.try_clone();
+__inventory_value_0
+}?))
+        .stderr(Stdio::from({
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0130-M01","item":"ratarmount::sandbox::run::pipeline","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"child stdio setup","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
+let __inventory_value_0 = mount_stderr.try_clone();
+__inventory_value_0
+}?))
         .spawn()?;
     let control_socket = control_socket_path(&control_dir, child.id());
     cleanup.record.mount_child = Some(ProcessIdentity::new(child.id()));
@@ -1004,86 +1331,52 @@ fn finish(args: &RunArgs, top: &Path, journal: &Path, execution: Execution) -> i
         bytes_written,
         start,
     } = execution;
-    let fsck = overlay_fsck::fsck(top, true)?;
-    if !fsck.is_clean() {
-        return Err(io::Error::other(format!("fsck: {}", fsck.result())));
-    }
     // Factory and lazy source progress must never contaminate the JSON report.
     let _progress = crate::diff::ProgressToStderr::new()?;
-    // The base is classified through the factory and gated against what the
-    // overlay recorded BEFORE anything is sealed or packed: a base edited
-    // during the run fails closed instead of being sealed as if unchanged.
-    let recorded = OverlayMeta::read(top).map_err(io::Error::other)?;
-    let base = crate::overlay_cmd::classify_base(
-        Some(&args.base),
-        recorded.as_ref(),
-        None,
-        &crate::base_identity::OverlayRunContext::default(),
-    )
-    .map_err(io::Error::other)?;
-    crate::overlay_cmd::gate_base(
-        top,
-        recorded.as_ref(),
-        &base,
-        &crate::overlay_cmd::BaseIdentityArgs {
-            force_base_mismatch: false,
+    let mut classify = |recorded: Option<&OverlayMeta>| {
+        crate::overlay_cmd::classify_base(
+            Some(&args.base),
+            recorded,
+            None,
+            &crate::base_identity::OverlayRunContext::default(),
+        )
+        .map_err(io::Error::other)
+    };
+    let mut compose = |source| {
+        crate::MountLowerStack::compose(source, &args.lower, &crate::lower_stack_services())
+    };
+    let manifest = sidecar(top, ".manifest.jsonl");
+    let summary = sidecar(top, ".journal.summary.json");
+    let finalized = super::finalize::finalize_top(
+        super::finalize::FinalizeTop {
+            top,
+            repair: super::finalize::Repair::Always,
+            classify: &mut classify,
+            compose: &mut compose,
             base_digest: match &args.base_digest {
                 Some(ratarmount_compositing::BaseDigestRequest::Supplied(digest)) => {
                     Some(digest.clone())
                 }
                 _ => None,
             },
+            seal: (args.seal || args.pack.is_some()).then_some(None),
+            pack: args.pack.as_deref().map(|bundle| super::finalize::Pack {
+                bundle,
+                journal: args.journal.then_some(journal),
+            }),
+            manifest: &manifest,
+            journal: args.journal.then_some((journal, summary.as_path())),
+            #[cfg(test)]
+            before_meta_read: None,
         },
-    )
-    .map_err(io::Error::other)?;
-    let lower = crate::MountLowerStack::compose(
-        base.source(),
-        &args.lower,
-        &crate::lower_stack_services(),
+        &mut super::finalize::FinalizeProgress::default(),
     )?;
-    if args.seal || args.pack.is_some() {
-        overlay_seal::seal(top, &base, lower.clone())?;
-    }
-    let bundle = args.pack.as_ref().map(std::path::absolute).transpose()?;
-    if let Some(bundle) = &bundle {
-        crate::overlay_pack::pack(
-            top,
-            bundle,
-            lower.clone(),
-            &crate::overlay_pack::PackOptions {
-                include_journal: args.journal.then(|| journal.to_path_buf()),
-                ..Default::default()
-            },
-        )?;
-    }
-    let options = ChangeOptions {
-        normalize: Normalize::Strict,
-        ..Default::default()
-    };
-    let changes = overlay_changes::change_set(top, lower, &options)?;
-    let hash = overlay_changes::canonical_hash(&changes, &options)?;
-    let manifest = sidecar(top, ".manifest.jsonl");
-    overlay_changes::write_manifest(&changes, &mut File::create(&manifest)?)?;
-    let meta = OverlayMeta::read(top)
-        .map_err(io::Error::other)?
-        .ok_or_else(|| io::Error::other("overlay metadata missing"))?;
-    let summary = if args.journal {
-        let summary =
-            crate::journal_cmd::summarize(BufReader::new(File::open(journal)?), None, None)?;
-        let path = sidecar(top, ".journal.summary.json");
-        serde_json::to_writer(File::create(&path)?, &summary)?;
-        Some(
-            json!({"path":path, "files_read":summary.files_read.len(), "files_read_then_written":summary.files_read_then_written.len(), "files_written_blind":summary.files_written_blind.len()}),
-        )
-    } else {
-        None
-    };
     Ok(json!({
         "exit_code":exit_code, "timed_out":timed_out, "interrupted":SIGNAL.load(Ordering::Relaxed) != 0,
         "wall_time_s":start.elapsed().as_secs_f64(),
-        "patch_hash":{"patch":hash, "base":meta.known_base_digest(), "stack":meta.stack_digest(), "files":changes.len(), "normalize":"strict", "algo":"sha256", "excludes":[], "sealed":meta.layer_sealed(), "base_pending":meta.base_digest_kind() == Some("pending"), "base_digest_state":meta.base_digest_state()},
-        "manifest_path":manifest, "journal_summary":summary, "overlay":top, "bundle":bundle,
-        "erofs_denied":erofs_denied, "bytes_written":bytes_written, "fsck_result":fsck.result()
+        "patch_hash":finalized.patch_hash(),
+        "manifest_path":finalized.manifest, "journal_summary":finalized.journal_summary, "overlay":top, "bundle":finalized.bundle,
+        "erofs_denied":erofs_denied, "bytes_written":bytes_written, "fsck_result":finalized.fsck_result
     }))
 }
 
@@ -1091,6 +1384,7 @@ fn finish(args: &RunArgs, top: &Path, journal: &Path, execution: Execution) -> i
 mod tests {
     use super::*;
     use clap::Parser;
+    use ratarmount_compositing::overlay_changes::{self, ChangeOptions, Normalize};
     use ratarmount_compositing::HIDDEN_DB;
     use std::sync::Arc;
 
@@ -1189,6 +1483,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Regression (#328): `--overlay-durability relaxed` reaches the mount
+    /// before `--`, and the default leaves the historical argv unchanged.
+    #[test]
+    fn regression_run_mount_argv_passes_overlay_durability() {
+        let full = mount_argv(
+            &args(&[]),
+            Path::new("/top"),
+            Path::new("/mnt"),
+            Path::new("/j"),
+        );
+        assert!(!full
+            .iter()
+            .any(|a| a.to_string_lossy().contains("durability")));
+        let explicit = mount_argv(
+            &args(&["--overlay-durability", "full"]),
+            Path::new("/top"),
+            Path::new("/mnt"),
+            Path::new("/j"),
+        );
+        assert_eq!(explicit, full);
+        let relaxed = mount_argv(
+            &args(&["--overlay-durability", "relaxed"]),
+            Path::new("/top"),
+            Path::new("/mnt"),
+            Path::new("/j"),
+        );
+        let separator = relaxed.iter().position(|a| a == "--").unwrap();
+        let at = relaxed
+            .iter()
+            .position(|a| a == "--overlay-durability=relaxed")
+            .unwrap();
+        assert!(at < separator);
+        assert_eq!(&relaxed[separator + 1..], ["/base", "/mnt"]);
+        assert_eq!(relaxed.len(), full.len() + 1);
     }
 
     /// Regression: a `--top` inside a directory `--base` would be hashed as base content.
@@ -1381,6 +1711,9 @@ mod tests {
     /// stderr unredacted, so a credentialed URL it echoed reached the terminal.
     #[test]
     fn regression_run_cleanup_warning_is_redacted() {
+        // Exclude children while writing the executable fixture as well as
+        // through Cleanup::drop; a child can inherit the writable fd (#242).
+        let _processes = ratarmount_index::test_process::exclusive();
         let dir = tempfile::tempdir().unwrap();
         let runtime = dir.path().join("runtime.sh");
         fs::write(
@@ -1409,7 +1742,10 @@ mod tests {
             runtime_stopped: false,
         };
         let error = cleanup.stop().unwrap_err();
-        assert!(error.to_string().contains("hunter2"), "stub did not echo");
+        assert!(
+            error.to_string().contains("hunter2"),
+            "stub did not echo: {error}"
+        );
         let warning = cleanup_warning(&error, &pid_file);
         for secret in ["hunter2", "SECRETTOK", "admin"] {
             assert!(!warning.contains(secret), "{warning}");
@@ -1468,6 +1804,7 @@ mod tests {
     /// Regression: stale recovery must stop the old runtime, copy RAM data, and retire its PID record.
     #[test]
     fn regression_run_stale_recovery_copies_ram_and_retires_record() {
+        let _processes = ratarmount_index::test_process::exclusive();
         let temp = tempfile::tempdir().unwrap();
         let runtime = temp.path().join("runtime");
         fs::write(
@@ -1510,6 +1847,7 @@ mod tests {
     /// Regression: a failed runtime removal must not be mistaken for an already removed container.
     #[test]
     fn regression_run_cleanup_failure_keeps_recovery_record() {
+        let _processes = ratarmount_index::test_process::exclusive();
         let temp = tempfile::tempdir().unwrap();
         let runtime = temp.path().join("runtime");
         fs::write(
@@ -1543,6 +1881,7 @@ mod tests {
     /// Regression: timeout during container creation must remove a container published after the first rm.
     #[test]
     fn regression_run_timeout_during_runtime_start_removes_late_container() {
+        let _processes = ratarmount_index::test_process::exclusive();
         let temp = tempfile::tempdir().unwrap();
         let runtime = temp.path().join("runtime");
         fs::write(&runtime, b"#!/bin/sh\ncase $1 in\nrun) sleep 0.1; touch \"$0.container\" ;;\nrm) rm -f \"$0.container\" ;;\nesac\n").unwrap();
@@ -1577,6 +1916,14 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper for regression_run_child_dies_with_supervisor"]
     fn run_child_death_probe() {
+        if !crate::child_helpers::spawned_by_parent(
+            crate::child_helpers::RUN_DEATH_PROBE_CHILD,
+            "run_child_death_probe",
+            "regression_run_child_dies_with_supervisor",
+        ) {
+            return;
+        }
+        let _processes = ratarmount_index::test_process::spawning();
         let Some(marker) = std::env::var_os("RATARMOUNT_RUN_DEATH_PROBE") else {
             return;
         };
@@ -1595,6 +1942,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn regression_run_child_dies_with_supervisor() {
+        let _processes = ratarmount_index::test_process::spawning();
         if !Path::new("/bin/sleep").exists() {
             eprintln!("skip: /bin/sleep unavailable");
             return;
@@ -1608,6 +1956,7 @@ mod tests {
                 "--ignored",
             ])
             .env("RATARMOUNT_RUN_DEATH_PROBE", &marker)
+            .env(crate::child_helpers::RUN_DEATH_PROBE_CHILD, "1")
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
@@ -1633,6 +1982,409 @@ mod tests {
             std::thread::sleep(POLL);
         }
         assert!(!child.alive(), "child outlived its killed supervisor");
+    }
+
+    /// Regression: stale-run recovery signals only the process a record names:
+    /// never a live process at the recorded PID with another start time (a
+    /// reused PID), a record without a start time, PID 0 (this process group),
+    /// a PID outside `pid_t`, or a reaped child. `signal_recorded` also opens
+    /// its pidfd before comparing start times, which closes the window between
+    /// the comparison and the signal; no test can force that window.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_run_signal_recorded_requires_the_recorded_identity() {
+        use std::os::unix::process::ExitStatusExt;
+        let _processes = ratarmount_index::test_process::spawning();
+        if !Path::new("/bin/sleep").exists() {
+            eprintln!("skip: /bin/sleep unavailable");
+            return;
+        }
+        let mut child = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let recorded = ProcessIdentity::new(child.id());
+        assert!(recorded.start.is_some());
+        for other in [
+            ProcessIdentity {
+                pid: child.id(),
+                start: Some("0".into()),
+            },
+            ProcessIdentity {
+                pid: child.id(),
+                start: None,
+            },
+            ProcessIdentity {
+                pid: 0,
+                start: recorded.start.clone(),
+            },
+            ProcessIdentity {
+                pid: u32::MAX,
+                start: recorded.start.clone(),
+            },
+        ] {
+            assert!(
+                !signal_recorded(&other, libc::SIGKILL).unwrap(),
+                "{other:?}"
+            );
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a record that does not name the child signalled it"
+        );
+        {
+            // A stat read failure after the pidfd is open is an error, not a
+            // missing process, and nothing is signalled.
+            let _fault = cleanup_test_hooks::StatFault::arm(child.id());
+            let error = signal_recorded(&recorded, libc::SIGKILL).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+            assert!(recorded.alive(), "an unreadable stat must count as busy");
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a stat read failure signalled the child"
+        );
+        assert!(signal_recorded(&recorded, libc::SIGTERM).unwrap());
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+        assert!(!signal_recorded(&recorded, libc::SIGKILL).unwrap());
+    }
+
+    /// Regression: stale-run recovery stops the recorded mount child (SIGTERM)
+    /// and runtime client (SIGKILL), and leaves alone live processes that hold
+    /// a recorded PID with another start time (the PID was reused).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_run_stale_recovery_never_signals_a_reused_pid() {
+        use std::os::unix::process::ExitStatusExt;
+        let _processes = ratarmount_index::test_process::exclusive();
+        if !Path::new("/bin/sleep").exists() {
+            eprintln!("skip: /bin/sleep unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        fs::write(&runtime, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        for reused in [true, false] {
+            let mut mount = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+            let mut client = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+            let identity = |child: &Child| ProcessIdentity {
+                pid: child.id(),
+                start: if reused {
+                    Some("0".into())
+                } else {
+                    process_start(child.id()).unwrap()
+                },
+            };
+            let top = temp.path().join(format!("top-{reused}"));
+            let pid = pid_path(&top);
+            let record = PidRecord {
+                owner: ProcessIdentity {
+                    pid: 0,
+                    start: None,
+                },
+                mountpoint: temp.path().join(format!("mount-{reused}")),
+                container: "ratarmount-run-stale".into(),
+                runtime: runtime.clone(),
+                mount_child: Some(identity(&mount)),
+                runtime_child: Some(identity(&client)),
+                ram_top: None,
+            };
+            fs::write(&pid, serde_json::to_vec(&record).unwrap()).unwrap();
+            recover(&pid, &top).unwrap();
+            assert!(!pid.exists());
+            if reused {
+                assert!(
+                    mount.try_wait().unwrap().is_none(),
+                    "reused mount PID signalled"
+                );
+                assert!(
+                    client.try_wait().unwrap().is_none(),
+                    "reused client PID signalled"
+                );
+                for mut child in [mount, client] {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                }
+            } else {
+                assert_eq!(mount.wait().unwrap().signal(), Some(libc::SIGTERM));
+                assert_eq!(client.wait().unwrap().signal(), Some(libc::SIGKILL));
+            }
+        }
+    }
+
+    /// Regression: stopping the runtime alone discarded a stale client's signal
+    /// failure and set runtime_stopped, preventing the later cleanup retry.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_run_stop_runtime_retains_record_when_signal_fails() {
+        use std::os::unix::process::ExitStatusExt;
+
+        struct LiveChild(Child);
+        impl Drop for LiveChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let _processes = ratarmount_index::test_process::exclusive();
+        let temp = tempfile::tempdir().unwrap();
+        let mut child = LiveChild(Command::new("sleep").arg("60").spawn().unwrap());
+        let top = temp.path().join("top");
+        let pid = pid_path(&top);
+        let mut cleanup = Cleanup {
+            control_dir: None,
+            record: PidRecord {
+                owner: ProcessIdentity {
+                    pid: 0,
+                    start: None,
+                },
+                mountpoint: temp.path().join("not-mounted"),
+                container: "ratarmount-run-runtime-fault".into(),
+                runtime: "/bin/true".into(),
+                mount_child: None,
+                runtime_child: Some(ProcessIdentity::new(child.0.id())),
+                ram_top: None,
+            },
+            pid_file: pid.clone(),
+            top: top.clone(),
+            mount_child: None,
+            runtime_child: None,
+            stopped: false,
+            runtime_stopped: false,
+        };
+        cleanup.save().unwrap();
+        let fault = cleanup_test_hooks::Guard::arm(child.0.id(), libc::SIGKILL, None);
+        let result = cleanup.stop_runtime();
+        let runtime_stopped = cleanup.runtime_stopped;
+        drop(cleanup); // Fault stays armed through the full cleanup retry.
+        let retained = pid.exists();
+        drop(fault);
+        // Observe recovery's exit before the guard's emergency cleanup can
+        // signal anything, so a failed recovery cannot pass this assertion.
+        let retry = recover(&pid, &top);
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "recovery left the runtime client running"
+            );
+            std::thread::sleep(POLL);
+        };
+        assert_eq!(result.unwrap_err().to_string(), "injected-signal");
+        assert!(!runtime_stopped);
+        assert!(retained);
+        retry.unwrap();
+        assert!(!pid.exists());
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    /// Regression: a failed stale-child signal was discarded, retiring the PID
+    /// record. Keep it across Drop's retry, finish the runtime/unmount steps,
+    /// and prefer the signal error over a later rm or second-unmount failure.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_run_stale_recovery_retains_record_when_signal_fails() {
+        use cleanup_test_hooks::{Event, Guard};
+        use std::os::unix::process::ExitStatusExt;
+
+        struct LiveChild(Child);
+        impl Drop for LiveChild {
+            fn drop(&mut self) {
+                if self.0.try_wait().unwrap().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+
+        // Exclude other spawns before writing the executable fixture and keep
+        // the guard through both recoveries, including Cleanup's Drop retries.
+        let _processes = ratarmount_index::test_process::exclusive();
+        for (case, runtime_child, ignore_term, fail_rm, fail_unmount) in [
+            ("a", true, false, false, false),
+            ("b", false, false, false, false),
+            ("c", false, true, false, false),
+            ("d", true, false, true, false),
+            ("e", false, false, false, true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let runtime = temp.path().join("runtime");
+            let mut script = String::from("#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$0.log\"\n");
+            if fail_rm {
+                script.push_str(
+                    "if [ \"$1\" = rm ]; then\n n=0\n if [ -f \"$0.rm-count\" ]; then read -r n < \"$0.rm-count\"; fi\n n=$((n + 1))\n printf '%s\\n' \"$n\" > \"$0.rm-count\"\n if [ \"$n\" = 2 ]; then : > \"$0.rm-failed\"; exit 1; fi\nfi\n",
+                );
+            }
+            script.push_str("exit 0\n");
+            fs::write(&runtime, script).unwrap();
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+            let readyfile = temp.path().join("ready");
+            let mut child = LiveChild(if ignore_term {
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(r#"trap "" TERM; : > "$1"; exec sleep 60"#)
+                    .arg("sh")
+                    .arg(&readyfile)
+                    .spawn()
+                    .unwrap()
+            } else {
+                Command::new("sleep").arg("60").spawn().unwrap()
+            });
+            if ignore_term {
+                let start = Instant::now();
+                while !readyfile.exists() {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(10),
+                        "case {case}: child readiness timed out"
+                    );
+                    std::thread::sleep(POLL);
+                }
+            }
+            let identity = ProcessIdentity::new(child.0.id());
+            assert!(
+                identity.start.is_some(),
+                "case {case}: missing child start time"
+            );
+            let signal = if runtime_child || ignore_term {
+                libc::SIGKILL
+            } else {
+                libc::SIGTERM
+            };
+            let child_pid = child.0.id();
+            let signal_event = |signal, injected| Event::Signal {
+                pid: child_pid,
+                signal,
+                injected,
+            };
+            let top = temp.path().join("top");
+            let pid = pid_path(&top);
+            let mountpoint = temp.path().join("not-mounted");
+            fs::create_dir(&mountpoint).unwrap();
+            let mut record = PidRecord {
+                owner: ProcessIdentity {
+                    pid: 0,
+                    start: None,
+                },
+                mountpoint: mountpoint.clone(),
+                container: "ratarmount-run-fault".into(),
+                runtime,
+                mount_child: None,
+                runtime_child: None,
+                ram_top: None,
+            };
+            if runtime_child {
+                record.runtime_child = Some(identity);
+            } else {
+                record.mount_child = Some(identity);
+            }
+            fs::write(&pid, serde_json::to_vec(&record).unwrap()).unwrap();
+            let fault = Guard::arm(child.0.id(), signal, fail_unmount.then_some(2));
+            let error = recover(&pid, &top).unwrap_err();
+            assert_eq!(error.to_string(), "injected-signal", "case {case}");
+            assert!(
+                pid.exists(),
+                "case {case}: failed signal retired the record"
+            );
+            assert!(
+                mountpoint.exists(),
+                "case {case}: failed signal removed recovery paths"
+            );
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "case {case}: child was signalled despite the fault"
+            );
+
+            let events = fault.events();
+            let attempts: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter_map(|(i, event)| (*event == Event::StopEntry).then_some(i))
+                .collect();
+            assert_eq!(
+                attempts.len(),
+                2,
+                "case {case}: Drop did not retry: {events:?}"
+            );
+            let mut expected = vec![Event::Runtime("kill".into()), Event::Runtime("rm".into())];
+            if runtime_child {
+                expected.extend([
+                    signal_event(libc::SIGKILL, true),
+                    Event::Runtime("kill".into()),
+                    Event::Runtime("rm".into()),
+                ]);
+            }
+            expected.push(Event::Unmount {
+                path: mountpoint.clone(),
+                occurrence: 1,
+                injected: false,
+            });
+            if !runtime_child {
+                expected.push(signal_event(libc::SIGTERM, !ignore_term));
+                if ignore_term {
+                    expected.push(signal_event(libc::SIGKILL, true));
+                }
+            }
+            expected.push(Event::Unmount {
+                path: mountpoint.clone(),
+                occurrence: 2,
+                injected: fail_unmount,
+            });
+            assert_eq!(
+                &events[attempts[0] + 1..attempts[1]],
+                expected,
+                "case {case}: first attempt stopped early"
+            );
+            assert_eq!(
+                &events[attempts[1] + 1..events.len() - 1],
+                if runtime_child {
+                    &expected[..]
+                } else {
+                    &expected[2..]
+                },
+                "case {case}: Drop stopped early"
+            );
+            assert_eq!(
+                events.last(),
+                Some(&Event::Warning(cleanup_warning(
+                    &io::Error::other("injected-signal"),
+                    &pid
+                ))),
+                "case {case}: Drop lost the signal error"
+            );
+            let verbs = fs::read_to_string(record.runtime.with_extension("log")).unwrap();
+            assert_eq!(
+                record.runtime.with_extension("rm-failed").exists(),
+                fail_rm,
+                "case {case}: the fixture must fail exactly the second rm"
+            );
+            let attempt_verbs = if runtime_child {
+                "kill\nrm\nkill\nrm\n"
+            } else {
+                "kill\nrm\n"
+            };
+            assert_eq!(
+                verbs,
+                attempt_verbs.repeat(if runtime_child { 2 } else { 1 }),
+                "case {case}: runtime steps did not execute"
+            );
+
+            // Keep faults armed through recover() and Cleanup::drop, then
+            // remove both and prove a fresh recovery can retire the record.
+            drop(fault);
+            recover(&pid, &top).unwrap();
+            assert!(
+                !pid.exists(),
+                "case {case}: successful recovery kept the record"
+            );
+            assert!(!mountpoint.exists());
+            assert_eq!(
+                child.0.wait().unwrap().signal(),
+                Some(signal),
+                "case {case}"
+            );
+        }
     }
 
     /// Regression: persisted RAM overlays must preserve DB bytes, modes and symlinks without following them.
@@ -1779,6 +2531,213 @@ mod tests {
             !OverlayMeta::read(&top).unwrap().unwrap().layer_sealed(),
             "nothing may be sealed over a changed base"
         );
+    }
+
+    const FINISH_GOLDEN: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/sandbox/testdata/sandbox-run-finish-golden.jsonl"
+    );
+
+    /// The T1 cases (R1c-1 §7): `finish` over a directory base, each report
+    /// or error with `wall_time_s` masked, the temporary directory as `$TMP`
+    /// and `weak:` digests (which hash the temporary path's mtimes) masked.
+    const FINISH_CASES: [&str; 6] = [
+        "plain",
+        "seal",
+        "pack_journal",
+        "repair",
+        "gate_refusal",
+        "bundle_lower_gate_refusal",
+    ];
+
+    /// `text` with every `weak:` digest's value replaced by `<weak>`.
+    fn mask_weak_digests(text: &str) -> String {
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(at) = rest.find("weak:") {
+            out.push_str(&rest[..at + "weak:".len()]);
+            rest = &rest[at + "weak:".len()..];
+            let digest = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == ':'))
+                .unwrap_or(rest.len());
+            if digest > 0 {
+                out.push_str("<weak>");
+            }
+            rest = &rest[digest..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Runs one T1 case on a fresh temporary directory: its normalized
+    /// report (`{"report":…}`) or error (`{"error":…}`).
+    fn finish_case(case: &str) -> Value {
+        use ratarmount_compositing::{BaseDigestRequest, FolderMountSource};
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let top = temp.path().join("top");
+        fs::create_dir(&base).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+        for (name, content) in [("f", "original\n"), ("g", "gone\n")] {
+            fs::write(base.join(name), content).unwrap();
+            fs::set_permissions(base.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let view = || -> Arc<dyn ratarmount_core::MountSource> {
+            Arc::new(FolderMountSource::new(&base).unwrap())
+        };
+        let gated = matches!(case, "gate_refusal" | "bundle_lower_gate_refusal");
+        let mut args = args(&[]);
+        args.base = base.clone();
+        args.top = top.clone();
+        if !gated {
+            args.base_digest = Some(BaseDigestRequest::Supplied(digest.clone()));
+        }
+        if case == "bundle_lower_gate_refusal" {
+            // A layer deleting `g`, sealed over the original base and packed.
+            let layer = temp.path().join("layer");
+            let overlay = crate::base_identity::fixtures::overlay_over(
+                view(),
+                &layer,
+                &base.to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+            overlay.unlink("/g").unwrap();
+            drop(overlay);
+            crate::base_identity::fixtures::seal(&layer, view()).unwrap();
+            let bundle = temp.path().join("layer.tar.zst");
+            crate::overlay_pack::pack(
+                &layer,
+                &bundle,
+                view(),
+                &crate::overlay_pack::PackOptions::default(),
+            )
+            .unwrap();
+            args.lower = vec![bundle];
+        }
+        let overlay = crate::base_identity::fixtures::overlay_over_with(
+            view(),
+            &top,
+            &base.to_string_lossy(),
+            Vec::new(),
+            if gated {
+                BaseDigestRequest::Compute
+            } else {
+                BaseDigestRequest::Supplied(digest)
+            },
+        )
+        .unwrap();
+        overlay.create_symlink("/link", "/target").unwrap();
+        overlay.unlink("/f").unwrap();
+        drop(overlay);
+        match case {
+            "seal" | "gate_refusal" | "bundle_lower_gate_refusal" => args.seal = true,
+            "pack_journal" => {
+                args.pack = Some(temp.path().join("bundle.tar.zst"));
+                args.journal = true;
+                fs::write(
+                    sidecar(&top, ".journal.jsonl"),
+                    concat!(
+                        "{\"journal\":1}\n",
+                        "{\"op\":\"open\",\"path\":\"/f\",\"layer\":\"base\",\"comm\":\"sh\"}\n",
+                        "{\"op\":\"read\",\"path\":\"/f\",\"ts\":1,\"bytes\":9}\n",
+                        "{\"op\":\"write\",\"path\":\"/new\",\"ts\":2,\"bytes\":5}\n",
+                    ),
+                )
+                .unwrap();
+            }
+            // Content under the tombstoned name: fsck removes it.
+            "repair" => fs::write(top.join("f"), b"stale").unwrap(),
+            _ => {}
+        }
+        match case {
+            // The base is edited while the container ran: `f` changes, and
+            // `g`, which the bundle layer deletes, disappears, so verifying
+            // that bundle on the edited base would fail with its own error.
+            "gate_refusal" | "bundle_lower_gate_refusal" => {
+                fs::write(base.join("f"), b"edited during the run, longer").unwrap();
+                fs::remove_file(base.join("g")).unwrap();
+            }
+            _ => {}
+        }
+        let result = finish(
+            &args,
+            &top,
+            &sidecar(&top, ".journal.jsonl"),
+            Execution {
+                exit_code: 3,
+                timed_out: false,
+                erofs_denied: 2,
+                bytes_written: 6,
+                start: Instant::now(),
+            },
+        );
+        let placeholders = |text: &str| {
+            let mut text = text.to_owned();
+            for root in [temp.path().canonicalize().unwrap(), temp.path().into()] {
+                text = text.replace(root.to_str().unwrap(), "$TMP");
+            }
+            mask_weak_digests(&text)
+        };
+        match result {
+            Ok(mut report) => {
+                assert!(report["wall_time_s"].is_number(), "{report}");
+                report["wall_time_s"] = json!("<masked>");
+                let text = placeholders(&serde_json::to_string(&report).unwrap());
+                json!({"case": case, "report": text})
+            }
+            Err(error) => json!({"case": case, "error": placeholders(&error.to_string())}),
+        }
+    }
+
+    /// Writes `testdata/sandbox-run-finish-golden.jsonl` from `finish`. The
+    /// committed fixture was recorded from the `finish` that predates
+    /// `finalize_top` (R1c-1 step 2a), then deliberately extended with journal
+    /// coverage fields; regenerate only on purpose.
+    #[test]
+    #[ignore = "fixture generator: cargo test -p ratarmount --bin ratarmount generate_sandbox_run_finish_golden -- --ignored"]
+    fn generate_sandbox_run_finish_golden() {
+        let mut output = String::new();
+        for case in FINISH_CASES {
+            output.push_str(&serde_json::to_string(&finish_case(case)).unwrap());
+            output.push('\n');
+        }
+        fs::write(FINISH_GOLDEN, output).unwrap();
+    }
+
+    /// Regression (R1c-1 T1, source test 10): `finalize_top` must leave every
+    /// `sandbox run` report byte for byte as the recorded `finish` baseline
+    /// (with the deliberate journal coverage additions),
+    /// and keep its error order (classify, gate, compose): a bundle lower over
+    /// an edited base is refused with the gate's text, never with a bundle
+    /// verification error.
+    #[test]
+    fn regression_sandbox_run_report_identical_after_finalize_top() {
+        let golden = fs::read_to_string(FINISH_GOLDEN).unwrap();
+        let expected: Vec<Value> = golden
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(expected.len(), FINISH_CASES.len());
+        for (case, expected) in FINISH_CASES.into_iter().zip(expected) {
+            assert_eq!(finish_case(case), expected, "case {case}");
+        }
+        let error = |case: &str| {
+            let line = golden
+                .lines()
+                .find(|line| line.contains(&format!("\"case\":\"{case}\"")))
+                .unwrap();
+            serde_json::from_str::<Value>(line).unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        for case in ["gate_refusal", "bundle_lower_gate_refusal"] {
+            let error = error(case);
+            assert!(error.contains("--force-base-mismatch"), "{case}: {error}");
+            assert!(!error.contains("lower bundle"), "{case}: {error}");
+        }
     }
 
     /// Regression (J): the private parent is 0700 and only a directory this

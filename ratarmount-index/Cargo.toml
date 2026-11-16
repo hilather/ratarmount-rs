@@ -8,13 +8,16 @@ rust-version.workspace = true
 description = "SQLite index 0.7.0 read/write for ratarmount-rs"
 
 [features]
-# Thread-local seams inside checked acquisition (`checked_open::test_seams`)
-# for other crates' tests. Enabled only through dev-dependencies (and
-# ratarmount-compositing's own `test-hooks`), never in a normal build.
+# Test seams inside checked acquisition (`checked_open::test_seams`) and
+# child-spawn/lock-probe coordination for other crates' tests. Enabled only
+# through dev-dependencies (and ratarmount-compositing's own `test-hooks`),
+# never in a normal build.
 test-hooks = []
 
 [dependencies]
 ratarmount-core.workspace = true
+ratarmount-compress.workspace = true
+zip = { version = "2", default-features = true }
 # Workspace rusqlite 0.32 has no `fts5` cargo feature. Bundled libsqlite3-sys
 # always compiles `-DSQLITE_ENABLE_FTS5`, so FTS5 cannot be compiled out of
 # this binary. Optional locate is the `files_fts` table + MATCH query.
@@ -30,8 +33,16 @@ md-5 = "0.10"
 crc32fast = "1"
 tempfile.workspace = true
 ureq = { version = "2", default-features = true, features = ["tls"] }
+url = "2"
 # Compressed SQLite index materialization (Python `_load_index` / `_undo_compression`).
 flate2 = "1"
 xz2 = { version = "0.1", features = ["static"] }
 zstd = "0.13"
 bzip2 = { version = "0.5", features = ["static"] }
+
+[dev-dependencies]
+# Portable SO_LINGER resets for HTTP body-error contract tests.
+socket2 = "0.6"
+
+[lints]
+workspace = true

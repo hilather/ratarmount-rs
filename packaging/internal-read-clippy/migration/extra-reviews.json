@@ -1,0 +1,3011 @@
+{
+  "schema": 1,
+  "status": "142 individual source reviews completed; migration metadata only, no enforcing operation interpretation",
+  "source": "clippy-only-explanations.json",
+  "entries": [
+    {
+      "extra_index": 1,
+      "disposition": "support",
+      "category": "builder-type-reference",
+      "reason": "Import OpenOptions for the empty-archive writer; this type reference opens nothing.",
+      "creation": {
+        "policy": "none",
+        "basis": "Type import only; creation is reviewed at the writer leaves."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/empty_archive.rs",
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0004"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ]
+    },
+    {
+      "extra_index": 2,
+      "disposition": "output-owner",
+      "category": "empty-archive-output",
+      "reason": "Configure exclusive creation of a previously absent empty archive without replacing an existing entry.",
+      "creation": {
+        "policy": "exclusive-new-file",
+        "basis": "The writer uses create_new and mode 0666 subject to umask; existing entries follow the explicit validation/error path."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/empty_archive.rs",
+      "function": "create_new_empty_archive",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0007"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ]
+    },
+    {
+      "extra_index": 3,
+      "disposition": "out-of-family",
+      "category": "feature-test-hook",
+      "reason": "Append archive hash-start events to the explicit RATARMOUNT_TEST_HASH_LOG instrumentation path when test-hooks is enabled.",
+      "creation": {
+        "policy": "append-or-create",
+        "basis": "The hook opens append/create, never truncates an existing log, and uses platform-default file permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/overlay_meta.rs",
+      "function": "test_hash_seam",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0025",
+        "D0026",
+        "D0027",
+        "D0028"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions",
+        "std::fs::OpenOptions::create",
+        "std::fs::OpenOptions::new",
+        "std::fs::OpenOptions::open"
+      ]
+    },
+    {
+      "extra_index": 4,
+      "disposition": "out-of-family",
+      "category": "feature-test-hook",
+      "reason": "Write the RATARMOUNT_TEST_PACK_HOLD readiness marker before the bounded pack hold.",
+      "creation": {
+        "policy": "create-or-truncate",
+        "basis": "The test-hooks readiness marker is explicit instrumentation output, written through fs::write with ordinary umask permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/overlay_meta.rs",
+      "function": "test_pack_hold",
+      "op": "fs::write",
+      "diagnostic_ids": [
+        "D0029"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::write"
+      ]
+    },
+    {
+      "extra_index": 5,
+      "disposition": "support",
+      "category": "builder-type-reference",
+      "reason": "Import the FsOpenOptions alias used by overlay output and no-follow builder helpers.",
+      "creation": {
+        "policy": "none",
+        "basis": "This import acquires no file; each constructor, creation setting and open has its own approval."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0035"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ]
+    },
+    {
+      "extra_index": 6,
+      "disposition": "out-of-family",
+      "category": "descriptor-control",
+      "reason": "Read existing overlay output descriptor flags before choosing the append/write path.",
+      "creation": {
+        "policy": "none",
+        "basis": "F_GETFL queries an already-open file; it creates and duplicates no descriptor."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "WriteOverlay::write_at_inner",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0036"
+      ],
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ]
+    },
+    {
+      "extra_index": 7,
+      "disposition": "output-owner",
+      "category": "overlay-directory",
+      "reason": "Create a missing overlay root after planning exclusions and rejecting an existing non-directory.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The overlay owner creates the requested tree with std directory defaults and umask, then canonicalizes the root."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "WriteOverlay::open_with_create_info",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0037"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 8,
+      "disposition": "output-owner",
+      "category": "overlay-directory",
+      "reason": "Materialize an archive parent directory inside the checked overlay root before a mutation.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "Only a missing parent represented as a base directory is materialized; host directory creation keeps existing default/umask behavior."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "WriteOverlay::ensure_parent",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0039"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 9,
+      "disposition": "output-owner",
+      "category": "overlay-directory",
+      "reason": "Materialize a base directory during copy-on-write and then apply the archived directory metadata.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The path passes overlay confinement checks; set_host_metadata restores the base directory metadata after creation."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "WriteOverlay::ensure_modifiable_inner",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0040"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 10,
+      "disposition": "output-owner",
+      "category": "overlay-directory",
+      "reason": "Create the confined parent before publishing a base symlink as a symlink during copy-on-write.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "Parent creation uses existing std defaults; the symlink operation and its metadata are handled separately."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "WriteOverlay::ensure_modifiable_inner",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0041"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 11,
+      "disposition": "output-owner",
+      "category": "overlay-directory",
+      "reason": "Materialize a directory in the reservation-aware copy-on-write branch before applying its base metadata.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "Confinement and mutation checks precede creation; archived directory metadata is restored afterward."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "WriteOverlay::copy_with_reservation",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0042"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 12,
+      "disposition": "output-owner",
+      "category": "overlay-directory",
+      "reason": "Ensure the confined parent exists before creating the caller-requested overlay file.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The parent is checked under the overlay root and keeps ordinary directory defaults; file mode is reviewed on the admitted open."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "WriteOverlay::create_file_inner",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0046"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 13,
+      "disposition": "output-owner",
+      "category": "overlay-content",
+      "reason": "Open the new overlay payload through admitted acquisition before truncation and permission application.",
+      "creation": {
+        "policy": "create-or-truncate",
+        "basis": "The admitted O_CREAT/O_TRUNC open uses caller mode masked to 07777, then sets the requested permission bits on the acquired descriptor."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "WriteOverlay::create_file_inner",
+      "op": "open_admitted",
+      "diagnostic_ids": [
+        "D0047"
+      ],
+      "compiler_definition_paths": [
+        "ratarmount_compositing::write_overlay::open_admitted_file"
+      ]
+    },
+    {
+      "extra_index": 14,
+      "disposition": "output-owner",
+      "category": "overlay-directory",
+      "reason": "Create the directory requested by the overlay mkdir operation and mark it present.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "Confinement/mutation checks precede creation; Unix permissions are explicitly set to caller mode masked to 07777."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "WriteOverlay::mkdir",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0051"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 15,
+      "disposition": "out-of-family",
+      "category": "overlay-content",
+      "reason": "Acquire the existing overlay payload through the admitted helper before truncating it.",
+      "creation": {
+        "policy": "none",
+        "basis": "This O_WRONLY/O_NOFOLLOW acquisition has no create flag and cannot invent a missing payload."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "WriteOverlay::truncate",
+      "op": "open_admitted",
+      "diagnostic_ids": [
+        "D0052"
+      ],
+      "compiler_definition_paths": [
+        "ratarmount_compositing::write_overlay::open_admitted_file"
+      ]
+    },
+    {
+      "extra_index": 16,
+      "disposition": "output-owner",
+      "category": "overlay-directory",
+      "reason": "Create the confined parent before creating a caller-requested overlay symlink.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The destination absence/confinement checks run first; parent directory creation preserves current defaults."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "WriteOverlay::create_symlink",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0053"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 17,
+      "disposition": "output-owner",
+      "category": "overlay-directory",
+      "reason": "Create the rename destination parent inside the checked overlay root before the host rename.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "Only the destination parent is created; payload ownership and tombstone publication remain in the rename transaction path."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "WriteOverlay::rename_inner",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0054"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 18,
+      "disposition": "out-of-family",
+      "category": "feature-test-hook",
+      "reason": "Publish the explicit readiness file for the test-hooks open-transaction hold.",
+      "creation": {
+        "policy": "create-or-truncate",
+        "basis": "This hook-only readiness output uses fs::write and existing umask behavior; it is not an archive input."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "WriteOverlay::test_hold_open_transaction",
+      "op": "fs::write",
+      "diagnostic_ids": [
+        "D0055"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::write"
+      ]
+    },
+    {
+      "extra_index": 19,
+      "disposition": "out-of-family",
+      "category": "overlay-content",
+      "reason": "Acquire an existing overlay member through the admitted read-only helper for an overlay open.",
+      "creation": {
+        "policy": "none",
+        "basis": "O_RDONLY/O_NOFOLLOW opens an existing payload; descriptor admission prevents borrowing an open database inode."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "WriteOverlay::open",
+      "op": "open_admitted",
+      "diagnostic_ids": [
+        "D0061"
+      ],
+      "compiler_definition_paths": [
+        "ratarmount_compositing::write_overlay::open_admitted_file"
+      ]
+    },
+    {
+      "extra_index": 20,
+      "disposition": "out-of-family",
+      "category": "structured-control-record",
+      "reason": "Read the previous commit manifest id through admitted acquisition before writing its replacement manifest.",
+      "creation": {
+        "policy": "none",
+        "basis": "The previous sidecar is opened read-only/nonblocking; NotFound starts at id zero and no input is created."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "write_commit_manifest",
+      "op": "open_admitted",
+      "diagnostic_ids": [
+        "D0062"
+      ],
+      "compiler_definition_paths": [
+        "ratarmount_compositing::write_overlay::open_admitted_file"
+      ]
+    },
+    {
+      "extra_index": 21,
+      "disposition": "output-owner",
+      "category": "overlay-control-record",
+      "reason": "Configure exclusive creation of the no-follow overlay ownership marker.",
+      "creation": {
+        "policy": "exclusive-new-file",
+        "basis": "An existing name is accepted only when symlink_metadata reports a regular file; creation uses ordinary file permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "create_overlay_marker",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0070"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ]
+    },
+    {
+      "extra_index": 22,
+      "disposition": "support",
+      "category": "builder-type-reference",
+      "reason": "Return the no-follow OpenOptions builder from the shared overlay helper.",
+      "creation": {
+        "policy": "none",
+        "basis": "The return type is setup only; the constructor and each actual open are separate events."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "open_options_nofollow",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0073"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ]
+    },
+    {
+      "extra_index": 23,
+      "disposition": "output-owner",
+      "category": "overlay-staging",
+      "reason": "Allocate the named sibling COW staging file through tempfile Builder::make_in.",
+      "creation": {
+        "policy": "exclusive-new-file",
+        "basis": "The supplied creation closure uses no-follow options and create_new; tempfile owns cleanup until publication."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "create_cow_staging",
+      "op": "tempfile",
+      "diagnostic_ids": [
+        "D0076"
+      ],
+      "compiler_definition_paths": [
+        "tempfile::Builder::make_in"
+      ]
+    },
+    {
+      "extra_index": 24,
+      "disposition": "output-owner",
+      "category": "overlay-staging",
+      "reason": "Set exclusive creation on the no-follow COW staging file builder.",
+      "creation": {
+        "policy": "exclusive-new-file",
+        "basis": "The staging closure uses create_new so a collision cannot truncate an existing path; file permissions retain existing default/umask behavior."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "create_cow_staging",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0078"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ]
+    },
+    {
+      "extra_index": 25,
+      "disposition": "out-of-family",
+      "category": "overlay-content",
+      "reason": "Acquire an existing overlay file through admission while rebuilding a ZIP member.",
+      "creation": {
+        "policy": "none",
+        "basis": "The helper opens the source O_RDONLY; the ZIP writer owns the separate output file."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "rebuild_zip_with_overlay",
+      "op": "open_admitted",
+      "diagnostic_ids": [
+        "D0085"
+      ],
+      "compiler_definition_paths": [
+        "ratarmount_compositing::write_overlay::open_admitted_file"
+      ]
+    },
+    {
+      "extra_index": 26,
+      "disposition": "output-owner",
+      "category": "compression-staging",
+      "reason": "Buffer a decoded candidate TAR suffix while finding a safe zstd rewrite window.",
+      "creation": {
+        "policy": "spill-private-temporary",
+        "basis": "The bounded spool starts in memory and may roll to tempfile storage using tempfile private temporary-file defaults."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "find_last_n_tar_window",
+      "op": "tempfile",
+      "diagnostic_ids": [
+        "D0093"
+      ],
+      "compiler_definition_paths": [
+        "tempfile::spooled_tempfile"
+      ]
+    },
+    {
+      "extra_index": 27,
+      "disposition": "output-owner",
+      "category": "compression-staging",
+      "reason": "Buffer a decoded suffix to validate that its starting point is a TAR member boundary.",
+      "creation": {
+        "policy": "spill-private-temporary",
+        "basis": "The existing memory cap controls rollover to a private tempfile; the spool is temporary analysis output."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compositing/src/write_overlay.rs",
+      "function": "suffix_window_has_member_boundary",
+      "op": "tempfile",
+      "diagnostic_ids": [
+        "D0094"
+      ],
+      "compiler_definition_paths": [
+        "tempfile::spooled_tempfile"
+      ]
+    },
+    {
+      "extra_index": 28,
+      "disposition": "output-owner",
+      "category": "compression-staging",
+      "reason": "Construct the spill sink used for the compressed rewrite tail.",
+      "creation": {
+        "policy": "spill-private-temporary",
+        "basis": "SpooledTempFile uses the existing memory cap and tempfile defaults on disk rollover; it does not create a named archive input."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-compress/src/zstd_splice.rs",
+      "function": "spill_sink",
+      "op": "tempfile",
+      "diagnostic_ids": [
+        "D0177"
+      ],
+      "compiler_definition_paths": [
+        "tempfile::spooled_tempfile"
+      ]
+    },
+    {
+      "extra_index": 29,
+      "disposition": "support",
+      "category": "builder-type-reference",
+      "reason": "Import OpenOptions for the CSI journal and lifetime lock files.",
+      "creation": {
+        "policy": "none",
+        "basis": "Type import only; journal and lock creation settings/open leaves are reviewed separately."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-csi/src/lib.rs",
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0181"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ]
+    },
+    {
+      "extra_index": 30,
+      "disposition": "output-owner",
+      "category": "runtime-state-directory",
+      "reason": "Create the CSI state tree before protecting it and opening the lifetime lock.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "Journal::open applies 0700 to the state directory immediately after creation; intermediate directory defaults remain unchanged."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-csi/src/lib.rs",
+      "function": "Journal::open",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0182"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 31,
+      "disposition": "output-owner",
+      "category": "runtime-lock",
+      "reason": "Allow creating the CSI lifetime lock without truncating a pre-existing lock.",
+      "creation": {
+        "policy": "create-or-open",
+        "basis": "The journal lock is read/write, no-follow, mode 0600 and truncate(false), and is retained for the driver lifetime."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-csi/src/lib.rs",
+      "function": "Journal::open",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0185"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ]
+    },
+    {
+      "extra_index": 32,
+      "disposition": "output-owner",
+      "category": "structured-control-record",
+      "reason": "Configure CSI journal.tmp replacement output before serializing, syncing and renaming it.",
+      "creation": {
+        "policy": "create-or-truncate",
+        "basis": "The temporary journal uses no-follow and mode 0600; completed output replaces journal.json only after fsync."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-csi/src/lib.rs",
+      "function": "Journal::save",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0190"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ]
+    },
+    {
+      "extra_index": 33,
+      "disposition": "output-owner",
+      "category": "mountpoint-directory",
+      "reason": "Create the CSI publish target after durable mount intent is written and before checking emptiness.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The requested target tree uses current directory defaults; the empty-directory check and mounter own later publication."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-csi/src/lib.rs",
+      "function": "State::publish",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0193"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 34,
+      "disposition": "support",
+      "category": "creation-builder",
+      "reason": "Construct the mode-aware builder for a fresh CSI socket staging directory.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder setup only; the distinct create event owns the 0700 directory creation."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-csi/src/linux.rs",
+      "function": "stage_dir",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0194",
+        "D0195"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ]
+    },
+    {
+      "extra_index": 35,
+      "disposition": "output-owner",
+      "category": "socket-staging-directory",
+      "reason": "Create the fresh CSI socket staging directory using its generated collision-retried name.",
+      "creation": {
+        "policy": "exclusive-directory",
+        "basis": "The builder requests 0700 and retries EEXIST without binding elsewhere; staging cleanup is retained."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-csi/src/linux.rs",
+      "function": "stage_dir",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0196"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ]
+    },
+    {
+      "extra_index": 36,
+      "disposition": "out-of-family",
+      "category": "socket-publication",
+      "reason": "Publish an already-created CSI socket with the renameat2 no-replace syscall.",
+      "creation": {
+        "policy": "none",
+        "basis": "This syscall renames an existing staged socket with RENAME_NOREPLACE; it acquires no file descriptor or new inode."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-csi/src/linux.rs",
+      "function": "rename_noreplace",
+      "op": "libc::syscall",
+      "diagnostic_ids": [
+        "D0200"
+      ],
+      "compiler_definition_paths": [
+        "libc::syscall"
+      ]
+    },
+    {
+      "extra_index": 37,
+      "disposition": "output-owner",
+      "category": "socket-parent-directory",
+      "reason": "Create the CSI listening socket parent before staged socket binding.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The parent uses existing std directory defaults; fresh staging mode and no-replace publication are separately reviewed."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-csi/src/linux.rs",
+      "function": "run",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0201"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 38,
+      "disposition": "output-owner",
+      "category": "tmpfs-overlay-directory",
+      "reason": "Create the CSI tmpfs overlay root before protecting it and verifying tmpfs.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The root is set to 0700 and require_tmpfs validates the backing filesystem before creating the per-target overlay."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-csi/src/process.rs",
+      "function": "ProcessMounter::mount",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0203"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 39,
+      "disposition": "output-owner",
+      "category": "tmpfs-overlay-directory",
+      "reason": "Create the target-specific CSI overlay directory on the verified tmpfs root.",
+      "creation": {
+        "policy": "exclusive-directory",
+        "basis": "create_dir refuses an existing name and set_permissions immediately applies 0700."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-csi/src/process.rs",
+      "function": "ProcessMounter::mount",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0204"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir"
+      ]
+    },
+    {
+      "extra_index": 40,
+      "disposition": "output-owner",
+      "category": "synthetic-git-cache",
+      "reason": "Create a 0700 child of an already-held no-follow Git cache directory descriptor.",
+      "creation": {
+        "policy": "directory-relative",
+        "basis": "mkdirat uses a validated single-component name and mode 0700; existing names are subsequently accessed through checked directory handles."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-formats-git/src/secure_cache.rs",
+      "function": "Directory::mkdir",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0234"
+      ],
+      "compiler_definition_paths": [
+        "libc::mkdirat"
+      ]
+    },
+    {
+      "extra_index": 41,
+      "disposition": "output-owner",
+      "category": "synthetic-git-staging",
+      "reason": "Create a uniquely generated 0700 Git repository staging directory beneath the held cache descriptor.",
+      "creation": {
+        "policy": "exclusive-directory-relative",
+        "basis": "mkdirat retries name collisions and then obtains the new child through the checked cache directory wrapper."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-formats-git/src/secure_cache.rs",
+      "function": "Directory::staging",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0236"
+      ],
+      "compiler_definition_paths": [
+        "libc::mkdirat"
+      ]
+    },
+    {
+      "extra_index": 42,
+      "disposition": "out-of-family",
+      "category": "feature-test-hook",
+      "reason": "Create the keys directory of the synthetic restic repository fixture.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The test-hooks synthetic repository writer uses ordinary directory defaults; it does not open a user repository for reading."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-formats-restic/src/repo.rs",
+      "function": "write_synthetic_repo_version",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0261"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 43,
+      "disposition": "out-of-family",
+      "category": "feature-test-hook",
+      "reason": "Create the data directory of the synthetic restic repository fixture.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "This all-features test-hooks writer owns its fixture output tree and retains ordinary directory permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-formats-restic/src/repo.rs",
+      "function": "write_synthetic_repo_version",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0262"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 44,
+      "disposition": "out-of-family",
+      "category": "feature-test-hook",
+      "reason": "Create the index directory of the synthetic restic repository fixture.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "Synthetic fixture output keeps the existing std directory defaults and umask."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-formats-restic/src/repo.rs",
+      "function": "write_synthetic_repo_version",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0263"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 45,
+      "disposition": "out-of-family",
+      "category": "feature-test-hook",
+      "reason": "Create the snapshots directory of the synthetic restic repository fixture.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "This fixture producer creates output directories only; ordinary permissions remain unchanged."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-formats-restic/src/repo.rs",
+      "function": "write_synthetic_repo_version",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0264"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 46,
+      "disposition": "out-of-family",
+      "category": "feature-test-hook",
+      "reason": "Create the locks directory of the synthetic restic repository fixture.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The test-hooks producer owns the synthetic output tree and preserves existing default directory modes."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-formats-restic/src/repo.rs",
+      "function": "write_synthetic_repo_version",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0265"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 47,
+      "disposition": "out-of-family",
+      "category": "feature-test-hook",
+      "reason": "Create the hash-prefix shard directory before writing the synthetic restic pack.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The pack shard is fixture output under data and uses existing default/umask directory permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-formats-restic/src/repo.rs",
+      "function": "write_synthetic_repo_version",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0268"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 48,
+      "disposition": "out-of-family",
+      "category": "descriptor-control",
+      "reason": "Read the detached overlay descriptor flags before choosing append/write behavior.",
+      "creation": {
+        "policy": "none",
+        "basis": "F_GETFL queries an already-held FUSE file descriptor; no pathname is opened and no descriptor is duplicated."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-fuse/src/lib.rs",
+      "function": "RatarmountFs::setattr_detached",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0326"
+      ],
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ]
+    },
+    {
+      "extra_index": 49,
+      "disposition": "support",
+      "category": "builder-type-reference",
+      "reason": "Import OpenOptions for append-only filesystem operation logging.",
+      "creation": {
+        "policy": "none",
+        "basis": "Type import only; log construction and creation/open leaves remain separately reviewed."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-fuse/src/oplog.rs",
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0329"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ]
+    },
+    {
+      "extra_index": 50,
+      "disposition": "output-owner",
+      "category": "operation-log",
+      "reason": "Permit creation of the append-only operation journal at the validated log path.",
+      "creation": {
+        "policy": "append-or-create",
+        "basis": "The log uses append plus CLOEXEC/NONBLOCK/NOFOLLOW, verifies a regular file, and preserves existing permission behavior."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-fuse/src/oplog.rs",
+      "function": "OpLog::open",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0332"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ]
+    },
+    {
+      "extra_index": 51,
+      "disposition": "output-owner",
+      "category": "passthrough-cache-directory",
+      "reason": "Ensure the selected absolute user cache root exists before passthrough cache allocation.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The root comes from absolute XDG_CACHE_HOME or HOME/.cache and retains current directory defaults."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-fuse/src/passthrough.rs",
+      "function": "cache_parent",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0337"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 52,
+      "disposition": "out-of-family",
+      "category": "descriptor-control",
+      "reason": "Read descriptor flags before retaining a checked-open descriptor across internal close handling.",
+      "creation": {
+        "policy": "none",
+        "basis": "F_GETFD reads an already-owned descriptor and performs no acquisition."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/checked_open/acquire.rs",
+      "function": "set_cloexec",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0347"
+      ],
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ]
+    },
+    {
+      "extra_index": 53,
+      "disposition": "out-of-family",
+      "category": "descriptor-control",
+      "reason": "Set close-on-exec on the descriptor retained by checked-open refusal handling.",
+      "creation": {
+        "policy": "none",
+        "basis": "F_SETFD changes the existing descriptor flags; it neither opens nor duplicates a file."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/checked_open/acquire.rs",
+      "function": "set_cloexec",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0348"
+      ],
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ]
+    },
+    {
+      "extra_index": 54,
+      "disposition": "out-of-family",
+      "category": "descriptor-control",
+      "reason": "Read flags from the descriptor just acquired by the checked-open VFS wrapper.",
+      "creation": {
+        "policy": "none",
+        "basis": "F_GETFL operates on the acquired fd before clearing the temporary NONBLOCK bit."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/checked_open/acquire.rs",
+      "function": "armed_open",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0352"
+      ],
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ]
+    },
+    {
+      "extra_index": 55,
+      "disposition": "out-of-family",
+      "category": "descriptor-control",
+      "reason": "Restore the checked-open descriptor blocking mode when the original request did not specify NONBLOCK.",
+      "creation": {
+        "policy": "none",
+        "basis": "F_SETFL updates the existing fd; failures retain the fd with CLOEXEC and fail acquisition closed."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/checked_open/acquire.rs",
+      "function": "armed_open",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0353"
+      ],
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ]
+    },
+    {
+      "extra_index": 56,
+      "disposition": "out-of-family",
+      "category": "checked-open-host-probe",
+      "reason": "Look up the checked-open host-test symbol through the already-loaded image own handle, then release that handle.",
+      "creation": {
+        "policy": "none",
+        "basis": "dlsym performs the reviewed own_handle_symbol probe, not arbitrary loader use or creation of a pathname resource."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/checked_open/host.rs",
+      "function": "own_handle_symbol",
+      "op": "libc::dlsym",
+      "diagnostic_ids": [
+        "D0354"
+      ],
+      "compiler_definition_paths": [
+        "libc::dlsym"
+      ]
+    },
+    {
+      "extra_index": 57,
+      "disposition": "output-owner",
+      "category": "runtime-lock",
+      "reason": "Permit creating the per-index digest-hashing advisory lock without truncating an existing lock.",
+      "creation": {
+        "policy": "create-or-open",
+        "basis": "The lock file uses write/create with truncate(false) and existing default/umask file permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/digest_cache.rs",
+      "function": "open_lock_file",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0360"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ]
+    },
+    {
+      "extra_index": 58,
+      "disposition": "output-owner",
+      "category": "index-output-directory",
+      "reason": "Create the requested writable index parent before initializing the new index.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "Directory output ownership is explicit in create_writable and keeps current std permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/lib.rs",
+      "function": "SqliteIndex::create_writable",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0367"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 59,
+      "disposition": "output-owner",
+      "category": "index-cache-directory",
+      "reason": "Create the local index cache tree before applying private Unix permissions.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "ensure_dir applies mode 0700 on Unix after std creation; platform defaults remain for unsupported mode APIs."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/local_cache.rs",
+      "function": "LocalIndexCache::ensure_dir",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0369"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 60,
+      "disposition": "output-owner",
+      "category": "index-pointer-directory",
+      "reason": "Create the index pointer parent before allocating a sibling temporary JSON output.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The pointer writer owns this parent tree; tempfile publication and pointer validation remain separate."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/location.rs",
+      "function": "store_index_pointer_atomic",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0373"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 61,
+      "disposition": "output-owner",
+      "category": "index-cache-directory",
+      "reason": "Create the content-addressed snapshot parent before hard-linking or atomically copying the known index.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "Only output directories are created; the well-known source is read through separately reviewed paths."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/location.rs",
+      "function": "snapshot_index_id",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0376"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 62,
+      "disposition": "output-owner",
+      "category": "index-output-directory",
+      "reason": "Create the destination parent before the atomic managed-source index copy.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The destination tree keeps current defaults; the source copy uses managed_read and sibling tempfile publication."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/location.rs",
+      "function": "atomic_copy_file",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0377"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 63,
+      "disposition": "output-owner",
+      "category": "index-staging-directory",
+      "reason": "Create the explicitly configured index temporary directory before decompression output allocation.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The output tempfile builder owns the decoded index; directory permissions preserve current defaults."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/location.rs",
+      "function": "decompress_index_to_temp",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0384"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 64,
+      "disposition": "output-owner",
+      "category": "index-staging-directory",
+      "reason": "Create the configured index temporary directory before streaming an HTTP sidecar into a tempfile.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "This directory supports downloaded output staging and retains current std/umask behavior."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/location.rs",
+      "function": "fetch_index_http_uncached",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0387"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 65,
+      "disposition": "output-owner",
+      "category": "writability-probe-directory",
+      "reason": "Create a missing prospective index parent as part of the documented index-creation capability probe.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The probe rejects URL-shaped paths first; directory creation is intentional and uses existing default permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/location.rs",
+      "function": "path_can_create_index",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0390"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 66,
+      "disposition": "output-owner",
+      "category": "writability-probe",
+      "reason": "Configure exclusive creation of the short-lived directory writability probe file.",
+      "creation": {
+        "policy": "exclusive-new-file",
+        "basis": "create_new prevents replacing a pre-existing name; a successful probe is unlinked immediately and uses default/umask file permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/location.rs",
+      "function": "test_writable_dir",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0393"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ]
+    },
+    {
+      "extra_index": 67,
+      "disposition": "managed-read",
+      "category": "managed-reader-backend",
+      "reason": "Open the managed cursor through its SQLite-backed ByteFile implementation.",
+      "creation": {
+        "policy": "none",
+        "basis": "The cursor reads an existing path through the managed backend; no file creation is requested."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/managed_read.rs",
+      "function": "ManagedReadCursor::open",
+      "op": "managed-read-wrapper",
+      "diagnostic_ids": [
+        "D0395"
+      ],
+      "compiler_definition_paths": [
+        "ratarmount_index::managed_read::imp::ByteFile::open"
+      ]
+    },
+    {
+      "extra_index": 68,
+      "disposition": "managed-read",
+      "category": "managed-reader-delegation",
+      "reason": "Delegate UTF-8 text loading to the managed byte reader before validating UTF-8.",
+      "creation": {
+        "policy": "none",
+        "basis": "The nested managed_read::read reads existing content; UTF-8 conversion creates no pathname resource."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/managed_read.rs",
+      "function": "read_to_string",
+      "op": "managed_read::read",
+      "diagnostic_ids": [
+        "D0397"
+      ],
+      "compiler_definition_paths": [
+        "ratarmount_index::managed_read::read"
+      ]
+    },
+    {
+      "extra_index": 69,
+      "disposition": "output-owner",
+      "category": "managed-copy-output",
+      "reason": "Configure exclusive creation of the managed copy destination.",
+      "creation": {
+        "policy": "exclusive-new-file",
+        "basis": "create_new refuses existing destinations; Unix source permission bits are applied by the copy helper before bytes are written."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/managed_read.rs",
+      "function": "copy_exclusive_new",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0404"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ]
+    },
+    {
+      "extra_index": 70,
+      "disposition": "output-owner",
+      "category": "managed-copy-output",
+      "reason": "Configure create-or-truncate output for a managed-source copy.",
+      "creation": {
+        "policy": "create-or-truncate",
+        "basis": "The helper intentionally permits a zero-length/existing destination and applies source permissions before copying."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/managed_read.rs",
+      "function": "copy_create_or_truncate",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0409"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ]
+    },
+    {
+      "extra_index": 71,
+      "disposition": "out-of-family",
+      "category": "standard-descriptor-control",
+      "reason": "Check whether a standard descriptor slot is occupied before filling vacant slots.",
+      "creation": {
+        "policy": "none",
+        "basis": "F_GETFD is a harmless query on the numeric slot; the later /dev/null opens have independent approvals."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/managed_read.rs",
+      "function": "occupied",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0411"
+      ],
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ]
+    },
+    {
+      "extra_index": 72,
+      "disposition": "out-of-family",
+      "category": "feature-test-hook",
+      "reason": "Open the explicit lock-probe file read-only in the forked child process.",
+      "creation": {
+        "policy": "none",
+        "basis": "The child uses O_RDONLY/CLOEXEC only, asks the kernel about locks and exits; no file is created or content read."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/managed_read.rs",
+      "function": "other_process_sees_lock",
+      "op": "libc::open",
+      "diagnostic_ids": [
+        "D0413"
+      ],
+      "compiler_definition_paths": [
+        "libc::open"
+      ]
+    },
+    {
+      "extra_index": 73,
+      "disposition": "out-of-family",
+      "category": "feature-test-hook",
+      "reason": "Ask F_GETLK whether the child observes the parent SQLite shared lock.",
+      "creation": {
+        "policy": "none",
+        "basis": "This query uses the child-held descriptor and neither duplicates nor creates a resource."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/managed_read.rs",
+      "function": "other_process_sees_lock",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0414"
+      ],
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ]
+    },
+    {
+      "extra_index": 74,
+      "disposition": "out-of-family",
+      "category": "feature-test-hook",
+      "reason": "Acquire a managed shared-lock holder at the AfterOpen test seam to verify that managed closes retain locks.",
+      "creation": {
+        "policy": "none",
+        "basis": "VfsLockHolder opens an existing path through ByteFile; this all-features test-hooks instrumentation requests no creation."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/managed_read.rs",
+      "function": "with_close_probes",
+      "op": "managed-read-wrapper",
+      "diagnostic_ids": [
+        "D0415"
+      ],
+      "compiler_definition_paths": [
+        "ratarmount_index::managed_read::VfsLockHolder::shared"
+      ]
+    },
+    {
+      "extra_index": 75,
+      "disposition": "out-of-family",
+      "category": "feature-test-hook",
+      "reason": "Run the child lock-observation probe after a managed close before releasing the test-held lock.",
+      "creation": {
+        "policy": "none",
+        "basis": "The probe only queries an existing file/lock relationship and has separately reviewed child acquisition."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/managed_read.rs",
+      "function": "with_close_probes",
+      "op": "managed-read-wrapper",
+      "diagnostic_ids": [
+        "D0416"
+      ],
+      "compiler_definition_paths": [
+        "ratarmount_index::managed_read::lock_probe::other_process_sees_lock"
+      ]
+    },
+    {
+      "extra_index": 76,
+      "disposition": "managed-read",
+      "category": "feature-test-hook",
+      "reason": "Construct the test-hook shared-lock holder using the managed ByteFile reader.",
+      "creation": {
+        "policy": "none",
+        "basis": "The helper opens existing content and then takes the SQLite shared lock; it does not create an input."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/managed_read.rs",
+      "function": "VfsLockHolder::shared",
+      "op": "managed-read-wrapper",
+      "diagnostic_ids": [
+        "D0417"
+      ],
+      "compiler_definition_paths": [
+        "ratarmount_index::managed_read::imp::ByteFile::open"
+      ]
+    },
+    {
+      "extra_index": 77,
+      "disposition": "output-owner",
+      "category": "meta-cache-directory",
+      "reason": "Create the remote metadata cache tree before applying private Unix permissions.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "MetaCache::ensure_dir applies mode 0700 on Unix and retains platform defaults elsewhere."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/meta_cache.rs",
+      "function": "MetaCache::ensure_dir",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0419"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 78,
+      "disposition": "support",
+      "category": "builder-type-reference",
+      "reason": "Import OpenOptions for exclusive payload-cache staging output.",
+      "creation": {
+        "policy": "none",
+        "basis": "The type import opens nothing; copy_hash_to_tmp owns the separately reviewed output allocation."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/payload_cache.rs",
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0423"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ]
+    },
+    {
+      "extra_index": 79,
+      "disposition": "output-owner",
+      "category": "payload-cache-staging",
+      "reason": "Configure exclusive creation of the payload temporary file before hashing and length-checking streamed output.",
+      "creation": {
+        "policy": "exclusive-new-file",
+        "basis": "create_new cannot replace an existing file; existing default/umask permissions are retained until cache publication."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/payload_cache.rs",
+      "function": "copy_hash_to_tmp",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0430"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ]
+    },
+    {
+      "extra_index": 80,
+      "disposition": "support",
+      "category": "builder-type-reference",
+      "reason": "Import OpenOptions for the range cache no-follow input/output helpers.",
+      "creation": {
+        "policy": "none",
+        "basis": "This type reference acquires no file and cannot approve the later opens."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/range_cache.rs",
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0432"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ]
+    },
+    {
+      "extra_index": 81,
+      "disposition": "support",
+      "category": "creation-builder",
+      "reason": "Construct the builder used to create a private recursive cache directory.",
+      "creation": {
+        "policy": "none",
+        "basis": "This is setup; the create event separately owns recursive mode-0700 directory creation."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/range_cache.rs",
+      "function": "ensure_private_dir",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0435",
+        "D0436"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ]
+    },
+    {
+      "extra_index": 82,
+      "disposition": "output-owner",
+      "category": "range-cache-directory",
+      "reason": "Create the range cache directory tree and validate its owner/private permissions.",
+      "creation": {
+        "policy": "private-recursive-directory",
+        "basis": "The builder requests 0700 on Unix, check_private_dir validates ownership/mode, and permissions are reset to 0700 afterward."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-index/src/range_cache.rs",
+      "function": "ensure_private_dir",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0437"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ]
+    },
+    {
+      "extra_index": 83,
+      "disposition": "output-owner",
+      "category": "hf-listing-cache-directory",
+      "reason": "Create the pinned Hub tree-listing cache parent before temporary JSON publication.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "This is cache output under the selected listing path; existing directory defaults and atomic tempfile publication are retained."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-remote/src/hf.rs",
+      "function": "HfRepo::tree",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0463"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 84,
+      "disposition": "support",
+      "category": "builder-type-reference",
+      "reason": "Import OpenOptions for Hub cache admission, publication locking and disk spools.",
+      "creation": {
+        "policy": "none",
+        "basis": "Type support only; acquisition and creation settings have distinct marked leaves."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-remote/src/hf_cache.rs",
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0465"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ]
+    },
+    {
+      "extra_index": 85,
+      "disposition": "output-owner",
+      "category": "hf-cache-directory",
+      "reason": "Create the explicitly configured Hub cache root before walking child components.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "Only the configured root uses create_dir_all; descendants are created and no-follow inspected component by component."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-remote/src/hf_cache.rs",
+      "function": "directories",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0466"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 86,
+      "disposition": "output-owner",
+      "category": "hf-cache-directory",
+      "reason": "Create each validated Hub cache child directory before rejecting symlinks/non-directories.",
+      "creation": {
+        "policy": "directory-component",
+        "basis": "Components must be Normal and every resulting path is checked with symlink_metadata; existing permission behavior is retained."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-remote/src/hf_cache.rs",
+      "function": "directories",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0467"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir"
+      ]
+    },
+    {
+      "extra_index": 87,
+      "disposition": "output-owner",
+      "category": "hf-cache-lock",
+      "reason": "Permit creation of the Hub blob publication lock without truncation.",
+      "creation": {
+        "policy": "create-or-open",
+        "basis": "The lock builder uses read/write/create and truncate(false), with Unix NOFOLLOW/NONBLOCK and existing permission defaults."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-remote/src/hf_cache.rs",
+      "function": "HubCache::install_with",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0481"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ]
+    },
+    {
+      "extra_index": 88,
+      "disposition": "output-owner",
+      "category": "torrent-checksum-cache-directory",
+      "reason": "Create the checksum cache output directory before writing an atomic hash-summary tempfile.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "Empty checksum sets return early; nonempty summary output uses the existing directory and tempfile defaults."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-remote/src/torrent/checksums.rs",
+      "function": "save",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0507"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 89,
+      "disposition": "output-owner",
+      "category": "torrent-metadata-cache-directory",
+      "reason": "Create the torrent metadata cache directory before persisting validated v1/v2 metainfo.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "This is metadata output, written through separately reviewed temporary files with current permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-remote/src/torrent/metadata.rs",
+      "function": "save",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0510"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 90,
+      "disposition": "output-owner",
+      "category": "torrent-scratch-owner",
+      "reason": "Configure exclusive creation of the scratch ownership marker before taking its lock.",
+      "creation": {
+        "policy": "exclusive-new-file",
+        "basis": "The ownership marker is read/write create_new under the newly allocated scratch directory; an existing marker cannot be replaced."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-remote/src/torrent/scratch.rs",
+      "function": "mark_owned",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0515"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ]
+    },
+    {
+      "extra_index": 91,
+      "disposition": "output-owner",
+      "category": "torrent-scratch-directory",
+      "reason": "Create the selected swarm cache root before stale scratch sweeping and private scratch allocation.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The cache root keeps current defaults; tempfile creates the per-swarm child and its ownership marker is reviewed separately."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-remote/src/torrent/swarm.rs",
+      "function": "Swarm::with_cache",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0520"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 92,
+      "disposition": "support",
+      "category": "builder-type-reference",
+      "reason": "Import OpenOptions for exclusive extraction staging files.",
+      "creation": {
+        "policy": "none",
+        "basis": "Type reference only; extracted content creation remains owned by create_extract_tmp."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-session/src/extract.rs",
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0524"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ]
+    },
+    {
+      "extra_index": 93,
+      "disposition": "output-owner",
+      "category": "extraction-directory",
+      "reason": "Create the caller-requested extraction destination tree before member traversal.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The extraction request explicitly owns this output root and preserves current std directory modes."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-session/src/extract.rs",
+      "function": "Session::extract_to",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0525"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 94,
+      "disposition": "output-owner",
+      "category": "extraction-directory",
+      "reason": "Create an archive directory entry after applying extraction path/symlink checks.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The destination is a checked extraction output; ordinary directory permissions remain unchanged."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-session/src/extract.rs",
+      "function": "Session::extract_one_named",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0526"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 95,
+      "disposition": "output-owner",
+      "category": "extraction-directory",
+      "reason": "Create a checked extracted member parent before symlink or regular-file publication.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "This parent supports caller-requested output and retains default/umask permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-session/src/extract.rs",
+      "function": "Session::extract_one_named",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0527"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 96,
+      "disposition": "output-owner",
+      "category": "extraction-staging",
+      "reason": "Configure exclusive sibling extraction temporary creation with collision retry.",
+      "creation": {
+        "policy": "exclusive-new-file",
+        "basis": "create_new prevents replacing a destination/collision; successful staged output is published only after extraction completes."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-session/src/extract.rs",
+      "function": "create_extract_tmp",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0530"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ]
+    },
+    {
+      "extra_index": 97,
+      "disposition": "output-owner",
+      "category": "remote-index-cache-directory",
+      "reason": "Best-effort create the cache destination parent before installing an already-validated remote index.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "Parent creation failure keeps the fetched sidecar path usable; the managed-source copy owns its separate output."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-session/src/remote_open.rs",
+      "function": "try_install_remote_index",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0534"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 98,
+      "disposition": "output-owner",
+      "category": "torrent-index-staging-directory",
+      "reason": "Create the torrent index cache directory before a named temporary sidecar is allocated.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The dedicated torrent-v1/indexes output tree and tempfile behavior keep current permission defaults."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-session/src/remote_open.rs",
+      "function": "torrent_index_temp",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0536"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 99,
+      "disposition": "output-owner",
+      "category": "index-cache-directory",
+      "reason": "Create the resolved index parent before applying private Unix directory permissions.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The resolver sets 0700 on Unix after creation; non-Unix keeps its existing platform behavior."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-session/src/resolve.rs",
+      "function": "resolve_index",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0538"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 100,
+      "disposition": "output-owner",
+      "category": "sftp-host-key-directory",
+      "reason": "Create the configured SFTP host key parent before writing a generated host key.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "This reviewed site creates only the parent tree with current defaults; host-key content writing is separately inventoried."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-sftp/src/handler.rs",
+      "function": "write_host_key",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0540"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 101,
+      "disposition": "support",
+      "category": "builder-type-reference",
+      "reason": "Import OpenOptions for Docker volume driver state locks and journal output.",
+      "creation": {
+        "policy": "none",
+        "basis": "Type reference only; actual state output and lock opens are separately approved."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0544"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ]
+    },
+    {
+      "extra_index": 102,
+      "disposition": "support",
+      "category": "creation-builder",
+      "reason": "Construct the recursive private state-directory builder for the volume driver.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder setup owns no path; the create leaf requests 0700 and is separately reviewed."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "function": "Driver::open",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0545",
+        "D0546"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ]
+    },
+    {
+      "extra_index": 103,
+      "disposition": "output-owner",
+      "category": "runtime-state-directory",
+      "reason": "Create the volume driver state tree before canonicalization and lifetime locking.",
+      "creation": {
+        "policy": "private-recursive-directory",
+        "basis": "DirBuilder requests recursive mode 0700; the state path is canonicalized before driver files are opened."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "function": "Driver::open",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0547"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ]
+    },
+    {
+      "extra_index": 104,
+      "disposition": "output-owner",
+      "category": "runtime-lock",
+      "reason": "Permit creation of the no-follow volume-driver lifetime lock without truncation.",
+      "creation": {
+        "policy": "create-or-open",
+        "basis": "The lock is read/write mode 0600 with CLOEXEC/NOFOLLOW and is held for the driver lifetime."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "function": "Driver::open",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0550"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ]
+    },
+    {
+      "extra_index": 105,
+      "disposition": "support",
+      "category": "creation-builder",
+      "reason": "Construct the mode-aware builder for the volume driver mount root.",
+      "creation": {
+        "policy": "none",
+        "basis": "This constructor is setup only; the following create leaf owns the mode-0755 directory output."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "function": "Driver::open",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0553",
+        "D0554"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ]
+    },
+    {
+      "extra_index": 106,
+      "disposition": "output-owner",
+      "category": "mountpoint-directory",
+      "reason": "Create the volume driver mnt root and accept an existing directory for later mountpoint checks.",
+      "creation": {
+        "policy": "directory",
+        "basis": "DirBuilder requests 0755; AlreadyExists is handled without truncating or replacing a host entry."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "function": "Driver::open",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0555"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ]
+    },
+    {
+      "extra_index": 107,
+      "disposition": "output-owner",
+      "category": "structured-control-record",
+      "reason": "Configure the temporary volumes.json output before atomic state publication.",
+      "creation": {
+        "policy": "create-or-truncate",
+        "basis": "The temporary state record uses 0600 and NOFOLLOW/CLOEXEC, is synced, then renamed over the durable state file."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "function": "Driver::persist",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0558"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ]
+    },
+    {
+      "extra_index": 108,
+      "disposition": "output-owner",
+      "category": "mountpoint-directory",
+      "reason": "Create a missing named volume mountpoint after rejecting symlinks and non-directories.",
+      "creation": {
+        "policy": "exclusive-directory",
+        "basis": "create_dir runs only after NotFound under the canonical state mount root; current permissions are retained."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-volume-plugin/src/lib.rs",
+      "function": "Driver::dispatch",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0561"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir"
+      ]
+    },
+    {
+      "extra_index": 109,
+      "disposition": "support",
+      "category": "creation-builder",
+      "reason": "Construct the private socket staging-directory builder in the volume plugin binary.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder setup is separate from the following mode-0700 staging create operation."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-volume-plugin/src/main.rs",
+      "function": "stage_dir",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0562",
+        "D0563"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ]
+    },
+    {
+      "extra_index": 110,
+      "disposition": "output-owner",
+      "category": "socket-staging-directory",
+      "reason": "Create a fresh private socket staging directory with bounded collision retry.",
+      "creation": {
+        "policy": "exclusive-directory",
+        "basis": "The generated name uses DirBuilder mode 0700; EEXIST retries and no replacing fallback is introduced."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-volume-plugin/src/main.rs",
+      "function": "stage_dir",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0564"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ]
+    },
+    {
+      "extra_index": 111,
+      "disposition": "out-of-family",
+      "category": "socket-publication",
+      "reason": "Publish the already-bound volume-plugin socket with a no-replace rename syscall.",
+      "creation": {
+        "policy": "none",
+        "basis": "renameat2 moves the existing staged socket with RENAME_NOREPLACE; it opens no pathname or descriptor."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-volume-plugin/src/main.rs",
+      "function": "rename_noreplace",
+      "op": "libc::syscall",
+      "diagnostic_ids": [
+        "D0568"
+      ],
+      "compiler_definition_paths": [
+        "libc::syscall"
+      ]
+    },
+    {
+      "extra_index": 112,
+      "disposition": "out-of-family",
+      "category": "descriptor-control",
+      "reason": "Restore close-on-exec on the inherited systemd activation listener.",
+      "creation": {
+        "policy": "none",
+        "basis": "F_SETFD changes the existing fd 3 flags after validating its socket address; children cannot retain the listener."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-volume-plugin/src/main.rs",
+      "function": "listener",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0570"
+      ],
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ]
+    },
+    {
+      "extra_index": 113,
+      "disposition": "output-owner",
+      "category": "socket-parent-directory",
+      "reason": "Create the configured volume-plugin socket parent before staged binding.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The parent keeps current directory defaults; staging creation and final publication are separately reviewed."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount-volume-plugin/src/main.rs",
+      "function": "listener",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0571"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 114,
+      "disposition": "output-owner",
+      "category": "mountpoint-directory",
+      "reason": "Create the accepted FUSE mountpoint after the guard has validated the mount plan.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "Only the explicit guarded FUSE path is created; export-only operation supplies no mountpoint and does not reach this leaf."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/main.rs",
+      "function": "main",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0603"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 115,
+      "disposition": "output-owner",
+      "category": "diagnostic-log",
+      "reason": "Configure append-or-create logging for the explicit CLI log file.",
+      "creation": {
+        "policy": "append-or-create",
+        "basis": "The log file is diagnostic output, preserves existing data, and retains default/umask file permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/main.rs",
+      "function": "init_logger",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0611"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ]
+    },
+    {
+      "extra_index": 116,
+      "disposition": "out-of-family",
+      "category": "standard-descriptor-control",
+      "reason": "Determine whether stdin/stdout/stderr is closed before filling vacant standard slots.",
+      "creation": {
+        "policy": "none",
+        "basis": "F_GETFD queries the standard slot only; no descriptor is opened or duplicated by this operation."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/main.rs",
+      "function": "neutralize_dead_stdio",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0614"
+      ],
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ]
+    },
+    {
+      "extra_index": 117,
+      "disposition": "out-of-family",
+      "category": "standard-descriptor-control",
+      "reason": "Clear descriptor flags when preparing the already-filled standard slot for process handoff.",
+      "creation": {
+        "policy": "none",
+        "basis": "F_SETFD updates an existing descriptor; /dev/null acquisition and redirection have their own events."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/main.rs",
+      "function": "neutralize_dead_stdio",
+      "op": "fcntl-other",
+      "diagnostic_ids": [
+        "D0617"
+      ],
+      "compiler_definition_paths": [
+        "libc::fcntl"
+      ]
+    },
+    {
+      "extra_index": 118,
+      "disposition": "support",
+      "category": "builder-type-reference",
+      "reason": "Import OpenOptions locally for standard-stream redirection to /dev/null.",
+      "creation": {
+        "policy": "none",
+        "basis": "Type import only; the read/write null-device open and handoff are separately reviewed."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/main.rs",
+      "function": "redirect_stdio_to_null",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0618"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ]
+    },
+    {
+      "extra_index": 119,
+      "disposition": "out-of-family",
+      "category": "mount-identity-probe",
+      "reason": "Query statx mount identity for the guard without acquiring a filesystem descriptor.",
+      "creation": {
+        "policy": "none",
+        "basis": "The direct SYS_statx call fills the local metadata buffer and returns no new fd; the generic syscall ban requires this review."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/mount_guard.rs",
+      "function": "mount_id_statx",
+      "op": "libc::syscall",
+      "diagnostic_ids": [
+        "D0626"
+      ],
+      "compiler_definition_paths": [
+        "libc::syscall"
+      ]
+    },
+    {
+      "extra_index": 120,
+      "disposition": "out-of-family",
+      "category": "mount-identity-probe",
+      "reason": "Query name_to_handle_at mount identity when statx cannot provide the mount id.",
+      "creation": {
+        "policy": "none",
+        "basis": "This direct syscall fills the local FileHandle/mount-id buffers and acquires no file descriptor; EOVERFLOW is handled explicitly."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/mount_guard.rs",
+      "function": "mount_id_handle",
+      "op": "libc::syscall",
+      "diagnostic_ids": [
+        "D0627"
+      ],
+      "compiler_definition_paths": [
+        "libc::syscall"
+      ]
+    },
+    {
+      "extra_index": 121,
+      "disposition": "output-owner",
+      "category": "overlay-directory",
+      "reason": "Create the missing overlay directory after the mount guard has validated the proposed layout.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "An existing path is left for the overlay opener to validate; new directory creation keeps existing std defaults."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/mount_guard.rs",
+      "function": "prepare_overlay_dir",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0628"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 122,
+      "disposition": "output-owner",
+      "category": "overlay-import-directory",
+      "reason": "Claim the validated overlay import destination before opening its database.",
+      "creation": {
+        "policy": "exclusive-directory",
+        "basis": "create_dir is called only for a missing destination; cleanup does not remove a directory whose claim/empty check failed."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/overlay_import.rs",
+      "function": "import",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0637"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir"
+      ]
+    },
+    {
+      "extra_index": 123,
+      "disposition": "output-owner",
+      "category": "bundle-extraction-directory",
+      "reason": "Create each extraction parent relative to the previous held directory descriptor.",
+      "creation": {
+        "policy": "directory-relative",
+        "basis": "mkdirat requests 0700 and each component is then reopened with the no-follow directory flags; collisions are not replacements."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/overlay_pack.rs",
+      "function": "parent",
+      "op": "rustix::mkdirat",
+      "diagnostic_ids": [
+        "D0642"
+      ],
+      "compiler_definition_paths": [
+        "rustix::fs::mkdirat"
+      ]
+    },
+    {
+      "extra_index": 124,
+      "disposition": "output-owner",
+      "category": "bundle-staging-lock",
+      "reason": "Permit creation of the adjacent bundle staging lock without truncating a previous lock.",
+      "creation": {
+        "policy": "create-or-open",
+        "basis": "The read/write lock uses truncate(false); flock plus the current-inode check coordinates the sweeper and publisher."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/overlay_pack.rs",
+      "function": "StageLock::beside",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0657"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ]
+    },
+    {
+      "extra_index": 125,
+      "disposition": "output-owner",
+      "category": "bundle-extraction-directory",
+      "reason": "Create a bundle directory entry relative to its validated parent descriptor.",
+      "creation": {
+        "policy": "directory-relative",
+        "basis": "mkdirat starts the directory at 0700, then a no-follow open validates it; the saved archive metadata is applied in the extraction flow."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/overlay_pack.rs",
+      "function": "extract_with_limits",
+      "op": "rustix::mkdirat",
+      "diagnostic_ids": [
+        "D0665"
+      ],
+      "compiler_definition_paths": [
+        "rustix::fs::mkdirat"
+      ]
+    },
+    {
+      "extra_index": 126,
+      "disposition": "support",
+      "category": "creation-builder",
+      "reason": "Construct the private verification-marker directory builder.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder setup is separate from the recursive mode-0700 directory creation leaf."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/overlay_pack.rs",
+      "function": "write_marker",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0673",
+        "D0674"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ]
+    },
+    {
+      "extra_index": 127,
+      "disposition": "output-owner",
+      "category": "bundle-verification-directory",
+      "reason": "Create the private per-digest verified-marker directory under the bundle cache.",
+      "creation": {
+        "policy": "private-recursive-directory",
+        "basis": "The recursive DirBuilder requests 0700 and preserves the existing cache verification structure."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/overlay_pack.rs",
+      "function": "write_marker",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0675"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ]
+    },
+    {
+      "extra_index": 128,
+      "disposition": "output-owner",
+      "category": "bundle-verification-marker",
+      "reason": "Configure exclusive creation of the verification marker for the checked bundle key.",
+      "creation": {
+        "policy": "exclusive-new-file",
+        "basis": "create_new never overwrites a marker; AlreadyExists is treated as the existing completed marker and default file permissions remain unchanged."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/overlay_pack.rs",
+      "function": "write_marker",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0677"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create_new"
+      ]
+    },
+    {
+      "extra_index": 129,
+      "disposition": "support",
+      "category": "creation-builder",
+      "reason": "Construct the private bundle cache-directory builder.",
+      "creation": {
+        "policy": "none",
+        "basis": "This event is setup only; the following create leaf requests a recursive 0700 cache tree."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/overlay_pack.rs",
+      "function": "cached_lower_in",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0679",
+        "D0680"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ]
+    },
+    {
+      "extra_index": 130,
+      "disposition": "output-owner",
+      "category": "bundle-cache-directory",
+      "reason": "Create the private bundle cache before making a validated private copy of the supplied bundle.",
+      "creation": {
+        "policy": "private-recursive-directory",
+        "basis": "The recursive builder requests 0700; copy verification/publication and marker operations have independent approvals."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/overlay_pack.rs",
+      "function": "cached_lower_in",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0681"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ]
+    },
+    {
+      "extra_index": 131,
+      "disposition": "output-owner",
+      "category": "overlay-import-directory",
+      "reason": "Claim a missing validated upperdir-conversion destination before opening overlay state.",
+      "creation": {
+        "policy": "exclusive-directory",
+        "basis": "create_dir cannot replace an existing entry and retains current directory-default permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/overlay_upperdir.rs",
+      "function": "run",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0682"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir"
+      ]
+    },
+    {
+      "extra_index": 132,
+      "disposition": "output-owner",
+      "category": "published-index-directory",
+      "reason": "Create the publication destination parent before atomic managed-source index copying.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "Only output parents are created; the separately reviewed managed copy and tempfile publication preserve source/input obligations."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/publish_index.rs",
+      "function": "atomic_copy",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0687"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 133,
+      "disposition": "support",
+      "category": "creation-builder",
+      "reason": "Construct the sandbox private-directory builder.",
+      "creation": {
+        "policy": "none",
+        "basis": "The builder constructor opens nothing; create and post-creation ownership/private-mode checks are separate."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/sandbox/daemon.rs",
+      "function": "private_dir",
+      "op": "DirBuilder",
+      "diagnostic_ids": [
+        "D0691",
+        "D0692"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder",
+        "std::fs::DirBuilder::new"
+      ]
+    },
+    {
+      "extra_index": 134,
+      "disposition": "output-owner",
+      "category": "sandbox-state-directory",
+      "reason": "Create an owned private sandbox directory or validate an existing one.",
+      "creation": {
+        "policy": "private-directory",
+        "basis": "DirBuilder requests 0700; symlink_metadata then requires a real directory owned by euid with no group/other permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/sandbox/daemon.rs",
+      "function": "private_dir",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0693"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::DirBuilder::create"
+      ]
+    },
+    {
+      "extra_index": 135,
+      "disposition": "output-owner",
+      "category": "runtime-lock",
+      "reason": "Permit creating the sandbox daemon lock while preserving an existing lock inode.",
+      "creation": {
+        "policy": "create-or-open",
+        "basis": "The lock uses 0600, NOFOLLOW/CLOEXEC and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/sandbox/daemon.rs",
+      "function": "lock",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0696"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ]
+    },
+    {
+      "extra_index": 136,
+      "disposition": "support",
+      "category": "builder-type-reference",
+      "reason": "Import OpenOptions for sandbox run locking and state output.",
+      "creation": {
+        "policy": "none",
+        "basis": "This type support reference acquires no file and cannot authorize later operations."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/sandbox/run.rs",
+      "function": "<module>",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0708"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions"
+      ]
+    },
+    {
+      "extra_index": 137,
+      "disposition": "output-owner",
+      "category": "runtime-lock",
+      "reason": "Permit creating the sandbox run coordination lock without truncating its inode.",
+      "creation": {
+        "policy": "create-or-open",
+        "basis": "The lock uses mode 0600 and NOFOLLOW/CLOEXEC, truncate(false), and a nonblocking exclusive flock retained in RunLock."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/sandbox/run.rs",
+      "function": "RunLock::acquire",
+      "op": "OpenOptions",
+      "diagnostic_ids": [
+        "D0713"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::OpenOptions::create"
+      ]
+    },
+    {
+      "extra_index": 138,
+      "disposition": "output-owner",
+      "category": "sandbox-parent-directory",
+      "reason": "Create the parent of the requested absolute sandbox top before canonicalizing it.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The top name must identify a child rather than /; its parent is canonicalized and an existing top is checked against symlink/non-directory substitution."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/sandbox/run.rs",
+      "function": "absolute_top",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0715"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 139,
+      "disposition": "output-owner",
+      "category": "sandbox-recovery-directory",
+      "reason": "Create the recovery-copy destination before recursively copying the sandbox tree.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The recovery copier checks and removes incompatible existing destinations without following their symlinks; directory defaults remain unchanged."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/sandbox/run.rs",
+      "function": "copy_tree",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0721"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 140,
+      "disposition": "output-owner",
+      "category": "sandbox-mountpoint",
+      "reason": "Create the pipeline mountpoint beneath its fresh canonical control directory.",
+      "creation": {
+        "policy": "exclusive-directory",
+        "basis": "create_dir starts a new child and set_permissions immediately applies 0700 before mount/runtime publication."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/sandbox/run.rs",
+      "function": "pipeline",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0725"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir"
+      ]
+    },
+    {
+      "extra_index": 141,
+      "disposition": "output-owner",
+      "category": "shard-output-directory",
+      "reason": "Create the caller-selected shard output directory before validating its relation to the input tree.",
+      "creation": {
+        "policy": "recursive-directory",
+        "basis": "The sharding command owns output creation, rejects output inside the canonical input and refuses an existing shards.json; default modes remain unchanged."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/shard.rs",
+      "function": "run",
+      "op": "fs::create_dir_all",
+      "diagnostic_ids": [
+        "D0738"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir_all"
+      ]
+    },
+    {
+      "extra_index": 142,
+      "disposition": "output-owner",
+      "category": "snapshot-output-directory",
+      "reason": "Materialize a Git snapshot directory entry in the caller-owned output tree.",
+      "creation": {
+        "policy": "exclusive-directory",
+        "basis": "create_dir refuses collisions; recursive materialization owns the output and retains existing directory permissions."
+      },
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 v3 narrow; explicit per-site review against 584311c1 source and current implementation; frozen diagnostic ids identify migration rows only",
+      "file": "ratarmount/src/snapshot.rs",
+      "function": "materialize_tree",
+      "op": "fs::create_dir",
+      "diagnostic_ids": [
+        "D0745"
+      ],
+      "compiler_definition_paths": [
+        "std::fs::create_dir"
+      ]
+    }
+  ]
+}

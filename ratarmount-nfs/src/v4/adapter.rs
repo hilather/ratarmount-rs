@@ -330,6 +330,10 @@ impl RatarmountNfs4 {
         let path = self.inodes.path_for_id(id).ok_or(FsError::Stale)?;
         let flags = libc::O_RDWR | libc::O_CREAT;
         let fd = ov.open_overlay_fd(&path, flags).map_err(overlay_to_fs)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0476-M01","item":"<ratarmount_nfs::v4::adapter::RatarmountNfs4>::write_sync","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
         let wrote = ov.write_all_at(&file, &path, offset, data);
         ov.finish_owned_write_fd(file);
@@ -372,14 +376,26 @@ impl RatarmountNfs4 {
             embednfs::SetTime::ServerNow => now,
             embednfs::SetTime::Client(t) => t.seconds as f64 + t.nanos as f64 / 1e9,
         };
-        let metadata = OverlayMetadata {
+        let mut metadata = OverlayMetadata {
             mode: attrs.mode,
             uid: attrs.uid,
             gid: attrs.gid,
             atime: attrs.atime.as_ref().map(time),
             mtime: attrs.mtime.as_ref().map(time),
         };
-        if !metadata.is_empty() || attrs.size.is_some() {
+        let requested = !metadata.is_empty() || attrs.size.is_some();
+        if metadata.uid.is_some() || metadata.gid.is_some() {
+            // A chown to the owner already presented is a no-op (#327).
+            if let Ok(fi) = self.file_info_for_id(id) {
+                (metadata.uid, metadata.gid) = self.attribute_mapping.drop_presented_owner(
+                    fi.uid,
+                    fi.gid,
+                    metadata.uid,
+                    metadata.gid,
+                );
+            }
+        }
+        if requested {
             ov.set_attributes(&path, attrs.size, &metadata)
                 .map_err(|e| match &e {
                     ratarmount_compositing::OverlayError::Io(io)
@@ -1422,6 +1438,34 @@ mod tests {
         assert!(names.contains(&"keep"), "{names:?}");
     }
 
+    /// Regression (#316): NFSv4 CREATE of a directory over an existing name
+    /// changed the directory's mode instead of failing; it is
+    /// `FsError::AlreadyExists` (NFS4ERR_EXIST) and the mode is kept.
+    #[test]
+    fn regression_316_v4_mkdir_existing_is_exist() {
+        let mut base = Synth::new();
+        base.add_file("/keep", b"archive", vec![UserData::Other("t".into())]);
+        let (_td, nfs) = overlay_export(base);
+        let dir = |mode| CreateRequest {
+            kind: CreateKind::Directory,
+            attrs: SetAttrs {
+                mode: Some(mode),
+                ..SetAttrs::default()
+            },
+        };
+        let made = nfs.create_sync(1, "sub", dir(0o750)).expect("mkdir");
+        assert_eq!(made.attrs.mode, 0o750);
+        assert!(matches!(
+            nfs.create_sync(1, "sub", dir(0o700)),
+            Err(FsError::AlreadyExists)
+        ));
+        assert_eq!(nfs.getattr_sync(made.handle).unwrap().mode, 0o750);
+        assert!(matches!(
+            nfs.create_sync(1, "keep", dir(0o700)),
+            Err(FsError::AlreadyExists)
+        ));
+    }
+
     /// Regression: write-then-cat empty when NFSv4 READ used a stale size-0
     /// inode cache instead of re-lookup.
     #[test]
@@ -1607,6 +1651,97 @@ mod tests {
 #[cfg(test)]
 mod sandbox_attr_tests {
     use super::*;
+
+    /// Regression: NFSv4 must retain read-only denials after filtering chown,
+    /// and refuse a real owner change before applying a combined truncate (#327).
+    #[test]
+    fn regression_327_chown_preserves_policy_and_readonly() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("member"), b"base").unwrap();
+        let source = Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+        for protected in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut ov =
+                crate::test_overlay::new_overlay(source.clone(), directory.path()).unwrap();
+            let rules = Arc::new(ratarmount_compositing::ReadOnlyGlobs::new(["member"]).unwrap());
+            if protected {
+                ov.set_policy(Some(rules.clone()));
+            }
+            let ov = Arc::new(ov);
+            for writable in [true, false] {
+                let fs = RatarmountNfs4::with_overlay(ov.clone(), 0, writable.then(|| ov.clone()))
+                    .with_attribute_mapping(
+                        ratarmount_core::AttributeMapping::parse("uid=12345,gid=23456").unwrap(),
+                    );
+                let id = fs.lookup_sync(1, "member").unwrap();
+                let chown = |size: Option<u64>, uid| {
+                    let attrs = OverlayMetadata {
+                        uid: Some(uid),
+                        gid: Some(23456),
+                        ..Default::default()
+                    };
+                    fs.setattr_sync(
+                        id,
+                        &SetAttrs {
+                            uid: attrs.uid,
+                            gid: attrs.gid,
+                            size,
+                            ..Default::default()
+                        },
+                    )
+                };
+                if !writable || protected {
+                    assert_eq!(chown(None, 12345).unwrap_err(), FsError::ReadOnly);
+                } else {
+                    assert!(chown(None, 12345).is_ok());
+                    assert_eq!(
+                        chown(Some(0), 12346).unwrap_err(),
+                        FsError::PermissionDenied
+                    );
+                }
+                assert!(!ov.has_file("/member"));
+                assert_eq!(ov.lookup("/member", 0).unwrap().size, 4);
+            }
+            assert_eq!(rules.erofs_denied(), u64::from(protected));
+        }
+    }
+
+    /// Regression: `cp -p` over NFSv4 failed because a SETATTR to the owner
+    /// already presented was refused with EPERM (#327).
+    #[test]
+    fn regression_nfs4_setattr_same_owner_chown_is_noop() {
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        for (mapping, shown) in [("", (uid, gid)), ("uid=12345,gid=23456", (12345, 23456))] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::write(base.path().join("member"), b"base").unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let source =
+                Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+            let ov = Arc::new(crate::test_overlay::new_overlay(source, directory.path()).unwrap());
+            let nfs = RatarmountNfs4::with_overlay(ov.clone(), 0, Some(ov))
+                .with_attribute_mapping(AttributeMapping::parse(mapping).unwrap());
+            let id = nfs.lookup_sync(1, "member").unwrap();
+            let chown = |uid: Option<u32>, gid: Option<u32>| {
+                nfs.setattr_sync(
+                    id,
+                    &SetAttrs {
+                        uid,
+                        gid,
+                        ..SetAttrs::default()
+                    },
+                )
+            };
+            assert!(chown(Some(shown.0), Some(shown.1)).is_ok(), "{mapping}");
+            assert!(chown(Some(shown.0), None).is_ok(), "{mapping}");
+            assert!(chown(None, Some(shown.1)).is_ok(), "{mapping}");
+            assert_eq!(
+                chown(Some(shown.0.wrapping_add(1)), None).unwrap_err(),
+                FsError::PermissionDenied,
+                "{mapping}"
+            );
+            assert!(chown(None, Some(shown.1.wrapping_add(1))).is_err());
+        }
+    }
 
     /// Regression: NFS attributes must report mapped owners and mode for every Unix type.
     #[test]

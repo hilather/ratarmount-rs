@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! Remote URL access for Phase 10.
 //!
 //! - `file://` → local path
@@ -95,6 +98,7 @@ use std::sync::Arc;
 
 pub use http_pool::HttpRangeSource;
 use http_pool::Prefetch;
+use ratarmount_index::http_client::HttpError;
 pub use ratarmount_index::ContentToken;
 use secrecy::SecretString;
 
@@ -359,6 +363,10 @@ fn load_http_cookie() -> Result<Option<String>> {
     let Some(path) = non_empty_env(HTTP_COOKIE_FILE_ENV) else {
         return Ok(None);
     };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0511-M01","item":"ratarmount_remote::load_http_cookie","disposition":"out-of-family","category":"configuration-or-credentials","reason":"credentials or client configuration file","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let text = std::fs::read_to_string(&path).map_err(|e| {
         RemoteError::Http(format!(
             "failed to read {HTTP_COOKIE_FILE_ENV} ({path}): {e}"
@@ -409,12 +417,12 @@ fn http_status_err(status: u16, url: &str) -> RemoteError {
     }
 }
 
-fn map_ureq_http_error(err: ureq::Error, url: &str) -> RemoteError {
+fn map_http_client_error(err: HttpError, url: &str) -> RemoteError {
     match err {
-        ureq::Error::Status(401, _) => http_unauthorized(url),
-        ureq::Error::Status(code, _) => http_status_err(code, url),
+        HttpError::Status(401, _) => http_unauthorized(url),
+        HttpError::Status(code, _) => http_status_err(code, url),
         // Transport Display (and its source chain) may contain a signed CDN URL.
-        ureq::Error::Transport(err) => RemoteError::Http(format!(
+        HttpError::Transport(err) => RemoteError::Http(format!(
             "HTTP {:?} for {}",
             err.kind(),
             http_pool::redacted_url(url)
@@ -506,17 +514,18 @@ pub fn remote_url_scheme(s: &str) -> Option<String> {
 
 /// Torrent metainfo is a lazy remote tree even when the metainfo file is local.
 pub fn is_torrent_input(s: &str) -> bool {
-    if s.get(..7)
-        .is_some_and(|p| p.eq_ignore_ascii_case("magnet:"))
-    {
-        return true;
-    }
+    let magnet = s
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("magnet:"));
     #[cfg(not(feature = "bittorrent"))]
     {
-        false
+        magnet
     }
     #[cfg(feature = "bittorrent")]
     {
+        if magnet {
+            return true;
+        }
         if s.contains("://") {
             return Url::parse(s).is_ok_and(|u| {
                 u.path().to_ascii_lowercase().ends_with(".torrent")
@@ -549,6 +558,10 @@ pub fn is_remote_url(s: &str) -> bool {
 
 /// Copy a seekable/stream body into a kept temp file.
 fn keep_from_reader(input: &str, mut r: impl Read) -> Result<RemoteLocal> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0512-M01","item":"ratarmount_remote::keep_from_reader","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     let size = io::copy(&mut r, &mut tmp)?;
     keep_fetched(input, tmp, size)
@@ -816,13 +829,13 @@ fn probe_http_source(source: &HttpRangeSource) -> Result<HttpProbe> {
                 resp.status()
             );
         }
-        Err(ureq::Error::Status(401, _)) => {
+        Err(HttpError::Status(401, _)) => {
             return Err(http_unauthorized(url));
         }
         Err(e) => {
             debug!(
                 "HEAD failed: {}, probing with Range GET",
-                map_ureq_http_error(e, url)
+                map_http_client_error(e, url)
             );
         }
     }
@@ -847,11 +860,11 @@ fn probe_range_size(source: &HttpRangeSource) -> Result<Option<HttpProbe>> {
     let url = source.url();
     let resp = match source.request("GET", Some((0, 0))) {
         Ok(r) => r,
-        Err(ureq::Error::Status(401, _)) => {
+        Err(HttpError::Status(401, _)) => {
             return Err(http_unauthorized(url));
         }
         Err(e) => {
-            debug!("Range probe failed: {}", map_ureq_http_error(e, url));
+            debug!("Range probe failed: {}", map_http_client_error(e, url));
             return Ok(None);
         }
     };
@@ -911,7 +924,7 @@ pub fn fetch_http_range_bytes(url: &str, start: u64, end_inclusive: u64) -> Resu
         loc.cookie.as_deref(),
     )
     .call()
-    .map_err(|e| map_ureq_http_error(e, loc.url.as_str()))?;
+    .map_err(|e| map_http_client_error(e, loc.url.as_str()))?;
     let status = resp.status();
     if status != 206 && !(200..300).contains(&status) {
         return Err(http_status_err(status, loc.url.as_str()));
@@ -943,7 +956,7 @@ pub fn hash_http_range_sha256(url: &str, start: u64, end_inclusive: u64) -> Resu
         loc.cookie.as_deref(),
     )
     .call()
-    .map_err(|e| map_ureq_http_error(e, loc.url.as_str()))?;
+    .map_err(|e| map_http_client_error(e, loc.url.as_str()))?;
     let status = resp.status();
     if status != 206 && !(200..300).contains(&status) {
         return Err(http_status_err(status, loc.url.as_str()));
@@ -986,7 +999,7 @@ pub fn fetch_http_bytes_capped_with_auth(
     let source = HttpRangeSource::new(parse_http_url(url)?, options);
     let resp = source
         .request("GET", None)
-        .map_err(|e| map_ureq_http_error(e, source.url()))?;
+        .map_err(|e| map_http_client_error(e, source.url()))?;
     let status = resp.status();
     if !(200..300).contains(&status) {
         return Err(http_status_err(status, source.url()));
@@ -1052,11 +1065,15 @@ fn fetch_http_full_get(loc: &HttpLocation) -> Result<(NamedTempFile, u64)> {
         loc.cookie.as_deref(),
     )
     .call()
-    .map_err(|e| map_ureq_http_error(e, &loc.url))?;
+    .map_err(|e| map_http_client_error(e, &loc.url))?;
     if !(200..300).contains(&resp.status()) {
         return Err(http_status_err(resp.status(), &loc.url));
     }
     let mut reader = resp.into_reader();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0513-M01","item":"ratarmount_remote::fetch_http_full_get","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     let n = io::copy(&mut reader, &mut tmp)?;
     tmp.flush()?;
@@ -1066,6 +1083,10 @@ fn fetch_http_full_get(loc: &HttpLocation) -> Result<(NamedTempFile, u64)> {
 
 /// Sequential Range GET materialization into a tempfile.
 fn fetch_http_via_ranges(loc: &HttpLocation, size: u64) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0514-M01","item":"ratarmount_remote::fetch_http_via_ranges","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     if size == 0 {
         tmp.flush()?;
@@ -1082,7 +1103,7 @@ fn fetch_http_via_ranges(loc: &HttpLocation, size: u64) -> Result<(NamedTempFile
             loc.cookie.as_deref(),
         )
         .call()
-        .map_err(|e| map_ureq_http_error(e, &loc.url))?;
+        .map_err(|e| map_http_client_error(e, &loc.url))?;
         let status = resp.status();
         if status == 206 {
             http_pool::validate_content_range(&resp, start, end, Some(size))?;
@@ -1172,7 +1193,7 @@ impl HttpRangeFile {
         }
         let resp = source
             .request("GET", None)
-            .map_err(|e| map_ureq_http_error(e, source.url()))?;
+            .map_err(|e| map_http_client_error(e, source.url()))?;
         if !(200..300).contains(&resp.status()) {
             return Err(http_status_err(resp.status(), source.url()));
         }
@@ -1182,6 +1203,10 @@ impl HttpRangeFile {
                 64 * 1024 * 1024,
                 ratarmount_core::budget::Priority::Cache,
             );
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0515-M01","item":"<ratarmount_remote::HttpRangeFile>::open_with_auth","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
             let mut file = tempfile::tempfile()?;
             let size = io::copy(&mut resp.into_reader(), &mut file)?;
             let mut reader = Self::from_source(source, size, None);
@@ -1846,11 +1871,13 @@ mod tests {
                             break;
                         }
                         headers.push(line.clone());
-                        if let Some(v) = line.strip_prefix("Range:") {
-                            range_hdr = Some(v.trim().to_string());
-                        }
-                        if let Some(v) = line.strip_prefix("Authorization:") {
-                            auth_hdr = Some(v.trim().to_string());
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("range") {
+                                range_hdr = Some(value.trim().to_string());
+                            }
+                            if name.eq_ignore_ascii_case("authorization") {
+                                auth_hdr = Some(value.trim().to_string());
+                            }
                         }
                         // Case-insensitive Cookie: (HTTP headers are case-insensitive).
                         let lower = line.to_ascii_lowercase();
@@ -2728,11 +2755,13 @@ mod tests {
                         if line == "\r\n" || line == "\n" || line.is_empty() {
                             break;
                         }
-                        if let Some(v) = line.strip_prefix("Content-Length:") {
-                            content_length = v.trim().parse().unwrap_or(0);
-                        }
-                        if let Some(v) = line.strip_prefix("Authorization:") {
-                            auth_hdr = Some(v.trim().to_string());
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                            if name.eq_ignore_ascii_case("authorization") {
+                                auth_hdr = Some(value.trim().to_string());
+                            }
                         }
                     }
                     // Drain request body if any (PROPFIND).
@@ -2904,6 +2933,29 @@ mod tests {
 
 #[cfg(test)]
 mod torrent_dispatch_tests {
+    /// Regression: the feature-dependent boolean rewrite must keep magnet prefix detection exact.
+    #[test]
+    fn regression_torrent_magnet_prefix() {
+        for input in [
+            "magnet:",
+            "MAGNET:?xt=urn:btih:0123456789012345678901234567890123456789",
+            "mAgNeT://example/a.torrent",
+        ] {
+            assert!(super::is_torrent_input(input), "{input}");
+        }
+        for input in [
+            "",
+            "magnet",
+            "magnetx:",
+            "prefix-magnet:",
+            " magnet:",
+            "magneté:",
+            "🧲🧲",
+        ] {
+            assert!(!super::is_torrent_input(input), "{input}");
+        }
+    }
+
     /// Regression: a minimal remote library returned a generic unsupported-scheme error.
     #[cfg(not(feature = "bittorrent"))]
     #[test]
@@ -2928,8 +2980,18 @@ mod torrent_dispatch_tests {
         assert!(!super::is_torrent_input(mount.to_str().unwrap()));
         assert!(!super::is_remote_url(mount.to_str().unwrap()));
         assert!(!super::is_torrent_input("missing.torrent"));
-        for input in [file.to_str().unwrap(), "https://example/a.torrent?token=x"] {
-            assert_eq!(super::is_torrent_input(input), cfg!(feature = "bittorrent"));
+        let file_url = url::Url::from_file_path(&file).unwrap();
+        for input in [
+            file.to_str().unwrap(),
+            file_url.as_str(),
+            "https://example/a.torrent?token=x",
+            "http://example/a.TORRENT#fragment",
+        ] {
+            assert_eq!(
+                super::is_torrent_input(input),
+                cfg!(feature = "bittorrent"),
+                "{input}"
+            );
         }
         assert_eq!(
             super::remote_url_scheme("https://example/a.torrent").as_deref(),
@@ -2942,12 +3004,17 @@ mod torrent_dispatch_tests {
         assert!(super::is_torrent_input(
             "magnet:?xt=urn:btih:0123456789012345678901234567890123456789"
         ));
+        let mount_url = url::Url::from_file_path(&mount).unwrap();
+        let missing_url = url::Url::from_file_path(dir.path().join("missing.torrent")).unwrap();
         for input in [
+            mount_url.as_str(),
+            missing_url.as_str(),
             "a.torrent.tar",
             "a.torrent/child",
             "a.txt",
             "https://example/a.tar?name=a.torrent",
             "s3://bucket/a.torrent",
+            "https://[invalid/a.torrent",
         ] {
             assert!(!super::is_torrent_input(input), "{input}");
         }

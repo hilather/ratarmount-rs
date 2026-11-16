@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! SQLite index compatible with Python `ratarmountcore.SQLiteIndex` (v0.7.0).
 //!
 //! Portable HTTP/OCI blobs use [`INDEX_MEDIA_TYPE`] (`v1` = this SQLite sidecar
@@ -15,6 +18,8 @@ pub mod checked_open;
 mod digest_cache;
 mod dirent_order;
 mod hashing;
+#[doc(hidden)]
+pub mod http_client;
 #[cfg(all(test, unix))]
 mod internal_reads_tests;
 mod local_cache;
@@ -25,19 +30,28 @@ mod meta_cache;
 mod nested;
 mod patch;
 mod payload_cache;
+#[cfg(test)]
+mod prepared_tests;
+#[cfg(all(test, unix))]
+mod publish_tests;
 mod range_cache;
 mod search;
+#[cfg(test)]
+mod test_log;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_process;
 
 pub use digest_cache::{
     archive_digest_cache_available, cached_archive_digest, cached_archive_digest_cancellable,
-    cached_archive_digest_with, peek_archive_digest, refresh_archive_digest, ArchiveDigestStamp,
+    cached_archive_digest_cancellable_for_snapshot, cached_archive_digest_with,
+    peek_archive_digest, peek_archive_digest_for_open, refresh_archive_digest, ArchiveDigestStamp,
     DIGEST_LOCK_SUFFIX,
 };
 pub use dirent_order::{cmp_offset_then_name, DirentOrder, VisibleMember};
 pub use hashing::{
     compute_hashes_limited, fill_content_hashes, hash_hex, normalize_algorithm, sha256_hex,
-    sha256_hex_stream, sha256_stream_calls_this_thread, HASH_STREAM_CHUNK,
-    SUPPORTED_HASH_ALGORITHMS,
+    sha256_hex_stream, sha256_stream_calls_this_thread, shared_xattr_slots_sql, FillReport,
+    HASH_STREAM_CHUNK, SEVENZIP_MEMBER_XATTR_BASE, SUPPORTED_HASH_ALGORITHMS,
 };
 pub use local_cache::{
     enforce_local_index_budget_if_path, find_existing_user_cache_index, is_local_index_cache_path,
@@ -46,18 +60,19 @@ pub use local_cache::{
 };
 pub use location::{
     archive_base_from_index_path, bind_local_index_id, default_index_folders, default_index_path,
-    expand_user, find_existing_sibling_index, index_id_path, index_pointer_path,
-    index_pointer_path_for_index_file, index_pointer_to_json, is_index_url, load_index_pointer,
-    local_sibling_index_candidates, looks_like_url_archive, materialize_index_file,
-    maybe_fetch_index_url, object_store_sibling_index_candidates, parse_index_folders,
-    parse_index_id, parse_index_pointer_json, parse_link_describedby, path_can_create_index,
-    path_is_usable_existing_index, pick_index_path, possible_index_paths, prune_index_snapshots,
-    publish_index_pointer, resolve_index_id_path, resolve_index_location,
-    resolve_sibling_index_location, sibling_index_candidates, sibling_index_id_candidates,
-    sibling_index_id_url, sibling_index_pointer_url, sibling_index_url, sibling_parent_dir,
-    snapshot_index_id, store_index_pointer_atomic, test_writable_dir, IndexLocation, IndexPointer,
-    INDEX_ID_HEX_LEN, INDEX_LINK_REL, INDEX_MEDIA_TYPE, INDEX_POINTER_KEEP_LAST,
-    INDEX_POINTER_SCHEMA, MEMORY_INDEX,
+    existing_sqlite_companion, expand_user, find_existing_sibling_index, fsync_dir, index_id_path,
+    index_pointer_path, index_pointer_path_for_index_file, index_pointer_to_json, is_index_url,
+    is_pin_file_name, load_index_pointer, local_sibling_index_candidates, looks_like_url_archive,
+    materialize_index_file, maybe_fetch_index_url, object_store_sibling_index_candidates,
+    parse_index_folders, parse_index_id, parse_index_pointer_json, parse_link_describedby,
+    path_can_create_index, path_is_usable_existing_index, pick_index_path, possible_index_paths,
+    prune_index_snapshots, publish_index_pointer, publish_index_pointer_for_pin,
+    require_publication_dir, resolve_index_id_path, resolve_index_location,
+    resolve_prepared_index_location, resolve_sibling_index_location, sibling_index_candidates,
+    sibling_index_id_candidates, sibling_index_id_url, sibling_index_pointer_url,
+    sibling_index_url, sibling_parent_dir, snapshot_index_id, store_index_pointer_atomic,
+    test_writable_dir, IndexLocation, IndexPointer, PublishedPin, INDEX_ID_HEX_LEN, INDEX_LINK_REL,
+    INDEX_MEDIA_TYPE, INDEX_POINTER_KEEP_LAST, INDEX_POINTER_SCHEMA, MEMORY_INDEX,
 };
 pub use meta_cache::{
     cache_identity, invalidate_meta_cache_file, invalidate_meta_cache_identity, is_meta_cache_path,
@@ -312,6 +327,10 @@ pub fn archive_edge_hashes(path: &Path) -> Result<(String, String)> {
     use std::io::{Seek, SeekFrom};
 
     // Managed (#151): the archive may be a database open in this process.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0423-M01","item":"ratarmount_index::archive_edge_hashes","disposition":"managed-read","regression":"regression_archive_fingerprints_keep_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut f = managed_read::ManagedReadCursor::open(path)?;
     let len = f.len()?;
     let mut buf = [0u8; TARSTATS_SAMPLE_BYTES];
@@ -332,6 +351,10 @@ pub fn archive_edge_hashes(path: &Path) -> Result<(String, String)> {
 /// Streams until EOF (no second size cap, no file-sized `Vec`). Policy cap is
 /// the `st_size` gate only — do not change [`TARSTATS_FULL_HASH_MAX`].
 pub fn archive_full_hash(path: &Path) -> Result<Option<String>> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0424-M01","item":"ratarmount_index::archive_full_hash","disposition":"managed-read","regression":"regression_archive_fingerprints_keep_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut f = managed_read::ManagedReadCursor::open(path)?;
     let len = f.len()?;
     if len > TARSTATS_FULL_HASH_MAX {
@@ -917,11 +940,19 @@ fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
             Some(format!("cannot snapshot {}: {e}", absolute.display())),
         )
     };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0425-M01","item":"ratarmount_index::snapshot_connection","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let dir = tempfile::tempdir().map_err(io)?;
     let copy = dir.path().join("snapshot.sqlite");
     // Managed sources (#151): the index and its companions are open in this
     // process. Exclusive-new outputs in the fresh directory with the exact
     // source permissions; a failed copy removes its own output.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0426-M01","item":"ratarmount_index::snapshot_connection","disposition":"managed-read","regression":"regression_lookup_snapshot_main_copy_keeps_index_lock","mode_policy":"exclusive-new in the private directory with the source mode & !umask; exact source permissions through the handle after the copy","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"exclusive-new in the private directory with the source mode & !umask; exact source permissions through the handle after the copy","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let exclusive = |from: &Path, to: &Path| {
         managed_read::copy_exclusive_new(
             from,
@@ -998,6 +1029,78 @@ fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// State of one SQLite -wal/-journal companion, from lstat.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CompanionState {
+    /// NotFound.
+    Absent,
+    /// A regular, non-symlink file of length 0.
+    EmptyRegular,
+    /// Anything else (symlink, reparse point, other non-regular file,
+    /// nonzero length, any metadata error but NotFound): fail closed.
+    Leftover,
+}
+
+/// Classify a companion's `symlink_metadata` result. Only `Absent` and
+/// `EmptyRegular` permit the read-only finalize shortcut.
+pub(crate) fn classify_companion(meta: &std::io::Result<std::fs::Metadata>) -> CompanionState {
+    match meta {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CompanionState::Absent,
+        Err(_) => CompanionState::Leftover,
+        Ok(meta) => {
+            let kind = meta.file_type();
+            if kind.is_file() && !kind.is_symlink() && meta.len() == 0 {
+                CompanionState::EmptyRegular
+            } else {
+                CompanionState::Leftover
+            }
+        }
+    }
+}
+
+/// Open a self-contained prepared SQLite artifact without recovery or companion writes.
+/// The preparer must have checkpointed every writer before this call.
+pub fn open_prepared_connection(path: &Path) -> Result<Connection> {
+    let invalid = |reason: &str| {
+        IndexError::Invalid(format!(
+        "prepared index {}: {reason}; --no-recreate-index requires completed preparation; stop workers and prepare the base/index before retrying", path.display()
+    ))
+    };
+    let metadata = std::fs::metadata(path).map_err(|e| invalid(&format!("unavailable: {e}")))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(invalid("expected a nonempty regular SQLite file"));
+    }
+    let absolute = path.canonicalize()?;
+    for suffix in ["-journal", "-wal"] {
+        let mut companion = absolute.as_os_str().to_owned();
+        companion.push(suffix);
+        match std::fs::symlink_metadata(PathBuf::from(companion)) {
+            Ok(meta) if suffix == "-journal" || !meta.is_file() || meta.len() != 0 => {
+                return Err(invalid(&format!(
+                    "incomplete preparation ({suffix}); finish checkpointing before workers start"
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(invalid(&format!("cannot inspect companion: {e}"))),
+        }
+    }
+    let uri = immutable_uri(&absolute).ok_or_else(|| invalid("cannot encode SQLite URI"))?;
+    let conn = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| invalid(&format!("cannot open SQLite artifact: {e}")))?;
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map_err(|e| invalid(&format!("cannot read SQLite schema: {e}")))?;
+    conn.execute_batch("PRAGMA query_only=ON")?;
+    Ok(conn)
+}
+
 fn immutable_uri(absolute: &Path) -> Option<String> {
     #[cfg(unix)]
     let bytes = {
@@ -1047,7 +1150,118 @@ impl SqliteIndex {
     /// sidecar's block table, a will-I-rebuild probe): it creates nothing
     /// beside the index. See [`open_lookup_connection`].
     pub fn open_lookup(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_read_only_with(path, false, false, true)
+        Self::open_read_only_with(path, false, false, true, false)
+    }
+
+    /// Native catalog open respecting the strict prepared-worker policy.
+    pub fn open_read_only_for_open(path: impl AsRef<Path>, options: &OpenOptions) -> Result<Self> {
+        if !options.read_only_index {
+            return Self::open_read_only(path);
+        }
+        let index = Self::open_prepared(path)?;
+        let metadata = index.metadata()?;
+        for required in ["backendName", "tarstats"] {
+            if metadata.get(required).is_none_or(String::is_empty) {
+                return Err(IndexError::Invalid(format!(
+                    "prepared index {} is missing required {required} metadata; --no-recreate-index forbids rebuilding; prepare the base/index before retrying",
+                    index.path.as_ref().expect("disk index").display()
+                )));
+            }
+        }
+        Ok(index)
+    }
+
+    /// Prepared immutable index with the ordinary compact projection.
+    pub fn open_prepared(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_with(path, true, true, false, true)
+    }
+
+    /// Prepared immutable SQL-only catalog, with no compact projection.
+    pub fn open_catalog_prepared(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_with(path, false, false, false, true)
+    }
+
+    /// Policy-aware lookup for codec and durable nested metadata.
+    pub fn open_lookup_for_open(path: impl AsRef<Path>, options: &OpenOptions) -> Result<Self> {
+        if options.read_only_index {
+            Self::open_catalog_prepared(path)
+        } else {
+            Self::open_lookup(path)
+        }
+    }
+
+    /// Validate the identity required by a prepared compression-only shell.
+    pub fn check_prepared_tarstats(&self, archive: &Path) -> Result<()> {
+        if self.tarstats()?.is_none() {
+            return Err(IndexError::Invalid(format!(
+                "prepared index {} is missing tarstats; --no-recreate-index requires preparation",
+                self.path.as_deref().unwrap_or(archive).display()
+            )));
+        }
+        if !archive.is_file() {
+            return Err(IndexError::Invalid(format!(
+                "prepared base {} is unavailable",
+                archive.display()
+            )));
+        }
+        self.check_tarstats_matches_archive(archive)
+    }
+
+    /// Preparer-only handoff: checkpoint an actual existing artifact, never create it.
+    pub fn finalize_prepared(path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if !std::fs::metadata(path)?.is_file() {
+            return Err(IndexError::Invalid(format!(
+                "prepared index {} is not a regular file",
+                path.display()
+            )));
+        }
+        // Only checkpoint when there is something to finish: any companion
+        // that classify_companion calls Leftover, or an empty -wal on a
+        // writable artifact (removed on close). Companions are probed next to BOTH the given path (SQLite
+        // may keep an alias spelling) and the canonical path. A complete
+        // read-only artifact is validated, never written; a read-only one
+        // with leftover WAL/journal state is refused.
+        let absolute = path.canonicalize()?;
+        let mut leftover = false;
+        let mut empty_wal = false;
+        for base in [path, absolute.as_path()] {
+            for suffix in ["-journal", "-wal"] {
+                let mut companion = base.as_os_str().to_owned();
+                companion.push(suffix);
+                match classify_companion(&std::fs::symlink_metadata(PathBuf::from(companion))) {
+                    CompanionState::Absent => {}
+                    CompanionState::EmptyRegular => empty_wal |= suffix == "-wal",
+                    CompanionState::Leftover => leftover = true,
+                }
+            }
+        }
+        let read_only = std::fs::metadata(&absolute)?.permissions().readonly();
+        if leftover && read_only {
+            return Err(IndexError::Invalid(format!(
+                "prepared index {} is read-only but has leftover WAL/journal state; preparation incomplete; finish checkpointing with a writable index before workers start",
+                path.display()
+            )));
+        }
+        if !leftover && (!empty_wal || read_only) {
+            Self::open_catalog_prepared(path)?;
+            return Ok(());
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::ZERO)?;
+        let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if busy != 0 {
+            return Err(IndexError::Invalid(format!(
+                "prepared index {}: wal_checkpoint(TRUNCATE) busy; preparation incomplete",
+                path.display()
+            )));
+        }
+        drop(conn);
+        Self::open_catalog_prepared(path)?;
+        Ok(())
     }
 
     fn open_read_only_inner(
@@ -1055,7 +1269,7 @@ impl SqliteIndex {
         announce: bool,
         load_mem: bool,
     ) -> Result<Self> {
-        Self::open_read_only_with(path, announce, load_mem, false)
+        Self::open_read_only_with(path, announce, load_mem, false, false)
     }
 
     fn open_read_only_with(
@@ -1063,9 +1277,12 @@ impl SqliteIndex {
         announce: bool,
         load_mem: bool,
         lookup: bool,
+        prepared: bool,
     ) -> Result<Self> {
         let path = path.as_ref();
-        let conn = if lookup {
+        let conn = if prepared {
+            open_prepared_connection(path)?
+        } else if lookup {
             open_lookup_connection(path)?
         } else {
             Connection::open_with_flags(
@@ -1130,6 +1347,10 @@ impl SqliteIndex {
         let (conn, path_buf, publish_target) = match path {
             Some(dest) => {
                 if let Some(parent) = dest.parent() {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-E0058-M01","item":"<ratarmount_index::SqliteIndex>::create_writable","disposition":"output-owner","category":"index-output-directory","reason":"Create the requested writable index parent before initializing the new index.","creation":{"policy":"recursive-directory","basis":"Directory output ownership is explicit in create_writable and keeps current std permissions."}}"###
+                    )]
                     std::fs::create_dir_all(parent)?;
                 }
                 // Concurrent readers keep dest's inode; do not remove_file dest.
@@ -1201,6 +1422,18 @@ impl SqliteIndex {
         index_path: Option<&Path>,
         options: &OpenOptions,
     ) -> Result<Self> {
+        let private_compact = index_path.is_none()
+            && options.index_compact_only
+            && !options.index_in_memory
+            && options.index_file_path.is_none()
+            && options.index_folders.is_empty()
+            && !options.write_index;
+        if options.read_only_index && !private_compact {
+            return Err(IndexError::Invalid(format!(
+                "prepared index {} is unavailable or invalid; --no-recreate-index forbids creating or rebuilding it; stop workers and prepare the base/index before retrying",
+                index_path.map(|p| p.display().to_string()).unwrap_or_else(|| ":memory:".into())
+            )));
+        }
         let idx = if options.index_compact_only {
             Self::create_compact_only()?
         } else if options.index_in_memory {
@@ -1782,6 +2015,10 @@ impl SqliteIndex {
         }
         // Managed sync (#151): the temporary index may be another name of a
         // database open in this process.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0427-M01","item":"<ratarmount_index::SqliteIndex>::publish_tmp","disposition":"managed-read","regression":"regression_index_publish_sync_keeps_aliased_database_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         managed_read::ManagedReadCursor::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, &dest)?;
         self.publish_target = None;
@@ -2051,7 +2288,8 @@ impl SqliteIndex {
     /// - `archive_path` does not exist → `Ok` (virtual labels; cannot fingerprint).
     ///   URL / `oci:{digest}` labels hit this no-op; after fetching a remote sidecar
     ///   call [`check_tarstats_matches_remote`] instead.
-    /// - Size or whole-second mtime mismatch → [`IndexError::Mismatch`] (caller rebuilds).
+    /// - Size, whole-second mtime or nanoseconds (when stored) mismatch →
+    ///   [`IndexError::Mismatch`] (caller rebuilds).
     /// - When edge SHA-256 samples are stored, they must match (catches same-size/same-second replaces).
     ///
     /// Call **before** trusting `files` rows or compression side tables (RGZI / zstdblocks /
@@ -2080,6 +2318,26 @@ impl SqliteIndex {
                 stored.st_mtime,
                 actual_meta.st_mtime
             )));
+        }
+        if let Some(stored_ns) = stored.st_mtime_ns {
+            match actual_meta.st_mtime_ns {
+                Some(actual_ns) if actual_ns == stored_ns => {}
+                Some(actual_ns) => {
+                    return Err(IndexError::Mismatch(format!(
+                        "archive mtime_ns mismatch for {}: index tarstats st_mtime_ns={} current={}",
+                        archive_path.display(),
+                        stored_ns,
+                        actual_ns
+                    )));
+                }
+                None => {
+                    return Err(IndexError::Mismatch(format!(
+                        "archive mtime_ns missing for {} but index stored st_mtime_ns={}",
+                        archive_path.display(),
+                        stored_ns
+                    )));
+                }
+            }
         }
         // Content samples: only when present in the index (Python indexes omit them).
         if let Some(ref want_full) = stored.full_sha256 {
@@ -2751,7 +3009,14 @@ impl SqliteIndex {
     /// or incomplete.
     pub fn open_writable(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let conn = Connection::open(path)?;
+        let conn = match location::index_write_access(path) {
+            location::IndexWriteAccess::Refused(reason) => return Err(IndexError::Invalid(reason)),
+            location::IndexWriteAccess::ReadOnly => Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?,
+            location::IndexWriteAccess::ReadWrite => Connection::open(path)?,
+        };
         // Brief wait if a concurrent reader is finishing (mount RO + side-table write).
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch(
@@ -3811,6 +4076,53 @@ mod tests {
         assert!(stats.full_sha256.is_none());
     }
 
+    /// Regression: #263 a same-second mtime change passed warm-index validation
+    /// for large archives with matching size and edge hashes; legacy stats omit ns.
+    #[test]
+    fn check_tarstats_matches_archive_rejects_mtime_ns_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, vec![0x5a; TARSTATS_FULL_HASH_MAX as usize + 1]).unwrap();
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.store_tarstats_for_path(&archive).unwrap();
+        let stored = idx.tarstats().unwrap().unwrap();
+        let stored_ns = stored.st_mtime_ns.unwrap();
+        assert!(stored.full_sha256.is_none());
+        assert!(stored.prefix512_sha256.is_some());
+        assert!(stored.suffix512_sha256.is_some());
+        idx.check_tarstats_matches_archive(&archive).unwrap();
+
+        let other_ns = (stored_ns + 500_000_000) % 1_000_000_000;
+        let when = std::time::UNIX_EPOCH
+            + std::time::Duration::new(stored.st_mtime.try_into().unwrap(), other_ns as u32);
+        std::fs::File::options()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+        let actual = tar_stats_from_path(&archive).unwrap();
+        assert_eq!(actual.st_size, stored.st_size);
+        assert_eq!(actual.st_mtime, stored.st_mtime);
+        assert_ne!(actual.st_mtime_ns, stored.st_mtime_ns);
+        assert_eq!(actual.prefix512_sha256, stored.prefix512_sha256);
+        assert_eq!(actual.suffix512_sha256, stored.suffix512_sha256);
+        let err = idx.check_tarstats_matches_archive(&archive).unwrap_err();
+        assert!(
+            matches!(err, IndexError::Mismatch(ref msg) if msg.contains("mtime_ns")),
+            "{err}"
+        );
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&serialize_tarstats(&stored)).unwrap();
+        legacy.as_object_mut().unwrap().remove("st_mtime_ns");
+        idx.store_metadata_key_value("tarstats", &legacy.to_string())
+            .unwrap();
+        assert!(idx.tarstats().unwrap().unwrap().st_mtime_ns.is_none());
+        idx.check_tarstats_matches_archive(&archive)
+            .expect("legacy tarstats without nanoseconds still accept the same whole second");
+    }
+
     /// Regression: warm index must not be trusted when archive size/mtime/content no longer match tarstats.
     #[test]
     fn check_tarstats_matches_archive_rejects_size_or_mtime_mismatch() {
@@ -3857,7 +4169,10 @@ mod tests {
         {
             let stored = idx.tarstats().unwrap().unwrap();
             let when = std::time::UNIX_EPOCH
-                + std::time::Duration::from_secs(stored.st_mtime.max(0) as u64);
+                + std::time::Duration::new(
+                    stored.st_mtime.max(0) as u64,
+                    stored.st_mtime_ns.unwrap().try_into().unwrap(),
+                );
             let times = std::fs::FileTimes::new().set_modified(when);
             std::fs::File::options()
                 .write(true)
@@ -3870,7 +4185,7 @@ mod tests {
             .check_tarstats_matches_archive(&archive)
             .expect_err("content fingerprint mismatch");
         assert!(
-            matches!(err, IndexError::Mismatch(_)),
+            matches!(err, IndexError::Mismatch(ref msg) if msg.contains("fingerprint")),
             "expected Mismatch for content sample, got {err:?}"
         );
 

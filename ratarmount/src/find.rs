@@ -13,8 +13,8 @@ use std::sync::{Arc, Weak};
 use ratarmount_compositing::{live_search_tsv, WriteOverlay};
 use ratarmount_core::{CheapSearchHit, MountSource, OpenOptions};
 use ratarmount_index::{
-    fill_content_hashes, resolve_index_location, SearchHit, SearchQuery, SqliteIndex,
-    DEFAULT_SEARCH_LIMIT, MEMORY_INDEX,
+    fill_content_hashes, resolve_index_location, resolve_prepared_index_location, SearchHit,
+    SearchQuery, SqliteIndex, DEFAULT_SEARCH_LIMIT, MEMORY_INDEX,
 };
 use ratarmount_session::{query_index, split_fts_pattern};
 
@@ -64,7 +64,7 @@ pub fn locate_hits(
     loc: &LocateOptions<'_>,
 ) -> Result<Vec<SearchHit>, String> {
     let idx = open_index_for_find(archive, open_opts)?;
-    query_index_cli(&idx, archive, pattern, loc)
+    query_index_cli(&idx, archive, pattern, loc, open_opts.read_only_index)
 }
 
 /// Search an existing sidecar only (control plane / socket). Does not cold-index.
@@ -75,7 +75,7 @@ pub fn search_existing_sidecar(
     loc: &LocateOptions<'_>,
 ) -> Result<Vec<SearchHit>, String> {
     let idx = open_existing_sidecar(archive, open_opts)?;
-    query_index_cli(&idx, archive, pattern, loc)
+    query_index_cli(&idx, archive, pattern, loc, open_opts.read_only_index)
 }
 
 /// Sidecar-only SearchFn (no overlay / SoA). Live mounts use [`live_search_callback`].
@@ -154,24 +154,40 @@ fn query_index_cli(
     archive: &Path,
     pattern: &str,
     loc: &LocateOptions<'_>,
+    read_only_index: bool,
 ) -> Result<Vec<SearchHit>, String> {
     let (fts, pattern) = split_fts_pattern(pattern, loc.fts);
     if !loc.fill_hashes.is_empty() {
+        if read_only_index {
+            return Err(
+                "--no-recreate-index forbids --hashes; prepare hashes before starting workers"
+                    .into(),
+            );
+        }
         fill_content_hashes(idx, archive, loc.fill_hashes).map_err(|e| e.to_string())?;
     }
     if fts {
-        idx.ensure_fts5().map_err(|e| e.to_string())?;
+        if read_only_index {
+            if !idx.has_files_fts().map_err(|e| e.to_string())? {
+                return Err("--no-recreate-index requires prepared FTS; stop workers and prepare FTS before searching".into());
+            }
+        } else {
+            idx.ensure_fts5().map_err(|e| e.to_string())?;
+        }
     }
     let predicates = loc
         .xattrs
         .iter()
         .map(|s| parse_xattr_filter(s))
         .collect::<Result<Vec<_>, _>>()?;
+    let filter_hashes = predicates
+        .iter()
+        .any(|(name, _, _)| name.starts_with("user.hash."));
     let mut hits = Vec::new();
     let mut cursor: Option<(String, Option<i64>)> = None;
     loop {
         let q = SearchQuery {
-            include_hashes: loc.include_hashes,
+            include_hashes: loc.include_hashes || filter_hashes,
             offset_order: false,
             after: cursor
                 .as_ref()
@@ -191,12 +207,20 @@ fn query_index_cli(
         if let Some(last) = page.last() {
             cursor = Some((last.path.clone(), last.offsetheader));
         }
-        for hit in page {
+        for mut hit in page {
             let mut matches = true;
             for (name, op, expected) in &predicates {
-                let value = match hit.offsetheader {
-                    Some(offset) => idx.get_xattr(offset, name).map_err(|e| e.to_string())?,
-                    None => None,
+                let value = if name.starts_with("user.hash.")
+                    && !hit.hashes.iter().any(|(key, _)| key == name)
+                {
+                    // Use the same ambiguity filtering as --hashes, including
+                    // presence and != predicates when hashes are not printed.
+                    None
+                } else {
+                    match hit.offsetheader {
+                        Some(offset) => idx.get_xattr(offset, name).map_err(|e| e.to_string())?,
+                        None => None,
+                    }
                 };
                 matches &= match op {
                     0 => value.is_some(),
@@ -205,6 +229,9 @@ fn query_index_cli(
                 };
             }
             if matches {
+                if !loc.include_hashes {
+                    hit.hashes.clear();
+                }
                 hits.push(hit);
             }
             if hits.len() == DEFAULT_SEARCH_LIMIT {
@@ -263,7 +290,29 @@ fn reject_memory(open_opts: &OpenOptions) -> Result<(), String> {
     Ok(())
 }
 
+fn open_prepared_sidecar(archive: &Path, open_opts: &OpenOptions) -> Result<SqliteIndex, String> {
+    reject_memory(open_opts)?;
+    let loc = resolve_prepared_index_location(
+        archive,
+        explicit_index_arg(open_opts).as_deref(),
+        &open_opts.index_folders,
+    )
+    .map_err(|e| e.to_string())?;
+    let path = loc.as_path().ok_or_else(memory_index_error)?;
+    let idx = SqliteIndex::open_read_only_for_open(path, open_opts).map_err(|e| e.to_string())?;
+    idx.check_prepared_tarstats(archive)
+        .map_err(|e| e.to_string())?;
+    // Dispatch verifies the selected backend as well as the archive identity.
+    // No strict path may rescue an invalid catalog with a cold build.
+    silence_stdout(|| ratarmount_session::factory::open_path(archive, open_opts, false))
+        .map_err(|e| e.to_string())?;
+    Ok(idx)
+}
+
 fn open_existing_sidecar(archive: &Path, open_opts: &OpenOptions) -> Result<SqliteIndex, String> {
+    if open_opts.read_only_index {
+        return open_prepared_sidecar(archive, open_opts);
+    }
     reject_memory(open_opts)?;
     let loc = resolve_index_location(
         archive,
@@ -281,6 +330,9 @@ fn open_existing_sidecar(archive: &Path, open_opts: &OpenOptions) -> Result<Sqli
 }
 
 fn open_index_for_find(archive: &Path, open_opts: &OpenOptions) -> Result<SqliteIndex, String> {
+    if open_opts.read_only_index {
+        return open_prepared_sidecar(archive, open_opts);
+    }
     reject_memory(open_opts)?;
     if !archive.exists() {
         return Err(format!("not found: {}", archive.display()));
@@ -334,6 +386,10 @@ fn sidecar_tarstats_ok(idx_path: &Path, archive: &Path) -> bool {
 fn silence_stdout<T>(f: impl FnOnce() -> T) -> T {
     let _ = io::stdout().flush();
     // SAFETY: duplicating STDOUT_FILENO to restore after `/dev/null` redirect.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0016-M01","item":"ratarmount::find::silence_stdout","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
     if saved < 0 {
         return f();
@@ -342,15 +398,39 @@ fn silence_stdout<T>(f: impl FnOnce() -> T) -> T {
 }
 
 fn restore_stdout_after<T>(saved: RawFd, f: impl FnOnce() -> T) -> T {
-    let devnull = std::fs::OpenOptions::new().write(true).open("/dev/null");
+    let devnull = {
+        #[expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-B0017-T01","item":"ratarmount::find::restore_stdout_after","disposition":"support","category":"builder-type-support","reason":"Builder type support: standard descriptor handoff","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0017-M01","item":"ratarmount::find::restore_stdout_after","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"standard descriptor handoff"}"###
+        )]
+        let mut __inventory_value_0 = std::fs::OpenOptions::new();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0017-M02","item":"ratarmount::find::restore_stdout_after","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
+        let __inventory_value_1 = __inventory_value_0.write(true).open("/dev/null");
+        __inventory_value_1
+    };
     match devnull {
         Ok(null) => {
             // SAFETY: `saved` is a dup of stdout; `null` is an open `/dev/null`.
             unsafe {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0018-M01","item":"ratarmount::find::restore_stdout_after","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
                 libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO);
             }
             let out = f();
             unsafe {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0019-M01","item":"ratarmount::find::restore_stdout_after","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
                 libc::dup2(saved, libc::STDOUT_FILENO);
                 libc::close(saved);
             }
@@ -400,6 +480,71 @@ mod tests {
         std::fs::write(path, out).unwrap();
     }
 
+    /// Regression: live FTS search must query prepared state without populating it.
+    #[test]
+    fn regression_prepared_index_live_search_fts_is_immutable() {
+        for prepared_fts in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("archive.tar");
+            write_fits_tar(&archive);
+            let index = dir.path().join("archive.tar.index.sqlite");
+            let mut options = OpenOptions {
+                index_file_path: Some(index.clone()),
+                ..Default::default()
+            };
+            drop(ratarmount_session::factory::open_path(&archive, &options, false).unwrap());
+            if prepared_fts {
+                let db = SqliteIndex::open_writable(&index).unwrap();
+                db.ensure_fts5().unwrap();
+            }
+            SqliteIndex::finalize_prepared(&index).unwrap();
+            options.read_only_index = true;
+            options.write_index = false;
+            let source = ratarmount_session::factory::open_path(&archive, &options, false).unwrap();
+            let overlay = Arc::new(
+                crate::base_identity::fixtures::overlay_over(
+                    source.clone(),
+                    dir.path().join("overlay"),
+                    archive.to_str().unwrap(),
+                    Vec::new(),
+                )
+                .unwrap(),
+            );
+            let snapshot = || {
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .filter_map(|e| {
+                        let p = e.unwrap().path();
+                        p.is_file().then(|| {
+                            (
+                                p.file_name().unwrap().to_owned(),
+                                std::fs::read(&p).unwrap(),
+                            )
+                        })
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before = snapshot();
+            let callback = live_search_callback(
+                source.clone(),
+                Some(overlay.clone()),
+                archive.clone(),
+                options,
+            );
+            let answer = callback("fts:fits");
+            if prepared_fts {
+                assert!(answer.contains("a.fits"), "{answer}");
+            } else {
+                assert!(answer.contains("prepared FTS"), "{answer}");
+            }
+            assert_eq!(snapshot(), before);
+            drop(callback);
+            drop(overlay);
+            drop(source);
+            assert_eq!(snapshot(), before);
+        }
+    }
+
     /// Regression: xattr predicates match index bytes and do not treat missing as !=.
     #[test]
     fn regression_provenance_find_xattr_filters() {
@@ -428,6 +573,46 @@ mod tests {
             assert_eq!(hits.len(), expected, "{filter}");
             if expected == 1 {
                 assert_eq!(hits[0].path, "/tagged");
+            }
+        }
+    }
+
+    /// Regression: #320 --xattr must not match ambiguous hashes through its
+    /// direct index lookup; ordinary shared attributes remain queryable.
+    #[test]
+    fn regression_320_find_xattr_refuses_shared_hash() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        for (name, oh, offset) in [("b.txt", 32, 0), ("text.txt", 32, 12), ("own.txt", 64, 0)] {
+            idx.insert_file(
+                "", name, oh, offset, 12, 0.0, 0o100644, 0, "", 0, 0, false, false, false, 0,
+            )
+            .unwrap();
+        }
+        idx.insert_xattr(32, "user.hash.sha256", b"stale").unwrap();
+        idx.insert_xattr(64, "user.hash.sha256", b"own").unwrap();
+        idx.insert_xattr(32, "user.teacher", b"shared").unwrap();
+        for (filter, expected) in [
+            ("hash.sha256", vec!["/own.txt"]),
+            ("hash.sha256=stale", vec![]),
+            ("hash.sha256!=own", vec![]),
+            ("hash.sha256=own", vec!["/own.txt"]),
+            ("hash.sha256!=stale", vec!["/own.txt"]),
+            ("teacher=shared", vec!["/b.txt", "/text.txt"]),
+        ] {
+            for include_hashes in [false, true] {
+                let filters = vec![filter.into()];
+                let options = LocateOptions {
+                    xattrs: &filters,
+                    include_hashes,
+                    ..Default::default()
+                };
+                let hits =
+                    query_index_cli(&idx, Path::new("unused.7z"), "*", &options, false).unwrap();
+                assert_eq!(
+                    hit_paths(&hits),
+                    expected,
+                    "{filter}, hashes={include_hashes}"
+                );
             }
         }
     }
@@ -493,6 +678,7 @@ mod tests {
     /// Regression: `find '*.fits'` without FUSE returns every matching basename as TSV.
     #[test]
     fn find_glob() {
+        let _processes = ratarmount_index::test_process::spawning();
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("a.tar");
         write_fits_tar(&archive);
@@ -578,6 +764,7 @@ mod tests {
     /// Regression: find `--offset-order` TSV follows `offsetheader` (CLI path).
     #[test]
     fn find_offset_order() {
+        let _processes = ratarmount_index::test_process::spawning();
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("za.tar");
         write_za_tar(&archive);

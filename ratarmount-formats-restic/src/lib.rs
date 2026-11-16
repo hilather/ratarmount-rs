@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! Read-only restic repository snapshot browser (`backendName=ResticMountSource`).
 //!
 //! Local repos only (`restic:/abs/path`). Presentation:

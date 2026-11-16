@@ -1,10 +1,12 @@
 //! Versioned JSON-lines messages. Unknown fields fail closed.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
+/// Version 1 is frozen: its requests and answers keep their baseline bytes.
 pub const VERSION: u32 = 1;
+pub const VERSION_2: u32 = 2;
 pub const MAX_REQUEST: usize = 1024 * 1024;
 pub const MAX_RESPONSE: usize = 64 * 1024 * 1024;
 
@@ -76,32 +78,332 @@ pub enum Operation {
     Shutdown,
 }
 
-fn one() -> usize {
+/// Which reads the per-attempt operation journal records (`--journal-reads`).
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalReads {
+    #[default]
+    All,
+    First,
+}
+
+/// Only the strings `"all"` and `"first"`: a derived enum also takes the
+/// map form `{"first": null}`.
+impl<'de> Deserialize<'de> for JournalReads {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "all" => Ok(Self::All),
+            "first" => Ok(Self::First),
+            other => Err(serde::de::Error::unknown_variant(other, &["all", "first"])),
+        }
+    }
+}
+
+/// What an attempt's overlay database waits for (#328): the child's
+/// `--overlay-durability`. `relaxed` stops waiting for the disk on every
+/// create, unlink and rename; an OS crash can then corrupt the layer, and
+/// finalize refuses such a layer (destroy the attempt).
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayDurability {
+    #[default]
+    Full,
+    Relaxed,
+}
+
+impl OverlayDurability {
+    pub fn is_full(&self) -> bool {
+        *self == Self::Full
+    }
+}
+
+/// Only the strings `"full"` and `"relaxed"`, as [`JournalReads`].
+impl<'de> Deserialize<'de> for OverlayDurability {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "full" => Ok(Self::Full),
+            "relaxed" => Ok(Self::Relaxed),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["full", "relaxed"],
+            )),
+        }
+    }
+}
+
+/// The per-attempt operation journal of a v2 `new` (§5.6). Every member is
+/// always serialized, so `journal: {}` never hashes like an absent journal.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct JournalSpec {
+    /// `--journal-exclude` globs, in order.
+    pub exclude: Vec<String>,
+    pub reads: JournalReads,
+    /// Fsync the journal at unmount (`--journal-sync`).
+    pub sync: bool,
+}
+
+/// Version 2: the v1 operations, where `new` also takes a `request_id`,
+/// `lowers`, a `journal`, `retain` and `overlay_durability`, and `list` takes `all`; plus
+/// `finalize`. Fields and defaults are v1's, and they never change within
+/// version 2; later releases only add fields,
+/// which an older daemon refuses as unknown. Only `new` and `finalize` take a
+/// request ID: `create_base`, `destroy` and every other operation take none,
+/// and a `request_id` there is an unknown field (`invalid_request`).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperationV2 {
+    CreateBase {
+        name: String,
+        source: String,
+        #[serde(default)]
+        options: BaseOptions,
+    },
+    New {
+        base: String,
+        #[serde(default = "one")]
+        count: usize,
+        #[serde(default)]
+        overlay: Overlay,
+        #[serde(default)]
+        quota: Option<u64>,
+        #[serde(default)]
+        readonly_globs: Vec<String>,
+        /// A string when present: `null` is refused, never read as "no ID".
+        #[serde(
+            default,
+            deserialize_with = "some",
+            skip_serializing_if = "Option::is_none"
+        )]
+        request_id: Option<String>,
+        /// Sealed layer directories or bundles, bottom first, as sent (an
+        /// array: `null` is refused). Empty means no lower stack.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lowers: Vec<String>,
+        /// An object when present: `null`, an array or a scalar is refused,
+        /// never read as "no journal".
+        #[serde(
+            default,
+            deserialize_with = "journal_object",
+            skip_serializing_if = "Option::is_none"
+        )]
+        journal: Option<JournalSpec>,
+        /// Keep each attempt in `retained/ID` once a `finalize` succeeds
+        /// (R1c-1 §5.6). Linux only, TAR, directory and `git:///` bases only.
+        #[serde(default, skip_serializing_if = "is_false")]
+        retain: bool,
+        /// The attempts' `--overlay-durability` (#328). Absent is `full`,
+        /// which is never serialized: R1a's bytes and hashes are unchanged.
+        #[serde(default, skip_serializing_if = "OverlayDurability::is_full")]
+        overlay_durability: OverlayDurability,
+    },
+    List {
+        #[serde(default)]
+        base: Option<String>,
+        /// Also list served retained attempts, after the attempts map.
+        /// Without it the answer is exactly v1 `list`'s.
+        #[serde(default, skip_serializing_if = "is_false")]
+        all: bool,
+    },
+    Diff {
+        id: String,
+        #[serde(default)]
+        git: bool,
+    },
+    Stats {
+        id: String,
+    },
+    Destroy {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        base: Option<String>,
+    },
+    /// A struct variant, so unknown fields are refused: serde drains and
+    /// ignores the remaining keys of an internally tagged unit variant, as
+    /// v1's `Shutdown` still does.
+    Shutdown {},
+    /// Stop, check, seal, hash and optionally pack an attempt (R1c-1 §5.4);
+    /// retry-safe under `request_id`. Linux only. No v1 form.
+    Finalize {
+        id: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        pack: bool,
+        /// A string when present: `null` is refused, never read as "no ID".
+        #[serde(
+            default,
+            deserialize_with = "some",
+            skip_serializing_if = "Option::is_none"
+        )]
+        request_id: Option<String>,
+    },
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+impl OperationV2 {
+    /// The same v1 operation; a `request_id` is not part of it. A `new` with
+    /// `lowers`, a `journal`, `retain` or relaxed durability, a `list` with `all` and `finalize`
+    /// have no v1 form: the supervisor never converts one (§5.1).
+    pub fn into_v1(self) -> Operation {
+        match self {
+            Self::CreateBase {
+                name,
+                source,
+                options,
+            } => Operation::CreateBase {
+                name,
+                source,
+                options,
+            },
+            Self::New {
+                base,
+                count,
+                overlay,
+                quota,
+                readonly_globs,
+                request_id: _,
+                lowers,
+                journal,
+                retain,
+                overlay_durability,
+            } => {
+                // `Supervisor::handle` takes every v2 `new` before this.
+                assert!(
+                    lowers.is_empty()
+                        && journal.is_none()
+                        && !retain
+                        && overlay_durability.is_full(),
+                    "a layered, journaled, retained or relaxed new has no v1 form"
+                );
+                Operation::New {
+                    base,
+                    count,
+                    overlay,
+                    quota,
+                    readonly_globs,
+                }
+            }
+            Self::List { base, all } => {
+                // `Supervisor::handle` takes a v2 `list` before this.
+                assert!(!all, "a list of retained attempts has no v1 form");
+                Operation::List { base }
+            }
+            Self::Diff { id, git } => Operation::Diff { id, git },
+            Self::Stats { id } => Operation::Stats { id },
+            Self::Destroy { id, base } => Operation::Destroy { id, base },
+            Self::Shutdown {} => Operation::Shutdown,
+            Self::Finalize { .. } => unreachable!("`Supervisor::handle` takes every finalize"),
+        }
+    }
+}
+
+pub(super) fn one() -> usize {
     1
+}
+
+/// `Some` of a present member: `null` is refused by `T`, never read as `None`.
+fn some<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+/// A present `journal`, which must be a JSON object: the derived
+/// `Deserialize` of a struct also accepts an array of its fields in order.
+fn journal_object<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<JournalSpec>, D::Error> {
+    struct Object;
+    impl<'de> serde::de::Visitor<'de> for Object {
+        type Value = JournalSpec;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a journal object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<JournalSpec, A::Error> {
+            JournalSpec::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_map(Object).map(Some)
+}
+
+/// An operation of either version. `Request::parse` chooses the variant
+/// itself; the untagged derive is only used to serialize.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum Op {
+    V1(Operation),
+    V2(OperationV2),
+}
+
+impl Op {
+    pub fn version(&self) -> u32 {
+        match self {
+            Self::V1(_) => VERSION,
+            Self::V2(_) => VERSION_2,
+        }
+    }
+}
+
+impl From<Operation> for Op {
+    fn from(operation: Operation) -> Self {
+        Self::V1(operation)
+    }
+}
+
+impl From<OperationV2> for Op {
+    fn from(operation: OperationV2) -> Self {
+        Self::V2(operation)
+    }
 }
 
 #[derive(Debug, Serialize)]
 pub struct Request {
     pub version: u32,
     #[serde(flatten)]
-    pub operation: Operation,
+    pub operation: Op,
+}
+
+/// A refused request line and the version its answer carries.
+#[derive(Debug)]
+pub struct Rejection {
+    pub version: u32,
+    pub error: ApiError,
 }
 
 impl Request {
-    pub fn parse(line: &[u8]) -> Result<Self, ApiError> {
-        // Deserialize separately so deny_unknown_fields also covers the envelope.
-        let mut value: Value = serde_json::from_slice(line)
-            .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
-        let version = value.as_object_mut().and_then(|m| m.remove("version"));
-        if version != Some(Value::from(VERSION)) {
-            return Err(ApiError::new("unsupported_version", "version must be 1"));
-        }
-        let operation = serde_json::from_value(value)
-            .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
-        Ok(Self {
-            version: VERSION,
+    pub fn new(operation: impl Into<Op>) -> Self {
+        let operation = operation.into();
+        Self {
+            version: operation.version(),
             operation,
-        })
+        }
+    }
+
+    /// Before its version is known (invalid JSON, or a `version` that is not
+    /// the integer 1 or 2) a line is refused in a v1 answer with the baseline
+    /// bytes; afterwards in an answer of its own version.
+    pub fn parse(line: &[u8]) -> Result<Self, Rejection> {
+        let invalid = |version, error: serde_json::Error| Rejection {
+            version,
+            error: ApiError::new("invalid_request", error.to_string()),
+        };
+        // Deserialize separately so deny_unknown_fields also covers the envelope.
+        let mut value: Value = serde_json::from_slice(line).map_err(|e| invalid(VERSION, e))?;
+        let version = value.as_object_mut().and_then(|m| m.remove("version"));
+        let operation = match version.as_ref().and_then(Value::as_u64) {
+            Some(1) => Op::V1(serde_json::from_value(value).map_err(|e| invalid(VERSION, e))?),
+            Some(2) => Op::V2(serde_json::from_value(value).map_err(|e| invalid(VERSION_2, e))?),
+            _ => {
+                return Err(Rejection {
+                    version: VERSION,
+                    error: ApiError::new("unsupported_version", "version must be 1"),
+                })
+            }
+        };
+        Ok(Self::new(operation))
     }
 }
 
@@ -154,16 +456,16 @@ pub struct Response {
 }
 
 impl Response {
-    pub fn from_result(result: Result<Value, ApiError>) -> Self {
+    pub fn from_result(version: u32, result: Result<Value, ApiError>) -> Self {
         match result {
             Ok(result) => Self {
-                version: VERSION,
+                version,
                 ok: true,
                 result: Some(result),
                 error: None,
             },
             Err(error) => Self {
-                version: VERSION,
+                version,
                 ok: false,
                 result: None,
                 error: Some(error),

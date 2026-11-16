@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! UDIF DMG block reader (inner FAT/ISO/exFAT/NTFS; HFS+/APFS residual).
 //!
 //! Parses the 512-byte `koly` trailer, XML `blkx` / `mish` maps, and reconstructs
@@ -58,6 +61,10 @@ pub struct DmgMountSource {
 impl DmgMountSource {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0304-M01","item":"<ratarmount_formats_dmg::DmgMountSource>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut file = File::open(path)?;
         if udif::looks_like_encrypted_reader(&mut file) {
             return Err(encrypted_residual(path));
@@ -68,6 +75,10 @@ impl DmgMountSource {
                 path.display()
             )));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0305-M01","item":"<ratarmount_formats_dmg::DmgMountSource>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = File::open(path)?;
         Self::from_reader(file, path.to_path_buf())
     }
@@ -146,15 +157,11 @@ fn looks_like_hfs_or_apfs<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         return true;
     }
     let mut sig = [0u8; 2];
-    if reader
+    reader
         .seek(SeekFrom::Start(partition_offset.saturating_add(1024)))
         .is_ok()
         && reader.read_exact(&mut sig).is_ok()
         && (sig == *b"H+" || sig == *b"HX" || sig == *b"BD")
-    {
-        return true;
-    }
-    false
 }
 
 fn try_fs_at(disk: DmgDisk, label: &Path, offset: u64) -> Option<Arc<dyn MountSource>> {
@@ -307,6 +314,10 @@ fn try_open_inner_fs(disk: DmgDisk, label: &Path) -> Result<Arc<dyn MountSource>
 /// Detect UDIF via a parseable `koly` trailer at EOF. No `.dmg` extension fallback
 /// (raw HFS+ files named `*.dmg` must not be claimed).
 pub fn looks_like_dmg(path: &Path) -> bool {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0306-M01","item":"ratarmount_formats_dmg::looks_like_dmg","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut f = match File::open(path) {
         Ok(f) => f,
         Err(_) => return false,
@@ -385,6 +396,70 @@ mod tests {
     };
 
     const FAT_BYTES: usize = 256 * 1024;
+
+    /// Regression: Clippy's boolean rewrite must preserve each signature and its partition offset.
+    #[test]
+    fn regression_hfs_apfs_probe_signatures() {
+        for partition_offset in [0, 4096] {
+            for (offset, signature) in [
+                (32, b"NXSB".as_slice()),
+                (1024, b"H+".as_slice()),
+                (1024, b"HX".as_slice()),
+                (1024, b"BD".as_slice()),
+            ] {
+                let start = partition_offset + offset;
+                let mut bytes = vec![0; start + signature.len()];
+                bytes[start..].copy_from_slice(signature);
+                let mut reader = Cursor::new(bytes);
+                reader.set_position(reader.get_ref().len() as u64);
+                assert!(looks_like_hfs_or_apfs(&mut reader, partition_offset as u64));
+                assert!(!looks_like_hfs_or_apfs(
+                    &mut reader,
+                    partition_offset as u64 + 1
+                ));
+                reader.get_mut().pop();
+                assert!(!looks_like_hfs_or_apfs(
+                    &mut reader,
+                    partition_offset as u64
+                ));
+            }
+        }
+        let mut reader = Cursor::new(vec![0; 2048]);
+        assert!(!looks_like_hfs_or_apfs(&mut reader, 0));
+        assert!(!looks_like_hfs_or_apfs(&mut reader, u64::MAX));
+    }
+
+    /// Regression: probe I/O failures remain false, and a failed seek must not trigger a read.
+    #[test]
+    fn regression_hfs_apfs_probe_io_errors() {
+        struct FailingReader {
+            fail_seek: bool,
+            reads: usize,
+        }
+        impl Seek for FailingReader {
+            fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
+                if self.fail_seek {
+                    Err(io::Error::other("seek failed"))
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                Err(io::Error::other("read failed"))
+            }
+        }
+        for fail_seek in [false, true] {
+            let mut reader = FailingReader {
+                fail_seek,
+                reads: 0,
+            };
+            assert!(!looks_like_hfs_or_apfs(&mut reader, 0));
+            assert_eq!(reader.reads, if fail_seek { 0 } else { 2 });
+        }
+    }
 
     fn fat_volume(name: &str, payload: &[u8]) -> Vec<u8> {
         let mut storage = vec![0u8; FAT_BYTES];

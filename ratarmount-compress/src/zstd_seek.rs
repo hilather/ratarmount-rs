@@ -179,6 +179,10 @@ where
 ///
 /// See [`export_zstd_blocks_from_reader`].
 pub fn export_zstd_blocks(path: impl AsRef<Path>) -> Result<Vec<(u64, u64)>> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0269-M01","item":"ratarmount_compress::zstd_seek::export_zstd_blocks","disposition":"residual","reason":"path form of the zstd frame scan (compress cannot depend on the managed reader); its remaining callers read a mounted or committed base archive (write_overlay commits, the factory's zstdblocks export, the live-commit last-frame warning); the mandatory export-index frame map and the Hub live commit's zstdblocks use the reader form on a ManagedReadCursor","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut file = File::open(path)?;
     export_zstd_blocks_from_reader(&mut file)
 }
@@ -238,6 +242,10 @@ pub fn scan_zstd_frames<R: Read + Seek>(reader: &mut R) -> Result<ZstdFrameMap> 
 
 /// [`scan_zstd_frames`] from a filesystem path.
 pub fn scan_zstd_frames_path(path: &Path) -> Result<ZstdFrameMap> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0270-M01","item":"ratarmount_compress::zstd_seek::scan_zstd_frames_path","disposition":"residual","reason":"path form of the zstd frame scan (compress cannot depend on the managed reader); its remaining callers read a mounted or committed base archive (write_overlay commits, the factory's zstdblocks export, the live-commit last-frame warning); the mandatory export-index frame map and the Hub live commit's zstdblocks use the reader form on a ManagedReadCursor","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut file = File::open(path)?;
     scan_zstd_frames(&mut file)
 }
@@ -389,14 +397,18 @@ fn scan_zstd_frames_walk<R: Read + Seek>(reader: &mut R) -> Result<ZstdFrameMap>
             let mut size_buf = [0u8; 4];
             match reader.read_exact(&mut size_buf) {
                 Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Err(CompressError::Msg("truncated zstd skippable frame".into()));
+                }
                 Err(e) => return Err(e.into()),
             }
-            let skip_size = u32::from_le_bytes(size_buf) as u64;
+            let skip_size = u64::from(u32::from_le_bytes(size_buf));
             let span_end = pos
-                .checked_add(SKIPPABLE_HEADER_SIZE + skip_size)
-                .ok_or_else(|| CompressError::Msg("zstd skippable frame size overflow".into()))?;
-            if magic == SEEK_TABLE_SKIPPABLE_MAGIC && skip_size >= 4 && span_end <= file_len {
+                .checked_add(SKIPPABLE_HEADER_SIZE)
+                .and_then(|p| p.checked_add(skip_size))
+                .filter(|&end| end <= file_len)
+                .ok_or_else(|| CompressError::Msg("truncated zstd skippable frame".into()))?;
+            if magic == SEEK_TABLE_SKIPPABLE_MAGIC && skip_size >= 4 {
                 reader.seek(SeekFrom::Start(span_end - 4))?;
                 let mut footer_magic = [0u8; 4];
                 if reader.read_exact(&mut footer_magic).is_ok()
@@ -569,6 +581,10 @@ impl SeekableZstd {
         let path = path.as_ref().to_path_buf();
         let threads = ParallelizationSpec::resolve_zero(options.threads).max(1);
         let options = ZstdReadOptions { threads, ..options };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0271-M01","item":"<ratarmount_compress::zstd_seek::SeekableZstd>::open_with_options","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut file = File::open(&path)?;
         match classify_zstd(&mut file, threads)? {
             ZstdPlan::Mapped {
@@ -668,18 +684,12 @@ impl SeekableZstd {
             ..options
         };
         let (frames, uncompressed_size) = frames_from_zstd_blocks(blocks)?;
-        // Best-effort bounds check against file length when available.
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if let Some(last) = frames.last() {
-                let end = last.compressed_offset + last.compressed_size.unwrap_or(0);
-                if end > meta.len() {
-                    return Err(CompressError::Msg(format!(
-                        "zstdblocks compressed end {end} exceeds file size {}",
-                        meta.len()
-                    )));
-                }
-            }
-        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-M0221-M01","item":"<ratarmount_compress::zstd_seek::SeekableZstd>::open_with_zstd_blocks_options","disposition":"residual","reason":"read-only open of the mounted base archive body to validate the imported zstdblocks terminal sentinel (same file the path backend reopens); never an index, companion or overlay file","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing archive body only; terminal-sentinel validation creates no pathname."}}"###
+        )]
+        let mut file = File::open(&path)?;
+        validate_zstd_blocks_terminal(&mut file, blocks)?;
         Ok(Arc::new(Self {
             path: path.clone(),
             backend: ZstdBackend::Path(path),
@@ -695,7 +705,7 @@ impl SeekableZstd {
     ///
     /// See [`Self::open_with_zstd_blocks`].
     pub fn open_with_zstd_blocks_from_reader<R>(
-        reader: R,
+        mut reader: R,
         threads: u32,
         archive_label: impl AsRef<Path>,
         blocks: &[(u64, u64)],
@@ -706,6 +716,7 @@ impl SeekableZstd {
         let path = archive_label.as_ref().to_path_buf();
         let threads = ParallelizationSpec::resolve_zero(threads).max(1);
         let (frames, uncompressed_size) = frames_from_zstd_blocks(blocks)?;
+        validate_zstd_blocks_terminal(&mut reader, blocks)?;
         let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
         Ok(Arc::new(Self {
             path,
@@ -805,6 +816,10 @@ fn decode_full(path: &Path, threads: u32) -> Result<Arc<dyn SeekableBody>> {
             return Ok(body as Arc<dyn SeekableBody>);
         }
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0272-M01","item":"ratarmount_compress::zstd_seek::decode_full","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let file = File::open(path)?;
     let dec =
         zstd::stream::read::Decoder::new(file).map_err(|e| CompressError::Msg(e.to_string()))?;
@@ -841,6 +856,10 @@ where
 
 /// Parallel decompress of independent zstd frames into one contiguous buffer.
 fn try_parallel_frame_decode(path: &Path, threads: u32) -> Result<Vec<u8>> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0273-M01","item":"ratarmount_compress::zstd_seek::try_parallel_frame_decode","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let data = std::fs::read(path)?;
     try_parallel_frame_decode_bytes(&data, threads)
 }
@@ -932,11 +951,16 @@ fn build_frame_map_from_bytes(data: &[u8]) -> Result<(Vec<FrameInfo>, u64)> {
         let magic = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
 
         if (SKIPPABLE_MAGIC_MIN..=SKIPPABLE_MAGIC_MAX).contains(&magic) {
-            if pos + 8 > data.len() {
-                break;
-            }
-            let sz = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
-            pos += 8 + sz;
+            let header_end = (pos as u64)
+                .checked_add(SKIPPABLE_HEADER_SIZE)
+                .filter(|&end| end <= file_len)
+                .ok_or_else(|| CompressError::Msg("truncated zstd skippable frame".into()))?;
+            let sz = u32::from_le_bytes(data[pos + 4..header_end as usize].try_into().unwrap());
+            let span_end = header_end
+                .checked_add(u64::from(sz))
+                .filter(|&end| end <= file_len)
+                .ok_or_else(|| CompressError::Msg("truncated zstd skippable frame".into()))?;
+            pos = span_end as usize;
             continue;
         }
         if data[pos..pos + 4] != ZSTD_MAGIC {
@@ -1109,7 +1133,14 @@ struct ZstdFrameReader {
 impl ZstdBackend {
     fn open_compressed(&self) -> io::Result<CompressedHandle> {
         match self {
-            Self::Path(p) => Ok(CompressedHandle::File(File::open(p)?)),
+            Self::Path(p) => Ok(CompressedHandle::File({
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0274-M01","item":"<ratarmount_compress::zstd_seek::ZstdBackend>::open_compressed","disposition":"residual","reason":"zstd backend reader of a mounted base; broader backend migration is excluded","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
+                let __inventory_value_0 = File::open(p);
+                __inventory_value_0
+            }?)),
             Self::Shared(shared) => Ok(CompressedHandle::Shared {
                 inner: Arc::clone(shared),
                 pos: 0,
@@ -1313,7 +1344,14 @@ impl ZstdFrameReader {
         if let ZstdBackend::Path(path) = &self.backend {
             if let Some((offset, len)) = self.compressed_prefetch_range(next, budget) {
                 if let (Ok(file), Ok(offset), Ok(len)) = (
-                    File::open(path),
+                    {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-B0275-M01","item":"<ratarmount_compress::zstd_seek::ZstdFrameReader>::prefetch","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                        )]
+                        let __inventory_value_0 = File::open(path);
+                        __inventory_value_0
+                    },
                     libc::off_t::try_from(offset),
                     libc::off_t::try_from(len),
                 ) {
@@ -1450,6 +1488,10 @@ impl ZstdFrameReader {
                         input.take(info.compressed_size.unwrap_or(u64::MAX)),
                     )?
                     .single_frame();
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0276-M01","item":"<ratarmount_compress::zstd_seek::ZstdFrameReader>::ensure_frame","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                    )]
                     let mut spool = tempfile::tempfile()?;
                     let expected = self.frame_size(best);
                     let size = io::copy(&mut decoder.take(expected.saturating_add(1)), &mut spool)?;
@@ -1577,6 +1619,14 @@ impl Seek for ZstdFrameReader {
 fn try_load_seek_table_from_reader<R: Read + Seek>(
     reader: &mut R,
 ) -> Result<(Vec<FrameInfo>, u64)> {
+    reader.seek(SeekFrom::Start(0))?;
+    let mut first_magic = [0u8; 4];
+    reader.read_exact(&mut first_magic)?;
+    if first_magic != ZSTD_MAGIC {
+        return Err(CompressError::Msg(
+            "seek table data does not start at offset 0".into(),
+        ));
+    }
     let file_len = reader.seek(SeekFrom::End(0))?;
     if file_len < SEEK_TABLE_FOOTER_SIZE + SKIPPABLE_HEADER_SIZE {
         return Err(CompressError::Msg("file too small for seek table".into()));
@@ -1705,6 +1755,11 @@ fn frames_from_zstd_blocks(blocks: &[(u64, u64)]) -> Result<(Vec<FrameInfo>, u64
             "zstdblocks map needs at least one frame start and an EOF sentinel".into(),
         ));
     }
+    if blocks[0].1 != 0 {
+        return Err(CompressError::Msg(
+            "zstdblocks requires an initial frame at data offset 0".into(),
+        ));
+    }
     for window in blocks.windows(2) {
         let (c0, d0) = window[0];
         let (c1, d1) = window[1];
@@ -1750,6 +1805,49 @@ fn frames_from_zstd_blocks(blocks: &[(u64, u64)]) -> Result<(Vec<FrameInfo>, u64
     }
     let total_uncomp = blocks[blocks.len() - 1].1;
     Ok((frames, total_uncomp))
+}
+
+/// Verify that the supplied terminal entry omits no data frame. Only complete
+/// skippable frames (including a seek-table footer) may follow it.
+fn validate_zstd_blocks_terminal<R: Read + Seek>(
+    reader: &mut R,
+    blocks: &[(u64, u64)],
+) -> Result<()> {
+    let saved = reader.stream_position()?;
+    let result = (|| {
+        let len = reader.seek(SeekFrom::End(0))?;
+        let mut offset = blocks
+            .last()
+            .ok_or_else(|| CompressError::Msg("zstdblocks missing terminal sentinel".into()))?
+            .0;
+        if offset > len {
+            return Err(CompressError::Msg(
+                "zstdblocks terminal sentinel exceeds source size".into(),
+            ));
+        }
+        while offset < len {
+            if len - offset < 8 {
+                return Err(CompressError::Msg(
+                    "zstdblocks terminal sentinel has a truncated skippable tail".into(),
+                ));
+            }
+            reader.seek(SeekFrom::Start(offset))?;
+            let mut header = [0; 8];
+            reader.read_exact(&mut header)?;
+            let magic = u32::from_le_bytes(header[..4].try_into().unwrap());
+            if magic & 0xfffffff0 != 0x184d2a50 {
+                return Err(CompressError::Msg(
+                    "zstdblocks terminal sentinel precedes a data frame or invalid tail".into(),
+                ));
+            }
+            offset = offset.checked_add(8).and_then(|n| n.checked_add(u64::from(u32::from_le_bytes(header[4..].try_into().unwrap()))))
+                .filter(|&n| n <= len)
+                .ok_or_else(|| CompressError::Msg("zstdblocks terminal sentinel has an overflowing or truncated skippable tail".into()))?;
+        }
+        Ok(())
+    })();
+    reader.seek(SeekFrom::Start(saved))?;
+    result
 }
 
 /// Export a frame map as Python `zstdblocks` pairs (including EOF sentinel).
@@ -1884,6 +1982,171 @@ mod tests {
         let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
         enc.write_all(part).unwrap();
         enc.finish().unwrap()
+    }
+
+    fn skippable_frame(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = SKIPPABLE_MAGIC_MIN.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    /// Regression: #257 a prefixed seek table must not replace real frame offsets.
+    #[test]
+    fn regression_257_skippable_seek_table_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seekable.zst");
+        let parts: [&[u8]; 2] = [b"first frame", b"second frame payload"];
+        let first = encode_frame(parts[0]);
+        let second = encode_frame(parts[1]);
+        let skip = skippable_frame(b"skip");
+        for (prefixed, cover_prefix) in [
+            (false, false),
+            (true, false),
+            // Even matching coverage cannot put a data frame at offset zero here.
+            (true, true),
+        ] {
+            let mut bytes = Vec::new();
+            if prefixed {
+                bytes.extend_from_slice(&skip);
+            }
+            let first_offset = bytes.len() as u64;
+            bytes.extend_from_slice(&first);
+            let second_offset = bytes.len() as u64;
+            bytes.extend_from_slice(&second);
+            let first_size = first.len() + if cover_prefix { skip.len() } else { 0 };
+            bytes.extend(build_seek_table_skippable(&[
+                (first_size as u32, parts[0].len() as u32),
+                (second.len() as u32, parts[1].len() as u32),
+            ]));
+            std::fs::write(&path, &bytes).unwrap();
+
+            let valid_table = !prefixed;
+            assert_eq!(
+                try_load_seek_table_from_reader(&mut Cursor::new(&bytes)).is_ok(),
+                valid_table
+            );
+            let map = scan_zstd_frames(&mut Cursor::new(&bytes)).unwrap();
+            assert_eq!(map.frames.len(), 2);
+            assert_eq!(map.frames[0].compressed_offset, first_offset);
+            assert_eq!(map.frames[1].compressed_offset, second_offset);
+            let blocks = export_zstd_blocks_from_reader(&mut Cursor::new(&bytes)).unwrap();
+            assert_eq!(blocks[0], (first_offset, 0));
+            assert_eq!(blocks[1], (second_offset, parts[0].len() as u64));
+
+            let expected = parts.concat();
+            for body in [
+                open_seekable_zstd(&path).unwrap(),
+                open_seekable_zstd_from_reader(Cursor::new(bytes.clone()), &path).unwrap(),
+            ] {
+                assert_eq!(
+                    body.kind(),
+                    if valid_table {
+                        "zstd-seek-table"
+                    } else {
+                        "zstd-frames"
+                    }
+                );
+                let mut reader = body.open_reader().unwrap();
+                let mut actual = Vec::new();
+                reader.read_to_end(&mut actual).unwrap();
+                assert_eq!(actual, expected);
+                reader
+                    .seek(SeekFrom::Start(parts[0].len() as u64 - 2))
+                    .unwrap();
+                let mut boundary = [0u8; 6];
+                reader.read_exact(&mut boundary).unwrap();
+                assert_eq!(boundary, expected[parts[0].len() - 2..parts[0].len() + 4]);
+            }
+        }
+    }
+
+    /// Regression: #257 truncated trailing skippables must not expose only earlier frames.
+    #[test]
+    fn regression_257_truncated_skippable_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.zst");
+        let output = dir.path().join("repacked.zst");
+        let skip = skippable_frame(b"prefix");
+        let mut suffixes = (4..8).map(|len| skip[..len].to_vec()).collect::<Vec<_>>();
+        for size in [10u32, u32::MAX] {
+            let mut suffix = SKIPPABLE_MAGIC_MAX.to_le_bytes().to_vec();
+            suffix.extend_from_slice(&size.to_le_bytes());
+            suffix.push(0);
+            suffixes.push(suffix);
+        }
+        for prefixed in [false, true] {
+            for suffix in &suffixes {
+                let mut bytes = if prefixed { skip.clone() } else { Vec::new() };
+                bytes.extend(encode_frame(b"first"));
+                bytes.extend(encode_frame(b"second"));
+                bytes.extend_from_slice(suffix);
+                std::fs::write(&path, &bytes).unwrap();
+                assert_eq!(
+                    crate::detect_compression(&path).unwrap(),
+                    crate::CompressionFormat::Zstd
+                );
+                for error in [
+                    scan_zstd_frames(&mut Cursor::new(&bytes)).unwrap_err(),
+                    build_frame_map_from_bytes(&bytes).unwrap_err(),
+                    try_parallel_frame_decode_bytes(&bytes, 2).unwrap_err(),
+                ] {
+                    assert_eq!(error.to_string(), "truncated zstd skippable frame");
+                }
+                for threads in [1, 4] {
+                    assert!(open_seekable_zstd_with_threads(&path, threads).is_err());
+                    assert!(open_seekable_zstd_with_threads_from_reader(
+                        Cursor::new(bytes.clone()),
+                        threads,
+                        &path
+                    )
+                    .is_err());
+                }
+                assert!(
+                    crate::repack_seekable(&path, &output, &crate::RepackOptions::default())
+                        .is_err()
+                );
+                assert!(!output.exists());
+            }
+        }
+    }
+
+    /// Regression: #257 complete skippable frames ending exactly at EOF remain valid.
+    #[test]
+    fn regression_257_complete_trailing_skippable_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("complete.zst");
+        for prefixed in [false, true] {
+            for payload in [b"".as_slice(), b"trailing payload"] {
+                let mut bytes = if prefixed {
+                    skippable_frame(b"prefix")
+                } else {
+                    Vec::new()
+                };
+                bytes.extend(encode_frame(b"first"));
+                bytes.extend(encode_frame(b"second"));
+                bytes.extend(skippable_frame(payload));
+                std::fs::write(&path, &bytes).unwrap();
+                assert_eq!(
+                    scan_zstd_frames(&mut Cursor::new(&bytes))
+                        .unwrap()
+                        .frames
+                        .len(),
+                    2
+                );
+                assert_eq!(build_frame_map_from_bytes(&bytes).unwrap().0.len(), 2);
+                for threads in [1, 4] {
+                    let body = open_seekable_zstd_with_threads(&path, threads).unwrap();
+                    assert_eq!(body.kind(), "zstd-frames");
+                    let mut actual = Vec::new();
+                    body.open_reader()
+                        .unwrap()
+                        .read_to_end(&mut actual)
+                        .unwrap();
+                    assert_eq!(actual, b"firstsecond");
+                }
+            }
+        }
     }
 
     fn ahead_fixture(threads: u32, budget: u64) -> (tempfile::TempDir, ZstdFrameReader, Vec<u8>) {
@@ -2987,5 +3250,106 @@ mod tests {
         let n1 = decode_zstd_frames_to(&mut Cursor::new(&two), &map2, 1, &mut last).unwrap();
         assert_eq!(n1, p1);
         assert_eq!(last, tail);
+    }
+
+    fn prepared_zstd_fixture(tail: &[u8]) -> (Vec<u8>, Vec<(u64, u64)>, Vec<u8>) {
+        let parts: [&[u8]; 2] = [b"first frame data", b"final frame bytes"];
+        let mut compressed = Vec::new();
+        let mut pairs = Vec::new();
+        let mut data = Vec::new();
+        for part in parts {
+            pairs.push((compressed.len() as u64, data.len() as u64));
+            compressed.extend(encode_frame(part));
+            data.extend(part);
+        }
+        pairs.push((compressed.len() as u64, data.len() as u64));
+        compressed.extend(tail);
+        (compressed, pairs, data)
+    }
+
+    fn prepared_zstd_refuses_both(bytes: &[u8], pairs: &[(u64, u64)], symptom: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prepared.zst");
+        std::fs::write(&path, bytes).unwrap();
+        let a = SeekableZstd::open_with_zstd_blocks(&path, 1, pairs)
+            .err()
+            .expect("path must refuse");
+        let b = SeekableZstd::open_with_zstd_blocks_from_reader(
+            Cursor::new(bytes.to_vec()),
+            1,
+            &path,
+            pairs,
+        )
+        .err()
+        .expect("reader must refuse");
+        for e in [a, b] {
+            assert!(e.to_string().contains(symptom), "{e}");
+        }
+    }
+
+    /// Regression: genuine frame-map suffixes lack initial uncompressed coverage.
+    #[test]
+    fn regression_prepared_index_zstd_usable_state_requires_initial_frame() {
+        let (bytes, pairs, _) = prepared_zstd_fixture(&[]);
+        prepared_zstd_refuses_both(&bytes, &pairs[1..], "initial frame");
+        prepared_zstd_refuses_both(&bytes, &[], "EOF sentinel");
+        prepared_zstd_refuses_both(&bytes, &[(0, 0), (0, 0)], "no frames");
+        prepared_zstd_refuses_both(&bytes, &[(1, 0), (0, 1)], "monotonic");
+    }
+
+    /// Regression: dropping only EOF silently omitted the last genuine zstd data frame.
+    #[test]
+    fn regression_prepared_index_zstd_requires_genuine_terminal_sentinel() {
+        let (bytes, pairs, _) = prepared_zstd_fixture(&[]);
+        prepared_zstd_refuses_both(&bytes, &pairs[..pairs.len() - 1], "terminal sentinel");
+        let mut outside = pairs.clone();
+        outside.last_mut().unwrap().0 = bytes.len() as u64 + 1;
+        prepared_zstd_refuses_both(&bytes, &outside, "terminal sentinel");
+        for tail in [
+            &b"\x50\x2a\x4d\x18"[..],
+            &b"\x50\x2a\x4d\x18\xff\xff\xff\xff"[..],
+        ] {
+            let (bytes, pairs, _) = prepared_zstd_fixture(tail);
+            prepared_zstd_refuses_both(&bytes, &pairs, "terminal sentinel");
+        }
+    }
+
+    /// Regression: an EOF before complete skippable tails is a valid zstd terminal.
+    #[test]
+    fn regression_prepared_index_zstd_terminal_preserves_skippable_tails() {
+        let (base, pairs, data) = prepared_zstd_fixture(&[]);
+        let mut generic = 0x184d2a50u32.to_le_bytes().to_vec();
+        generic.extend(3u32.to_le_bytes());
+        generic.extend(b"abc");
+        let entries: Vec<_> = pairs
+            .windows(2)
+            .map(|w| ((w[1].0 - w[0].0) as u32, (w[1].1 - w[0].1) as u32))
+            .collect();
+        for tail in [generic, build_seek_table_skippable(&entries)] {
+            let mut bytes = base.clone();
+            bytes.extend(tail);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tails.zst");
+            std::fs::write(&path, &bytes).unwrap();
+            let path_body = SeekableZstd::open_with_zstd_blocks(&path, 1, &pairs).unwrap();
+            let reader_body = SeekableZstd::open_with_zstd_blocks_from_reader(
+                Cursor::new(bytes),
+                1,
+                &path,
+                &pairs,
+            )
+            .unwrap();
+            for body in [path_body, reader_body] {
+                assert_eq!(body.size(), data.len() as u64);
+                let mut got = Vec::new();
+                body.open_reader().unwrap().read_to_end(&mut got).unwrap();
+                assert_eq!(got, data);
+                let mut reader = body.open_reader().unwrap();
+                reader.seek(SeekFrom::End(-5)).unwrap();
+                let mut last = [0; 5];
+                reader.read_exact(&mut last).unwrap();
+                assert_eq!(&last, &data[data.len() - 5..]);
+            }
+        }
     }
 }

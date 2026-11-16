@@ -119,6 +119,11 @@ ratarmount-formats-wim = { workspace = true, optional = true }
 ratarmount-formats-xar = { workspace = true, optional = true }
 
 [dev-dependencies]
+flate2 = "1"
+bzip2 = "0.5"
+zstd = "0.13"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+ratarmount-compress = { workspace = true, features = ["test-hooks"] }
 ratarmount-index = { workspace = true, features = ["test-hooks"] }
 git2 = { version = "0.19", features = ["vendored-libgit2", "vendored-openssl"] }
 url = "2"
@@ -128,3 +133,6 @@ libc.workspace = true
 [[example]]
 name = "ai-zstd-read"
 path = "../benchmarks/ai/session-read.rs"
+
+[lints]
+workspace = true

@@ -43,7 +43,7 @@ directory holding the decompressed file.
 | **gzip** | Checkpoint every few MiB, built on first mount | Imports and exports RGZI and GZIDX seek indexes. Throughput is below Python's rapidgzip on small `.tar.gz` files; an opt-in `gzip-rapidgzip` build feature closes part of the gap. If you own the file, `--repack-seekable` converts it to multi-frame zstd or writes a sidecar seek index |
 | **bzip2** | 900 KiB block | Block map stored in the index; multi-stream files supported |
 | **xz** | Block | Multi-block and multi-stream files (`xz --block-size`, `pixz`) seek cheaply. A single-block file larger than about 256 MiB is decoded in full and spilled to a temporary file |
-| **zstd** | Frame | Multi-frame files and files with the official seek table are random access; `ratarmount shard` and `--repack-seekable` produce both. A single-frame file is decoded in full. Sequential reads decode ahead on up to four threads |
+| **zstd** | Frame | Multi-frame files and files with the official seek table are random access; `ratarmount shard` and `--repack-seekable` produce both. Top-level local archives and repacking support leading skippable frames; nested/Range sniffing requires data-frame magic at offset 0. A single-frame file is decoded in full. Sequential reads decode ahead on up to four threads |
 | **lz4** | Independent block | `lz4 -B7` style independent blocks seek cheaply |
 | **lzip**, **lzo**, **compress (`.Z`)**, **lzma**, **zlib** | Stream or member | Seekable bodies with the same checkpoint approach |
 | Concatenated streams | Partial | `--ignore-zeros` for TAR; concatenated zstd frames are the normal multi-frame case |
@@ -100,7 +100,7 @@ record) logs one warning and the index keeps the ISO 9660 directory.
 
 | Format | What you get | Notes |
 |---|---|---|
-| **safetensors** | A directory per model: `model/layers/12/mlp/down_proj/weight` is a file holding that tensor's bytes, with a `.json` sidecar describing dtype, shape and offsets, plus `__metadata__.json` and `__header__.json` at the root | One shard file per mount; `model.safetensors.index.json` is not merged. Opens inside TARs and from `hf://` without copying. [Details](formats-tensors.md) |
+| **safetensors** | A directory per model: `model/layers/12/mlp/down_proj/weight` is a file holding that tensor's bytes, with a `.json` sidecar describing dtype, shape and offsets, plus `__metadata__.json` and `__header__.json` at the root | One shard file per mount; `model.safetensors.index.json` is not merged. The local `tensors manifest` command follows its shards and maps expert byte ranges. Opens inside TARs and from `hf://` without copying. [Details](formats-tensors.md#expert-manifest) |
 | **GGUF** (v2, v3, little-endian) | Same layout; quantized tensors stay quantized | Every metadata key lands in `__metadata__.json` |
 | **WebDataset shards** | Ordinary TAR; samples grouped by key when read through the Python library | Produce them with `ratarmount shard`; publish indexes with `--publish-index`. [Shards](shards.md) |
 | **Parquet, JSONL, images, audio** | Lazy files from any remote; read inside archives with the `ratar://` fsspec protocol | [Python guide](python.md#fsspec) |
@@ -138,13 +138,69 @@ ratarmount --index-id <sha256> archive.tar mnt/        # bind a mount to one pub
 ratarmount export-index shards/shards.json --format parquet -o members.parquet
 ```
 
+Local publication uses `VACUUM INTO` to make a complete snapshot, including
+committed rows still in the live index's WAL. The pin is read-only, has its own
+inode, is never linked to the live index, and its id hashes the snapshot as
+written. A destination copy is made from that pin on another inode. Build FTS
+and hashes before publishing; pins are never modified in place. Use
+`--index-id` to bind a read-only index. With an index elsewhere, `--publish-index`
+leaves an existing `archive.index.sqlite` alone with a warning, and creates it
+only when absent; it still publishes the pin and pointer.
+
+`--publish-index-to PATH` does not create directories. The directory of `PATH`
+must exist; `mkdir -p` it first. ratarmount syncs the files it publishes and
+their directory. It does not sync that directory's own entry in its parent or
+any ancestor. For a directory that was just created, `sync` (GNU coreutils:
+`sync -f DIR`) makes it durable. Pin, pointer and copy are placed in that one
+directory byte for byte, including non-UTF-8 names and `.index.sqlite` paths.
+Pruning keeps the current and previous id in the pin's own directory.
+
+Publication never replaces an existing database. An existing destination of
+any type or size, or a leftover `-wal`, `-shm` or `-journal` beside a new
+destination or pin name, is refused. An existing pin must already have exactly
+the snapshot's bytes and no write permission bit; it is fsynced before reuse.
+Choose a fresh destination, or remove the old copy and companions only after
+all processes using it have stopped. No process may retain a connection to a
+file removed from a destination or pin name: an idle rollback-mode connection
+on an unlinked inode leaves no trace this tool can inspect. A destination must
+end with a file name, not a separator, `.` or `..`.
+
+Local publication requires Unix permissions, directory fsync and installation
+without replacement; unsupported platforms or filesystems fail closed. Pin
+read bits are taken from the source, with owner read always enabled. If the
+new file's owner or group differs from the source, only owner read is granted
+unless the source was readable by both group and others. The source's owner,
+group and ACL are not copied; the publishing user owns the new pin, and its
+group and ACL follow directory creation rules. Use `chmod go+r` to share an
+owner-only pin. Its bytes and id stay the same.
+
+`VACUUM INTO` writes one extra full copy of the index per publication, rebuilding
+all tables and indexes. Time depends on row count and index structure; no
+fixed ratio to a file copy is promised. It needs up to one index size of
+private temporary space, and pins now occupy their own blocks (at most two
+are kept). An unchanged republish still makes a snapshot and syncs and hashes
+the existing pin. WAL writers can continue, but the snapshot delays WAL reset;
+a rollback-mode source blocks writers for the snapshot's duration and waits
+up to 10 seconds for an active writer.
+
+Run one publication of an archive at a time. Concurrent publications are not
+coordinated, and one can remove the other's pin after it was checked. A pointer
+can then name a missing pin; `--index-id` refuses it and the next publication
+writes a new pointer. An interrupted publication can leave
+`.ratarmount-index-snap-*.tmp` and `.ratarmount-index-snap-*.tmp-journal` files;
+they are excluded from directory-base digests, are not reaped automatically,
+and can be removed once no publication uses them. A filesystem's link/unlink
+installation fallback can leave an extra read-only temporary name for a valid
+pin; link count does not identify old or invalid pins.
+
 On HTTP, S3, GCS, Azure, the Hub and inside torrents, a mount looks for
 `{url}.index.ptr`, then the immutable `{url}.index.<sha256>.sqlite` blob it
 names, then a `Link: rel="describedby"` header on the archive, then the
 well-known `{url}.index.sqlite` (also `.gz`, `.zst`, `.xz`, `.bz2`). OCI images
 look up a referrer with media type `application/vnd.ratarmount.index.v1+sqlite`.
 Every candidate is validated against the archive's size and content
-fingerprint before use, so a stale index is rebuilt rather than trusted.
+fingerprint before use. Ordinary mounts can rebuild stale indexes;
+`--no-recreate-index` refuses detected preparation failures instead.
 
 ## Nested archives
 
@@ -220,6 +276,9 @@ disk speeds. Full methodology, CSV and caveats:
 
 ## Known limits
 
+Sealing over a split archive is not supported. Join the parts into one archive
+file and seal that.
+
 The complete status against the Python original is in the
 [parity checklist](parity-todo.md). The practical limits by area:
 
@@ -227,7 +286,9 @@ The complete status against the Python original is in the
    rapidgzip's parallel decoder, so small `.tar.gz` reads are slower than in
    Python. The opt-in `gzip-rapidgzip` build feature is a partial answer; the
    complete one is to repack archives you own with `--repack-seekable`. Exotic
-   xz filters and single-frame zstd larger than RAM decode in full.
+   xz filters and single-frame zstd larger than RAM decode in full. Nested/Range
+   zstd sniffing still requires data-frame magic at offset 0; leading skippables
+   are supported for top-level local archives and `--repack-seekable`.
 2. **Formats that are partial.** Classic SquashFS LZMA (spools through
    `unsquashfs`), pure RAR (libarchive only), encrypted SQLAR without
    sqlcipher, PDF Separation and Lab colour, LVM/RAID/Btrfs inside disk images,
@@ -237,19 +298,92 @@ The complete status against the Python original is in the
 3. **7z solids.** AES+LZMA2 and BCJ/Delta+LZMA2 solids are progressive with a
    window cache but have no dictionary-reset resume; BCJ2 and multi-pack
    folders still decompress whole. The first read of a late member in a
-   multi-GB solid archive is slow.
+   multi-GB solid archive is slow. `--hashes` digests of members of a solid
+   folder are reported by the mount (`getfattr`, the payload cache) but not by
+   `find --hashes`, hash predicates in `find --xattr`, FTS search or `export-index`, whose index rows share one
+   `offsetheader` per solid folder. An index built with `--hashes` before the
+   #320 fix holds the last member's digest for the whole folder; it is not
+   reported, and `ratarmount --recreate-index --hashes sha256 ARCHIVE` stores
+   each member's own digest. Warm hash fills require each member's recorded
+   slot and requested key; a partial hashing pass does not count missing hashes
+   as kept. Old prepared FTS tables containing shared hashes must be rebuilt
+   with `ratarmount find --fts PATTERN ARCHIVE` before read-only searches.
+   Pack offsets at or above 2^61 bytes are refused to keep real offsets separate
+   from synthetic xattr slots. The Python-compatible `files`/`xattrs` layout
+   is unchanged; Python does not resolve the Rust per-member slots, and the
+   additive `sevenzip_member_xattrs` binding table is ignored by Python.
 4. **Writes.** ZIP commits rebuild the archive and cannot handle encrypted or
    multi-part ZIPs. Live commits cover uncompressed TAR and `.tar.zst` only
    and refuse to touch members in earlier zstd frames; the offline commit is
    the escape hatch. Gzip, bzip2 and xz TARs commit offline through GNU tar.
    Create-if-missing offline is uncompressed `.tar` only. Details in
-   [Writing into archives](write-overlay.md#known-limits).
+   [Writing into archives](write-overlay.md#known-limits). The opt-in
+   `--overlay-durability=relaxed` skips overlay database fsyncs and cannot be
+   combined with archive commits; explicit `full` retains commit support.
+   After a machine failure, a leftover relaxed marker requires
+   `overlay fsck --repair` before reuse. See
+   [Relaxed overlay durability](sandbox.md#relaxed-overlay-durability).
+   [Patch import](sandbox.md#overlay-import) accepts Git binary literals and
+   deltas; deltas require full SHA-1/SHA-256 index ids, a regular-file preimage
+   and sizes within `--max-patch-bytes`.
+   The supervisor accepts `sandbox new --overlay-durability relaxed` and
+   refuses to finalize an attempt with a foreign/unknown-boot marker; discard
+   that attempt. See [relaxed attempts](sandbox.md#relaxed-attempts).
 5. **Platforms.** Linux and macOS on Apple silicon. No Intel macOS package (no
    CI runner), no Windows CLI. The library crates compile on Windows.
-6. **Mount point inside its own folder.** The refusal (exit 2) is a point-in-time
+6. **Tensor manifests.** Local regular files only; no scheme paths, overlapping
+   tensor ranges or GGUF split indexes. Merged unknown GGML types cannot be
+   split. Caps are 65,536 experts per merged tensor and 16,777,216 rows per
+   manifest; [the tensor guide](formats-tensors.md#expert-manifest) covers
+   classification and all v1 refusals.
+7. **Mount point inside its own folder.** The refusal (exit 2) is a point-in-time
    check: a bind created later, mount propagation from another namespace or an ancestor
    rename after mounting are not caught, mount propagation flags are not read (a private
    bind is refused too), and `--corpus` members are not checked.
 
+8. **Index files and publication.**
+   A read-only mount can leave an empty `-wal` and a 32 KiB `-shm` beside the index; they hold no data and are harmless.
+   Side tables written after a publication can stay in the live index's `-wal` until the next writer checkpoints; they are not in the published pin (remaining limitation).
+   Copying the live `X.index.sqlite` without its `-wal` loses rows; copy the pin or use `--publish-index-to` instead.
+   `--publish-index-to PATH` refuses an existing `PATH`, except when `PATH` is the index being published itself (the same path under another spelling, or a symlink that resolves to it); a hard link or a bind mount of that index and a `PATH` with a pin name are refused.
+   ratarmount creates no directory for a publication: the directory of `--publish-index-to PATH` must exist.
+   ratarmount never opens an index file without a write permission bit for writing, also as root.
+   Local index publication is Unix-only.
+   An interrupted publication can leave files named `.ratarmount-index-snap-*.tmp`; they are not part of any published index.
+
 Remote, export and platform limits are listed with their own guides:
 [Remote inputs](phase10-remote.md#not-yet) · [NFS](nfs-export.md) · [other exports](export.md) · [macOS](macos.md).
+
+### Shared prepared indexes
+
+For concurrent writable workers, prepare the local base/index once, then treat
+both as immutable until every worker has stopped. `--no-recreate-index` opens
+self-contained prepared SQLite artifacts immutably: a pending rollback journal
+or nonempty WAL is refused instead of recovered or checkpointed. A zero-length
+WAL and leftover SHM can be ignored without touching them. Native archive
+catalogs require schema validation and matching backend/tarstats identity;
+compression-only shells use matching tarstats and validated codec seek state
+without requiring native `backendName` metadata. These checks detect specific
+preparation failures; they do not validate every possible catalog defect (for
+example, every required `files` column).
+
+Required gzip/zstd/bzip2 seek state must be present and usable. Missing,
+damaged or wrong-codec state fails closed. Imported maps require initial
+coverage; zstd/bzip2 also check a genuine terminal boundary against the source.
+Valid zstd seek-table and
+skippable-frame tails and bzip2 padded multistream/trailing-data tails remain
+supported. Strict G3 gzip uses nonempty prepared RGZI checkpoints with initial
+coverage; it refuses GZIDX to avoid its internal repair fallback. The optional
+rapidgzip importer can use compatible prepared data; prepare and consume with
+compatible selected backends.
+
+Single-block bzip2 cannot currently persist the block map required by strict
+workers: preparation refuses with `single-block bzip2 cannot be prepared for
+read-only workers`. Use multi-block bzip2 or another supported prepared format.
+Compressed non-TAR readers that always build a file table also remain a limit:
+`base.zip.gz` can prepare normally, but a strict worker refuses its required
+reader rebuild. This adds no warm-reader support for those formats. Unindexed
+sources and ordinary-file binds need no external SQLite sidecar. Private nested
+computation is allowed; writes to the shared outer index remain disabled.
+
+See the [prepare-once, N-worker recipe](sandbox.md#prepare-once-n-writable-workers).

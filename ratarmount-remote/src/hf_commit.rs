@@ -6,6 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use ratarmount_index::http_client::{HttpError, HttpResponse};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -70,16 +71,16 @@ fn error(message: impl Into<String>) -> RemoteError {
     RemoteError::Hf(message.into())
 }
 
-fn write_error(repo: &str, stage: &str, err: ureq::Error) -> RemoteError {
+fn write_error(repo: &str, stage: &str, err: HttpError) -> RemoteError {
     match err {
-        ureq::Error::Status(status, _) => error(format!(
+        HttpError::Status(status, _) => error(format!(
             "Hub {stage} HTTP {status} for {repo}; publishing requires a token with write scope and repository write access; if this repository requires Xet and refuses LFS, Xet uploads are unsupported"
         )),
         _ => error(format!("Hub {stage} request failed for {repo}")),
     }
 }
 
-fn read_json(response: ureq::Response) -> Result<Value> {
+fn read_json(response: HttpResponse) -> Result<Value> {
     let mut bytes = Vec::new();
     response
         .into_reader()
@@ -132,6 +133,10 @@ impl HfRepo {
         // Managed (#151): the staged archive may be a database open in this
         // process; the one reader is sampled, hashed, rewound and kept through
         // the LFS uploads and their retries.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0509-M01","item":"<ratarmount_remote::hf::HfRepo>::commit_archive","disposition":"managed-read","regression":"regression_hf_archive_upload_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut files = vec![UploadFile::new(
             &self.location.path,
             Box::new(ratarmount_index::managed_read::ManagedReadCursor::open(

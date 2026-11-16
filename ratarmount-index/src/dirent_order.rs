@@ -137,12 +137,11 @@ impl SqliteIndex {
                         return Err(IndexError::Invalid("sidecar shares its inode with another path".into()));
                     }
                 }
+                if let Some(reason) = crate::location::index_pin_refusal(path) {
+                    return Err(IndexError::Invalid(reason));
+                }
                 let canonical = std::fs::canonicalize(path)?;
-                let snapshot = canonical.file_name().and_then(|name| name.to_str())
-                    .and_then(|name| name.strip_suffix(".sqlite"))
-                    .and_then(|name| name.rsplit_once(".index."))
-                    .is_some_and(|(_, id)| crate::parse_index_id(id).is_ok());
-                if snapshot || crate::index_pointer_path_for_index_file(&canonical).is_file() {
+                if crate::index_pointer_path_for_index_file(&canonical).is_file() {
                     return Err(IndexError::Invalid("published index bytes are pinned by SHA-256".into()));
                 }
                 let sql = "CREATE INDEX IF NOT EXISTS files_offsetheader ON files(offsetheader)";

@@ -262,6 +262,10 @@ fn digest_base(args: &DigestBaseArgs) -> Result<(String, i32), String> {
         ("directory", digest, excluded)
     } else {
         // Managed (#151): the base may be a database open in this process.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0037-M01","item":"ratarmount::overlay_cmd::digest_base","disposition":"managed-read","regression":"regression_digest_base_file_keeps_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let hex = ratarmount_index::managed_read::sha256_hex(&args.path)
             .map_err(|e| format!("digest-base {}: {e}", args.path.display()))?;
         ("file", format!("sha256:{hex}"), Vec::new())
@@ -537,8 +541,18 @@ pub fn seal(cmd: &SealCmd, context: &OverlayRunContext) -> Result<(String, i32),
         let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
         ratarmount_compositing::overlay_seal::reseal(&record)
     } else {
+        let operation = ratarmount_compositing::overlay_seal::SealOperation::acquire(&args.directory)
+            .map_err(|e| format!("seal {}: {e}", args.directory.display()))?;
+        if let Some(outcome) = operation.finish_if_sealed()
+            .map_err(|e| format!("seal {}: {e}", args.directory.display()))? {
+            return Ok((if args.json {
+                serde_json::json!({"layer_digest":outcome.layer_digest,"sealed_at":outcome.sealed_at}).to_string()
+            } else { outcome.layer_digest }, 0));
+        }
         let meta = OverlayMeta::read(&args.directory)
             .map_err(|e| super::overlay_open_error(&args.directory, &e))?;
+        ratarmount_compositing::relaxed_durability::refuse_unclean(meta.as_ref())
+            .map_err(|e| format!("seal {}: {e}", args.directory.display()))?;
         let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
         let base = classify_base(args.base.as_ref(), meta.as_ref(), None, context)?;
         if let Some(forced) =
@@ -552,7 +566,7 @@ pub fn seal(cmd: &SealCmd, context: &OverlayRunContext) -> Result<(String, i32),
             .map_err(|e| format!("seal {}: {e}", args.directory.display()))?;
         }
         let lower = lower_view(&base, &args.lower, meta.as_ref())?;
-        ratarmount_compositing::overlay_seal::seal(&args.directory, &base, lower)
+        operation.seal(&base, lower)
     }
     .map_err(|e| format!("seal {}: {e}", args.directory.display()))?;
     let output = if args.json {
@@ -609,6 +623,7 @@ pub fn verify(args: &VerifyArgs, context: &OverlayRunContext) -> Result<(String,
     let output = if args.seal.json {
         serde_json::json!({"ok":report.ok,"recorded":report.recorded,"computed":report.computed,
             "sentinel_ok":report.sentinel_ok,"mismatched":report.mismatched,
+            "preimages_bound":report.preimages_bound,"preimage_mismatched":report.preimage_mismatched,
             "base_ok":base_ok,"base_check":base_kind,"base_current":base_current})
         .to_string()
     } else if report.ok && !base_mismatch {
@@ -625,6 +640,15 @@ pub fn verify(args: &VerifyArgs, context: &OverlayRunContext) -> Result<(String,
             }
             for path in report.mismatched {
                 text.push_str(&format!("\n{path}"));
+            }
+            if report.preimages_bound == Some(false) {
+                text.push_str(&format!(
+                    "\n{}",
+                    ratarmount_compositing::overlay_seal::PREIMAGES_UNBOUND
+                ));
+            }
+            for pin in report.preimage_mismatched {
+                text.push_str(&format!("\nbase preimage changed: {pin}"));
             }
             lines.push(text);
         }

@@ -16,3 +16,6 @@ libc.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 bzip2 = { version = "0.5", features = ["static"] }
+
+[lints]
+workspace = true

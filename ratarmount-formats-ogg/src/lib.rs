@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! Ogg container demux MountSource (`backendName=OGGMountSource`).
 //!
 //! Parses `OggS` pages, demultiplexes by stream serial, and exposes each logical
@@ -167,7 +170,14 @@ pub fn parse_ogg<R: Read + Seek>(file: &mut R) -> Result<HashMap<u32, OggStream>
 }
 
 pub fn looks_like_ogg(path: &Path) -> bool {
-    if let Ok(mut f) = File::open(path) {
+    if let Ok(mut f) = {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0333-M01","item":"ratarmount_formats_ogg::looks_like_ogg","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = File::open(path);
+        __inventory_value_0
+    } {
         let mut magic = [0u8; 5];
         if f.read(&mut magic).ok() == Some(5) && &magic == b"OggS\0" {
             return true;
@@ -201,6 +211,10 @@ impl OggMountSource {
         let archive_path = archive_path.as_ref().to_path_buf();
         if !looks_like_ogg(&archive_path) {
             // Soft check: still require magic for open.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0334-M01","item":"<ratarmount_formats_ogg::OggMountSource>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let mut f = File::open(&archive_path)?;
             let mut magic = [0u8; 4];
             f.read_exact(&mut magic)?;
@@ -225,6 +239,7 @@ impl OggMountSource {
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options) {
                         Ok(s) => return Ok(s),
+                        Err(e) if options.read_only_index => return Err(e),
                         Err(e) => eprintln!("info: could not load ogg index ({e}); rebuilding"),
                     }
                 }
@@ -243,7 +258,7 @@ impl OggMountSource {
         index_path: &Path,
         options: &OpenOptions,
     ) -> Result<Self> {
-        let index = SqliteIndex::open_read_only(index_path)?;
+        let index = SqliteIndex::open_read_only_for_open(index_path, options)?;
         index.check_backend_name(BACKEND_NAME)?;
         // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
         // Missing tarstats still Ok (legacy indexes).
@@ -268,6 +283,10 @@ impl OggMountSource {
         );
         let t0 = Instant::now();
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0335-M01","item":"<ratarmount_formats_ogg::OggMountSource>::create_index","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut file = File::open(archive_path)?;
         let streams = parse_ogg(&mut file)?;
         if streams.is_empty() {
@@ -406,6 +425,10 @@ impl MountSource for OggMountSource {
             serde_json::from_str(&file_info.linkname)
                 .map_err(|e| io::Error::other(format!("ogg stencil json: {e}")))?
         };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0336-M01","item":"<ratarmount_formats_ogg::OggMountSource as ratarmount_core::MountSource<ratarmount_formats_ogg::OggMountSource>>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = File::open(&self.archive_path)?;
         Ok(Box::new(StenciledFile::new(file, regions)))
     }
@@ -448,6 +471,58 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn prepared_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect()
+    }
+
+    /// Regression: a strict warm worker must read members without changing its prepared sidecar.
+    #[test]
+    fn regression_prepared_index_warm_open_is_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.ogg");
+        let index = dir.path().join("index.sqlite");
+        let fixture = synthetic_ogg();
+        std::fs::write(&archive, &fixture).unwrap();
+        drop(
+            OggMountSource::open(
+                &archive,
+                Some(&index),
+                &OpenOptions::default(),
+                "test",
+                true,
+            )
+            .unwrap(),
+        );
+        SqliteIndex::finalize_prepared(&index).unwrap();
+        let before = prepared_snapshot(dir.path());
+        let options = OpenOptions {
+            read_only_index: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let source = OggMountSource::open(&archive, Some(&index), &options, "test", false).unwrap();
+        let entry = source
+            .list_dirents("/")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFREG)
+            .unwrap();
+        let member = format!("/{}", entry.name);
+        let info = source.lookup(&member, 0).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut source.open(&info, 0).unwrap(), &mut bytes).unwrap();
+        assert_eq!(bytes, fixture.as_slice());
+        assert_eq!(prepared_snapshot(dir.path()), before);
+        drop(source);
+        assert_eq!(prepared_snapshot(dir.path()), before);
+    }
+
     use std::io::Cursor;
 
     /// Minimal single-page OggS with a fake vorbis-like identification packet.

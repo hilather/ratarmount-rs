@@ -184,7 +184,8 @@ impl MountGuard {
             return;
         }
         self.armed = false;
-        for w in &self.workers {
+        // Only groups whose leader is unreaped: a reaped leader's pgid may name another group.
+        for w in self.workers.iter().filter(|w| w.status.is_none()) {
             kill_process_group(w.pgid);
         }
         self.reap_workers(KILL_REAP);
@@ -224,6 +225,62 @@ impl MountGuard {
             _ => signal_kill_pid(self.daemon_pid),
         }
     }
+}
+
+/// Regression: `MountGuard::deadlock_cleanup` sent SIGKILL to the process group of every worker,
+/// including workers already reaped, whose pgid may since name an unrelated group. Only groups of
+/// unreaped workers are signalled. Needs no FUSE.
+#[test]
+fn regression_deadlock_cleanup_never_signals_a_reaped_workers_group() {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = tempfile::tempdir().unwrap();
+    let group = || {
+        Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    };
+    // The pgid recorded for a reaped worker now names a live, unrelated group.
+    let mut unrelated = group();
+    let mut reaped = Command::new("true").spawn().unwrap();
+    let reaped_status = reaped.wait().unwrap();
+    let running = group();
+    let running_pgid = i32::try_from(running.id()).unwrap();
+    let worker = |child, pgid, status| Worker {
+        child,
+        pgid,
+        label: "worker".into(),
+        log: dir.path().join("worker.log"),
+        status,
+    };
+    let daemon = Command::new("sleep").arg("60").spawn().unwrap();
+    let mut guard = MountGuard {
+        mnt: dir.path().join("mnt"),
+        daemon_pid: daemon.id(),
+        daemon,
+        daemon_log: dir.path().join("daemon.log"),
+        workers: vec![
+            worker(
+                reaped,
+                i32::try_from(unrelated.id()).unwrap(),
+                Some(reaped_status),
+            ),
+            worker(running, running_pgid, None),
+        ],
+        armed: true,
+        defused: false,
+    };
+    guard.deadlock_cleanup();
+    let alive = unrelated.try_wait().unwrap().is_none();
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+    assert!(alive, "the recorded pgid of a reaped worker was signalled");
+    assert_eq!(
+        guard.workers[1].status.and_then(|s| s.signal()),
+        Some(Signal::SIGKILL as i32),
+        "an unreaped worker's group was not killed"
+    );
 }
 
 /// Regression: Latin-1 file names must return EILSEQ without a U+FFFD overlay row.

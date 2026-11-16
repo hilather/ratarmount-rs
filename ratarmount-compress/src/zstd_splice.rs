@@ -4,8 +4,6 @@
 //! does not depend on `ratarmount-formats-tar`. The decoded last-N is
 //! materialized as [`SeekRead`] so the caller does not recopy the suffix.
 
-#![allow(clippy::disallowed_methods)]
-
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -21,6 +19,35 @@ use crate::{CompressError, Result};
 
 /// Fixed encode level: original frame parameters are unrecoverable (design).
 const SPLICE_ENCODE_LEVEL: i32 = 3;
+
+#[cfg(any(test, feature = "test-hooks"))]
+thread_local! {
+    static SEEK_TABLE_SIZE_LIMIT: std::cell::Cell<u64> = const { std::cell::Cell::new(u32::MAX as u64) };
+}
+
+/// Restore the previous per-thread seek-table size limit when dropped.
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct SeekTableLimitGuard(u64);
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for SeekTableLimitGuard {
+    fn drop(&mut self) {
+        SEEK_TABLE_SIZE_LIMIT.with(|limit| limit.set(self.0));
+    }
+}
+
+/// Exercise the oversized-frame publication route with a small fixture.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn zstd_splice_seek_table_limit_for_test(limit: u64) -> SeekTableLimitGuard {
+    SeekTableLimitGuard(SEEK_TABLE_SIZE_LIMIT.with(|slot| slot.replace(limit)))
+}
+
+/// Exercise oversized splice publication without writing a 4 GiB test fixture.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn with_splice_frame_size_limit<T>(limit: u32, run: impl FnOnce() -> T) -> T {
+    let _reset = zstd_splice_seek_table_limit_for_test(u64::from(limit));
+    run()
+}
 
 /// Bytes copied / written by [`splice_zstd_last_frames`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,12 +160,33 @@ where
 /// ([`crate::commit_journal::ReplaceError::RolledBack`]). It is published only
 /// while the archive is still exactly that stamp with no journal pending,
 /// under its lock ([`crate::commit_journal::guard_copy`]). On failure before
-/// persist the original inode is untouched.
+/// persist the original inode is untouched. `before_write` runs under that
+/// lock immediately before publication.
 pub fn splice_zstd_last_frames_replace<F>(
     path: &Path,
     from_idx: usize,
     transform: F,
     reference: &std::fs::Metadata,
+    before_write: crate::commit_journal::BeforeWrite,
+) -> Result<SpliceStats>
+where
+    F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
+{
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The copy splice convenience API delegates with the caller pre-publication guard"
+    )]
+    splice_zstd_last_frames_replace_guarded(path, from_idx, transform, reference, before_write)
+}
+
+/// Copy splice with a caller guard under the archive lock immediately before
+/// publication. Preparation may read and stage bytes but cannot publish them.
+pub fn splice_zstd_last_frames_replace_guarded<F>(
+    path: &Path,
+    from_idx: usize,
+    transform: F,
+    reference: &std::fs::Metadata,
+    before_write: crate::commit_journal::BeforeWrite,
 ) -> Result<SpliceStats>
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
@@ -147,8 +195,16 @@ where
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0277-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded","disposition":"output-owner","mode_policy":"private-staging-then-source-archive-metadata","category":"output-owner","reason":"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).","creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename."}}"###
+    )]
     let mut tmp = NamedTempFile::new_in(parent)?;
     crate::commit_journal::fault::point("copy source open")?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0278-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded","disposition":"residual","reason":"zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut src = File::open(path)?;
     let source = src.metadata()?;
     if !crate::commit_journal::same_stamp(reference, &source) {
@@ -173,9 +229,16 @@ where
     let method = crate::fastcopy::copy_range(&mut src, 0, tmp.as_file_mut(), 0, prefix)?;
     crate::fastcopy::log_commit_copy(prefix, method);
     let stats = write_zstd_splice_suffix(&mut src, &map, from_idx, transform, tmp.as_file_mut())?;
+    crate::fastcopy::preserve_archive_metadata(path, &source, tmp.as_file())?;
     tmp.as_file().sync_all()?;
-    let _guard = crate::commit_journal::guard_copy(path, &source)
-        .map_err(|e| CompressError::Msg(e.to_string()))?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The splice implementation holds the journal copy guard while publishing the staged archive"
+    )]
+    let _guard = crate::commit_journal::guard_copy(path, &source).map_err(CompressError::Io)?;
+    before_write()?;
+    crate::commit_journal::test_prewrite_hold()?;
+    before_write()?;
     tmp.persist(path).map_err(|e| {
         CompressError::Msg(format!(
             "Failed to replace '{}' after zstd splice: {}",
@@ -196,7 +259,19 @@ pub fn splice_zstd_last_frames_append<F>(
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
 {
-    splice_zstd_last_frames_append_with(path, from_idx, transform, original, &mut |_| Ok(()))
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The append convenience API delegates to the implementation with an empty unlink hook"
+    )]
+    let result = splice_zstd_last_frames_append_with(
+        path,
+        from_idx,
+        transform,
+        original,
+        &mut || Ok(()),
+        &mut |_| Ok(()),
+    );
+    result
 }
 
 /// [`splice_zstd_last_frames_append`] with a `before_unlink` hook that runs
@@ -204,18 +279,51 @@ where
 /// unlinked. `original` is the caller's snapshot of the archive (the file
 /// its gate judged): the source opened here must still be exactly that file,
 /// and the replacement compares it again under the archive lock. A failure
-/// of the journaled replacement is [`CompressError::Replace`].
+/// of the journaled replacement is [`CompressError::Replace`]. `before_write`
+/// runs under the archive lock before any mutation or copy publication.
 pub fn splice_zstd_last_frames_append_with<F>(
     path: &Path,
     from_idx: usize,
     transform: F,
     original: &std::fs::Metadata,
+    before_write: crate::commit_journal::BeforeWrite,
+    before_unlink: crate::commit_journal::BeforeUnlink,
+) -> Result<SpliceStats>
+where
+    F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
+{
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The append splice convenience API delegates with the caller pre-write guard"
+    )]
+    splice_zstd_last_frames_append_guarded(
+        path,
+        from_idx,
+        transform,
+        original,
+        before_write,
+        before_unlink,
+    )
+}
+
+/// Journaled splice with a caller guard before any journal, locator or archive
+/// mutation; the copy fallback uses it under the publication lock as well.
+pub fn splice_zstd_last_frames_append_guarded<F>(
+    path: &Path,
+    from_idx: usize,
+    transform: F,
+    original: &std::fs::Metadata,
+    before_write: crate::commit_journal::BeforeWrite,
     before_unlink: crate::commit_journal::BeforeUnlink,
 ) -> Result<SpliceStats>
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
 {
     crate::commit_journal::fault::check("before splice scan")?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0279-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded","disposition":"residual","reason":"zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut src = File::open(path)?;
     let source = src.metadata()?;
     if !crate::commit_journal::same_stamp(original, &source) {
@@ -233,11 +341,19 @@ where
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0280-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tail = NamedTempFile::new_in(parent)?;
     let stats = write_zstd_splice_suffix(&mut src, &map, from_idx, transform, tail.as_file_mut())?;
     if !stats.wrote_seek_table {
         // A new frame may exceed the seek-table u32 limit. Keep the existing
         // no-size-refusal rule: publish the staged suffix through copy/rename.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0281-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded","disposition":"output-owner","mode_policy":"private-staging-then-source-archive-metadata","category":"output-owner","reason":"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).","creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename."}}"###
+        )]
         let mut tmp = NamedTempFile::new_in(parent)?;
         let method = crate::fastcopy::copy_range(
             &mut src,
@@ -249,19 +365,31 @@ where
         crate::fastcopy::log_commit_copy(stats.prefix_compressed_bytes, method);
         tail.as_file_mut().rewind()?;
         io::copy(tail.as_file_mut(), tmp.as_file_mut())?;
+        crate::fastcopy::preserve_archive_metadata(path, &source, tmp.as_file())?;
         tmp.as_file().sync_all()?;
         // Published only over the file the copy was read from, unchanged and
         // with no journal pending, under its lock.
-        let _guard = crate::commit_journal::guard_copy(path, &source)
-            .map_err(|e| CompressError::Msg(e.to_string()))?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The oversized splice fallback holds the journal guard while publishing its staged copy"
+        )]
+        let _guard = crate::commit_journal::guard_copy(path, &source).map_err(CompressError::Io)?;
+        before_write()?;
+        crate::commit_journal::test_prewrite_hold()?;
+        before_write()?;
         tmp.persist(path).map_err(|e| e.error)?;
         return Ok(stats);
     }
-    crate::commit_journal::replace_suffix_if_unchanged_with(
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The append splice commits its checked suffix through the journal implementation"
+    )]
+    crate::commit_journal::replace_suffix_if_unchanged_guarded(
         path,
         stats.prefix_compressed_bytes,
         tail.as_file_mut(),
         original,
+        before_write,
         before_unlink,
     )
     .map_err(CompressError::Replace)?;
@@ -273,7 +401,14 @@ where
 }
 
 fn spill_sink() -> tempfile::SpooledTempFile {
-    tempfile::spooled_tempfile(DEFAULT_MEMORY_CAP as usize)
+    {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0028-M01","item":"ratarmount_compress::zstd_splice::spill_sink","disposition":"output-owner","category":"compression-staging","reason":"Construct the spill sink used for the compressed rewrite tail.","creation":{"policy":"spill-private-temporary","basis":"SpooledTempFile uses the existing memory cap and tempfile defaults on disk rollover; it does not create a named archive input."}}"###
+        )]
+        let __inventory_value_0 = tempfile::spooled_tempfile(DEFAULT_MEMORY_CAP as usize);
+        __inventory_value_0
+    }
 }
 
 /// Rebuild skippable seek table for prefix frames + one new last frame.
@@ -287,6 +422,10 @@ fn maybe_rebuild_seek_table(
     new_plain: u64,
 ) -> Option<Vec<u8>> {
     map.seek_table.as_ref()?;
+    #[cfg(any(test, feature = "test-hooks"))]
+    if SEEK_TABLE_SIZE_LIMIT.with(|limit| new_comp > limit.get() || new_plain > limit.get()) {
+        return None;
+    }
     let mut entries = Vec::with_capacity(from_idx.saturating_add(1));
     for (i, f) in map.frames[..from_idx].iter().enumerate() {
         // cSize from offset deltas so skippable gaps in the copied prefix stay consistent.
@@ -333,574 +472,5 @@ fn maybe_rebuild_seek_table(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::zstd_seek::{encode_zstd_frame, scan_zstd_frames_path, ZstdFrameInfo};
-    use crate::{open_seekable_zstd, open_seekable_zstd_from_reader};
-    use std::io::Cursor;
-
-    /// Official seekable-format footer magic (`0x8F92EAB1`).
-    const SEEKABLE_MAGIC: u32 = 0x8F92_EAB1;
-
-    fn generated_payload(tag: &str, n: usize) -> Vec<u8> {
-        let mut out = format!("{tag}-{}-", std::process::id()).into_bytes();
-        out.extend((0..n).map(|i| ((i.wrapping_mul(31) + tag.len()) % 251) as u8));
-        out
-    }
-
-    fn pack_frames(parts: &[&[u8]], with_seek_table: bool) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut entries = Vec::new();
-        for p in parts {
-            let f = encode_zstd_frame(p, 3).unwrap();
-            entries.push((f.len() as u32, p.len() as u32));
-            out.extend_from_slice(&f);
-        }
-        if with_seek_table {
-            out.extend_from_slice(&build_seek_table_skippable(&entries));
-        }
-        out
-    }
-
-    fn has_seek_table_footer(bytes: &[u8]) -> bool {
-        if bytes.len() < 4 {
-            return false;
-        }
-        let n = bytes.len();
-        u32::from_le_bytes(bytes[n - 4..].try_into().unwrap()) == SEEKABLE_MAGIC
-    }
-
-    fn append_extra(
-        extra: Vec<u8>,
-    ) -> impl FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()> {
-        move |suffix, _off, out| {
-            // Seekable hook: overlay persist will scan the suffix; prove we did not hand a forward-only Read.
-            let end = suffix.seek(SeekFrom::End(0))?;
-            suffix.seek(SeekFrom::Start(0))?;
-            let copied = io::copy(suffix, out)?;
-            assert_eq!(copied, end, "transform must see the full decoded last-N");
-            out.write_all(&extra)?;
-            Ok(())
-        }
-    }
-
-    fn read_body(label: &str, bytes: &[u8]) -> (Vec<u8>, &'static str) {
-        let body = open_seekable_zstd_from_reader(Cursor::new(bytes.to_vec()), label).unwrap();
-        let kind = body.kind();
-        let mut all = Vec::new();
-        body.open_reader().unwrap().read_to_end(&mut all).unwrap();
-        (all, kind)
-    }
-
-    /// Regression: prefix frames stay byte-identical; remount sees the transformed suffix.
-    #[test]
-    fn splice_zstd_multi_frame_prefix_identity() {
-        let prefix_plain = generated_payload("mf-prefix", 64);
-        let last_plain = generated_payload("mf-last", 48);
-        let extra = generated_payload("mf-extra", 1024);
-        let src_bytes = pack_frames(&[&prefix_plain, &last_plain], false);
-        let mut src = Cursor::new(src_bytes.clone());
-        let map = scan_zstd_frames(&mut src).unwrap();
-        assert_eq!(map.frames.len(), 2);
-        assert!(map.seek_table.is_none());
-        let old_frame1_offset = map.frames[1].compressed_offset as usize;
-
-        let mut dst = Vec::new();
-        let stats =
-            splice_zstd_last_frames(&mut src, &map, 1, append_extra(extra.clone()), &mut dst)
-                .unwrap();
-        assert_eq!(stats.prefix_compressed_bytes, old_frame1_offset as u64);
-        assert!(!stats.wrote_seek_table);
-        assert_eq!(&dst[..old_frame1_offset], &src_bytes[..old_frame1_offset]);
-        assert!(!has_seek_table_footer(&dst));
-
-        let (all, kind) = read_body("splice-mf.zst", &dst);
-        assert_eq!(kind, "zstd-frames");
-        let mut expected = prefix_plain.clone();
-        expected.extend_from_slice(&last_plain);
-        expected.extend_from_slice(&extra);
-        assert_eq!(all, expected);
-        assert_eq!(
-            stats.new_frame_uncompressed_size,
-            (last_plain.len() + extra.len()) as u64
-        );
-
-        // Seek-table fixture remounts via the footer-priority opener.
-        let src_st = pack_frames(&[&prefix_plain, &last_plain], true);
-        let mut src_st_cur = Cursor::new(src_st.clone());
-        let map_st = scan_zstd_frames(&mut src_st_cur).unwrap();
-        assert!(map_st.seek_table.is_some());
-        let mut dst_st = Vec::new();
-        let stats_st = splice_zstd_last_frames(
-            &mut src_st_cur,
-            &map_st,
-            1,
-            append_extra(extra.clone()),
-            &mut dst_st,
-        )
-        .unwrap();
-        assert!(stats_st.wrote_seek_table);
-        let prefix_end = map_st.frames[1].compressed_offset as usize;
-        assert_eq!(&dst_st[..prefix_end], &src_st[..prefix_end]);
-        let (all_st, kind_st) = read_body("splice-mf-st.zst", &dst_st);
-        assert_eq!(kind_st, "zstd-seek-table");
-        assert_eq!(all_st, expected);
-    }
-
-    /// Last-N merge: three frames, rewrite from frame 1 (not only the final frame).
-    #[test]
-    fn splice_zstd_three_frame_from_idx_one() {
-        let p0 = generated_payload("n3-p0", 40);
-        let p1 = generated_payload("n3-p1", 28);
-        let p2 = generated_payload("n3-p2", 16);
-        let extra = generated_payload("n3-extra", 64);
-
-        let src_bytes = pack_frames(&[&p0, &p1, &p2], true);
-        let mut src = Cursor::new(src_bytes.clone());
-        let map = scan_zstd_frames(&mut src).unwrap();
-        assert_eq!(map.frames.len(), 3);
-        assert!(map.seek_table.is_some());
-        let prefix_end = map.frames[1].compressed_offset as usize;
-
-        let mut dst = Vec::new();
-        let stats =
-            splice_zstd_last_frames(&mut src, &map, 1, append_extra(extra.clone()), &mut dst)
-                .unwrap();
-        assert_eq!(stats.prefix_compressed_bytes, prefix_end as u64);
-        assert_eq!(&dst[..prefix_end], &src_bytes[..prefix_end]);
-        assert!(stats.wrote_seek_table);
-
-        let out_map = scan_zstd_frames(&mut Cursor::new(&dst)).unwrap();
-        assert_eq!(out_map.frames.len(), 2);
-        assert!(out_map.seek_table.is_some());
-        assert_eq!(
-            out_map.frames[0].compressed_size,
-            map.frames[0].compressed_size
-        );
-        assert_eq!(
-            out_map.frames[0].uncompressed_size,
-            map.frames[0].uncompressed_size
-        );
-        assert_eq!(
-            out_map.frames[1].compressed_size,
-            stats.new_frame_compressed_size
-        );
-        assert_eq!(
-            out_map.frames[1].uncompressed_size,
-            stats.new_frame_uncompressed_size
-        );
-
-        let (all, kind) = read_body("splice-n3.zst", &dst);
-        assert_eq!(kind, "zstd-seek-table");
-        let mut expected = p0.clone();
-        expected.extend_from_slice(&p1);
-        expected.extend_from_slice(&p2);
-        expected.extend_from_slice(&extra);
-        assert_eq!(all, expected);
-        assert_eq!(
-            stats.new_frame_uncompressed_size,
-            (p1.len() + p2.len() + extra.len()) as u64
-        );
-    }
-
-    /// Single-frame rewrite: `from_idx == 0` produces one new data frame.
-    #[test]
-    fn splice_zstd_single_frame() {
-        let plain = generated_payload("sf-body", 80);
-        let extra = generated_payload("sf-extra", 32);
-        let src_bytes = pack_frames(&[&plain], false);
-        let mut src = Cursor::new(src_bytes);
-        let map = scan_zstd_frames(&mut src).unwrap();
-        assert_eq!(map.frames.len(), 1);
-
-        let mut dst = Vec::new();
-        let stats =
-            splice_zstd_last_frames(&mut src, &map, 0, append_extra(extra.clone()), &mut dst)
-                .unwrap();
-        assert_eq!(stats.prefix_compressed_bytes, 0);
-        assert!(!stats.wrote_seek_table);
-
-        let out_map = scan_zstd_frames(&mut Cursor::new(&dst)).unwrap();
-        assert_eq!(out_map.frames.len(), 1);
-        assert!(out_map.seek_table.is_none());
-        assert_eq!(
-            out_map.frames[0].compressed_size,
-            stats.new_frame_compressed_size
-        );
-        assert_eq!(
-            out_map.frames[0].uncompressed_size,
-            stats.new_frame_uncompressed_size
-        );
-
-        let (all, _) = read_body("splice-sf.zst", &dst);
-        let mut expected = plain.clone();
-        expected.extend_from_slice(&extra);
-        assert_eq!(all, expected);
-
-        // Same rewrite when the input already had a seek table: one frame + new footer.
-        let src_st = pack_frames(&[&plain], true);
-        let mut src_st_cur = Cursor::new(src_st);
-        let map_st = scan_zstd_frames(&mut src_st_cur).unwrap();
-        let mut dst_st = Vec::new();
-        let stats_st = splice_zstd_last_frames(
-            &mut src_st_cur,
-            &map_st,
-            0,
-            append_extra(extra.clone()),
-            &mut dst_st,
-        )
-        .unwrap();
-        assert!(stats_st.wrote_seek_table);
-        assert!(has_seek_table_footer(&dst_st));
-        let out_st = scan_zstd_frames(&mut Cursor::new(&dst_st)).unwrap();
-        assert_eq!(out_st.frames.len(), 1);
-        assert!(out_st.seek_table.is_some());
-        let (all_st, _kind_st) = read_body("splice-sf-st.zst", &dst_st);
-        // Small single-frame + footer is FullDecode (`zstd`); payload still remounts.
-        assert_eq!(all_st, expected);
-    }
-
-    /// Seek table rewrite: footer magic present; last cSize matches the new frame;
-    /// prefix uncompressed range matches the generated seed.
-    #[test]
-    fn splice_zstd_seek_table_rewrite() {
-        let prefix_plain = generated_payload("st-prefix", 96);
-        let last_plain = generated_payload("st-last", 40);
-        let extra = generated_payload("st-extra", 1024);
-        let src_bytes = pack_frames(&[&prefix_plain, &last_plain], true);
-        let mut src = Cursor::new(src_bytes.clone());
-        let map = scan_zstd_frames(&mut src).unwrap();
-        assert!(map.seek_table.is_some());
-        assert!(has_seek_table_footer(&src_bytes));
-
-        let mut dst = Vec::new();
-        let stats =
-            splice_zstd_last_frames(&mut src, &map, 1, append_extra(extra.clone()), &mut dst)
-                .unwrap();
-        assert!(stats.wrote_seek_table);
-        assert!(has_seek_table_footer(&dst));
-
-        let out_map = scan_zstd_frames(&mut Cursor::new(&dst)).unwrap();
-        assert!(out_map.seek_table.is_some());
-        assert_eq!(out_map.frames.len(), 2);
-        assert_eq!(
-            out_map.frames[1].compressed_size,
-            stats.new_frame_compressed_size
-        );
-        assert_eq!(
-            out_map.frames[1].uncompressed_size,
-            stats.new_frame_uncompressed_size
-        );
-        assert_eq!(
-            out_map.frames[0].uncompressed_size,
-            prefix_plain.len() as u64
-        );
-        assert_eq!(
-            out_map.frames[0].compressed_size,
-            map.frames[0].compressed_size
-        );
-
-        let body =
-            open_seekable_zstd_from_reader(Cursor::new(dst.clone()), "splice-st.zst").unwrap();
-        assert_eq!(body.kind(), "zstd-seek-table");
-        let mut r = body.open_reader().unwrap();
-        let mut prefix_got = vec![0u8; prefix_plain.len()];
-        r.read_exact(&mut prefix_got).unwrap();
-        assert_eq!(prefix_got, prefix_plain);
-
-        r.seek(SeekFrom::Start(0)).unwrap();
-        let mut all = Vec::new();
-        r.read_to_end(&mut all).unwrap();
-        let mut expected = prefix_plain.clone();
-        expected.extend_from_slice(&last_plain);
-        expected.extend_from_slice(&extra);
-        assert_eq!(all, expected);
-    }
-
-    /// u32 overflow drops the footer; spliced data frames still remount.
-    #[test]
-    fn splice_zstd_seek_table_u32_overflow_drops_footer() {
-        // cSize comes from offset deltas; a span > u32::MAX drops the footer.
-        let fake = ZstdFrameMap {
-            frames: vec![
-                ZstdFrameInfo {
-                    compressed_offset: 0,
-                    uncompressed_offset: 0,
-                    compressed_size: 10,
-                    uncompressed_size: 10,
-                },
-                ZstdFrameInfo {
-                    compressed_offset: u32::MAX as u64 + 1,
-                    uncompressed_offset: 10,
-                    compressed_size: 20,
-                    uncompressed_size: 5,
-                },
-            ],
-            seek_table: Some(120..140),
-        };
-        assert!(maybe_rebuild_seek_table(&fake, 1, 20, 5).is_none());
-
-        let fake_plain = ZstdFrameMap {
-            frames: vec![
-                ZstdFrameInfo {
-                    compressed_offset: 0,
-                    uncompressed_offset: 0,
-                    compressed_size: 10,
-                    uncompressed_size: u32::MAX as u64 + 1,
-                },
-                ZstdFrameInfo {
-                    compressed_offset: 10,
-                    uncompressed_offset: u32::MAX as u64 + 1,
-                    compressed_size: 20,
-                    uncompressed_size: 5,
-                },
-            ],
-            seek_table: Some(30..50),
-        };
-        assert!(maybe_rebuild_seek_table(&fake_plain, 1, 20, 5).is_none());
-        assert!(maybe_rebuild_seek_table(&fake, 1, u32::MAX as u64 + 1, 5).is_none());
-        assert!(maybe_rebuild_seek_table(&fake, 1, 20, u32::MAX as u64 + 1).is_none());
-        assert!(maybe_rebuild_seek_table(
-            &ZstdFrameMap {
-                frames: fake.frames.clone(),
-                seek_table: None,
-            },
-            1,
-            20,
-            5
-        )
-        .is_none());
-
-        // Real splice: lie about prefix dSize so the rebuild overflows without 4 GiB I/O.
-        // Prefix copy still uses compressed_offset (unchanged).
-        let prefix_plain = generated_payload("ov-prefix", 48);
-        let last_plain = generated_payload("ov-last", 24);
-        let extra = generated_payload("ov-extra", 16);
-        let src_bytes = pack_frames(&[&prefix_plain, &last_plain], true);
-        let mut src = Cursor::new(src_bytes);
-        let mut map = scan_zstd_frames(&mut src).unwrap();
-        assert!(map.seek_table.is_some());
-        map.frames[0].uncompressed_size = u32::MAX as u64 + 1;
-
-        let mut dst = Vec::new();
-        let stats =
-            splice_zstd_last_frames(&mut src, &map, 1, append_extra(extra.clone()), &mut dst)
-                .unwrap();
-        assert!(!stats.wrote_seek_table);
-        assert!(!has_seek_table_footer(&dst));
-
-        let out_map = scan_zstd_frames(&mut Cursor::new(&dst)).unwrap();
-        assert!(out_map.seek_table.is_none());
-        assert_eq!(out_map.frames.len(), 2);
-
-        let (all, kind) = read_body("splice-ov.zst", &dst);
-        assert_eq!(kind, "zstd-frames");
-        let mut expected = prefix_plain;
-        expected.extend_from_slice(&last_plain);
-        expected.extend_from_slice(&extra);
-        assert_eq!(all, expected);
-    }
-
-    /// Prefix seek-table cSize is the compressed_offset span, not recorded compressed_size
-    /// (skippable gaps live inside the byte-copied prefix).
-    #[test]
-    fn splice_zstd_seek_table_prefix_csize_uses_offset_deltas() {
-        let map = ZstdFrameMap {
-            frames: vec![
-                ZstdFrameInfo {
-                    compressed_offset: 0,
-                    uncompressed_offset: 0,
-                    compressed_size: 100,
-                    uncompressed_size: 10,
-                },
-                ZstdFrameInfo {
-                    compressed_offset: 150,
-                    uncompressed_offset: 10,
-                    compressed_size: 20,
-                    uncompressed_size: 5,
-                },
-            ],
-            seek_table: Some(170..190),
-        };
-        let table = maybe_rebuild_seek_table(&map, 1, 20, 5).unwrap();
-        assert_eq!(table, build_seek_table_skippable(&[(150, 10), (20, 5)]));
-    }
-
-    /// Regression: leaving the old footer after a last-frame rewrite is why K5
-    /// rebuilds (or drops) the table. Loader prefers the stale last-entry size.
-    #[test]
-    fn splice_zstd_stale_seek_table_loader_is_wrong() {
-        let prefix_plain = generated_payload("stale-prefix", 64);
-        let last_plain = generated_payload("stale-last", 32);
-        let extra = generated_payload("stale-extra", 1024);
-        let src_bytes = pack_frames(&[&prefix_plain, &last_plain], true);
-        let mut src = Cursor::new(src_bytes.clone());
-        let map = scan_zstd_frames(&mut src).unwrap();
-        let table_range = map.seek_table.clone().expect("fixture has a seek table");
-        let old_table = src_bytes[table_range.start as usize..].to_vec();
-        let old_last_plain = last_plain.len() as u64;
-        let old_total = (prefix_plain.len() + last_plain.len()) as u64;
-
-        let mut new_plain = last_plain.clone();
-        new_plain.extend_from_slice(&extra);
-        let new_frame = encode_zstd_frame(&new_plain, 3).unwrap();
-        let prefix_end = map.frames[1].compressed_offset as usize;
-        let mut stale = src_bytes[..prefix_end].to_vec();
-        stale.extend_from_slice(&new_frame);
-        stale.extend_from_slice(&old_table);
-
-        let stale_map = scan_zstd_frames(&mut Cursor::new(&stale)).unwrap();
-        assert!(
-            stale_map.seek_table.is_some(),
-            "loader must prefer the leftover footer"
-        );
-        let stale_last = stale_map.frames.last().unwrap();
-        assert_eq!(
-            stale_last.uncompressed_size, old_last_plain,
-            "stale last-entry dSize hides the rewritten suffix"
-        );
-        assert_ne!(stale_last.uncompressed_size, new_plain.len() as u64);
-
-        let body = open_seekable_zstd_from_reader(Cursor::new(stale), "stale-footer.zst").unwrap();
-        assert_eq!(body.kind(), "zstd-seek-table");
-        assert_eq!(
-            body.size(),
-            old_total,
-            "seek-table remount reports the old uncompressed total"
-        );
-        let mut expected_new = prefix_plain.clone();
-        expected_new.extend_from_slice(&new_plain);
-        // Truncated last-frame decode may error or yield the old (short) payload — never the new suffix.
-        let mut got = Vec::new();
-        if body.open_reader().unwrap().read_to_end(&mut got).is_ok() {
-            assert_eq!(got.len() as u64, old_total);
-            assert_ne!(got, expected_new);
-        }
-    }
-
-    /// `replace` writes a sibling tempfile, persist-overwrites, and leaves the
-    /// original bytes in place if splice fails before persist.
-    #[test]
-    fn splice_zstd_replace_persists_sibling() {
-        let prefix_plain = generated_payload("rp-prefix", 40);
-        let last_plain = generated_payload("rp-last", 20);
-        let extra = generated_payload("rp-extra", 8);
-        let src_bytes = pack_frames(&[&prefix_plain, &last_plain], true);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("replace.zst");
-        std::fs::write(&path, &src_bytes).unwrap();
-
-        let map = scan_zstd_frames_path(&path).unwrap();
-        let from_idx = 1;
-        let stats = splice_zstd_last_frames_replace(
-            &path,
-            from_idx,
-            append_extra(extra.clone()),
-            &std::fs::metadata(&path).unwrap(),
-        )
-        .unwrap();
-        assert!(stats.wrote_seek_table);
-        assert_eq!(
-            stats.prefix_compressed_bytes,
-            map.frames[from_idx].compressed_offset
-        );
-
-        let after = std::fs::read(&path).unwrap();
-        assert_eq!(
-            &after[..map.frames[from_idx].compressed_offset as usize],
-            &src_bytes[..map.frames[from_idx].compressed_offset as usize]
-        );
-        let body = open_seekable_zstd(&path).unwrap();
-        assert_eq!(body.kind(), "zstd-seek-table");
-        let mut all = Vec::new();
-        body.open_reader().unwrap().read_to_end(&mut all).unwrap();
-        let mut expected = prefix_plain.clone();
-        expected.extend_from_slice(&last_plain);
-        expected.extend_from_slice(&extra);
-        assert_eq!(all, expected);
-
-        // Bad from_idx must not touch the inode.
-        let before_fail = std::fs::read(&path).unwrap();
-        let err = splice_zstd_last_frames_replace(
-            &path,
-            99,
-            append_extra(extra),
-            &std::fs::metadata(&path).unwrap(),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("from_idx"), "{err}");
-        assert_eq!(std::fs::read(&path).unwrap(), before_fail);
-    }
-
-    /// Transform `Err` after a non-empty suffix must not persist over the original inode.
-    #[test]
-    fn splice_zstd_replace_transform_err_leaves_inode() {
-        let prefix_plain = generated_payload("tf-prefix", 24);
-        let last_plain = generated_payload("tf-last", 16);
-        let src_bytes = pack_frames(&[&prefix_plain, &last_plain], false);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("transform-err.zst");
-        std::fs::write(&path, &src_bytes).unwrap();
-
-        let original = std::fs::metadata(&path).unwrap();
-        let transform = |suffix: &mut dyn SeekRead, _off: u64, _out: &mut dyn Write| {
-            let n = io::copy(suffix, &mut io::sink())?;
-            assert!(n > 0, "transform must see a non-empty decoded suffix");
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "transform failed after suffix",
-            ))
-        };
-        let err = splice_zstd_last_frames_replace(&path, 1, transform, &original).unwrap_err();
-        assert!(
-            err.to_string().contains("transform failed after suffix"),
-            "{err}"
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), src_bytes);
-    }
-
-    #[test]
-    fn splice_zstd_from_idx_out_of_range() {
-        let plain = generated_payload("oor", 8);
-        let src_bytes = pack_frames(&[&plain], false);
-        let mut src = Cursor::new(src_bytes);
-        let map = scan_zstd_frames(&mut src).unwrap();
-        let err = splice_zstd_last_frames(
-            &mut src,
-            &map,
-            1,
-            append_extra(b"x".to_vec()),
-            &mut Vec::new(),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("from_idx"), "{err}");
-    }
-
-    #[test]
-    fn splice_zstd_transform_sees_stream_offset() {
-        let prefix_plain = generated_payload("off-prefix", 20);
-        let last_plain = generated_payload("off-last", 12);
-        let src_bytes = pack_frames(&[&prefix_plain, &last_plain], false);
-        let mut src = Cursor::new(src_bytes);
-        let map = scan_zstd_frames(&mut src).unwrap();
-        let expect_off = map.frames[1].uncompressed_offset;
-        assert_eq!(expect_off, prefix_plain.len() as u64);
-        let mut dst = Vec::new();
-        splice_zstd_last_frames(
-            &mut src,
-            &map,
-            1,
-            |suffix, off, out| {
-                assert_eq!(off, expect_off);
-                io::copy(suffix, out)?;
-                Ok(())
-            },
-            &mut dst,
-        )
-        .unwrap();
-        let (all, _) = read_body("splice-off.zst", &dst);
-        let mut expected = prefix_plain;
-        expected.extend_from_slice(&last_plain);
-        assert_eq!(all, expected);
-    }
-}
+#[path = "zstd_splice_tests.rs"]
+mod tests;

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -32,6 +33,262 @@ pub struct VerifyReport {
     pub computed: String,
     pub sentinel_ok: bool,
     pub mismatched: Vec<String>,
+    /// Whether the recorded preimage pins (#341) belong to this seal: `None`
+    /// for a layer that records none (sealed before #341, or over a base
+    /// whose identity covers content), `Some(false)` when the pin rows were
+    /// changed or their meta row is missing or stale.
+    pub preimages_bound: Option<bool>,
+    /// `path: reason` for every pinned base entry that differs from the base
+    /// as it is now (a same-size edit with a restored mtime included).
+    pub preimage_mismatched: Vec<String>,
+}
+
+/// Preimage pins (#341): for a layer sealed over a local directory base, the
+/// base side of every row that has one (modified, deleted, type changed; a
+/// rename source is a deleted row), so a reuse can tell that the base under
+/// a still-`modified` row changed. Not part of the canonical hash.
+const PREIMAGE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS seal_preimages (path TEXT PRIMARY KEY, kind TEXT NOT NULL, mode TEXT NOT NULL, size INTEGER NOT NULL, hash TEXT NOT NULL);";
+
+/// Meta row binding the `seal_preimages` rows to the seal's layer digest.
+pub const PREIMAGE_DIGEST_KEY: &str = "base_preimage_digest";
+
+/// One pinned base entry: a regular file or a symlink.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pin {
+    /// `file` or `symlink`.
+    pub kind: String,
+    /// `%06o` of a file's mode; empty for a symlink (its mode is not portable).
+    pub mode: String,
+    pub size: u64,
+    /// Content hash of the exact bytes (a symlink's target).
+    pub hash: String,
+}
+
+/// Pins by mount-relative path.
+pub type Pins = BTreeMap<String, Pin>;
+
+fn pin_of(entry: &changes::Entry) -> Option<Pin> {
+    let kind = entry.kind();
+    if kind == "dir" {
+        return None;
+    }
+    let (size, hash) = if kind == "symlink" {
+        use sha2::{Digest, Sha256};
+        let target = entry.symlink_target_bytes();
+        (
+            target.len() as u64,
+            format!("sha256:{:x}", Sha256::digest(target)),
+        )
+    } else {
+        (entry.size, entry.hash.clone()?)
+    };
+    Some(Pin {
+        kind: kind.into(),
+        mode: if kind == "symlink" {
+            String::new()
+        } else {
+            format!("{:06o}", entry.mode)
+        },
+        size,
+        hash,
+    })
+}
+
+fn pins_of(changes: &[changes::Change]) -> io::Result<Pins> {
+    let mut pins = Pins::new();
+    for change in changes {
+        if let Some(pin) = change.old.as_ref().and_then(pin_of) {
+            let path = String::from_utf8(change.path.clone()).map_err(io::Error::other)?;
+            pins.insert(path, pin);
+        }
+    }
+    Ok(pins)
+}
+
+/// `sha256:` over the layer digest and the sorted pins.
+pub fn preimage_digest(layer_digest: &str, pins: &Pins) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"ratarmount-preimage-pins-v1\0");
+    hash.update(layer_digest.as_bytes());
+    hash.update(b"\0");
+    for (path, pin) in pins {
+        for field in [
+            path.as_bytes(),
+            pin.kind.as_bytes(),
+            pin.mode.as_bytes(),
+            pin.size.to_string().as_bytes(),
+            pin.hash.as_bytes(),
+        ] {
+            hash.update(field);
+            hash.update(b"\0");
+        }
+    }
+    format!("sha256:{:x}", hash.finalize())
+}
+
+/// Whether a seal over the recorded base records pins: a local directory
+/// (its weak manifest is recorded) with a `weak` or `strong` identity. A
+/// directory's supplied strong digest is a claim the mount never rehashes;
+/// `none` asked for no identity; an archive, Git tree or remote base is not
+/// pinned (docs/tasks/plans/issue-341-preimage-pins.md).
+pub fn pins_preimages(meta: &OverlayMeta) -> bool {
+    meta.get("base_weak_digest").is_some()
+        && meta.get("base_git_tree").is_none()
+        && matches!(meta.base_digest_kind(), Some("weak" | "strong"))
+}
+
+fn table_exists(conn: &rusqlite::Connection, name: &str) -> io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [name],
+        |r| r.get(0),
+    )
+    .map_err(sql_error)
+}
+
+fn read_pins(conn: &rusqlite::Connection) -> io::Result<Option<Pins>> {
+    if !table_exists(conn, "seal_preimages")? {
+        return Ok(None);
+    }
+    let mut stmt = conn
+        .prepare("SELECT path,kind,mode,size,hash FROM seal_preimages")
+        .map_err(sql_error)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                Pin {
+                    kind: r.get(1)?,
+                    mode: r.get(2)?,
+                    size: r.get(3)?,
+                    hash: r.get(4)?,
+                },
+            ))
+        })
+        .map_err(sql_error)?;
+    let mut pins = Pins::new();
+    for row in rows {
+        let (path, pin) = row.map_err(sql_error)?;
+        if pins.insert(path.clone(), pin).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate preimage pin for {path}"),
+            ));
+        }
+    }
+    Ok(Some(pins))
+}
+
+/// The pins a sealed layer records and whether they belong to its seal, or
+/// `None` when it records none.
+fn recorded_pins(
+    conn: &rusqlite::Connection,
+    meta: &OverlayMeta,
+) -> io::Result<Option<(Pins, bool)>> {
+    let table = read_pins(conn)?;
+    match (meta.get(PREIMAGE_DIGEST_KEY), table) {
+        (None, None) => Ok(None),
+        (None, Some(pins)) if pins.is_empty() => Ok(None),
+        // Rows whose binding was removed.
+        (None, Some(pins)) => Ok(Some((pins, false))),
+        // Even an empty pin set must retain its table while its binding exists.
+        (Some(_), None) => Ok(Some((Pins::new(), false))),
+        (Some(recorded), Some(pins)) => {
+            let bound = meta
+                .get("layer_digest")
+                .is_some_and(|layer| preimage_digest(layer, &pins) == recorded);
+            Ok(Some((pins, bound)))
+        }
+    }
+}
+
+/// Why `now` (the base entry as it is) differs from `pinned`.
+fn pin_difference(pinned: Option<&Pin>, now: Option<&Pin>) -> Option<&'static str> {
+    match (pinned, now) {
+        (None, None) => None,
+        (None, Some(_)) => Some("not pinned by the seal"),
+        (Some(_), None) => Some("missing from the base, or no longer changed by the layer"),
+        (Some(a), Some(b)) if a == b => None,
+        (Some(a), Some(b)) if a.kind != b.kind => Some("type changed"),
+        (Some(a), Some(b)) if a.size != b.size => Some("size changed"),
+        (Some(a), Some(b)) if a.hash != b.hash => Some("content changed"),
+        _ => Some("mode changed"),
+    }
+}
+
+/// Text naming a binding failure, in the lists of mismatched pins.
+pub const PREIMAGES_UNBOUND: &str =
+    "seal_preimages: the pin rows do not match base_preimage_digest (changed after sealing)";
+
+fn pin_differences(pins: &Pins, now: &Pins) -> Vec<String> {
+    let paths: BTreeSet<_> = pins.keys().chain(now.keys()).collect();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            pin_difference(pins.get(path), now.get(path)).map(|reason| format!("{path}: {reason}"))
+        })
+        .collect()
+}
+
+fn read_sealed_pins(dir: &Path) -> io::Result<Option<(Pins, bool)>> {
+    let required = !crate::write_overlay::overlay_markers(dir)
+        .map_err(overlay_error)?
+        .is_empty();
+    let conn = connection_required(dir, true, required)?;
+    let Some(meta) = OverlayMeta::from_opened(&conn)
+        .map_err(overlay_error)?
+        .filter(OverlayMeta::layer_sealed)
+    else {
+        return Ok(None);
+    };
+    recorded_pins(&conn, &meta)
+}
+
+/// Check a seal's pins against an already computed complete, exact SHA-256
+/// change set (including `.git`, without exclusions or ignored modes). Pack
+/// uses this to validate every base without reading the preimages twice.
+pub fn check_preimages_for_changes(
+    dir: &Path,
+    changes: &[changes::Change],
+) -> io::Result<Vec<String>> {
+    let Some((pins, bound)) = read_sealed_pins(dir)? else {
+        return Ok(Vec::new());
+    };
+    let mut differing = pin_differences(&pins, &pins_of(changes)?);
+    if !bound {
+        differing.insert(0, PREIMAGES_UNBOUND.to_owned());
+    }
+    Ok(differing)
+}
+
+/// The cheap reuse check (#341): rehash only the base entries a sealed layer
+/// pinned, in `lower_view` (the base and the lowers beneath the layer), and
+/// check that the pins belong to the seal. Returns `path: reason` per
+/// difference (empty when the layer records no pins or nothing changed).
+/// An unsealed directory has no pins.
+pub fn check_preimages(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Vec<String>> {
+    let Some((pins, bound)) = read_sealed_pins(dir)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    if !bound {
+        out.push(PREIMAGES_UNBOUND.to_owned());
+    }
+    let opts = options();
+    for (path, pin) in &pins {
+        let now = match changes::base_entry(lower_view.clone(), path, &opts) {
+            Ok(entry) => entry.as_ref().and_then(pin_of),
+            Err(e) => {
+                out.push(format!("{path}: cannot read the base entry: {e}"));
+                continue;
+            }
+        };
+        if let Some(reason) = pin_difference(Some(pin), now.as_ref()) {
+            out.push(format!("{path}: {reason}"));
+        }
+    }
+    Ok(out)
 }
 
 fn overlay_error(error: OverlayError) -> io::Error {
@@ -53,8 +310,15 @@ fn directory_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
-fn root(dir: &Path) -> io::Result<OwnedFd> {
-    Ok(host::open(dir, directory_flags(), Mode::empty())?)
+pub(crate) fn root(dir: &Path) -> io::Result<OwnedFd> {
+    Ok({
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0156-M01","item":"ratarmount_compositing::overlay_seal::root","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = host::open(dir, directory_flags(), Mode::empty());
+        __inventory_value_0
+    }?)
 }
 
 fn connection(dir: &Path, immutable: bool) -> io::Result<crate::OverlayDb> {
@@ -107,21 +371,78 @@ fn walk_modes(fd: &OwnedFd, parent: &str, modes: &mut BTreeMap<String, u32>) -> 
 }
 
 fn chmod_tree(fd: &OwnedFd, writable: bool) -> io::Result<()> {
-    let mode = crate::host_stat::fstat(fd)?.st_mode;
-    let change = |mode: host::RawMode| {
-        Mode::from_raw_mode(if writable {
+    with_transition_modes(fd, writable, || Ok(()))
+}
+
+// Record the exact modes, including internal files, as the transition changes
+// them. A failure after the permission walk (such as BEGIN EXCLUSIVE refusing
+// a live reader) must put every mode back while the operation lock is held.
+fn with_transition_modes<T>(
+    fd: &OwnedFd,
+    writable: bool,
+    finish: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let mut original = BTreeMap::new();
+    let result = walk_chmod(fd, Path::new(""), writable, None, &mut |path, mode| {
+        original.insert(path.to_path_buf(), mode);
+        if writable {
             mode | 0o200
         } else {
             mode & !0o222
-        })
-    };
-    if writable {
-        host::fchmod(fd, change(mode))?;
+        }
+    })
+    .and_then(|()| finish());
+    if let Err(error) = result {
+        let visited = original.keys().cloned().collect();
+        walk_chmod(
+            fd,
+            Path::new(""),
+            false,
+            Some(&visited),
+            &mut |path, mode| original.get(path).copied().unwrap_or(mode),
+        )
+        .map_err(|restore| {
+            io::Error::new(
+                error.kind(),
+                format!("{error}; restoring overlay modes failed: {restore}"),
+            )
+        })?;
+        return Err(error);
+    }
+    result
+}
+
+fn walk_chmod(
+    fd: &OwnedFd,
+    parent: &Path,
+    directories_first: bool,
+    visited: Option<&BTreeSet<std::path::PathBuf>>,
+    change: &mut impl FnMut(&Path, host::RawMode) -> host::RawMode,
+) -> io::Result<()> {
+    let mode = crate::host_stat::fstat(fd)?.st_mode;
+    // Snapshot directories before descending, even when their chmod is last:
+    // rollback must still reach children changed before an interrupted walk.
+    let target = change(parent, mode);
+    if directories_first && target != mode {
+        host::fchmod(fd, Mode::from_raw_mode(target))?;
     }
     for entry in Dir::read_from(fd)? {
         let entry = entry?;
         let name = entry.file_name();
         if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        // Obsolete coordination files are ignored, including their modes.
+        if name
+            .to_bytes()
+            .eq_ignore_ascii_case(crate::write_overlay::SEAL_COMMIT_LOCK.as_bytes())
+        {
+            continue;
+        }
+        let path = parent.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        // An unvisited subtree cannot contain changes from this operation.
+        // In particular, do not retry an unreadable directory during rollback.
+        if visited.is_some_and(|paths| !paths.contains(&path)) {
             continue;
         }
         let stat = crate::host_stat::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
@@ -130,18 +451,28 @@ fn chmod_tree(fd: &OwnedFd, writable: bool) -> io::Result<()> {
             continue;
         }
         if kind == libc::S_IFDIR {
-            chmod_tree(
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0157-M01","item":"ratarmount_compositing::overlay_seal::walk_chmod","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
+            walk_chmod(
                 &host::openat(fd, name, directory_flags(), Mode::empty())?,
-                writable,
+                &path,
+                directories_first,
+                visited,
+                change,
             )?;
         } else {
             // Never a data descriptor: closing one would release this
             // process's locks on the overlay database (#149).
-            crate::host_stat::chmod_entry_at(fd, name, &stat, |mode| change(mode).as_raw_mode())?;
+            let target = change(&path, stat.st_mode);
+            if target != stat.st_mode {
+                crate::host_stat::chmod_entry_at(fd, name, &stat, |_| target)?;
+            }
         }
     }
-    if !writable {
-        host::fchmod(fd, change(mode))?;
+    if !directories_first && target != mode {
+        host::fchmod(fd, Mode::from_raw_mode(target))?;
     }
     Ok(())
 }
@@ -164,7 +495,7 @@ fn digest_rows(
     dir: &Path,
     lower: Arc<dyn MountSource>,
     immutable: bool,
-) -> io::Result<(String, BTreeMap<String, String>)> {
+) -> io::Result<(String, BTreeMap<String, String>, Pins)> {
     let paths = changes::mentioned_paths_with_immutability(
         dir,
         if immutable {
@@ -192,12 +523,14 @@ fn digest_rows(
             Ok((path, c.row_hash(&opts)?))
         })
         .collect::<io::Result<_>>()?;
-    Ok((digest, rows))
+    Ok((digest, rows, pins_of(&changes)?))
 }
 
 /// Seal against the supplied composed lower view. Legacy overlays get minimal
 /// metadata; callers must supply their base explicitly when none is recorded.
-/// A writer reservation covers fsck, hashing, and the atomic metadata update.
+/// The overlay-scoped seal/commit lock covers base resolution, hashing and
+/// seal publication. Seal never acquires an archive lock.
+/// Callers whose opened base changed must reopen it and retry.
 /// Seal an overlay that is not sealed yet, over the base the opener served
 /// (`composed` is that base under the `--lower` layers: what the rows hash
 /// against). An overlay that recorded no kind (made by a released build)
@@ -218,6 +551,7 @@ pub fn seal(
 pub fn reseal(record: &crate::SealedRecord) -> io::Result<SealOutcome> {
     let dir = record.dir();
     let root = root(dir)?;
+    let _seal_commit = crate::write_overlay::SealCommitGuard::acquire(dir)?;
     let meta = OverlayMeta::read(dir)
         .map_err(overlay_error)?
         .filter(OverlayMeta::layer_sealed)
@@ -240,35 +574,147 @@ pub fn reseal(record: &crate::SealedRecord) -> io::Result<SealOutcome> {
     })
 }
 
+fn finish_recorded_seal(dir: &Path, root: &OwnedFd, meta: &OverlayMeta) -> io::Result<SealOutcome> {
+    check_hash_format(|key| meta.get(key))?;
+    let layer_digest: String = meta
+        .get("layer_digest")
+        .ok_or_else(|| io::Error::other("sealed overlay has no layer_digest"))?
+        .into();
+    finish_sealed(dir, root, &layer_digest)?;
+    Ok(SealOutcome {
+        layer_digest,
+        sealed_at: meta.get("sealed_at").unwrap_or_default().into(),
+        already_sealed: true,
+    })
+}
+
+/// Holds the overlay lock while an offline caller opens and gates its base.
+/// This also covers forced identity updates made before digest resolution.
+pub struct SealOperation {
+    dir: std::path::PathBuf,
+    lock: crate::write_overlay::SealCommitGuard,
+}
+
+impl SealOperation {
+    pub fn acquire(dir: &Path) -> io::Result<Self> {
+        Self::acquire_until(dir, None)
+    }
+
+    /// [`acquire`](Self::acquire) bounded by `deadline`: the overlay root
+    /// flock still held by another seal, unseal or commit at the deadline
+    /// answers `WouldBlock`; `None` waits as `acquire` does. For callers that
+    /// must not wait unboundedly (the sandbox supervisor's serial serve loop).
+    pub fn acquire_until(dir: &Path, deadline: Option<std::time::Instant>) -> io::Result<Self> {
+        let dir = dir.canonicalize()?;
+        let lock = crate::write_overlay::SealCommitGuard::acquire_until(&dir, deadline)?;
+        Ok(Self { dir, lock })
+    }
+
+    /// Recheck after acquiring the lock before a caller opens its base.
+    pub fn finish_if_sealed(&self) -> io::Result<Option<SealOutcome>> {
+        let meta = OverlayMeta::read(&self.dir).map_err(overlay_error)?;
+        meta.as_ref()
+            .filter(|meta| meta.layer_sealed())
+            .map(|meta| finish_recorded_seal(&self.dir, &root(&self.dir)?, meta))
+            .transpose()
+    }
+
+    pub fn seal(
+        self,
+        base: &crate::ClassifiedBase,
+        composed: Arc<dyn MountSource>,
+    ) -> io::Result<SealOutcome> {
+        seal_impl_locked(&self.dir, Some(base), composed, Some(&self.lock))
+    }
+}
+
 pub(crate) fn seal_impl(
     dir: &Path,
     identity: Option<&crate::ClassifiedBase>,
     lower_view: Arc<dyn MountSource>,
 ) -> io::Result<SealOutcome> {
+    seal_impl_locked(dir, identity, lower_view, None)
+}
+
+fn seal_impl_locked(
+    dir: &Path,
+    identity: Option<&crate::ClassifiedBase>,
+    lower_view: Arc<dyn MountSource>,
+    held: Option<&crate::write_overlay::SealCommitGuard>,
+) -> io::Result<SealOutcome> {
     let root = root(dir)?;
     let required = std::cell::Cell::new(false);
     let meta = OverlayMeta::read_for_operation(dir, &required).map_err(overlay_error)?;
+    if meta.as_ref().is_some_and(|meta| meta.layer_sealed()) {
+        #[cfg(test)]
+        fire_once(&BEFORE_RECORDED_SEAL_LOCK);
+        let _seal_commit = held
+            .is_none()
+            .then(|| crate::write_overlay::SealCommitGuard::acquire(dir))
+            .transpose()?;
+        let meta = OverlayMeta::read_for_operation(dir, &required)
+            .map_err(overlay_error)?
+            .filter(OverlayMeta::layer_sealed)
+            .ok_or_else(|| io::Error::other("overlay is no longer sealed"))?;
+        return finish_recorded_seal(dir, &root, &meta);
+    }
+    let archive =
+        identity.and_then(
+            |base| match (base.actual().kind(), base.actual().location()) {
+                (crate::BaseKind::Archive, Some(crate::BaseLocation::Local(path))) => {
+                    Some((base, path))
+                }
+                _ => None,
+            },
+        );
+    // A source was opened before this call. If commit wins while seal waits,
+    // refuse that old view rather than pair it with post-commit base bytes.
+    let before_wait = archive.map(|(_, path)| fs::metadata(path)).transpose()?;
+    let _seal_commit = held
+        .is_none()
+        .then(|| crate::write_overlay::SealCommitGuard::acquire(dir))
+        .transpose()?;
+    crate::write_overlay::test_operation_hold(
+        "RATARMOUNT_TEST_SEAL_LOCK_READY",
+        "RATARMOUNT_TEST_SEAL_LOCK_RELEASE",
+    )
+    .map_err(overlay_error)?;
     #[cfg(test)]
     fire_once(&AFTER_INITIAL_READ);
-    if let Some(meta) = meta.filter(OverlayMeta::layer_sealed) {
-        check_hash_format(|key| meta.get(key))?;
-        let layer_digest: String = meta
-            .get("layer_digest")
-            .ok_or_else(|| io::Error::other("sealed overlay has no layer_digest"))?
-            .into();
-        finish_sealed(dir, &root, &layer_digest)?;
-        return Ok(SealOutcome {
-            layer_digest,
-            sealed_at: meta.get("sealed_at").unwrap().into(),
-            already_sealed: true,
-        });
+    // The first read is only an idempotence fast path. Recheck after waiting.
+    let meta = OverlayMeta::read_for_operation(dir, &required).map_err(overlay_error)?;
+    if let Some(meta) = meta.as_ref().filter(|meta| meta.layer_sealed()) {
+        return finish_recorded_seal(dir, &root, meta);
     }
+    // #328: before any write (the pending-digest resolution below writes).
+    crate::relaxed_durability::refuse_unclean(meta.as_ref()).map_err(overlay_error)?;
+    let archive_guard = archive.map(|(base, path)| {
+        if std::iter::once(path.as_path()).chain(base.actual().typed_named.as_deref())
+            .any(|path| ratarmount_compress::check_for_split_file_in_folder(path).is_some())
+        {
+            return Err(io::Error::other(
+                "sealing over a split archive is not supported; join the parts into one archive file and seal that",
+            ));
+        }
+        let current = fs::metadata(path)?;
+        if before_wait.as_ref().is_none_or(|before| !ratarmount_compress::commit_journal::same_stamp(before, &current))
+            || base.actual().file_id != crate::overlay_identity::FileId::from_metadata(&current)
+        {
+            return Err(io::Error::other("archive changed since its base view was opened; reopen it and retry sealing"));
+        }
+        crate::overlay_meta::SealArchive::open(path, current)
+    }).transpose()?;
     let conn = connection_required(dir, false, required.get())?;
     required.set(required.get() || conn.required_record());
     // A sealed layer is never `pending`: hash the base first, outside the
     // write transaction (a cache hit is free).
-    crate::overlay_meta::resolve_pending_base_digest_required(&conn, identity, required.get())
-        .map_err(overlay_error)?;
+    crate::overlay_meta::resolve_pending_base_digest_required(
+        &conn,
+        identity,
+        required.get(),
+        archive_guard.as_ref(),
+    )
+    .map_err(overlay_error)?;
     #[cfg(test)]
     fire_once(&AFTER_PENDING_RESOLVER);
     // Readers can still take snapshots for canonical hashing. Competing writers,
@@ -280,6 +726,16 @@ pub(crate) fn seal_impl(
     {
         return Err(io::Error::other("overlay was sealed while starting; retry"));
     }
+    // #328: re-checked under the writer reservation. A marker of this boot (a
+    // killed relaxed mount) is safe and must not be sealed into the layer:
+    // after a reboot it would read as unclean and nothing could clear it.
+    crate::relaxed_durability::refuse_unclean(
+        OverlayMeta::from_opened(&conn)
+            .map_err(overlay_error)?
+            .as_ref(),
+    )
+    .map_err(overlay_error)?;
+    crate::relaxed_durability::clear_marker(&conn).map_err(overlay_error)?;
     let report = crate::overlay_fsck::check_connection(&conn, &root, false, false)?;
     if report.import_incomplete > 0 {
         return Err(io::Error::other(
@@ -293,9 +749,25 @@ pub(crate) fn seal_impl(
             report.errors()
         )));
     }
+    if let (Some((_, path)), Some(guard), Some(meta)) = (
+        archive,
+        archive_guard.as_ref(),
+        OverlayMeta::from_opened(&conn).map_err(overlay_error)?,
+    ) {
+        if let Some(stamp) = check_archive_baseline(&meta, path, guard)? {
+            OverlayMeta::set_many(
+                &conn,
+                &[
+                    ("base_size", &stamp.size.to_string()),
+                    ("base_mtime_ns", &stamp.mtime_ns.to_string()),
+                ],
+            )
+            .map_err(overlay_error)?;
+        }
+    }
     let mut modes = BTreeMap::new();
     walk_modes(&root, "", &mut modes)?;
-    let (layer_digest, rows) = digest_rows(dir, lower_view, false)?;
+    let (layer_digest, rows, pins) = digest_rows(dir, lower_view, false)?;
     if let Some(base) = identity {
         // The caller's gate already accepted (or forced) this base. A released
         // overlay recorded no kind: the seal writes it now (no digest). An
@@ -329,6 +801,40 @@ pub(crate) fn seal_impl(
         )
         .map_err(sql_error)?;
     }
+    // Pins (#341) are decided by the rows written above: the base this seal
+    // was gated (or forced) against, never by the caller's token.
+    if OverlayMeta::from_opened(&conn)
+        .map_err(overlay_error)?
+        .as_ref()
+        .is_some_and(pins_preimages)
+    {
+        conn.execute_batch(PREIMAGE_SCHEMA).map_err(sql_error)?;
+        conn.execute("DELETE FROM seal_preimages", [])
+            .map_err(sql_error)?;
+        for (path, pin) in &pins {
+            conn.execute(
+                "INSERT INTO seal_preimages(path,kind,mode,size,hash) VALUES (?1,?2,?3,?4,?5)",
+                params![
+                    path,
+                    pin.kind,
+                    pin.mode,
+                    i64::try_from(pin.size).map_err(io::Error::other)?,
+                    pin.hash
+                ],
+            )
+            .map_err(sql_error)?;
+        }
+        OverlayMeta::set(
+            &conn,
+            PREIMAGE_DIGEST_KEY,
+            &preimage_digest(&layer_digest, &pins),
+        )
+        .map_err(overlay_error)?;
+    } else {
+        conn.execute_batch("DROP TABLE IF EXISTS seal_preimages")
+            .map_err(sql_error)?;
+        OverlayMeta::remove(&conn, PREIMAGE_DIGEST_KEY).map_err(overlay_error)?;
+    }
     if OverlayMeta::from_opened(&conn)
         .map_err(overlay_error)?
         .is_none_or(|m| m.format_version().ok().flatten().is_none())
@@ -344,6 +850,9 @@ pub(crate) fn seal_impl(
         ],
     )
     .map_err(overlay_error)?;
+    if let (Some((_, path)), Some(guard)) = (archive, archive_guard.as_ref()) {
+        guard.check_path(path)?;
+    }
     conn.execute_batch("COMMIT").map_err(sql_error)?;
     // Publish without following an existing sentinel symlink. Keep the DB open
     // until its commit is durable, then close before changing host permissions.
@@ -357,7 +866,51 @@ pub(crate) fn seal_impl(
     })
 }
 
+/// Check that a recorded strong digest still describes the archive being sealed.
+/// The overlay lock covers commit publication and baseline refresh together. Accepted moves retain their caller's supplied-digest semantics.
+fn check_archive_baseline(
+    meta: &OverlayMeta,
+    archive: &Path,
+    guard: &crate::overlay_meta::SealArchive,
+) -> io::Result<Option<ratarmount_index::ArchiveDigestStamp>> {
+    if meta.base_digest_kind().is_none_or(|kind| kind == "none")
+        || meta.get("base_local_path") != archive.to_str()
+    {
+        return Ok(None);
+    }
+    if let Some((size, mtime_ns)) = meta.get("base_size").zip(meta.get("base_mtime_ns")) {
+        guard.check_path(archive)?;
+        let stamp = ratarmount_index::ArchiveDigestStamp::from_metadata(guard.metadata())?;
+        if size != stamp.size.to_string() || mtime_ns != stamp.mtime_ns.to_string() {
+            // A caller may have confirmed a byte-identical, retimestamped base
+            // with --base-digest. Preserve that case only after measuring its
+            // current digest under the overlay lock; then advance its stamp
+            // in the seal transaction. A stale digest after commit must fail.
+            if meta.base_digest_kind() == Some("strong") {
+                let pending = crate::overlay_meta::PendingBase {
+                    path: archive.into(),
+                    index: meta.get("base_index_path").map(Into::into),
+                    size: stamp.size,
+                    mtime_ns: stamp.mtime_ns,
+                };
+                let digest = pending.hash_seal(guard).map_err(overlay_error)?;
+                if meta.base_digest() == Some(digest.as_str()) {
+                    return Ok(Some(stamp));
+                }
+            }
+            return Err(io::Error::other(
+                "archive changed since its recorded base digest; retry sealing after the commit finishes",
+            ));
+        }
+    }
+    Ok(None)
+}
+
 fn write_sentinel(dir: &Path, layer_digest: &str) -> io::Result<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0158-M01","item":"ratarmount_compositing::overlay_seal::write_sentinel","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut sentinel = tempfile::Builder::new()
         .prefix(".ratarmount.overlay.cow-seal-")
         .tempfile_in(dir)?;
@@ -371,12 +924,19 @@ fn write_sentinel(dir: &Path, layer_digest: &str) -> io::Result<()> {
 /// of an open overlay database is refused without closing a descriptor of it.
 fn open_sentinel(root: &OwnedFd) -> io::Result<OwnedFd> {
     use std::os::fd::AsFd;
-    ratarmount_core::db_inodes::openat_admitted(
-        Some(root.as_fd()),
-        Path::new(SENTINEL),
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        0,
-    )
+    {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0159-M01","item":"ratarmount_compositing::overlay_seal::open_sentinel","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = ratarmount_core::db_inodes::openat_admitted(
+            Some(root.as_fd()),
+            Path::new(SENTINEL),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0,
+        );
+        __inventory_value_0
+    }
 }
 
 /// Finish a seal that was interrupted after its metadata commit: write the
@@ -422,34 +982,42 @@ thread_local! {
 }
 
 /// Remove seal metadata and restore owner write permission. Mode overrides stay.
+/// This never hashes or resolves the base, so it needs no archive lock.
 pub fn unseal(dir: &Path) -> io::Result<()> {
     let root = root(dir)?;
-    // Probe before touching permissions, so a mounted overlay is never changed.
-    OverlayMeta::read(dir).map_err(overlay_error)?;
-    chmod_tree(&root, true)?;
+    let _seal_commit = crate::write_overlay::SealCommitGuard::acquire(dir)?;
     #[cfg(test)]
-    AFTER_UNSEAL_WALK.with(|hook| {
-        if let Some(f) = hook.borrow_mut().as_mut() {
-            f()
-        }
-    });
-    let conn = connection(dir, false)?;
-    conn.execute_batch("BEGIN EXCLUSIVE").map_err(sql_error)?;
-    conn.execute_batch(crate::overlay_meta::META_SCHEMA)
-        .map_err(sql_error)?;
-    conn.execute_batch(SEAL_SCHEMA).map_err(sql_error)?;
-    conn.execute_batch(
-        "DELETE FROM meta WHERE key IN ('sealed_at','layer_digest'); DELETE FROM seal_rows;",
-    )
-    .map_err(sql_error)?;
-    OverlayMeta::set(&conn, "unsealed_at", &chrono::Utc::now().to_rfc3339())
-        .map_err(overlay_error)?;
-    match host::unlinkat(&root, SENTINEL, AtFlags::empty()) {
-        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-        Err(e) => return Err(e.into()),
+    fire_once(&AFTER_UNSEAL_LOCK);
+    // Probe before touching permissions, so a mounted overlay is never changed.
+    let meta = OverlayMeta::read(dir).map_err(overlay_error)?;
+    if meta.is_none_or(|meta| !meta.layer_sealed()) {
+        return Ok(());
     }
-    conn.execute_batch("COMMIT").map_err(sql_error)?;
-    Ok(())
+    with_transition_modes(&root, true, || {
+        #[cfg(test)]
+        AFTER_UNSEAL_WALK.with(|hook| {
+            if let Some(f) = hook.borrow_mut().as_mut() {
+                f()
+            }
+        });
+        let conn = connection(dir, false)?;
+        conn.execute_batch("BEGIN EXCLUSIVE").map_err(sql_error)?;
+        conn.execute_batch(crate::overlay_meta::META_SCHEMA)
+            .map_err(sql_error)?;
+        conn.execute_batch(SEAL_SCHEMA).map_err(sql_error)?;
+        conn.execute_batch(
+            "DELETE FROM meta WHERE key IN ('sealed_at','layer_digest','base_preimage_digest'); DELETE FROM seal_rows; DROP TABLE IF EXISTS seal_preimages;",
+        )
+        .map_err(sql_error)?;
+        OverlayMeta::set(&conn, "unsealed_at", &chrono::Utc::now().to_rfc3339())
+            .map_err(overlay_error)?;
+        match host::unlinkat(&root, SENTINEL, AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => return Err(e.into()),
+        }
+        conn.execute_batch("COMMIT").map_err(sql_error)?;
+        Ok(())
+    })
 }
 
 /// Verify without writing or changing permissions, including per-path differences
@@ -499,7 +1067,8 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
         .map_err(sql_error)?
         .collect::<rusqlite::Result<BTreeMap<_, _>>>()
         .map_err(sql_error)?;
-    let (computed, current) = digest_rows(dir, lower_view, true)?;
+    let pinned = recorded_pins(&conn, &meta)?;
+    let (computed, current, now_pins) = digest_rows(dir, lower_view, true)?;
     let paths: BTreeSet<_> = rows.keys().chain(current.keys()).collect();
     let mismatched: Vec<_> = paths
         .into_iter()
@@ -524,12 +1093,22 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
         }
         Err(e) => return Err(e),
     };
+    let (preimages_bound, preimage_mismatched) = match &pinned {
+        None => (None, Vec::new()),
+        Some((pins, bound)) => (Some(*bound), pin_differences(pins, &now_pins)),
+    };
     Ok(VerifyReport {
-        ok: recorded == computed && sentinel_ok && mismatched.is_empty(),
+        ok: recorded == computed
+            && sentinel_ok
+            && mismatched.is_empty()
+            && preimages_bound != Some(false)
+            && preimage_mismatched.is_empty(),
         recorded,
         computed,
         sentinel_ok,
         mismatched,
+        preimages_bound,
+        preimage_mismatched,
     })
 }
 
@@ -538,6 +1117,8 @@ type OnceHook = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
 
 #[cfg(test)]
 thread_local! {
+    static AFTER_UNSEAL_LOCK: OnceHook = const { std::cell::RefCell::new(None) };
+    static BEFORE_RECORDED_SEAL_LOCK: OnceHook = const { std::cell::RefCell::new(None) };
     static AFTER_INITIAL_READ: OnceHook = const { std::cell::RefCell::new(None) };
     static AFTER_PENDING_RESOLVER: OnceHook = const { std::cell::RefCell::new(None) };
 }
@@ -713,6 +1294,430 @@ mod tests {
         (rows, tables, modes)
     }
 
+    /// Regression: #240 public seal is idempotent with an identity even after
+    /// its base disappears; the recorded seal is checked before archive validation.
+    #[test]
+    fn regression_240_public_seal_idempotent_after_base_deleted() {
+        let f = Fixture::new();
+        let archive = f._tmp.path().join("archive.tar");
+        fs::write(&archive, b"archive bytes").unwrap();
+        let base = crate::ClassifiedBase::for_tests(
+            f.base.clone(),
+            crate::ServedKind::Archive,
+            Some(crate::ServedLocation::Local(archive.clone())),
+        );
+        let first = super::seal(&f.dir, &base, f.base.clone()).unwrap();
+        assert!(!first.already_sealed);
+        fs::remove_file(&archive).unwrap();
+        let repeated = super::seal(&f.dir, &base, f.base.clone()).unwrap();
+        assert!(repeated.already_sealed);
+        assert_eq!(first.layer_digest, repeated.layer_digest);
+        assert_eq!(first.sealed_at, repeated.sealed_at);
+        assert!(!f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK).exists());
+    }
+
+    /// Regression: public seal queued behind unseal must not restore a seal
+    /// from metadata read before acquiring the overlay operation lock.
+    #[test]
+    fn regression_240_queued_public_seal_rechecks_unsealed_metadata() {
+        let _process_guard = ratarmount_index::test_process::exclusive();
+        let f = Fixture::new();
+        let base =
+            crate::ClassifiedBase::for_tests(f.base.clone(), crate::ServedKind::Folder, None);
+        super::seal(&f.dir, &base, f.base.clone()).unwrap();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (unseal_tx, unseal_rx) = std::sync::mpsc::channel();
+        let unseal_dir = f.dir.clone();
+        let unsealing = std::thread::spawn(move || {
+            // unseal holds the overlay lock, but has not cleared the metadata.
+            AFTER_UNSEAL_WALK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    locked_tx.send(()).unwrap();
+                    unseal_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }));
+            });
+            unseal(&unseal_dir)
+        });
+        locked_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let probe = root(&f.dir).unwrap();
+        assert_eq!(
+            host::flock(&probe, host::FlockOperation::NonBlockingLockExclusive),
+            Err(rustix::io::Errno::WOULDBLOCK),
+            "public unseal must hold the overlay operation lock"
+        );
+        drop(probe);
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let seal_dir = f.dir.clone();
+        let lower = f.base.clone();
+        let sealing = std::thread::spawn(move || {
+            let _hook = OnceGuard::set(&BEFORE_RECORDED_SEAL_LOCK, move || {
+                read_tx.send(()).unwrap();
+            });
+            super::seal(&seal_dir, &base, lower)
+        });
+        read_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        unseal_tx.send(()).unwrap();
+        unsealing.join().unwrap().unwrap();
+        let result = sealing.join().unwrap();
+        assert!(OverlayMeta::read(&f.dir)
+            .unwrap()
+            .is_some_and(|meta| !meta.layer_sealed()));
+        let error = result.expect_err("queued seal must refuse metadata cleared by unseal");
+        assert!(error.to_string().contains("no longer sealed"), "{error}");
+        assert!(!f.dir.join(SENTINEL).exists());
+        assert_ne!(
+            fs::metadata(&f.dir).unwrap().permissions().mode() & 0o200,
+            0
+        );
+    }
+
+    /// Regression: a two-process re-seal queued behind unseal must refuse
+    /// the cleared seal without restoring the root's stale sealed mode.
+    #[test]
+    fn regression_240_queued_reseal_preserves_unsealed_root_mode() {
+        let _process_guard = ratarmount_index::test_process::exclusive();
+        use std::process::{Child, Command};
+        use std::time::{Duration, Instant};
+
+        const CHILD_DIR: &str = "RATARMOUNT_TEST_QUEUED_RESEAL_DIR";
+        const CHILD_READY: &str = "RATARMOUNT_TEST_QUEUED_RESEAL_READY";
+        const CHILD_RELEASE: &str = "RATARMOUNT_TEST_QUEUED_RESEAL_RELEASE";
+        fn wait_for(path: &Path) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !path.exists() {
+                assert!(Instant::now() < deadline, "timed out waiting for {path:?}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        if let Some(dir) = std::env::var_os(CHILD_DIR) {
+            let dir = PathBuf::from(dir);
+            let ready = PathBuf::from(std::env::var_os(CHILD_READY).unwrap());
+            let release = PathBuf::from(std::env::var_os(CHILD_RELEASE).unwrap());
+            let record = crate::SealedRecord::read(&dir).unwrap().unwrap();
+            fs::write(ready, b"seal record read").unwrap();
+            wait_for(&release);
+            let error = reseal(&record).expect_err("queued re-seal must refuse an unsealed layer");
+            assert!(error.to_string().contains("no longer sealed"), "{error}");
+            return;
+        }
+
+        let f = Fixture::new();
+        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o700)).unwrap();
+        seal(&f.dir, f.base.clone()).unwrap();
+        let ready = f._tmp.path().join("reseal-ready");
+        let release = f._tmp.path().join("reseal-release");
+        let contended = f._tmp.path().join("reseal-contended");
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "overlay_seal::tests::regression_240_queued_reseal_preserves_unsealed_root_mode",
+                    "--nocapture",
+                ])
+                .env(CHILD_DIR, &f.dir)
+                .env(CHILD_READY, &ready)
+                .env(CHILD_RELEASE, &release)
+                .env("RATARMOUNT_TEST_OVERLAY_CONTENDED", &contended)
+                .spawn()
+                .unwrap(),
+        );
+        wait_for(&ready);
+        let _hook = OnceGuard::set(&AFTER_UNSEAL_LOCK, move || {
+            // The child retained the sealed record. Make it queue on the same
+            // operation lock while unseal still owns it and metadata is sealed.
+            fs::write(&release, b"try reseal now").unwrap();
+            wait_for(&contended);
+        });
+        unseal(&f.dir).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "queued re-seal did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success(), "re-seal child: {status}");
+        let meta = OverlayMeta::read(&f.dir).unwrap().unwrap();
+        assert!(!meta.layer_sealed());
+        assert!(meta.get("sealed_at").is_none());
+        assert!(meta.get("unsealed_at").is_some());
+        assert!(!f.dir.join(SENTINEL).exists());
+        assert_eq!(
+            fs::metadata(&f.dir).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+    }
+
+    /// Regression: acquiring the shared directory lock never changes private,
+    /// setgid or writable root modes, and never creates a coordination file.
+    #[test]
+    fn regression_240_directory_lock_preserves_root_modes() {
+        let _process_guard = ratarmount_index::test_process::exclusive();
+        for mode in [0o500, 0o550, 0o2550, 0o700] {
+            for stale_lock in [false, true] {
+                let f = Fixture::new();
+                let obsolete = f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK);
+                if stale_lock {
+                    fs::write(&obsolete, b"obsolete lock").unwrap();
+                    fs::set_permissions(&obsolete, fs::Permissions::from_mode(0o400)).unwrap();
+                }
+                fs::set_permissions(&f.dir, fs::Permissions::from_mode(mode)).unwrap();
+                let before = rows_and_modes(&f.dir);
+                let guard = crate::write_overlay::SealCommitGuard::acquire(&f.dir).unwrap();
+                let probe = root(&f.dir).unwrap();
+                assert_eq!(
+                    host::flock(&probe, host::FlockOperation::NonBlockingLockExclusive),
+                    Err(rustix::io::Errno::WOULDBLOCK),
+                );
+                drop(guard);
+                host::flock(&probe, host::FlockOperation::NonBlockingLockExclusive).unwrap();
+                assert_eq!(rows_and_modes(&f.dir), before, "lock mode {mode:04o}");
+                if stale_lock {
+                    assert_eq!(fs::read(&obsolete).unwrap(), b"obsolete lock");
+                    assert_eq!(
+                        fs::metadata(&obsolete).unwrap().permissions().mode() & 0o7777,
+                        0o400
+                    );
+                } else {
+                    assert!(!obsolete.exists());
+                }
+            }
+        }
+    }
+
+    /// Regression: directory lock acquisition must preserve private and setgid
+    /// sealed roots during idempotent seal and sealed-commit refusal.
+    #[test]
+    fn regression_240_directory_lock_preserves_sealed_root_modes() {
+        for original_mode in [0o700, 0o750, 0o2750] {
+            let f = Fixture::new();
+            fs::set_permissions(&f.dir, fs::Permissions::from_mode(original_mode)).unwrap();
+            let first = seal(&f.dir, f.base.clone()).unwrap();
+            let sealed_mode = original_mode & !0o222;
+            assert_eq!(
+                fs::metadata(&f.dir).unwrap().permissions().mode() & 0o7777,
+                sealed_mode
+            );
+            let before = rows_and_modes(&f.dir);
+            let repeated = seal(&f.dir, f.base.clone()).unwrap();
+            assert!(repeated.already_sealed);
+            assert_eq!(first.layer_digest, repeated.layer_digest);
+            assert_eq!(first.sealed_at, repeated.sealed_at);
+            assert_eq!(
+                rows_and_modes(&f.dir),
+                before,
+                "reseal mode {sealed_mode:04o}"
+            );
+            let error = match crate::OverlayCommitGuard::acquire(&f.dir) {
+                Ok(_) => panic!("sealed commit must refuse mode {sealed_mode:04o}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("is sealed"), "{error}");
+            assert_eq!(
+                rows_and_modes(&f.dir),
+                before,
+                "commit mode {sealed_mode:04o}"
+            );
+            assert!(!f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK).exists());
+            unseal(&f.dir).unwrap();
+            assert_eq!(
+                fs::metadata(&f.dir).unwrap().permissions().mode() & 0o7777,
+                sealed_mode | 0o200
+            );
+            let unsealed = rows_and_modes(&f.dir);
+            unseal(&f.dir).unwrap();
+            assert_eq!(
+                rows_and_modes(&f.dir),
+                unsealed,
+                "repeated unseal changed a completed transition"
+            );
+        }
+    }
+
+    /// Regression: a busy database during unseal must leave all private and
+    /// setgid sealed modes, seal metadata, and sentinel unchanged.
+    #[test]
+    fn regression_240_unseal_busy_database_preserves_sealed_root_modes() {
+        for original_mode in [0o700, 0o750, 0o2750] {
+            let f = Fixture::new();
+            fs::set_permissions(&f.dir, fs::Permissions::from_mode(original_mode)).unwrap();
+            let sealed = seal(&f.dir, f.base.clone()).unwrap();
+            let sentinel = fs::read(f.dir.join(SENTINEL)).unwrap();
+            let before = rows_and_modes(&f.dir);
+            let db = f.dir.join(HIDDEN_DB);
+            let db_mode = fs::metadata(&db).unwrap().permissions().mode();
+            fs::set_permissions(&db, fs::Permissions::from_mode(db_mode | 0o200)).unwrap();
+            let blocker = rusqlite::Connection::open(&db).unwrap();
+            fs::set_permissions(&db, fs::Permissions::from_mode(db_mode)).unwrap();
+            blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+            let error = unseal(&f.dir).expect_err("busy unseal must fail");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+            assert!(error.to_string().contains("in use"), "{error}");
+            blocker.execute_batch("ROLLBACK").unwrap();
+            drop(blocker);
+
+            let meta = OverlayMeta::read(&f.dir).unwrap().unwrap();
+            assert!(meta.layer_sealed());
+            assert_eq!(meta.get("sealed_at"), Some(sealed.sealed_at.as_str()));
+            assert_eq!(meta.get("layer_digest"), Some(sealed.layer_digest.as_str()));
+            assert_eq!(fs::read(f.dir.join(SENTINEL)).unwrap(), sentinel);
+            assert_eq!(
+                rows_and_modes(&f.dir),
+                before,
+                "busy unseal mode {original_mode:04o}"
+            );
+            assert!(!f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK).exists());
+        }
+    }
+
+    /// Regression: a first seal that cannot create its journal or sentinel in
+    /// a read-only root must refuse without changing any host modes or metadata.
+    #[test]
+    fn regression_240_first_seal_readonly_root_preserves_modes_on_failure() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skip: read-only root failure requires directory permission enforcement");
+            return;
+        }
+        for mode in [0o500, 0o550, 0o2550] {
+            let f = Fixture::new();
+            fs::set_permissions(&f.dir, fs::Permissions::from_mode(mode)).unwrap();
+            let before = rows_and_modes(&f.dir);
+            assert!(seal(&f.dir, f.base.clone()).is_err());
+            assert_eq!(rows_and_modes(&f.dir), before, "first seal mode {mode:04o}");
+            assert!(!f.dir.join(SENTINEL).exists());
+            assert!(!f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK).exists());
+        }
+    }
+
+    /// Regression: #240 seal's byte reader must stay bound to the file it
+    /// digested, including when another inode replaces its pathname.
+    #[test]
+    fn regression_240_seal_reader_refuses_replaced_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("archive");
+        fs::write(&path, b"original bytes").unwrap();
+        let reader =
+            crate::overlay_meta::SealArchive::open(&path, fs::metadata(&path).unwrap()).unwrap();
+        let replacement = tmp.path().join("replacement");
+        fs::write(&replacement, b"replacement!!!").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert!(reader.check_path(&path).is_err());
+    }
+
+    /// Regression: #238 a commit can finish its archive write before refreshing
+    /// its recorded strong digest. A freshly opened source alone cannot prove
+    /// that the old recorded baseline describes the archive being sealed.
+    #[test]
+    fn regression_238_seal_refuses_stale_strong_baseline() {
+        let f = Fixture::new();
+        let archive = f._tmp.path().join("archive.tar");
+        fs::write(&archive, b"old archive bytes").unwrap();
+        let archive = archive.canonicalize().unwrap();
+        let stamp = ratarmount_index::ArchiveDigestStamp::read(&archive).unwrap();
+        let digest = format!(
+            "sha256:{}",
+            ratarmount_index::sha256_hex(b"old archive bytes")
+        );
+        {
+            let conn = connection(&f.dir, false).unwrap();
+            OverlayMeta::set_many(
+                &conn,
+                &[
+                    ("base_kind", "archive"),
+                    ("base_url", archive.to_str().unwrap()),
+                    ("base_location", &format!("local:{}", archive.display())),
+                    ("base_local_path", archive.to_str().unwrap()),
+                    ("base_size", &stamp.size.to_string()),
+                    ("base_mtime_ns", &stamp.mtime_ns.to_string()),
+                    ("base_digest_kind", "strong"),
+                    ("base_digest", &digest),
+                ],
+            )
+            .unwrap();
+        }
+        // Model the interval after the archive write and before the commit's
+        // digest refresh. Classification happens after the new bytes landed.
+        fs::write(&archive, b"new, longer archive bytes").unwrap();
+        let base = crate::ClassifiedBase::for_tests(
+            f.base.clone(),
+            crate::ServedKind::Archive,
+            Some(crate::ServedLocation::Local(archive.clone())),
+        );
+        let before = rows_and_modes(&f.dir);
+        super::seal(&f.dir, &base, f.base.clone())
+            .expect_err("a fresh source must not authorize sealing a stale recorded digest");
+        assert_eq!(
+            rows_and_modes(&f.dir),
+            before,
+            "seal mutated the old baseline"
+        );
+        assert!(!OverlayMeta::read(&f.dir).unwrap().unwrap().layer_sealed());
+        assert!(!f.dir.join(SENTINEL).exists());
+    }
+
+    /// Regression: #238 a changed stamp can still describe identical bytes.
+    /// Recheck the strong digest under the overlay lock and refresh the accepted stamp.
+    #[test]
+    fn regression_238_seal_refreshes_stamp_for_matching_strong_digest() {
+        let f = Fixture::new();
+        let archive = f._tmp.path().join("archive.tar");
+        fs::write(&archive, b"unchanged archive bytes").unwrap();
+        let archive = archive.canonicalize().unwrap();
+        let stamp = ratarmount_index::ArchiveDigestStamp::read(&archive).unwrap();
+        let digest = format!(
+            "sha256:{}",
+            ratarmount_index::sha256_hex(b"unchanged archive bytes")
+        );
+        {
+            let conn = connection(&f.dir, false).unwrap();
+            OverlayMeta::set_many(
+                &conn,
+                &[
+                    ("base_kind", "archive"),
+                    ("base_url", archive.to_str().unwrap()),
+                    ("base_location", &format!("local:{}", archive.display())),
+                    ("base_local_path", archive.to_str().unwrap()),
+                    ("base_size", &stamp.size.to_string()),
+                    ("base_mtime_ns", &(stamp.mtime_ns - 1).to_string()),
+                    ("base_digest_kind", "strong"),
+                    ("base_digest", &digest),
+                ],
+            )
+            .unwrap();
+        }
+        let base = crate::ClassifiedBase::for_tests(
+            f.base.clone(),
+            crate::ServedKind::Archive,
+            Some(crate::ServedLocation::Local(archive.clone())),
+        );
+        super::seal(&f.dir, &base, f.base.clone()).unwrap();
+        let meta = OverlayMeta::read(&f.dir).unwrap().unwrap();
+        assert!(meta.layer_sealed());
+        assert_eq!(meta.base_digest(), Some(digest.as_str()));
+        assert_eq!(meta.get("base_size"), Some(stamp.size.to_string().as_str()));
+        assert_eq!(
+            meta.get("base_mtime_ns"),
+            Some(stamp.mtime_ns.to_string().as_str())
+        );
+        assert!(f.dir.join(SENTINEL).is_file());
+    }
+
     fn pending_fixture() -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let archive = tmp.path().join("uncached.tar");
@@ -735,6 +1740,119 @@ mod tests {
             dir,
             base,
         }
+    }
+
+    /// Regression: #240 a same-stamp pathname swap at the hash open could seal
+    /// a different inode's digest after the original name was restored.
+    #[test]
+    fn regression_240_seal_hash_binds_managed_reader() {
+        use ratarmount_index::managed_read::{seams, Seam};
+
+        let f = pending_fixture();
+        let index = f._tmp.path().join("archive.sqlite");
+        rusqlite::Connection::open(&index)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (name TEXT)")
+            .unwrap();
+        OverlayMeta::set(
+            &connection(&f.dir, false).unwrap(),
+            "base_index_path",
+            index.to_str().unwrap(),
+        )
+        .unwrap();
+        let archive = f._tmp.path().join("uncached.tar").canonicalize().unwrap();
+        let held = archive.with_extension("held");
+        let replacement = archive.with_extension("replacement");
+        let stamp = fs::metadata(&archive).unwrap();
+        fs::write(&replacement, vec![b'x'; stamp.len() as usize]).unwrap();
+        fs::File::open(&replacement)
+            .unwrap()
+            .set_modified(stamp.modified().unwrap())
+            .unwrap();
+        let base = crate::ClassifiedBase::for_tests(
+            f.base.clone(),
+            crate::ServedKind::Archive,
+            Some(crate::ServedLocation::Local(archive.clone())),
+        );
+        let before = rows_and_modes(&f.dir);
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (path, saved, swapped) = (archive.clone(), held.clone(), fired.clone());
+        let _hash = OnceGuard::set(&crate::overlay_meta::DURING_PENDING_HASH, move || {
+            fs::rename(&path, &saved).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+            swapped.set(true);
+        });
+        let result = seams::with(
+            move |seam| {
+                // Red control: the old pathname reader opens the substitute, then
+                // this restores the original path before its stamp checks.
+                if seam == Seam::AfterOpen
+                    && seams::opened_path().as_ref() == Some(&archive)
+                    && held.exists()
+                {
+                    fs::rename(&held, &archive)?;
+                }
+                Ok(())
+            },
+            || super::seal(&f.dir, &base, f.base.clone()),
+        );
+        assert!(fired.get(), "the archive hash boundary was reached");
+        assert!(
+            result.is_err(),
+            "a substituted hash source must not authorize a seal"
+        );
+        assert_eq!(rows_and_modes(&f.dir), before);
+        assert_eq!(
+            OverlayMeta::read(&f.dir)
+                .unwrap()
+                .unwrap()
+                .base_digest_kind(),
+            Some("pending")
+        );
+        assert!(!f.dir.join(SENTINEL).exists());
+        let cached: u64 = rusqlite::Connection::open(&index)
+            .unwrap()
+            .query_row("SELECT count(*) FROM overlay_base_digests", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            cached, 0,
+            "refused inode substitution must not publish a cached digest"
+        );
+    }
+
+    /// Regression: #240 the archive name can change after the initial
+    /// managed-reader check, before seal publication.
+    #[test]
+    fn regression_240_seal_rechecks_inode_before_publication() {
+        let f = Fixture::new();
+        let archive = f._tmp.path().join("archive.tar");
+        fs::write(&archive, b"original archive bytes").unwrap();
+        let replacement = archive.with_extension("replacement");
+        fs::write(&replacement, b"substitute same length").unwrap();
+        let base = crate::ClassifiedBase::for_tests(
+            f.base.clone(),
+            crate::ServedKind::Archive,
+            Some(crate::ServedLocation::Local(archive.clone())),
+        );
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let changed = fired.clone();
+        let before = rows_and_modes(&f.dir);
+        let _resolver = OnceGuard::set(&AFTER_PENDING_RESOLVER, move || {
+            fs::rename(&replacement, &archive).unwrap();
+            changed.set(true);
+        });
+        let result = super::seal(&f.dir, &base, f.base.clone());
+        assert!(fired.get(), "the initial archive check finished");
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("archive changed while sealing"),
+            "{error}"
+        );
+        assert_eq!(rows_and_modes(&f.dir), before);
+        assert!(!OverlayMeta::read(&f.dir).unwrap().unwrap().layer_sealed());
+        assert!(!f.dir.join(SENTINEL).exists());
     }
 
     fn refusal(result: io::Result<SealOutcome>, before: &RecordState, f: &Fixture) {
@@ -1081,6 +2199,7 @@ mod tests {
     /// database: another process could then write under a holder's read.
     #[test]
     fn regression_reseal_keeps_shared_db_lock() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         let f = Fixture::new();
         seal(&f.dir, f.base.clone()).unwrap();
         let holder = shared_holder(&f.dir);
@@ -1103,8 +2222,10 @@ mod tests {
     /// read lock and would hide the bug from a probe made afterwards.
     #[test]
     fn regression_unseal_failure_keeps_shared_db_lock() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         let f = Fixture::new();
         seal(&f.dir, f.base.clone()).unwrap();
+        let before = rows_and_modes(&f.dir);
         let holder = shared_holder(&f.dir);
         let db = f.dir.join(HIDDEN_DB);
         let seen = std::rc::Rc::new(std::cell::Cell::new(None));
@@ -1134,7 +2255,40 @@ mod tests {
             .execute_batch("SELECT count(*) FROM files; COMMIT;")
             .unwrap();
         drop(holder);
+        assert_eq!(
+            rows_and_modes(&f.dir),
+            before,
+            "failed unseal changed modes or metadata"
+        );
         unseal(&f.dir).unwrap();
+    }
+
+    /// Regression: a permission-walk failure must restore changed entries even
+    /// when the unreadable subtree cannot be revisited during rollback.
+    #[test]
+    fn regression_240_unseal_failed_walk_restores_modes() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skip: unreadable-directory failure requires permission enforcement");
+            return;
+        }
+        let f = Fixture::new();
+        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o2700)).unwrap();
+        seal(&f.dir, f.base.clone()).unwrap();
+        let before = rows_and_modes(&f.dir);
+        let sub = f.dir.join("sub");
+        let sub_mode = fs::metadata(&sub).unwrap().permissions().mode();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+        let error = unseal(&f.dir).expect_err("unreadable directory must refuse the transition");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert_eq!(fs::metadata(&sub).unwrap().permissions().mode() & 0o7777, 0);
+        assert_eq!(
+            fs::metadata(&f.dir).unwrap().permissions().mode() & 0o7777,
+            0o2500
+        );
+        // Restore only the fixture's deliberately unreadable directory, then
+        // compare the rest of the exact pre-transition metadata and modes.
+        fs::set_permissions(&sub, fs::Permissions::from_mode(sub_mode)).unwrap();
+        assert_eq!(rows_and_modes(&f.dir), before);
     }
 
     /// Regression: chmod -w changed lookup and readdir modes, and leaked the sentinel.
@@ -1239,7 +2393,9 @@ mod tests {
                 .contains("in use by another ratarmount process"));
         }
         drop(writer);
-        fs::remove_file(f.dir.join("plain")).unwrap();
+        // A row without its host entry. `plain` has no row since #328, so
+        // removing it would leave a consistent overlay; the symlink keeps one.
+        fs::remove_file(f.dir.join("link")).unwrap();
         assert!(seal(&f.dir, f.base.clone())
             .unwrap_err()
             .to_string()
@@ -1360,5 +2516,56 @@ mod tests {
             verify(&f.dir, f.base.clone()).unwrap().mismatched,
             [".git/config"]
         );
+    }
+
+    /// Regression (R1c-1 T2): the supervisor's finalize must not wait without
+    /// a bound for an overlay root flock held by another seal, unseal or
+    /// commit (its serve loop is serial). `acquire_until` with a deadline
+    /// answers `WouldBlock` within the deadline plus one poll; with `None` it
+    /// waits until the holder releases, as `acquire` does; a free lock is
+    /// taken either way.
+    #[test]
+    fn regression_seal_operation_acquire_until() {
+        use std::time::{Duration, Instant};
+        let f = Fixture::new();
+        // Free: acquired with a deadline, without one, and by `acquire`.
+        drop(SealOperation::acquire_until(&f.dir, Some(Instant::now())).unwrap());
+        drop(SealOperation::acquire_until(&f.dir, None).unwrap());
+        drop(SealOperation::acquire(&f.dir).unwrap());
+        // Held (by the guard every seal, unseal and commit takes).
+        let held = crate::write_overlay::SealCommitGuard::acquire(&f.dir).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let error = SealOperation::acquire_until(&f.dir, Some(deadline))
+            .err()
+            .unwrap();
+        let returned = Instant::now();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        assert!(returned >= deadline, "returned before its deadline");
+        assert!(
+            returned < deadline + Duration::from_secs(2),
+            "returned {:?} after its deadline",
+            returned - deadline
+        );
+        assert!(error.to_string().contains("is locked by a seal"), "{error}");
+        // Unbounded: waits for the holder, as `acquire` does.
+        let dir = f.dir.clone();
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiter = {
+            let released = released.clone();
+            std::thread::spawn(move || {
+                let operation = SealOperation::acquire_until(&dir, None).unwrap();
+                assert!(
+                    released.load(std::sync::atomic::Ordering::SeqCst),
+                    "acquired while the holder kept the lock"
+                );
+                drop(operation);
+                let operation = SealOperation::acquire(&dir).unwrap();
+                drop(operation);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(held);
+        waiter.join().unwrap();
     }
 }

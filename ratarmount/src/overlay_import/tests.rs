@@ -173,6 +173,16 @@ fn roundtrip(case: &str) {
         "latin1" => cow::cow_write(&ov, "/latin", b"caf\xe9, d\xe9j\xe0 vu\n"),
         "quoted" => put(&ov, "/caf\u{e9}\t\"\\.txt", b"quoted\n", 0o644),
         "empty_dir" => ov.mkdir("/empty-dir", 0o755).unwrap(),
+        "file_to_dir" => {
+            ov.unlink("/type").unwrap();
+            ov.mkdir("/type", 0o755).unwrap();
+            put(&ov, "/type/y", b"inside\n", 0o644);
+        }
+        "dir_to_file" => {
+            ov.unlink("/nested/base").unwrap();
+            ov.rmdir("/nested").unwrap();
+            put(&ov, "/nested", b"now a file\n", 0o644);
+        }
         _ => unreachable!(),
     }
     drop(ov);
@@ -225,6 +235,8 @@ roundtrips! {
     regression_import_roundtrip_latin1 => "latin1",
     regression_import_roundtrip_quoted_paths => "quoted",
     regression_import_empty_dirs_are_not_representable => "empty_dir",
+    regression_import_roundtrip_file_replaced_by_directory => "file_to_dir",
+    regression_import_roundtrip_directory_replaced_by_file => "dir_to_file",
 }
 
 /// Regression: exact context may move, but mismatched context is never fuzzed.
@@ -364,7 +376,7 @@ fn regression_import_refuses_lower_and_overlay_symlink_components() {
     assert!(!args.directory.exists());
 }
 
-/// Regression: unsupported binary encodings must name the affected path.
+/// Regression: a malformed delta section and `Binary files … differ` must name the affected path.
 #[test]
 fn regression_import_delta_and_contentless_binary_name_path() {
     for body in [
@@ -499,6 +511,7 @@ fn regression_import_clap_positionals_not_stolen() {
 }
 
 fn git_binary_roundtrip(external: bool) {
+    let _processes = ratarmount_index::test_process::spawning();
     if external
         && std::process::Command::new("git")
             .arg("--version")
@@ -746,5 +759,1055 @@ fn regression_import_clears_marker_on_success() {
                 .unwrap()
                 .is_clean()
         );
+    }
+}
+
+const DELETE_TYPE: &[u8] = b"diff --git a/type b/type\ndeleted file mode 100644\n--- a/type\n+++ /dev/null\n@@ -1 +0,0 @@\n-regular\n";
+const ADD_TYPE_Y: &[u8] = b"diff --git a/type/y b/type/y\nnew file mode 100644\n--- /dev/null\n+++ b/type/y\n@@ -0,0 +1 @@\n+inside\n";
+const ADD_NESTED: &[u8] = b"diff --git a/nested b/nested\nnew file mode 100644\n--- /dev/null\n+++ b/nested\n@@ -0,0 +1 @@\n+now a file\n";
+const DELETE_NESTED_BASE: &[u8] = b"diff --git a/nested/base b/nested/base\ndeleted file mode 100644\n--- a/nested/base\n+++ /dev/null\n@@ -1 +0,0 @@\n-keep\n";
+
+fn is_dir(view: &ReadOnlyOverlayLayer, path: &str) -> bool {
+    view.lookup(path, 0)
+        .is_some_and(|fi| fi.mode & S_IFMT == ratarmount_core::S_IFDIR)
+}
+
+fn fsck_clean(dir: &Path) {
+    let report = ratarmount_compositing::overlay_fsck::fsck(dir, false).unwrap();
+    assert!(report.is_clean(), "{report:?}");
+}
+
+/// Regression (#329): deleting file `type` and adding `type/y` failed with
+/// "parent /type is not a directory" because the lower view still had the file.
+#[test]
+fn regression_import_file_replaced_by_directory() {
+    let f = Fixture::new();
+    let args = f.args("file-to-dir");
+    let (_, code) = f.apply(&args, &[DELETE_TYPE, ADD_TYPE_Y].concat()).unwrap();
+    assert_eq!(code, 0);
+    let view = f.view(&args.directory);
+    assert!(is_dir(&view, "/type"));
+    assert!(args.directory.join("type").is_dir());
+    assert_eq!(
+        fs::read(args.directory.join("type/y")).unwrap(),
+        b"inside\n"
+    );
+    fsck_clean(&args.directory);
+}
+
+/// Regression (#329): `add nested` precedes `delete nested/base` in Git's
+/// order; the directory being replaced is emptied and removed first.
+#[test]
+fn regression_import_directory_replaced_by_file() {
+    let f = Fixture::new();
+    let args = f.args("dir-to-file");
+    let (_, code) = f
+        .apply(&args, &[ADD_NESTED, DELETE_NESTED_BASE].concat())
+        .unwrap();
+    assert_eq!(code, 0);
+    let view = f.view(&args.directory);
+    let fi = view.lookup("/nested", 0).unwrap();
+    assert_eq!(fi.mode & S_IFMT, S_IFREG);
+    assert!(view.lookup("/nested/base", 0).is_none());
+    assert_eq!(
+        fs::read(args.directory.join("nested")).unwrap(),
+        b"now a file\n"
+    );
+    fsck_clean(&args.directory);
+    // An add over a directory whose children are not all deleted still fails.
+    let args = f.args("dir-to-file-partial");
+    let error = f.apply(&args, ADD_NESTED).unwrap_err();
+    assert!(error.contains("added file already exists"), "{error}");
+}
+
+/// Regression (#329): a stream that modifies a path and then deletes it reads
+/// the second preimage from the overlay; deletions are not hoisted globally.
+#[test]
+fn regression_import_modify_then_delete_stream_unchanged() {
+    let f = Fixture::new();
+    let args = f.args("modify-delete");
+    let patch = b"--- a/a\n+++ b/a\n@@ -1 +1 @@\n-one\n+ONE\ndiff --git a/a b/a\ndeleted file mode 100644\n--- a/a\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-ONE\n-two\n-three\n";
+    let (_, code) = f.apply(&args, patch).unwrap();
+    assert_eq!(code, 0);
+    assert!(f.view(&args.directory).lookup("/a", 0).is_none());
+}
+
+/// Regression (#329): only a directory replaced by a file is removed; an
+/// import that merely empties a directory keeps it.
+#[test]
+fn regression_import_emptied_directory_is_kept() {
+    let f = Fixture::new();
+    let args = f.args("emptied");
+    let (_, code) = f.apply(&args, DELETE_NESTED_BASE).unwrap();
+    assert_eq!(code, 0);
+    let view = f.view(&args.directory);
+    assert!(is_dir(&view, "/nested"));
+    assert!(view.lookup("/nested/base", 0).is_none());
+}
+
+/// Regression (#329): with --reject, a failed section under a file that this
+/// import turned into a directory restores the lower file (the whole type
+/// change is rejected) and writes its hunks to `type.rej`.
+#[test]
+fn regression_import_type_change_reject_restores_lower() {
+    let f = Fixture::new();
+    let mut args = f.args("type-reject");
+    args.reject = true;
+    let add_z: &[u8] = b"--- /dev/null\n+++ b/type/z\n@@ -0,0 +1 @@\n+zed\n";
+    let bad: &[u8] = b"--- a/type/y\n+++ b/type/y\n@@ -1 +1 @@\n-wrong\n+new\n";
+    let later: &[u8] = b"--- /dev/null\n+++ b/type/w\n@@ -0,0 +1 @@\n+late\n";
+    let (output, code) = f
+        .apply(
+            &args,
+            &[DELETE_TYPE, ADD_TYPE_Y, add_z, bad, later].concat(),
+        )
+        .unwrap();
+    assert_eq!(code, 1, "{output}");
+    let view = f.view(&args.directory);
+    let fi = view.lookup("/type", 0).unwrap();
+    assert_eq!(fi.mode & S_IFMT, S_IFREG);
+    assert_eq!(fs::read(args.directory.join("type")).unwrap(), b"regular\n");
+    for gone in ["/type/y", "/type/z", "/type/w"] {
+        assert!(view.lookup(gone, 0).is_none(), "{gone}");
+    }
+    assert_eq!(
+        fs::read(args.directory.join("type.rej")).unwrap(),
+        b"diff a/type/y b/type/y\t(rejected hunks)\n@@ -1 +1 @@\n-wrong\n+new\n"
+    );
+    let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["rejected"], 1);
+    assert_eq!(json["files"], 0, "nothing below type is kept: {output}");
+    fsck_clean(&args.directory);
+    // The same stream sealed: the restored type change must not make fsck
+    // or seal refuse (that would turn exit 1 into exit 2).
+    let mut args = f.args("type-reject-sealed");
+    args.reject = true;
+    args.no_seal = false;
+    let (output, code) = f
+        .apply(
+            &args,
+            &[DELETE_TYPE, ADD_TYPE_Y, add_z, bad, later].concat(),
+        )
+        .unwrap();
+    assert_eq!(code, 1, "{output}");
+    let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert!(json["layer_digest"].is_string(), "{output}");
+    assert!(
+        ratarmount_compositing::overlay_seal::verify(&args.directory, f.source.clone())
+            .unwrap()
+            .ok
+    );
+}
+
+/// Regression (#329): skipping the parent check for sections of a rejected
+/// file must not let a rename into a symlink parent reach `restore`.
+#[test]
+fn regression_import_reject_still_refuses_symlink_parent() {
+    let f = Fixture::new();
+    let outside = f.temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("file"), b"outside\n").unwrap();
+    let mut args = f.args("reject-link");
+    args.reject = true;
+    let patch = format!(
+        "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-missing\n+x\ndiff --git a/new-link b/new-link\nnew file mode 120000\n--- /dev/null\n+++ b/new-link\n@@ -0,0 +1 @@\n+{}\n\\ No newline at end of file\ndiff --git a/a b/new-link/file\nsimilarity index 50%\nrename from a\nrename to new-link/file\n--- a/a\n+++ b/new-link/file\n@@ -1 +1 @@\n-missing\n+x\n",
+        outside.display()
+    );
+    let error = f.apply(&args, patch.as_bytes()).unwrap_err();
+    assert!(error.contains("symlink parent /new-link"), "{error}");
+    assert_eq!(fs::read(outside.join("file")).unwrap(), b"outside\n");
+}
+
+/// Regression (#329): with --reject, a failing deletion of a child of the
+/// directory being replaced rejects the whole directory -> file change.
+#[test]
+fn regression_import_directory_to_file_reject_keeps_directory() {
+    let f = Fixture::new();
+    let mut args = f.args("dir-reject");
+    args.reject = true;
+    let bad: &[u8] = b"diff --git a/nested/base b/nested/base\ndeleted file mode 100644\n--- a/nested/base\n+++ /dev/null\n@@ -1 +0,0 @@\n-wrong\n";
+    let (_, code) = f.apply(&args, &[ADD_NESTED, bad].concat()).unwrap();
+    assert_eq!(code, 1);
+    let view = f.view(&args.directory);
+    assert!(is_dir(&view, "/nested"));
+    assert!(view.lookup("/nested/base", 0).is_some());
+    let rej = fs::read(args.directory.join("nested.rej")).unwrap();
+    assert!(
+        rej.ends_with(b"@@ -1 +0,0 @@\n-wrong\n"),
+        "{}",
+        String::from_utf8_lossy(&rej)
+    );
+    assert!(
+        rej.windows(b"+now a file\n".len())
+            .any(|w| w == b"+now a file\n"),
+        "{}",
+        String::from_utf8_lossy(&rej)
+    );
+}
+
+/// Regression (#329): lower symlink parents remain refused even after deletion;
+/// folder-backed lower lookups can still follow the link's target.
+#[test]
+fn regression_import_deleted_lower_symlink_parent_is_refused() {
+    let f = Fixture::new();
+    let args = f.args("link-to-dir");
+    let patch = b"diff --git a/link b/link\ndeleted file mode 120000\n--- a/link\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n\\ No newline at end of file\ndiff --git a/link/f b/link/f\nnew file mode 100644\n--- /dev/null\n+++ b/link/f\n@@ -0,0 +1 @@\n+real\n";
+    let error = f.apply(&args, patch).unwrap_err();
+    assert!(error.contains("symlink parent /link"), "{error}");
+    assert!(!args.directory.exists());
+}
+
+/// Regression (#329): a failed first child addition must restore the deleted
+/// lower file even though no replacement directory has been created yet.
+#[test]
+fn regression_import_type_change_reject_before_first_child() {
+    let f = Fixture::new();
+    let mut args = f.args("first-child-reject");
+    args.reject = true;
+    let bad: &[u8] = b"--- /dev/null\n+++ b/type/y\n@@ -1,0 +2 @@\n+inside\n";
+    let (output, code) = f.apply(&args, &[DELETE_TYPE, bad].concat()).unwrap();
+    assert_eq!(code, 1, "{output}");
+    assert_eq!(fs::read(args.directory.join("type")).unwrap(), b"regular\n");
+    assert!(args.directory.join("type.rej").is_file());
+    let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["files"], 0);
+    fsck_clean(&args.directory);
+}
+
+/// Regression (#329): a rejected directory replacement must undo earlier
+/// child edits, not leave a partially changed directory behind.
+#[test]
+fn regression_import_directory_reject_restores_earlier_changes() {
+    let f = Fixture::new();
+    let mut args = f.args("earlier-child-reject");
+    args.reject = true;
+    let modify: &[u8] = b"--- a/nested/base\n+++ b/nested/base\n@@ -1 +1 @@\n-keep\n+changed\n";
+    let (output, code) = f
+        .apply(&args, &[modify, ADD_NESTED, DELETE_NESTED_BASE].concat())
+        .unwrap();
+    assert_eq!(code, 1, "{output}");
+    let view = f.view(&args.directory);
+    let fi = view.lookup("/nested/base", 0).unwrap();
+    assert_eq!(view.read(&fi, 100, 0).unwrap(), b"keep\n");
+    let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["files"], 0);
+    assert!(fs::read(args.directory.join("nested.rej"))
+        .unwrap()
+        .ends_with(b"@@ -1 +0,0 @@\n-keep\n"));
+    fsck_clean(&args.directory);
+}
+
+/// Regression (#329): a later failed hunk at a directory-to-file replacement
+/// restores the original directory and its deleted descendants, then seals.
+#[test]
+fn regression_import_directory_reject_after_replacement() {
+    let f = Fixture::new();
+    let mut args = f.args("late-directory-reject");
+    args.reject = true;
+    args.no_seal = false;
+    let bad: &[u8] = b"--- a/nested\n+++ b/nested\n@@ -1 +1 @@\n-wrong\n+changed\n";
+    let (output, code) = f
+        .apply(&args, &[ADD_NESTED, DELETE_NESTED_BASE, bad].concat())
+        .unwrap();
+    assert_eq!(code, 1, "{output}");
+    let view = f.view(&args.directory);
+    assert!(is_dir(&view, "/nested"));
+    let fi = view.lookup("/nested/base", 0).unwrap();
+    assert_eq!(view.read(&fi, 100, 0).unwrap(), b"keep\n");
+    let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["files"], 0);
+    assert!(json["layer_digest"].is_string());
+    fsck_clean(&args.directory);
+    drop(view);
+    assert!(
+        ratarmount_compositing::overlay_seal::verify(&args.directory, f.source.clone())
+            .unwrap()
+            .ok
+    );
+    ratarmount_compositing::overlay_seal::unseal(&args.directory).unwrap();
+}
+
+/// Regression (#329): hoisted deletions must not discard a child that an
+/// earlier failed section already promised to preserve under --reject.
+#[test]
+fn regression_import_directory_replacement_preserves_rejected_child() {
+    let f = Fixture::new();
+    let mut args = f.args("already-rejected-child");
+    args.reject = true;
+    let bad: &[u8] = b"--- a/nested/base\n+++ b/nested/base\n@@ -1 +1 @@\n-wrong\n+changed\n";
+    let (output, code) = f
+        .apply(&args, &[bad, ADD_NESTED, DELETE_NESTED_BASE].concat())
+        .unwrap();
+    assert_eq!(code, 1, "{output}");
+    let view = f.view(&args.directory);
+    assert!(is_dir(&view, "/nested"));
+    let fi = view.lookup("/nested/base", 0).unwrap();
+    assert_eq!(view.read(&fi, 100, 0).unwrap(), b"keep\n");
+    assert!(args.directory.join("nested.rej").is_file());
+    let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["files"], 0);
+    assert_eq!(json["rejected"], 1);
+    fsck_clean(&args.directory);
+}
+
+/// Regression (#329): restoring a rejected replacement also restores pruned
+/// empty subdirectories and removes children added earlier in the stream.
+#[test]
+fn regression_import_directory_reject_restores_pruned_tree() {
+    use ratarmount_compositing::FolderMountSource;
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base");
+    fs::create_dir_all(base.join("nested/sub/empty")).unwrap();
+    fs::write(base.join("nested/sub/base"), b"keep\n").unwrap();
+    let source = Arc::new(FolderMountSource::new(&base).unwrap());
+    let f = Fixture { temp, base, source };
+    let mut args = f.args("tree-reject");
+    args.reject = true;
+    let add = b"--- /dev/null\n+++ b/nested/added\n@@ -0,0 +1 @@\n+extra\n";
+    let deletes = b"--- a/nested/added\n+++ /dev/null\n@@ -1 +0,0 @@\n-extra\n--- a/nested/sub/base\n+++ /dev/null\n@@ -1 +0,0 @@\n-keep\n";
+    let bad = b"--- a/nested\n+++ b/nested\n@@ -1 +1 @@\n-wrong\n+changed\n";
+    let (output, code) = f
+        .apply(
+            &args,
+            &[
+                add.as_slice(),
+                ADD_NESTED,
+                deletes.as_slice(),
+                bad.as_slice(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+    assert_eq!(code, 1, "{output}");
+    let view = f.view(&args.directory);
+    assert!(is_dir(&view, "/nested/sub/empty"));
+    assert!(view.lookup("/nested/added", 0).is_none());
+    let fi = view.lookup("/nested/sub/base", 0).unwrap();
+    assert_eq!(view.read(&fi, 100, 0).unwrap(), b"keep\n");
+    fsck_clean(&args.directory);
+}
+
+/// Regression (#329): sections suppressed by a restored non-directory must
+/// not read a preimage through it before deciding to skip the section.
+#[test]
+fn regression_import_rejected_symlink_descendant_is_not_read() {
+    use ratarmount_compositing::FolderMountSource;
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&base).unwrap();
+    fs::create_dir(&outside).unwrap();
+    // Any accidental read attempt fails the per-file limit before opening.
+    fs::write(outside.join("large"), vec![b'x'; 8192]).unwrap();
+    std::os::unix::fs::symlink("../outside", base.join("link")).unwrap();
+    let source = Arc::new(FolderMountSource::new(&base).unwrap());
+    let f = Fixture { temp, base, source };
+    let mut args = f.args("reject-link-read");
+    args.reject = true;
+    args.max_patch_bytes = 4096;
+    let patch = b"diff --git a/link b/link\ndeleted file mode 120000\n--- a/link\n+++ /dev/null\n@@ -1 +0,0 @@\n-wrong\n\\ No newline at end of file\ndiff --git a/link/large b/stolen\nsimilarity index 100%\ncopy from link/large\ncopy to stolen\n";
+    let (output, code) = f.apply(&args, patch).unwrap();
+    assert_eq!(code, 1, "{output}");
+    assert_eq!(
+        fs::read_link(args.directory.join("link")).unwrap(),
+        Path::new("../outside")
+    );
+    assert!(!args.directory.join("stolen").exists());
+    fsck_clean(&args.directory);
+}
+
+/// Regression (#329): a failed lower listing is not an empty directory. A
+/// replacement must refuse before it can hide children missing from the list.
+#[test]
+fn regression_import_directory_replacement_refuses_failed_lower_listing() {
+    use ratarmount_compositing::FolderMountSource;
+    struct FailedListing {
+        inner: Arc<dyn MountSource>,
+        path: &'static str,
+    }
+    impl MountSource for FailedListing {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if path == self.path {
+                None
+            } else {
+                self.inner.list(path)
+            }
+        }
+        fn lookup(&self, path: &str, version: i32) -> Option<FileInfo> {
+            self.inner.lookup(path, version)
+        }
+        fn open(
+            &self,
+            fi: &FileInfo,
+            buffering: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.inner.open(fi, buffering)
+        }
+        fn is_immutable(&self) -> bool {
+            self.inner.is_immutable()
+        }
+    }
+    for missing in ["/nested", "/nested/hidden"] {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        fs::create_dir_all(base.join("nested/hidden")).unwrap();
+        fs::write(base.join("nested/base"), b"keep\n").unwrap();
+        fs::write(base.join("nested/hidden/secret"), b"preserve\n").unwrap();
+        let source = Arc::new(FailedListing {
+            inner: Arc::new(FolderMountSource::new(&base).unwrap()),
+            path: missing,
+        });
+        let f = Fixture { temp, base, source };
+        for reject in [false, true] {
+            let mut args = f.args("missing-listing");
+            args.reject = reject;
+            let patch = if missing == "/nested" {
+                ADD_NESTED.to_vec()
+            } else {
+                [ADD_NESTED, DELETE_NESTED_BASE].concat()
+            };
+            let error = f.apply(&args, &patch).unwrap_err();
+            assert!(
+                error.contains("cannot list lower directory"),
+                "{missing}: {error}"
+            );
+            assert!(!args.directory.exists());
+            assert_eq!(
+                fs::read(f.base.join("nested/hidden/secret")).unwrap(),
+                b"preserve\n"
+            );
+        }
+    }
+}
+
+/// A `diff --git` section modifying `path` with a forward delta from `pre` to `post`.
+fn delta_section(path: &str, pre: &[u8], post: &[u8], index: Option<String>) -> Vec<u8> {
+    use parse::tests::{encode85, make_delta, zlib};
+    let index = index
+        .unwrap_or_else(|| format!("{}..{}", parse::blob_ids(pre)[0], parse::blob_ids(post)[0]));
+    let forward = make_delta(pre, post);
+    let reverse = make_delta(post, pre);
+    let mut patch =
+        format!("diff --git a/{path} b/{path}\nindex {index} 100644\nGIT binary patch\n")
+            .into_bytes();
+    patch.extend(format!("delta {}\n", forward.len()).as_bytes());
+    patch.extend(encode85(&zlib(&forward)));
+    patch.extend(format!("delta {}\n", reverse.len()).as_bytes());
+    patch.extend(encode85(&zlib(&reverse)));
+    patch
+}
+
+const TEXT_A: &[u8] =
+    b"diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
+
+/// Regression (#343): a `delta` binary section applies to the lower preimage,
+/// with full SHA-1 and SHA-256 blob ids, alongside text hunks.
+#[test]
+fn regression_import_binary_delta_applies_to_preimage() {
+    let f = Fixture::new();
+    let pre = b"\x00old binary";
+    let post = b"\x00new binary, longer\xff";
+    for (name, index) in [
+        ("full", None),
+        (
+            "sha256",
+            Some(format!(
+                "{}..{}",
+                parse::blob_ids(pre)[1],
+                parse::blob_ids(post)[1]
+            )),
+        ),
+    ] {
+        let args = f.args(name);
+        let patch = [delta_section("binary", pre, post, index), TEXT_A.to_vec()].concat();
+        let (_, code) = f.apply(&args, &patch).unwrap();
+        assert_eq!(code, 0);
+        let view = f.view(&args.directory);
+        let fi = view.lookup("/binary", 0).unwrap();
+        assert_eq!(fi.mode & 0o7777, 0o644);
+        assert_eq!(
+            read_entry(&view, "binary", 1 << 20).unwrap().unwrap().1,
+            post
+        );
+        assert_eq!(
+            read_entry(&view, "a", 1 << 20).unwrap().unwrap().1,
+            b"one\nTWO\nthree\n"
+        );
+    }
+}
+
+/// Regression (#343): a delta whose index line does not match the preimage is
+/// refused naming the path (exit 2, partial overlay removed); `--reject` keeps
+/// the lower file, writes the section to `PATH.rej` and applies other files.
+/// A non-regular or missing preimage and a source-size mismatch behave alike.
+#[test]
+fn regression_import_binary_delta_wrong_preimage_and_reject() {
+    let f = Fixture::new();
+    let lower = b"\x00old binary";
+    let other = b"\x00other base";
+    let post = b"\x00new binary";
+    let wrong = delta_section("binary", other, post, None);
+    // Blob id matches the lower bytes, but the delta was made for 3 more bytes.
+    let longer = [lower.as_slice(), b"xyz"].concat();
+    let sized = delta_section(
+        "binary",
+        &longer,
+        post,
+        Some(format!(
+            "{}..{}",
+            parse::blob_ids(lower)[0],
+            parse::blob_ids(post)[0]
+        )),
+    );
+    let on_link = delta_section("link", b"a", b"b", None);
+    let missing = delta_section("missing", lower, post, None);
+    let wrong_result = delta_section(
+        "binary",
+        lower,
+        post,
+        Some(format!(
+            "{}..{}",
+            parse::blob_ids(lower)[0],
+            parse::blob_ids(other)[0]
+        )),
+    );
+    for (case, section, message) in [
+        ("blob", wrong, "sha1 information is lacking or useless"),
+        ("size", sized, "does not match the preimage size"),
+        ("link", on_link, "not a regular file"),
+        ("missing", missing, "preimage does not exist"),
+        ("result", wrong_result, "index expects"),
+    ] {
+        let mut args = f.args(&format!("{case}-strict"));
+        let patch = [section.clone(), TEXT_A.to_vec()].concat();
+        let error = f.apply(&args, &patch).unwrap_err();
+        let name = match case {
+            "link" => "link",
+            "missing" => "missing",
+            _ => "binary",
+        };
+        let path = format!("{name}:");
+        assert!(
+            error.contains(&path) && error.contains(message),
+            "{case}: {error}"
+        );
+        assert!(!args.directory.exists(), "{case}");
+        args.directory = f.temp.path().join(format!("{case}-reject"));
+        args.reject = true;
+        let (json, code) = f.apply(&args, &patch).unwrap();
+        assert_eq!(code, 1, "{case}: {json}");
+        assert!(json.contains("\"rejected\":1"), "{json}");
+        let view = f.view(&args.directory);
+        let restored = view.lookup(&format!("/{name}"), 0);
+        if case == "link" {
+            assert_eq!(restored.unwrap().linkname, "a");
+        } else if case == "missing" {
+            assert!(restored.is_none());
+        } else {
+            assert_eq!(read_entry(&view, name, 1 << 20).unwrap().unwrap().1, lower);
+        }
+        let rej = read_entry(&view, &format!("{name}.rej"), 1 << 20)
+            .unwrap()
+            .unwrap()
+            .1;
+        let rej = String::from_utf8(rej).unwrap();
+        assert!(rej.contains(&format!("diff a/{name} b/{name}")), "{rej}");
+        assert!(
+            rej.contains("\nindex ") && rej.contains("GIT binary patch\ndelta "),
+            "{rej}"
+        );
+        assert_eq!(
+            read_entry(&view, "a", 1 << 20).unwrap().unwrap().1,
+            b"one\nTWO\nthree\n"
+        );
+    }
+}
+
+/// Regression (#343): a delta declaring a postimage over --max-patch-bytes is
+/// refused while parsing, before the target is allocated or anything is written.
+#[test]
+fn regression_import_binary_delta_over_max_patch_bytes() {
+    let f = Fixture::new();
+    let pre = b"\x00old binary";
+    let post = vec![7u8; 4096];
+    let mut args = f.args("budget");
+    args.max_patch_bytes = 1024;
+    let patch = delta_section("binary", pre, &post, None);
+    let error = f.apply(&args, &patch).unwrap_err();
+    assert!(
+        error.contains("binary:") && error.contains("exceeds --max-patch-bytes"),
+        "{error}"
+    );
+    assert!(!args.directory.exists());
+    args.max_patch_bytes = 8192;
+    args.directory = f.temp.path().join("budget-ok");
+    assert_eq!(f.apply(&args, &patch).unwrap().1, 0);
+}
+
+/// Regression (#343): a directory preimage must take the delta rejection path
+/// instead of aborting --reject before unrelated files can be applied.
+#[test]
+fn regression_import_binary_delta_directory_preimage_reject() {
+    let f = Fixture::new();
+    let section = delta_section("nested", b"\0old", b"\0new", None);
+    let patch = [section, TEXT_A.to_vec()].concat();
+    let mut args = f.args("directory-delta");
+    let error = f.apply(&args, &patch).unwrap_err();
+    assert!(
+        error.contains("nested:") && error.contains("not a regular file"),
+        "{error}"
+    );
+    assert!(!args.directory.exists());
+    args.reject = true;
+    args.no_seal = false;
+    let (json, code) = f.apply(&args, &patch).unwrap();
+    assert_eq!(code, 1, "{json}");
+    let view = f.view(&args.directory);
+    assert!(is_dir(&view, "/nested"));
+    assert_eq!(
+        read_entry(&view, "nested/base", 1024).unwrap().unwrap().1,
+        b"keep\n"
+    );
+    assert_eq!(
+        read_entry(&view, "a", 1024).unwrap().unwrap().1,
+        b"one\nTWO\nthree\n"
+    );
+    assert!(args.directory.join("nested.rej").is_file());
+    drop(view);
+    fsck_clean(&args.directory);
+    assert!(
+        ratarmount_compositing::overlay_seal::verify(&args.directory, f.source.clone())
+            .unwrap()
+            .ok
+    );
+    ratarmount_compositing::overlay_seal::unseal(&args.directory).unwrap();
+}
+
+/// Regression (#343): a rejected rename/copy delta must retain both paths,
+/// its operation and mode headers, so the rejection can be inspected/replayed.
+#[test]
+fn regression_import_binary_delta_reject_preserves_section() {
+    let f = Fixture::new();
+    for operation in ["rename", "copy"] {
+        let section = delta_section("binary", b"\0other base", b"\0changed", None);
+        let section = String::from_utf8(section).unwrap().replacen(
+            "diff --git a/binary b/binary\n",
+            &format!("diff --git a/binary b/moved\nold mode 100644\nnew mode 100755\n{operation} from binary\n{operation} to moved\n"),
+            1,
+        );
+        let mut args = f.args(operation);
+        args.reject = true;
+        let (_, code) = f.apply(&args, section.as_bytes()).unwrap();
+        assert_eq!(code, 1);
+        let view = f.view(&args.directory);
+        assert!(view.lookup("/moved", 0).is_none());
+        assert_eq!(
+            read_entry(&view, "binary", 1024).unwrap().unwrap().1,
+            b"\0old binary"
+        );
+        let rejected = fs::read(args.directory.join("moved.rej")).unwrap();
+        assert!(
+            rejected.ends_with(section.as_bytes()),
+            "{}",
+            String::from_utf8_lossy(&rejected)
+        );
+        let parsed = parse::parse(&rejected, 4096).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].old.as_deref(), Some("binary"));
+        assert_eq!(parsed[0].new.as_deref(), Some("moved"));
+        assert_eq!(parsed[0].copy, operation == "copy");
+        assert_eq!(parsed[0].new_mode, Some(0o100755));
+    }
+}
+
+/// Regression (#343): delta sources come from the merged lower stack and
+/// earlier sections; a later rejection restores that stack, not the base.
+#[test]
+fn regression_import_binary_delta_lower_and_chained_sections() {
+    let f = Fixture::new();
+    let lower = b"\0prepared bytes";
+    let middle = b"\0first edit";
+    let last = b"\0second edit";
+    let mut prepared = f.args("prepared");
+    prepared.no_seal = false;
+    f.apply(
+        &prepared,
+        &delta_section("binary", b"\0old binary", lower, None),
+    )
+    .unwrap();
+    for reject in [false, true] {
+        let mut args = f.args(if reject { "chain-rejected" } else { "chain" });
+        args.lower.push(prepared.directory.clone());
+        args.reject = reject;
+        args.no_seal = false;
+        let pre: &[u8] = if reject { b"\0wrong edit" } else { middle };
+        let patch = [
+            delta_section("binary", lower, middle, None),
+            delta_section("binary", pre, last, None),
+            TEXT_A.to_vec(),
+        ]
+        .concat();
+        let patches = parse::parse(&patch, args.max_patch_bytes).unwrap();
+        let stack = ImportStack::open(&args, &Default::default()).unwrap();
+        let lower_view = stack.view.clone();
+        assert_eq!(
+            import(&args, &patches, stack, 123.0).unwrap().1,
+            i32::from(reject)
+        );
+        let view =
+            ReadOnlyOverlayLayer::new(lower_view.clone(), &args.directory, Immutability::Shared)
+                .unwrap();
+        assert_eq!(
+            read_entry(&view, "binary", 4096).unwrap().unwrap().1,
+            if reject {
+                lower.as_slice()
+            } else {
+                last.as_slice()
+            }
+        );
+        assert_eq!(
+            read_entry(&view, "a", 4096).unwrap().unwrap().1,
+            b"one\nTWO\nthree\n"
+        );
+        drop(view);
+        assert!(
+            ratarmount_compositing::overlay_seal::verify(&args.directory, lower_view)
+                .unwrap()
+                .ok
+        );
+        ratarmount_compositing::overlay_seal::unseal(&args.directory).unwrap();
+    }
+    ratarmount_compositing::overlay_seal::unseal(&prepared.directory).unwrap();
+}
+
+/// Regression (#343/#329): failed deltas restore both directions of a type
+/// change; later child deltas cannot read through the restored regular file.
+#[test]
+fn regression_import_binary_delta_type_change_reject() {
+    let f = Fixture::new();
+    let child = delta_section("type/y", b"wrong\n", b"new\n", None);
+    let later = delta_section("type/z", b"missing\n", b"new\n", None);
+    let parent = delta_section("nested", b"wrong\n", b"new\n", None);
+    for (name, patch) in [
+        (
+            "file-dir",
+            [DELETE_TYPE, ADD_TYPE_Y, &child, &later, TEXT_A].concat(),
+        ),
+        (
+            "dir-file",
+            [ADD_NESTED, DELETE_NESTED_BASE, &parent, TEXT_A].concat(),
+        ),
+    ] {
+        let mut args = f.args(name);
+        args.reject = true;
+        args.no_seal = false;
+        let (json, code) = f.apply(&args, &patch).unwrap();
+        assert_eq!(code, 1, "{json}");
+        let view = f.view(&args.directory);
+        assert_eq!(
+            read_entry(&view, "type", 4096).unwrap().unwrap().1,
+            b"regular\n"
+        );
+        assert!(is_dir(&view, "/nested"));
+        assert_eq!(
+            read_entry(&view, "nested/base", 4096).unwrap().unwrap().1,
+            b"keep\n"
+        );
+        assert_eq!(
+            read_entry(&view, "a", 4096).unwrap().unwrap().1,
+            b"one\nTWO\nthree\n"
+        );
+        if name == "file-dir" {
+            assert!(view.lookup("/type/y", 0).is_none());
+            assert!(view.lookup("/type/z", 0).is_none());
+            let rejected = fs::read(args.directory.join("type.rej")).unwrap();
+            let parsed = parse::parse(&rejected, 4096).unwrap();
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].path(), "type/y");
+            assert_eq!(parsed[1].path(), "type/z");
+        }
+        drop(view);
+        fsck_clean(&args.directory);
+        assert!(
+            ratarmount_compositing::overlay_seal::verify(&args.directory, f.source.clone())
+                .unwrap()
+                .ok
+        );
+        ratarmount_compositing::overlay_seal::unseal(&args.directory).unwrap();
+    }
+}
+
+fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+    let output = std::process::Command::new("git")
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn noise(seed: u32, len: usize) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x >> 8) as u8
+        })
+        .collect()
+}
+
+/// Regression (#343): real `git diff --binary` delta sections (random bytes, a
+/// docx-like zip, and a 96 KiB file needing multi-byte copy sizes), with full
+/// index lines, import to the same tree as the edited files; then
+/// `diff --git` of the result imports to the same canonical hash.
+#[test]
+fn regression_import_real_git_binary_delta() {
+    let _processes = ratarmount_index::test_process::spawning();
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skip: git is unavailable; delta import is tested with built deltas");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir(&repo_dir).unwrap();
+    git(&repo_dir, &["init", "-q"]);
+    let mut docx = b"PK\x03\x04\x14\x00\x06\x00\x08\x00\x00\x00!\x00".to_vec();
+    docx.extend(b"[Content_Types].xml");
+    docx.extend(noise(3, 3000));
+    docx.extend(b"PK\x01\x02\x14\x00word/document.xml\x00\x00");
+    docx.extend(noise(4, 1500));
+    let files = [
+        ("random.bin", [vec![0u8], noise(1, 2000)].concat()),
+        ("t/etc/x.docx", docx),
+        ("big.bin", [vec![0u8], noise(2, 96 * 1024)].concat()),
+    ];
+    for (name, data) in &files {
+        let path = repo_dir.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, data).unwrap();
+    }
+    git(&repo_dir, &["add", "-A"]);
+    git(&repo_dir, &["commit", "-qm", "base"]);
+    let commit = String::from_utf8(git(&repo_dir, &["rev-parse", "HEAD"]).stdout).unwrap();
+    let commit = commit.trim();
+    let mut edited = Vec::new();
+    for (name, data) in &files {
+        let mut data = data.clone();
+        for at in [17, data.len() / 2, data.len() - 9] {
+            data[at] ^= 0x5a;
+        }
+        if *name == "big.bin" {
+            data.splice(70_000..70_000, b"inserted bytes".iter().copied());
+        }
+        fs::write(repo_dir.join(name), &data).unwrap();
+        edited.push((*name, data));
+    }
+    let full = git(
+        &repo_dir,
+        &["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"],
+    )
+    .stdout;
+    let text = String::from_utf8(full.clone()).unwrap();
+    assert_eq!(
+        text.matches("\nGIT binary patch\ndelta ").count(),
+        files.len(),
+        "git chose literal sections:\n{text}"
+    );
+    // `--binary` implies full ids; abbreviate them to 7 digits as well.
+    let abbrev: String = text
+        .lines()
+        .map(|line| match line.strip_prefix("index ") {
+            Some(rest) => {
+                let (ids, mode) = rest.split_once(' ').unwrap();
+                let (old, new) = ids.split_once("..").unwrap();
+                format!("index {}..{} {mode}\n", &old[..7], &new[..7])
+            }
+            None => format!("{line}\n"),
+        })
+        .collect();
+    let source: Arc<dyn MountSource> =
+        Arc::new(ratarmount_formats_git::GitMountSource::open(&repo_dir, Some(commit)).unwrap());
+    let base = PathBuf::from(format!("{}@{commit}", repo_dir.display()));
+    let f = Fixture { temp, base, source };
+    let expected = f.temp.path().join("expected");
+    let token = crate::base_identity::fixtures::classify(&f.base);
+    let ov = WriteOverlay::open(
+        &token,
+        f.source.clone(),
+        &expected,
+        &ratarmount_compositing::CreateOptions::default(),
+    )
+    .unwrap();
+    for (name, data) in &edited {
+        cow::cow_write(&ov, &format!("/{name}"), data);
+    }
+    drop(ov);
+    let error = parse::parse(abbrev.as_bytes(), 1 << 20)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("full index"), "{error}");
+    let args = f.args("full");
+    let patches = parse::parse(&full, args.max_patch_bytes).unwrap();
+    assert!(patches.iter().all(|p| p.delta.is_some()));
+    let stack = ImportStack::open(&args, &Default::default()).unwrap();
+    assert_eq!(import(&args, &patches, stack, 123.0).unwrap().1, 0);
+    let view = f.view(&args.directory);
+    for (name, data) in &edited {
+        assert_eq!(
+            &read_entry(&view, name, 1 << 20).unwrap().unwrap().1,
+            data,
+            "{name}"
+        );
+    }
+    assert_eq!(f.hash(&expected), f.hash(&args.directory));
+    drop(view);
+    // Reverse round trip: ratarmount's own `diff --git` (literal sections) of
+    // the imported overlay must import to the same canonical hash.
+    let args = f.args("again");
+    let diff = crate::diff::DiffArgs {
+        directory: f.temp.path().join("full"),
+        base_source: Some(f.base.clone()),
+        git: true,
+        output: Some(args.patch.clone()),
+        ..Default::default()
+    };
+    assert_eq!(crate::diff::run(&diff, &Default::default()), 1);
+    let patch = fs::read(&args.patch).unwrap();
+    let patches = parse::parse(&patch, args.max_patch_bytes).unwrap();
+    let stack = ImportStack::open(&args, &Default::default()).unwrap();
+    assert_eq!(import(&args, &patches, stack, 123.0).unwrap().1, 0);
+    assert_eq!(f.hash(&expected), f.hash(&args.directory));
+}
+
+/// Regression (#343): deterministic randomized binary edits, including
+/// renames, copies and chmod, must agree byte-for-byte with real git apply
+/// under both supported object formats. Pure opcode/hash tests run without Git.
+#[test]
+fn regression_import_real_git_binary_delta_randomized() {
+    use ratarmount_compositing::FolderMountSource;
+    use std::os::unix::fs::PermissionsExt;
+    let _processes = ratarmount_index::test_process::spawning();
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skip: git is unavailable; pure delta/hash tests remain active");
+        return;
+    }
+    for format in ["sha1", "sha256"] {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let base = temp.path().join("base");
+        fs::create_dir(&repo).unwrap();
+        fs::create_dir(&base).unwrap();
+        git(&repo, &["init", "-q", &format!("--object-format={format}")]);
+        let mut pairs = Vec::new();
+        for i in 0..64 {
+            let name = format!("file-{i}.bin");
+            let mut pre = noise(2 * i + 13, 4096 + i as usize * 1093);
+            pre[0] = 0;
+            fs::write(repo.join(&name), &pre).unwrap();
+            fs::write(base.join(&name), &pre).unwrap();
+            for root in [&repo, &base] {
+                fs::set_permissions(root.join(&name), fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            let mut post = pre.clone();
+            let at = post.len() / 3;
+            match i % 4 {
+                0 => {
+                    post[at] ^= 0x5a;
+                }
+                1 => {
+                    post.splice(at..at, noise(i + 17, 113));
+                }
+                2 => {
+                    post.drain(at..at + 79);
+                }
+                _ => {
+                    post.rotate_left(at);
+                }
+            }
+            let target = match i {
+                0 => "renamed binary.bin".to_string(),
+                1 => "copied binary.bin".to_string(),
+                _ => name.clone(),
+            };
+            pairs.push((name, target, pre, post));
+        }
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        for (i, (name, target, _, post)) in pairs.iter().enumerate() {
+            if i == 0 {
+                fs::remove_file(repo.join(name)).unwrap();
+            }
+            fs::write(repo.join(target), post).unwrap();
+            fs::set_permissions(
+                repo.join(target),
+                fs::Permissions::from_mode(if i == 2 { 0o755 } else { 0o644 }),
+            )
+            .unwrap();
+        }
+        git(&repo, &["add", "-A"]);
+        let patch = git(
+            &repo,
+            &[
+                "diff",
+                "--cached",
+                "--binary",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--find-renames",
+                "--find-copies-harder",
+                "HEAD",
+            ],
+        )
+        .stdout;
+        let parsed = parse::parse(&patch, 16 << 20).unwrap();
+        assert_eq!(parsed.len(), pairs.len(), "{format}");
+        assert!(
+            parsed.iter().all(|p| p.delta.is_some()),
+            "Git must exercise delta decoding"
+        );
+        assert!(parsed.iter().any(|p| p.copy));
+        assert!(parsed.iter().any(|p| !p.copy && p.old != p.new));
+        assert!(parsed.iter().any(|p| p.new_mode == Some(0o100755)));
+        let patch_path = temp.path().join("patch");
+        fs::write(&patch_path, &patch).unwrap();
+        git(&repo, &["reset", "--hard", "-q", "HEAD"]);
+        git(&repo, &["apply", "--index", patch_path.to_str().unwrap()]);
+        let source = Arc::new(FolderMountSource::new(&base).unwrap());
+        let f = Fixture { temp, base, source };
+        let args = f.args("imported");
+        assert_eq!(f.apply(&args, &patch).unwrap().1, 0);
+        let view = f.view(&args.directory);
+        for (i, (name, target, pre, post)) in pairs.iter().enumerate() {
+            let expected = fs::read(repo.join(target)).unwrap();
+            assert_eq!(&expected, post, "git output for {format} {target}");
+            let (fi, actual) = read_entry(&view, target, 1 << 20).unwrap().unwrap();
+            assert_eq!(actual, expected, "{format} {target}");
+            assert_eq!(fi.mode & 0o777, if i == 2 { 0o755 } else { 0o644 });
+            if i == 0 {
+                assert!(view.lookup(&format!("/{name}"), 0).is_none());
+            }
+            if i == 1 {
+                assert_eq!(&read_entry(&view, name, 1 << 20).unwrap().unwrap().1, pre);
+            }
+        }
     }
 }

@@ -829,6 +829,97 @@ fn create_without_overlay_is_access_denied() {
     assert_eq!(st, smb2::STATUS_ACCESS_DENIED);
 }
 
+/// Regression (#316): a directory OPEN_IF lost a lookup/mkdir race and
+/// returned a collision instead of opening the winning directory.
+#[test]
+fn regression_316_directory_open_if_handles_mkdir_race() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct WinnerDuringLookup {
+        overlay: Arc<WriteOverlay>,
+        directory: bool,
+        pending: AtomicBool,
+    }
+    impl MountSource for WinnerDuringLookup {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.overlay.list(path)
+        }
+        fn lookup(&self, path: &str, version: i32) -> Option<FileInfo> {
+            if path == "/race" && self.pending.swap(false, Ordering::SeqCst) {
+                // Return the negative lookup after a competing request has
+                // created the entry, so do_create must handle mkdir's EEXIST.
+                if self.directory {
+                    self.overlay.mkdir(path, 0o750).unwrap();
+                } else {
+                    let fd = self.overlay.create_file(path, 0o640).unwrap();
+                    self.overlay.close_overlay_fd(fd);
+                }
+                return None;
+            }
+            self.overlay.lookup(path, version)
+        }
+        fn open(
+            &self,
+            fi: &FileInfo,
+            flags: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.overlay.open(fi, flags)
+        }
+        fn is_immutable(&self) -> bool {
+            false
+        }
+    }
+
+    for directory in [true, false] {
+        for disposition in [smb2::FILE_OPEN_IF, smb2::FILE_CREATE] {
+            let tmp = tempfile::tempdir().unwrap();
+            let overlay = Arc::new(
+                crate::test_overlay::new_overlay(Arc::new(MemFs::fixture()), tmp.path()).unwrap(),
+            );
+            let source = Arc::new(WinnerDuringLookup {
+                overlay: overlay.clone(),
+                directory,
+                pending: AtomicBool::new(true),
+            });
+            let server = Serving::start(source, Some(overlay));
+            let mut client = SmbClient::connect(server.addr);
+            let (header, body) = client.create_resp(
+                "race",
+                0x0012_0089,
+                disposition,
+                smb2::FILE_DIRECTORY_FILE,
+                0,
+                &[],
+            );
+            let expected = if disposition == smb2::FILE_CREATE {
+                smb2::STATUS_OBJECT_NAME_COLLISION
+            } else if directory {
+                smb2::STATUS_SUCCESS
+            } else {
+                smb2::STATUS_NOT_A_DIRECTORY
+            };
+            assert_eq!(
+                header.status, expected,
+                "directory={directory}, disposition={disposition}"
+            );
+            let meta = std::fs::metadata(tmp.path().join("race")).unwrap();
+            assert_eq!(meta.is_dir(), directory);
+            assert_eq!(
+                meta.permissions().mode() & 0o7777,
+                if directory { 0o750 } else { 0o640 }
+            );
+            if header.status == smb2::STATUS_SUCCESS {
+                assert_eq!(
+                    u32::from_le_bytes(body[4..8].try_into().unwrap()),
+                    smb2::FILE_OPENED
+                );
+                client.close(body[64..80].try_into().unwrap());
+            }
+        }
+    }
+}
+
 #[test]
 fn overlay_create_write_read() {
     let td = tempfile::tempdir().unwrap();

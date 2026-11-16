@@ -182,6 +182,57 @@ fn copy_io(src: &mut File, src_off: u64, dst: &mut File, dst_off: u64, len: u64)
     Ok(())
 }
 
+/// Restore an accepted regular archive's ownership and permission bits on the
+/// finished staging fd, before its final sync and guarded publication. A final
+/// symlink supplies no metadata; publication retains its existing checks.
+pub fn preserve_archive_metadata(
+    path: &Path,
+    source: &std::fs::Metadata,
+    temp: &File,
+) -> crate::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let named = std::fs::symlink_metadata(path)?;
+        if !named.is_file() || named.dev() != source.dev() || named.ino() != source.ino() {
+            return Ok(());
+        }
+        let fd = temp.as_raw_fd();
+        let root = unsafe { libc::geteuid() } == 0;
+        for (step, uid, gid) in [
+            ("archive metadata owner", source.uid(), !0 as libc::gid_t),
+            ("archive metadata group", !0 as libc::uid_t, source.gid()),
+        ] {
+            let changed = crate::commit_journal::fault::instead(step, || {
+                if unsafe { libc::fchown(fd, uid, gid) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            });
+            if let Err(error) = changed {
+                if root {
+                    return Err(crate::CompressError::ArchiveMetadata(error));
+                }
+                log::debug!("commit: could not restore {step}: {error}");
+            }
+        }
+        crate::commit_journal::fault::instead("archive metadata mode", || {
+            if unsafe { libc::fchmod(fd, (source.mode() & 0o777) as libc::mode_t) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        })
+        .map_err(crate::CompressError::ArchiveMetadata)?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, source, temp);
+    Ok(())
+}
+
 /// Whole-file copy to a sibling temporary file. macOS cloning creates a new
 /// pathname, so it is attempted here, never for a partial range or an open fd.
 pub fn copy_to_temp(
@@ -194,24 +245,39 @@ pub fn copy_to_temp(
         use std::os::fd::AsRawFd;
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0222-I01","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","item":"ratarmount_compress::fastcopy::copy_to_temp","native_observed":false,"creation":{"policy":"private-temporary-directory","basis":"tempfile::tempdir_in creates the macOS clone staging directory with tempfile private defaults; original unchanged-from-e6ca64e mode provenance is retained."},"category":"compression-staging","reason":"macOS private clone staging directory"}"###
+        )]
         let dir = tempfile::tempdir_in(parent)?;
         let path = dir.path().join("clone");
         let name = CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid_range())?;
         if unsafe { libc::fclonefileat(src.as_raw_fd(), libc::AT_FDCWD, name.as_ptr(), 0) } == 0 {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0223-I01","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","item":"ratarmount_compress::fastcopy::copy_to_temp","native_observed":false,"creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile allocates a private sibling; the previously cloned file is then renamed over that temporary pathname, retaining the reviewed existing clone flow."},"category":"compression-staging","reason":"macOS named clone output publication"}"###
+            )]
             let tmp = tempfile::NamedTempFile::new_in(parent)?;
             std::fs::rename(&path, tmp.path())?;
             let (_, temp_path) = tmp.into_parts();
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&temp_path)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0224-I01","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"range-copy probe on a private temporary file","mode_policy":"unchanged-from-e6ca64e","item":"ratarmount_compress::fastcopy::copy_to_temp","native_observed":false,"creation":{"policy":"none","basis":"The read/write OpenOptions path reopens the already-created temporary clone after rename; it requests no creation."}}"###
+            )]
+            let file = options.open(&temp_path)?;
             return Ok((
                 tempfile::NamedTempFile::from_parts(file, temp_path),
                 CopyMethod::Reflink,
             ));
         }
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0225-M01","item":"ratarmount_compress::fastcopy::copy_to_temp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     let len = src.metadata()?.len();
     let method = copy_range(src, 0, tmp.as_file_mut(), 0, len)?;
@@ -224,6 +290,10 @@ pub fn log_commit_copy(len: u64, method: CopyMethod) {
         len as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 }
+
+#[cfg(all(test, unix))]
+#[path = "fastcopy_metadata_tests.rs"]
+mod metadata_tests;
 
 #[cfg(test)]
 mod tests {

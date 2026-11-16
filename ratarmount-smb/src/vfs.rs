@@ -293,6 +293,10 @@ impl RatarmountSmb {
         let fd = ov
             .open_overlay_fd(&path, flags)
             .map_err(|e| errno_to_nt(io_to_errno(&overlay_to_io(e))))?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0545-M01","item":"<ratarmount_smb::vfs::RatarmountSmb>::write","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
         let wrote = ov.write_all_at(&file, &path, offset, data);
         ov.finish_owned_write_fd(file);
@@ -404,6 +408,28 @@ mod tests {
                 return Err(io::Error::new(io::ErrorKind::QuotaExceeded, "policy quota"));
             }
             Ok(())
+        }
+    }
+
+    /// Regression (#316): overlay mkdir of an existing name re-moded the
+    /// directory; through SMB it is STATUS_OBJECT_NAME_COLLISION (EEXIST).
+    #[test]
+    fn regression_316_mkdir_existing_is_name_collision() {
+        let td = tempfile::tempdir().unwrap();
+        let ov = Arc::new(crate::test_overlay::new_overlay(Arc::new(EmptyFs), td.path()).unwrap());
+        let fs = RatarmountSmb::with_overlay(ov.clone(), 0, 8, Some(ov));
+        fs.mkdir("/d", 0o750).expect("mkdir");
+        assert_eq!(
+            fs.mkdir("/d", 0o700).unwrap_err(),
+            smb2::STATUS_OBJECT_NAME_COLLISION
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(td.path().join("d"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o7777, 0o750);
         }
     }
 

@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! Read-only safetensors and GGUF v2/v3 mounts with SQLite listings and stenciled
 //! tensor ranges. Nested readers are retained in place, without a temporary body.
 
@@ -17,7 +20,14 @@ use serde_json::{json, Value};
 use thiserror::Error;
 
 mod gguf;
+mod manifest;
 mod safetensors;
+pub use manifest::{
+    build_manifest, compile_expert_pattern, write_jsonl, ExpertPattern, Manifest, ManifestOptions,
+    ManifestRow, Role,
+};
+#[cfg(test)]
+mod manifest_tests;
 #[cfg(test)]
 mod tests;
 
@@ -59,11 +69,24 @@ fn elements(shape: &[u64]) -> Result<u64> {
     })
 }
 
+pub(crate) enum Layout {
+    Safetensors {
+        dtype: String,
+        shape: Vec<u64>,
+        size_checked: bool,
+    },
+    Gguf {
+        ty: u32,
+        dims: Vec<u64>,
+    },
+}
+
 struct Tensor {
     name: String,
     offset: u64,
     size: u64,
     sidecar: Value,
+    layout: Layout,
 }
 
 struct Parsed {
@@ -150,8 +173,18 @@ impl TensorsMountSource {
                 .unwrap_or_else(|| default_index_path(path))
         });
         if !recreate && !options.clear_index_cache {
+            if options.read_only_index {
+                if let Some(ip) = &ip {
+                    let index = Self::existing(ip, options)?;
+                    index.check_tarstats_matches_archive(path)?;
+                    return Ok(Self {
+                        backend: Backend::Path(path.to_path_buf()),
+                        index,
+                    });
+                }
+            }
             if let Some(ip) = &ip {
-                if let Ok(index) = Self::existing(ip) {
+                if let Ok(index) = Self::existing(ip, options) {
                     if index.check_tarstats_matches_archive(path).is_ok() {
                         return Ok(Self {
                             backend: Backend::Path(path.to_path_buf()),
@@ -161,6 +194,10 @@ impl TensorsMountSource {
                 }
             }
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0369-M01","item":"<ratarmount_formats_tensors::TensorsMountSource>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut reader = File::open(path)?;
         let size = reader.metadata()?.len();
         let parsed = parse(&mut reader, size)?;
@@ -192,13 +229,22 @@ impl TensorsMountSource {
         } else {
             None
         };
-        let existing = if !options.clear_index_cache {
-            ip.and_then(|ip| Self::existing(ip).ok()).filter(|idx| {
-                idx.metadata()
-                    .ok()
-                    .and_then(|m| m.get("tensorReaderFingerprint").cloned())
-                    == fingerprint
-            })
+        let existing = if let Some(path) =
+            ip.filter(|_| options.read_only_index && !options.clear_index_cache)
+        {
+            let index = Self::existing(path, options)?;
+            if index.metadata()?.get("tensorReaderFingerprint") != fingerprint.as_ref() {
+                return Err(invalid("prepared tensor reader index fingerprint mismatch; --no-recreate-index forbids rebuilding"));
+            }
+            Some(index)
+        } else if !options.clear_index_cache {
+            ip.and_then(|ip| Self::existing(ip, options).ok())
+                .filter(|idx| {
+                    idx.metadata()
+                        .ok()
+                        .and_then(|m| m.get("tensorReaderFingerprint").cloned())
+                        == fingerprint
+                })
         } else {
             None
         };
@@ -223,8 +269,8 @@ impl TensorsMountSource {
         })
     }
 
-    fn existing(path: &Path) -> Result<SqliteIndex> {
-        let index = SqliteIndex::open_read_only(path)?;
+    fn existing(path: &Path, options: &OpenOptions) -> Result<SqliteIndex> {
+        let index = SqliteIndex::open_read_only_for_open(path, options)?;
         index.check_backend_name(BACKEND_NAME)?;
         if index.metadata()?.get("tensorSchema").map(String::as_str) != Some("1") {
             return Err(invalid("unsupported tensor index schema"));
@@ -468,7 +514,17 @@ impl MountSource for TensorsMountSource {
             })?;
         let regions = vec![(offset, file_info.size)];
         match &self.backend {
-            Backend::Path(path) => Ok(Box::new(StenciledFile::new(File::open(path)?, regions))),
+            Backend::Path(path) => Ok(Box::new(StenciledFile::new(
+                {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0370-M01","item":"<ratarmount_formats_tensors::TensorsMountSource as ratarmount_core::MountSource<ratarmount_formats_tensors::TensorsMountSource>>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )]
+                    let __inventory_value_0 = File::open(path);
+                    __inventory_value_0
+                }?,
+                regions,
+            ))),
             Backend::Shared(shared) => Ok(Box::new(StenciledFile::new(
                 PositionedReader {
                     shared: Arc::clone(shared),
@@ -498,7 +554,11 @@ pub fn looks_like_safetensors(path: &Path) -> bool {
     {
         return true;
     }
-    File::open(path)
+    {
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0371-M01","item":"ratarmount_formats_tensors::looks_like_safetensors","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
+let __inventory_value_0 = File::open(path);
+__inventory_value_0
+}
         .ok()
         .is_some_and(|mut reader| looks_like_safetensors_reader(&mut reader))
 }
@@ -527,7 +587,11 @@ pub fn looks_like_gguf(path: &Path) -> bool {
     {
         return true;
     }
-    File::open(path).ok().is_some_and(|mut reader| {
+    {
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0372-M01","item":"ratarmount_formats_tensors::looks_like_gguf","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
+let __inventory_value_0 = File::open(path);
+__inventory_value_0
+}.ok().is_some_and(|mut reader| {
         let mut magic = [0; 4];
         reader.read_exact(&mut magic).is_ok() && matches!(&magic, b"GGUF" | b"FUGG")
     })

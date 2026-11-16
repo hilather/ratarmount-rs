@@ -57,8 +57,15 @@ fn directory_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
-fn open_root(path: &Path) -> io::Result<OwnedFd> {
-    Ok(host::open(path, directory_flags(), Mode::empty())?)
+pub(crate) fn open_root(path: &Path) -> io::Result<OwnedFd> {
+    Ok({
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0046-M01","item":"ratarmount::overlay_pack::open_root","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = host::open(path, directory_flags(), Mode::empty());
+        __inventory_value_0
+    }?)
 }
 
 fn regular_flags() -> OFlags {
@@ -69,12 +76,19 @@ fn regular_flags() -> OFlags {
 /// database without closing a descriptor of it (R10-C).
 fn openat_admitted(dir: &OwnedFd, name: &str, flags: OFlags) -> io::Result<OwnedFd> {
     use std::os::fd::AsFd;
-    ratarmount_core::db_inodes::openat_admitted(
-        Some(dir.as_fd()),
-        Path::new(name),
-        flags.bits() as libc::c_int,
-        0,
-    )
+    {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0047-M01","item":"ratarmount::overlay_pack::openat_admitted","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","non_mandatory_callers":["append_host","pack","sync_children"],"category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = ratarmount_core::db_inodes::openat_admitted(
+            Some(dir.as_fd()),
+            Path::new(name),
+            flags.bits() as libc::c_int,
+            0,
+        );
+        __inventory_value_0
+    }
 }
 
 // Each component is opened relative to the previous directory, never via a
@@ -82,15 +96,34 @@ fn openat_admitted(dir: &OwnedFd, name: &str, flags: OFlags) -> io::Result<Owned
 fn parent(root: &OwnedFd, path: &str, create: bool) -> io::Result<(OwnedFd, String)> {
     let mut parts: Vec<_> = path.split('/').collect();
     let name = parts.pop().ok_or_else(|| invalid("empty member path"))?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0048-M01","item":"ratarmount::overlay_pack::parent","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut fd = host::openat(root, ".", directory_flags(), Mode::empty())?;
     for part in parts {
         if create {
-            match host::mkdirat(&fd, part, Mode::from_raw_mode(0o700)) {
-                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                Err(e) => return Err(e.into()),
+            {
+                let __inventory_condition_5230 = {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-E0123-M01","item":"ratarmount::overlay_pack::parent","disposition":"output-owner","category":"bundle-extraction-directory","reason":"Create each extraction parent relative to the previous held directory descriptor.","creation":{"policy":"directory-relative","basis":"mkdirat requests 0700 and each component is then reopened with the no-follow directory flags; collisions are not replacements."}}"###
+                    )]
+                    let __inventory_value_0 = host::mkdirat(&fd, part, Mode::from_raw_mode(0o700));
+                    __inventory_value_0
+                };
+                match __inventory_condition_5230 {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
-        fd = host::openat(&fd, part, directory_flags(), Mode::empty())?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0049-M01","item":"ratarmount::overlay_pack::parent","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_assigned = host::openat(&fd, part, directory_flags(), Mode::empty())?;
+        fd = __inventory_assigned;
     }
     Ok((fd, name.into()))
 }
@@ -100,6 +133,7 @@ fn omitted(path: &str) -> bool {
         let name = name.to_ascii_lowercase();
         name == ".ratarmount-overlay.used"
             || name == ".ratarmount.overlay.sqlite.used"
+            || name == ".ratarmount.overlay.seal-commit.lock"
             || name.starts_with(".ratarmount.overlay.cow-")
             || name.starts_with(".ratarmount-spool-")
             || (name.starts_with(HIDDEN_DB) && name != HIDDEN_DB)
@@ -124,6 +158,10 @@ fn collect(fd: &OwnedFd, prefix: &str, paths: &mut BTreeSet<String>) -> io::Resu
         }
         let stat = ratarmount_compositing::host_stat::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
         if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0050-M01","item":"ratarmount::overlay_pack::collect","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let child = host::openat(fd, name, directory_flags(), Mode::empty())?;
             collect(&child, &path, paths)?;
         }
@@ -232,6 +270,10 @@ fn append_host<W: Write>(
     path: &str,
     replacement: Option<&Path>,
 ) -> io::Result<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0051-M01","item":"ratarmount::overlay_pack::append_host","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let (fd, name) = if path.is_empty() {
         (
             host::openat(root, ".", directory_flags(), Mode::empty())?,
@@ -277,11 +319,19 @@ fn append_host<W: Write>(
                 // The layer database's SQLite snapshot, read through a managed
                 // reader (#151): its close keeps this process's locks.
                 Some(copy) => {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0052-M01","item":"ratarmount::overlay_pack::append_host","disposition":"sqlite-snapshot","regression":"regression_pack_snapshot_output_readers_keep_database_lock","category":"sqlite-snapshot","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )]
                     let mut file = ratarmount_index::managed_read::ManagedReadCursor::open(copy)?;
                     h.set_size(file.len()?);
                     tar.append_data(&mut h, archive_path, &mut file)
                 }
                 None => {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0054-M01","item":"ratarmount::overlay_pack::append_host","disposition":"residual","reason":"pack payload branch (None): admitted open of an overlay payload; reverse-order payload ownership needs the excluded coordinator","family":"payload-admitted-readers","issue":"#196","non_mandatory_callers":["pack"],"category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )]
                     let mut file =
                         File::from(openat_admitted(&fd, name.as_str(), regular_flags())?);
                     h.set_size(file.metadata()?.len());
@@ -325,10 +375,7 @@ pub fn pack(
     };
     let changes = overlay_changes::change_set(directory, lower_view.clone(), &opts)?;
     if (options.base_rows.is_some() || options.check_change_set)
-        && ratarmount_compositing::overlay_seal::current_layer_digest(
-            directory,
-            lower_view.clone(),
-        )? != digest
+        && overlay_changes::canonical_hash(&changes, &opts)? != digest
     {
         // The sealed digest covers the change set on the base the layer was
         // sealed on. Replacing only the base rows would make a bundle whose
@@ -339,10 +386,27 @@ pub fn pack(
              run `overlay unseal --i-know`, then `overlay seal --force-base-mismatch` against this base, then pack",
         ));
     }
+    let differing =
+        ratarmount_compositing::overlay_seal::check_preimages_for_changes(directory, &changes)?;
+    if !differing.is_empty() {
+        return Err(invalid(format!(
+            "base preimage pins of {} no longer match: {}; restore the base, or run \
+             `overlay unseal --i-know`, then `overlay seal --force-base-mismatch` against this base, then pack",
+            directory.display(), differing.join("; ")
+        )));
+    }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0055-M01","item":"ratarmount::overlay_pack::pack","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut manifest = tempfile::tempfile()?;
     overlay_changes::write_manifest(&changes, &mut manifest)?;
     let mut paths = BTreeSet::new();
     collect(&root, "", &mut paths)?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0056-M01","item":"ratarmount::overlay_pack::pack","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut plain = tempfile::tempfile()?;
     // An overlay from an earlier build may hold a credentialed base URL: export
     // a redacted copy of its database; the source is never modified.
@@ -373,6 +437,10 @@ pub fn pack(
                     let copy = staging.path().canonicalize()?.join("index.sqlite");
                     ratarmount_index::snapshot_index_into(&index, &copy)?;
                     // Its bytes through a managed reader (#151).
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0057-M01","item":"ratarmount::overlay_pack::pack","disposition":"sqlite-snapshot","regression":"regression_pack_snapshot_output_readers_keep_database_lock","category":"sqlite-snapshot","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )]
                     let file = ratarmount_index::managed_read::ManagedReadCursor::open(&copy)?;
                     let name = format!(
                         "index/{}",
@@ -387,6 +455,10 @@ pub fn pack(
             }
         }
         if let Some(journal) = &options.include_journal {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0059-M01","item":"ratarmount::overlay_pack::pack","disposition":"out-of-family","category":"structured-control-record","reason":"--include-journal: operation journal JSONL summarized into the bundle (documented residual of the lock guarantee)","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let mut file = File::from(host::open(journal, regular_flags(), Mode::empty())?);
             let summary = crate::journal_cmd::summarize(BufReader::new(&mut file), None, None)?;
             append_bytes(
@@ -425,6 +497,10 @@ pub fn pack(
     }
     plain.rewind()?;
     let mut remaining = plain.metadata()?.len();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0060-M01","item":"ratarmount::overlay_pack::pack","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut encoded = tempfile::Builder::new()
         .prefix(PACK_TEMP_PREFIX)
         .suffix(PACK_TEMP_SUFFIX)
@@ -454,7 +530,7 @@ pub fn pack(
     Ok(digest)
 }
 
-fn valid_digest(digest: &str) -> io::Result<&str> {
+pub(crate) fn valid_digest(digest: &str) -> io::Result<&str> {
     digest
         .strip_prefix("sha256:")
         .filter(|s| {
@@ -479,15 +555,52 @@ thread_local! {
     static DECODED_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// This thread's decoded bytes since the last call, which resets the count.
+#[cfg(test)]
+pub(crate) fn take_decoded_bytes() -> u64 {
+    DECODED_BYTES.with(|c| c.replace(0))
+}
+
+/// Decoded bytes that several bundle scans share: every capped decoder draws
+/// on its budget and fails once the budget is spent. The sandbox supervisor
+/// gives the bundle lowers of one request one budget; other reads have none.
+#[derive(Debug)]
+pub(crate) struct DecodeBudget {
+    total: u64,
+    left: std::cell::Cell<u64>,
+    exceeded: std::cell::Cell<bool>,
+}
+
+impl DecodeBudget {
+    pub(crate) fn new(total: u64) -> std::rc::Rc<Self> {
+        std::rc::Rc::new(Self {
+            total,
+            left: std::cell::Cell::new(total),
+            exceeded: std::cell::Cell::new(false),
+        })
+    }
+
+    pub(crate) fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// Whether a decoder failed because the budget was spent.
+    pub(crate) fn exceeded(&self) -> bool {
+        self.exceeded.get()
+    }
+}
+
 /// Streaming zstd decoder that fails once it has produced more than the
 /// bundle's limits allow: `max_bytes` of payload plus tar framing (a header and
-/// padding per entry and a small constant for PAX records). Nothing is spooled
-/// to disk, so `--max-bytes` stops the work, not only the extraction.
+/// padding per entry and a small constant for PAX records), or more than is
+/// left of its shared budget. Nothing is spooled to disk, so `--max-bytes`
+/// stops the work, not only the extraction.
 struct CappedDecode<R> {
     inner: R,
     decoded: u64,
     max_bytes: u64,
     entries: std::rc::Rc<std::cell::Cell<u64>>,
+    budget: std::rc::Rc<DecodeBudget>,
 }
 
 impl<R: Read> Read for CappedDecode<R> {
@@ -503,30 +616,50 @@ impl<R: Read> Read for CappedDecode<R> {
                 self.max_bytes
             )));
         }
-        let want = buf.len().min(usize::try_from(room).unwrap_or(usize::MAX));
+        // One byte past the budget tells a stream that ends exactly at it
+        // from one that goes on.
+        let left = self.budget.left.get();
+        let want = buf
+            .len()
+            .min(usize::try_from(room.min(left.saturating_add(1))).unwrap_or(usize::MAX));
         let n = self.inner.read(&mut buf[..want])?;
-        self.decoded += n as u64;
         #[cfg(test)]
         DECODED_BYTES.with(|c| c.set(c.get() + n as u64));
+        if n as u64 > left {
+            self.budget.exceeded.set(true);
+            return Err(invalid(format!(
+                "bundles decode to more than {} bytes together",
+                self.budget.total
+            )));
+        }
+        self.budget.left.set(left - n as u64);
+        self.decoded += n as u64;
         Ok(n)
     }
 }
 
 type BundleTar = tar::Archive<CappedDecode<zstd::stream::read::Decoder<'static, BufReader<File>>>>;
 
-/// Open `bundle` as a tar read through the capped streaming decoder. The
-/// returned counter is the number of entries seen, kept by the caller.
+/// Open `bundle` as a tar read through the capped streaming decoder, drawing
+/// on `budget`. The returned counter is the number of entries seen, kept by
+/// the caller.
 fn open_bundle_tar(
     bundle: &Path,
     limits: Limits,
+    budget: std::rc::Rc<DecodeBudget>,
 ) -> io::Result<(BundleTar, std::rc::Rc<std::cell::Cell<u64>>)> {
     let entries = std::rc::Rc::new(std::cell::Cell::new(0));
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0061-M01","item":"ratarmount::overlay_pack::open_bundle_tar","disposition":"out-of-family","category":"patch-or-bundle-input","reason":"bundle input stream","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let decoder = zstd::stream::read::Decoder::new(File::open(bundle)?)?;
     let archive = tar::Archive::new(CappedDecode {
         inner: decoder,
         decoded: 0,
         max_bytes: limits.max_bytes,
         entries: entries.clone(),
+        budget,
     });
     Ok((archive, entries))
 }
@@ -546,8 +679,18 @@ fn read_capped_member(entry: &mut impl Read, what: &str) -> io::Result<Vec<u8>> 
 /// and `bundle.json` are read (each at most 1 MiB) and every other payload is
 /// skipped, never extracted or spooled. The scan is bounded by `limits`, like
 /// extraction, so a hostile bundle cannot make this step do unbounded work.
-fn bundle_meta(bundle: &Path, limits: Limits) -> io::Result<BTreeMap<String, String>> {
-    let (mut archive, seen) = open_bundle_tar(bundle, limits)?;
+pub(crate) fn bundle_meta(bundle: &Path, limits: Limits) -> io::Result<BTreeMap<String, String>> {
+    bundle_meta_within(bundle, limits, &DecodeBudget::new(u64::MAX))
+}
+
+/// [`bundle_meta`], whose decoded bytes are also drawn from `budget`, which
+/// several scans may share.
+pub(crate) fn bundle_meta_within(
+    bundle: &Path,
+    limits: Limits,
+    budget: &std::rc::Rc<DecodeBudget>,
+) -> io::Result<BTreeMap<String, String>> {
+    let (mut archive, seen) = open_bundle_tar(bundle, limits, budget.clone())?;
     let mut layout = None;
     let mut meta_json = None;
     for entry in archive.entries()? {
@@ -658,6 +801,10 @@ fn run_pack_record_hook(hook: &'static std::thread::LocalKey<PackRecordHook>) {
 
 fn sentinel_matches(directory: &Path, digest: &str) -> io::Result<bool> {
     let root = open_root(directory)?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0062-M01","item":"ratarmount::overlay_pack::sentinel_matches","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","non_mandatory_callers":["pack"],"category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let fd = match openat_admitted(&root, SENTINEL, regular_flags()) {
         Ok(fd) => fd,
         Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ELOOP) => {
@@ -734,7 +881,14 @@ fn cleanup_dirs(fd: &OwnedFd) {
             if name.to_bytes() == b"." || name.to_bytes() == b".." {
                 continue;
             }
-            if let Ok(child) = host::openat(fd, name, directory_flags(), Mode::empty()) {
+            if let Ok(child) = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0064-M01","item":"ratarmount::overlay_pack::cleanup_dirs","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
+                let __inventory_value_0 = host::openat(fd, name, directory_flags(), Mode::empty());
+                __inventory_value_0
+            } {
                 cleanup_dirs(&child);
             }
         }
@@ -757,12 +911,24 @@ fn try_flock(file: &File) -> bool {
 impl StageLock {
     fn beside(stage: &Path) -> io::Result<Self> {
         let path = lock_path(stage);
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        let file = {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0065-M01","item":"<ratarmount::overlay_pack::StageLock>::beside","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
+            )]
+            let mut __inventory_value_0 = File::options();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0124-M01","item":"<ratarmount::overlay_pack::StageLock>::beside","disposition":"output-owner","category":"bundle-staging-lock","reason":"Permit creation of the adjacent bundle staging lock without truncating a previous lock.","creation":{"policy":"create-or-open","basis":"The read/write lock uses truncate(false); flock plus the current-inode check coordinates the sweeper and publisher."}}"###
+            )]
+            let __inventory_value_1 = __inventory_value_0.read(true).write(true).create(true);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0065-M02","item":"<ratarmount::overlay_pack::StageLock>::beside","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_2 = __inventory_value_1.truncate(false).open(&path);
+            __inventory_value_2
+        }?;
         if !try_flock(&file) {
             return Err(io::Error::other("staging lock is held by another process"));
         }
@@ -823,6 +989,10 @@ impl Stage {
         sweep_stale_stages(parent, sweep_copies);
         let mut last = None;
         for _ in 0..ATTEMPTS {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0066-M01","item":"<ratarmount::overlay_pack::Stage>::new_in_with","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
             let dir = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
             match lock_for(dir.path()) {
                 // The sweeper may also have removed the stage itself.
@@ -917,6 +1087,10 @@ fn sweep_pack_temps_in(dir: &OwnedFd) {
         // Admitted (R10-FIX3): an old temp name that is a hard link of an open
         // overlay database is skipped without a descriptor of it being
         // opened and closed (its flock says nothing about SQLite's locks).
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0067-M01","item":"ratarmount::overlay_pack::sweep_pack_temps_in","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","non_mandatory_callers":["pack"],"category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let Ok(fd) = name
             .to_str()
             .map_err(io::Error::other)
@@ -961,10 +1135,17 @@ fn unlink_if_same(dir: &OwnedFd, name: &str, locked: &File) -> bool {
     })
 }
 
-/// `renameat` that fails with `EEXIST` instead of replacing `to`.
+/// `renameat` of `old_dir`/`from` to `new_dir`/`to` that fails with `EEXIST`
+/// instead of replacing `to`. Pass `rustix::fs::CWD` with absolute paths to
+/// rename across directories by name (the retain commit, R1c-1 §5.8).
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn rename_no_replace(dir: &OwnedFd, from: &str, to: &str) -> rustix::io::Result<()> {
-    host::renameat_with(dir, from, dir, to, host::RenameFlags::NOREPLACE)
+pub(crate) fn rename_no_replace(
+    old_dir: impl std::os::fd::AsFd,
+    from: &str,
+    new_dir: impl std::os::fd::AsFd,
+    to: &str,
+) -> rustix::io::Result<()> {
+    host::renameat_with(old_dir, from, new_dir, to, host::RenameFlags::NOREPLACE)
 }
 
 /// No atomic no-replace rename on this platform (e.g. BSD). `linkat` followed
@@ -973,7 +1154,12 @@ fn rename_no_replace(dir: &OwnedFd, from: &str, to: &str) -> rustix::io::Result<
 /// and stale temps are left for manual deletion; see
 /// [`no_replace_rename_available`].
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn rename_no_replace(_: &OwnedFd, _: &str, _: &str) -> rustix::io::Result<()> {
+pub(crate) fn rename_no_replace(
+    _: impl std::os::fd::AsFd,
+    _: &str,
+    _: impl std::os::fd::AsFd,
+    _: &str,
+) -> rustix::io::Result<()> {
     Err(rustix::io::Errno::NOSYS)
 }
 
@@ -1017,7 +1203,7 @@ fn unlink_if_same_named(
     let mut quarantine = None;
     for _ in 0..QUARANTINE_ATTEMPTS {
         let candidate = next_name();
-        match rename_no_replace(dir, name, &candidate) {
+        match rename_no_replace(dir, name, dir, &candidate) {
             Ok(()) => {
                 quarantine = Some(candidate);
                 break;
@@ -1063,7 +1249,14 @@ fn stat_age(stat: &rustix::fs::Stat) -> std::time::Duration {
 /// never following a symlink planted under the name.
 fn open_lock_at(dir: &OwnedFd, name: &str) -> io::Result<File> {
     let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    Ok(File::from(openat_admitted(dir, name, flags)?))
+    Ok(File::from({
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0070-M01","item":"ratarmount::overlay_pack::open_lock_at","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","non_mandatory_callers":["pack"],"category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = openat_admitted(dir, name, flags);
+        __inventory_value_0
+    }?))
 }
 
 /// Delete everything below `fd` through descriptors only: each child is opened
@@ -1088,7 +1281,15 @@ fn remove_contents(fd: &OwnedFd) {
         )
         .is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
         if is_dir {
-            if let Ok(child) = host::openat(fd, name.as_c_str(), directory_flags(), Mode::empty()) {
+            if let Ok(child) = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0071-M01","item":"ratarmount::overlay_pack::remove_contents","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
+                let __inventory_value_0 =
+                    host::openat(fd, name.as_c_str(), directory_flags(), Mode::empty());
+                __inventory_value_0
+            } {
                 remove_contents(&child);
             }
             let _ = host::unlinkat(fd, name.as_c_str(), AtFlags::REMOVEDIR);
@@ -1197,8 +1398,11 @@ fn sweep_stale_stages_in(dir: &OwnedFd, sweep_copies: bool) {
                 Err(_) if stat_age(&stat) > day => None,
                 Err(_) => continue,
             };
-            let Ok(child) = host::openat(dir, name.as_str(), directory_flags(), Mode::empty())
-            else {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0072-M01","item":"ratarmount::overlay_pack::sweep_stale_stages_in","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
+            let Ok(child) = host::openat(dir, name.as_str(), directory_flags(), Mode::empty()) else {
                 continue;
             };
             // Still the directory that was checked, not one renamed in under
@@ -1228,6 +1432,10 @@ fn seal_directories(fd: &OwnedFd) -> io::Result<()> {
         }
         let stat = ratarmount_compositing::host_stat::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
         if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0073-M01","item":"ratarmount::overlay_pack::seal_directories","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let child = host::openat(fd, name, directory_flags(), Mode::empty())?;
             seal_directories(&child)?;
         }
@@ -1236,6 +1444,378 @@ fn seal_directories(fd: &OwnedFd) -> io::Result<()> {
         fd,
         Mode::from_raw_mode(ratarmount_compositing::host_stat::fstat(fd)?.st_mode & !0o222),
     )?;
+    Ok(())
+}
+
+/// Removes the tree at `path`, sealed (no write bits) or not, through
+/// descriptors only (`remove_contents`), then the root; the root's removal
+/// reports anything left behind (R1c-1 §5.8). A missing tree is gone already.
+pub(crate) fn remove_tree(path: &Path) -> io::Result<()> {
+    let root = match open_root(path) {
+        Ok(root) => root,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    remove_contents(&root);
+    drop(root);
+    fs::remove_dir(path)
+}
+
+/// Test-only record of the entry-lock, publication and sync events, with
+/// absolute paths, across threads: each test filters by its own directory.
+#[cfg(test)]
+pub(crate) mod events {
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record(what: &str, path: &Path) {
+        EVENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(format!("{what} {}", path.display()));
+    }
+
+    /// Every event naming a path under `root`, in order, with `root`
+    /// replaced by `$ROOT`.
+    pub(crate) fn under(root: &Path) -> Vec<String> {
+        let root = root.display().to_string();
+        EVENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|event| event.contains(&root))
+            .map(|event| event.replace(&root, "$ROOT"))
+            .collect()
+    }
+}
+
+/// A test hook given the entry it is reached for.
+#[cfg(test)]
+pub(crate) type EntryHook = std::cell::RefCell<Option<Box<dyn Fn(&Path)>>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs in `publish_layer` after its rename, before its mode restore.
+    pub(crate) static AFTER_PUBLISH_RENAME: EntryHook = const { std::cell::RefCell::new(None) };
+    /// Runs in a cache hit after its publication check, holding the lock.
+    pub(crate) static AFTER_HIT_CHECK: EntryHook = const { std::cell::RefCell::new(None) };
+    /// Makes the mode restore of `publish_layer` fail.
+    pub(crate) static FAIL_PUBLISH_RESTORE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The errno every entry `flock` of this thread fails with.
+    pub(crate) static ENTRY_FLOCK_ERRNO: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// How an entry lock is taken.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryLock {
+    Shared,
+    Exclusive,
+}
+
+/// Whether the entry lock is unavailable on this filesystem: then a fill
+/// and a hit proceed unlocked, as every `--lower` mount did before.
+fn flock_unsupported(error: rustix::io::Errno) -> bool {
+    matches!(
+        error,
+        rustix::io::Errno::NOSYS | rustix::io::Errno::NOLCK | rustix::io::Errno::OPNOTSUPP
+    )
+}
+
+/// Takes the entry lock of a layer root on `root` (its overlay root flock,
+/// which seal, unseal and commit of that layer take too), waiting for it.
+/// A cache filesystem without `flock` proceeds unlocked, logged once.
+fn lock_entry(root: &OwnedFd, path: &Path, how: EntryLock) -> io::Result<()> {
+    use rustix::fs::FlockOperation;
+    let operation = match how {
+        EntryLock::Shared => FlockOperation::LockShared,
+        EntryLock::Exclusive => FlockOperation::LockExclusive,
+    };
+    loop {
+        #[cfg(test)]
+        let injected = ENTRY_FLOCK_ERRNO.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let injected: Option<i32> = None;
+        let result = match injected {
+            Some(errno) => Err(rustix::io::Errno::from_raw_os_error(errno)),
+            None => rustix::fs::flock(root, operation),
+        };
+        match result {
+            Ok(()) => {
+                #[cfg(test)]
+                events::record("lock", path);
+                return Ok(());
+            }
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) if flock_unsupported(error) => {
+                static LOGGED: std::sync::Once = std::sync::Once::new();
+                LOGGED.call_once(|| {
+                    log::warn!(
+                        "the layer cache at {} does not support flock ({error}); cache entries are used without their entry lock",
+                        path.display()
+                    )
+                });
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::Error::from(error).kind(),
+                    format!("cannot lock layer {}: {error}", path.display()),
+                ))
+            }
+        }
+    }
+}
+
+/// The entry lock of the sealed layer at `path` for finalize's step S
+/// (R1c-1 ruling 1+2): an exclusive `flock` on an `open_root` descriptor of
+/// the layer root, which is that layer's overlay root flock, polled until
+/// `deadline` (`WouldBlock` then). Returns the locked descriptor; the lock
+/// lasts as long as it.
+pub(crate) fn lock_layer_entry(path: &Path, deadline: std::time::Instant) -> io::Result<OwnedFd> {
+    use rustix::fs::FlockOperation;
+    let root = open_root(path)?;
+    loop {
+        #[cfg(test)]
+        let injected = ENTRY_FLOCK_ERRNO.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let injected: Option<i32> = None;
+        let result = match injected {
+            Some(errno) => Err(rustix::io::Errno::from_raw_os_error(errno)),
+            None => rustix::fs::flock(&root, FlockOperation::NonBlockingLockExclusive),
+        };
+        match result {
+            Ok(()) => {
+                #[cfg(test)]
+                events::record("lock", path);
+                return Ok(root);
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(rustix::io::Errno::WOULDBLOCK) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "layer {} is locked by its publication, a cache hit, or a seal, unseal or commit of it",
+                        path.display()
+                    ),
+                ))
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::Error::from(error).kind(),
+                    format!("cannot lock layer {}: {error}", path.display()),
+                ))
+            }
+        }
+    }
+}
+
+/// What `sync_tree` checks on each descriptor before its fsync (R1c-1 §5.6,
+/// ruling 6), and the fsync itself, so tests can record and fail it.
+pub(crate) struct SyncChecks<'a> {
+    /// Whether finalize may rely on the fsync of the filesystem a descriptor
+    /// is on (its own `fstatfs`); `Err` says why not.
+    pub filesystem: &'a dyn Fn(std::os::fd::BorrowedFd<'_>, &Path) -> Result<(), String>,
+    /// The device a node reports: its real `st_dev` (tests override it).
+    pub device: &'a dyn Fn(&Path, u64) -> u64,
+    /// Refuse any regular file or directory that carries a write bit (lowers).
+    pub read_only: bool,
+    pub fsync: &'a mut dyn FnMut(std::os::fd::BorrowedFd<'_>, &Path) -> io::Result<()>,
+    /// Runs between a node's listing and its open (tests swap it).
+    #[cfg(test)]
+    pub before_open: Option<&'a dyn Fn(&Path)>,
+}
+
+/// Why `sync_tree` stopped.
+#[derive(Debug)]
+pub(crate) enum SyncError {
+    /// A node's device, type or filesystem is not its tree's (or changed
+    /// under the walk): refused like poisoning, but nothing is poisoned.
+    Mismatch(String),
+    /// A writable node in a tree that must be read-only.
+    Writable(PathBuf),
+    /// A failed fsync on `device`, which may have lost data.
+    Fsync {
+        device: u64,
+        path: PathBuf,
+        error: io::Error,
+    },
+    /// Anything else (a listing, a stat, an open, a name that is not UTF-8).
+    Other(String),
+}
+
+fn other(path: &Path, what: &str, error: impl std::fmt::Display) -> SyncError {
+    SyncError::Other(format!("{}: {what}: {error}", path.display()))
+}
+
+fn device_mismatch(path: &Path, found: u64, expected: u64) -> SyncError {
+    SyncError::Mismatch(format!(
+        "{} is on device {found}, not on the filesystem of its tree (device {expected}); finalize syncs only trees that lie wholly on one filesystem, and an overlayfs whose layers are on different filesystems reports such devices",
+        path.display()
+    ))
+}
+
+/// Checks the descriptor `fd` of the node at `path` that the listing saw as
+/// `listed`, on the tree's device `expected`: the same type and `(dev,
+/// ino)`, the tree's device, an allowed filesystem by its own `fstatfs`, and
+/// no write bit when `read_only`.
+fn check_node(
+    fd: &OwnedFd,
+    path: &Path,
+    listed: &rustix::fs::Stat,
+    expected: u64,
+    checks: &SyncChecks<'_>,
+) -> Result<(), SyncError> {
+    use std::os::fd::AsFd;
+    let stat = ratarmount_compositing::host_stat::fstat_named(fd, path)
+        .map_err(|e| other(path, "cannot stat", e))?;
+    let device = (checks.device)(path, stat.st_dev as u64);
+    if stat.st_mode & libc::S_IFMT != listed.st_mode & libc::S_IFMT
+        || stat.st_ino != listed.st_ino
+        || stat.st_dev != listed.st_dev
+    {
+        return Err(SyncError::Mismatch(format!(
+            "{} was replaced while it was being synced",
+            path.display()
+        )));
+    }
+    if device != expected {
+        return Err(device_mismatch(path, device, expected));
+    }
+    (checks.filesystem)(fd.as_fd(), path).map_err(SyncError::Mismatch)?;
+    if checks.read_only && stat.st_mode & 0o222 != 0 {
+        return Err(SyncError::Writable(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn fsync_node(
+    fd: &OwnedFd,
+    path: &Path,
+    device: u64,
+    checks: &mut SyncChecks<'_>,
+) -> Result<(), SyncError> {
+    use std::os::fd::AsFd;
+    (checks.fsync)(fd.as_fd(), path).map_err(|error| SyncError::Fsync {
+        device,
+        path: path.to_path_buf(),
+        error,
+    })
+}
+
+/// Fsyncs every node of the tree at `path`, whose root `root` the caller
+/// opened (a lower's locked descriptor, or `open_root`), in post-order: each
+/// directory's regular files, then its subdirectories the same way, then the
+/// directory itself, ending with the root (R1c-1 §5.6, ruling 6).
+///
+/// Every node is checked on the descriptor that is synced: directories open
+/// `O_DIRECTORY | O_NOFOLLOW`, regular files through the admitted
+/// `O_NOFOLLOW | O_NONBLOCK` open (so a symlink in a node's place fails with
+/// `ELOOP` and a FIFO opens without blocking, then fails the type check);
+/// each descriptor's `fstat` must show the type and `(dev, ino)` its listing
+/// saw, its device must be the root's, and its own `fstatfs` must be on the
+/// allowlist. Symlinks, sockets, FIFOs and device nodes are only listed
+/// (their device is checked; their names are covered by their directory's
+/// fsync). Nothing below the root is opened by host path.
+pub(crate) fn sync_tree(
+    root: &OwnedFd,
+    path: &Path,
+    checks: &mut SyncChecks<'_>,
+) -> Result<(), SyncError> {
+    use std::os::fd::AsFd;
+    let stat = ratarmount_compositing::host_stat::fstat_named(root, path)
+        .map_err(|e| other(path, "cannot stat", e))?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(SyncError::Other(format!(
+            "{} is not a directory",
+            path.display()
+        )));
+    }
+    let device = (checks.device)(path, stat.st_dev as u64);
+    (checks.filesystem)(root.as_fd(), path).map_err(SyncError::Mismatch)?;
+    if checks.read_only && stat.st_mode & 0o222 != 0 {
+        return Err(SyncError::Writable(path.to_path_buf()));
+    }
+    sync_children(root, path, device, checks)?;
+    fsync_node(root, path, device, checks)
+}
+
+fn sync_children(
+    dir: &OwnedFd,
+    dir_path: &Path,
+    device: u64,
+    checks: &mut SyncChecks<'_>,
+) -> Result<(), SyncError> {
+    let mut names = Vec::new();
+    for entry in Dir::read_from(dir).map_err(|e| other(dir_path, "cannot list", e))? {
+        let entry = entry.map_err(|e| other(dir_path, "cannot list", e))?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        // The admitted open takes a `&str`, as pack's `collect` does.
+        let name = std::str::from_utf8(name).map_err(|_| {
+            SyncError::Other(format!(
+                "{} holds a name that is not UTF-8, which finalize cannot sync",
+                dir_path.display()
+            ))
+        })?;
+        names.push(name.to_owned());
+    }
+    names.sort();
+    let mut directories = Vec::new();
+    for name in names {
+        let path = dir_path.join(&name);
+        let listed = ratarmount_compositing::host_stat::statat(
+            dir,
+            name.as_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|e| other(&path, "cannot stat", e))?;
+        let found = (checks.device)(&path, listed.st_dev as u64);
+        if found != device {
+            return Err(device_mismatch(&path, found, device));
+        }
+        match listed.st_mode & libc::S_IFMT {
+            libc::S_IFREG => {
+                #[cfg(test)]
+                if let Some(hook) = checks.before_open {
+                    hook(&path);
+                }
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0147-M01","item":"ratarmount::overlay_pack::sync_children","disposition":"residual","reason":"fsync-only descriptor of a file in a tree a finalize syncs; reads no content; creates nothing","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname."}}"###
+                )]
+                let file = openat_admitted(dir, &name, regular_flags())
+                    .map_err(|e| other(&path, "cannot open", e))?;
+                check_node(&file, &path, &listed, device, checks)?;
+                fsync_node(&file, &path, device, checks)?;
+            }
+            libc::S_IFDIR => directories.push((name, path, listed)),
+            _ => {}
+        }
+    }
+    for (name, path, listed) in directories {
+        #[cfg(test)]
+        if let Some(hook) = checks.before_open {
+            hook(&path);
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0146-M01","item":"ratarmount::overlay_pack::sync_children","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this site creates no pathname."}}"###
+        )]
+        let child = host::openat(dir, name.as_str(), directory_flags(), Mode::empty())
+            .map_err(|e| other(&path, "cannot open", io::Error::from(e)))?;
+        check_node(&child, &path, &listed, device, checks)?;
+        sync_children(&child, &path, device, checks)?;
+        fsync_node(&child, &path, device, checks)?;
+    }
     Ok(())
 }
 
@@ -1294,7 +1874,8 @@ fn extract_with_limits(bundle: &Path, directory: &Path, limits: Limits) -> io::R
     let mut entries_seen = 0u64;
     let mut remaining = limits.max_bytes;
     let mut files = Vec::new();
-    let (mut archive, entry_counter) = open_bundle_tar(bundle, limits)?;
+    let (mut archive, entry_counter) =
+        open_bundle_tar(bundle, limits, DecodeBudget::new(u64::MAX))?;
     let mut seen = BTreeSet::new();
     let mut directories = BTreeMap::new();
     for entry in archive.entries()? {
@@ -1330,13 +1911,32 @@ fn extract_with_limits(bundle: &Path, directory: &Path, limits: Limits) -> io::R
         }
         let (fd, name) = parent(&root, relative, true)?;
         if kind.is_dir() {
-            match host::mkdirat(&fd, name.as_str(), Mode::from_raw_mode(0o700)) {
-                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                Err(e) => return Err(e.into()),
+            {
+                let __inventory_condition_67038 = {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-E0125-M01","item":"ratarmount::overlay_pack::extract_with_limits","disposition":"output-owner","category":"bundle-extraction-directory","reason":"Create a bundle directory entry relative to its validated parent descriptor.","creation":{"policy":"directory-relative","basis":"mkdirat starts the directory at 0700, then a no-follow open validates it; the saved archive metadata is applied in the extraction flow."}}"###
+                    )]
+                    let __inventory_value_0 =
+                        host::mkdirat(&fd, name.as_str(), Mode::from_raw_mode(0o700));
+                    __inventory_value_0
+                };
+                match __inventory_condition_67038 {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0074-M01","item":"ratarmount::overlay_pack::extract_with_limits","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             host::openat(&fd, name.as_str(), directory_flags(), Mode::empty())?;
             directories.insert(relative.into(), (mode, mtime));
         } else if kind.is_file() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0075-M01","item":"ratarmount::overlay_pack::extract_with_limits","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
             let child = host::openat(
                 &fd,
                 name.as_str(),
@@ -1427,10 +2027,26 @@ fn finalize_stage(directory: &Path, recorded: Recorded) -> io::Result<()> {
     // Children first, so sealed parent permissions never obstruct this walk.
     for (path, (mode, mtime)) in recorded.directories.into_iter().rev() {
         let fd = if path.is_empty() {
-            host::openat(&root, ".", directory_flags(), Mode::empty())?
+            {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0077-M01","item":"ratarmount::overlay_pack::finalize_stage","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
+                let __inventory_value_0 =
+                    host::openat(&root, ".", directory_flags(), Mode::empty());
+                __inventory_value_0
+            }?
         } else {
             let (fd, name) = parent(&root, &path, false)?;
-            host::openat(&fd, name.as_str(), directory_flags(), Mode::empty())?
+            {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0078-M01","item":"ratarmount::overlay_pack::finalize_stage","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
+                let __inventory_value_0 =
+                    host::openat(&fd, name.as_str(), directory_flags(), Mode::empty());
+                __inventory_value_0
+            }?
         };
         let file = File::from(fd);
         file.set_times(fs::FileTimes::new().set_modified(mtime))?;
@@ -1558,13 +2174,59 @@ fn unpack_impl(bundle: &Path, directory: &Path, limits: Limits) -> io::Result<Un
 /// permission on a directory to rename it, even within one parent, and the
 /// sealed layer root is read-only. Hold the root by fd so the permission
 /// change follows the renamed inode.
+///
+/// The stage root's entry lock (its overlay root flock) is held exclusively
+/// from before the rename until after the mode restore, so no hit and no
+/// finalize step S sees the entry between the two (R1c-1 ruling 1+2); the
+/// staged root and the published entry are one inode.
 fn publish_layer(layer: &Path, directory: &Path) -> io::Result<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0080-M01","item":"ratarmount::overlay_pack::publish_layer","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let root = host::open(layer, directory_flags(), Mode::empty())?;
+    lock_entry(&root, directory, EntryLock::Exclusive)?;
     let sealed = ratarmount_compositing::host_stat::fstat_named(&root, layer)?.st_mode;
     host::fchmod(&root, Mode::from_raw_mode(sealed | 0o200))?;
     fs::rename(layer, directory)
         .map_err(|e| io::Error::new(e.kind(), format!("publish layer: {e}")))?;
+    #[cfg(test)]
+    {
+        events::record("rename", directory);
+        AFTER_PUBLISH_RENAME.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook(directory);
+            }
+        });
+        if FAIL_PUBLISH_RESTORE.with(std::cell::Cell::get) {
+            return Err(io::Error::other("injected mode restore failure"));
+        }
+    }
     host::fchmod(&root, Mode::from_raw_mode(sealed))?;
+    #[cfg(test)]
+    {
+        events::record("restore", directory);
+        events::record("unlock", directory);
+    }
+    // Closing `root` releases the entry lock.
+    Ok(())
+}
+
+/// The publication check of a cache hit, made under its entry lock: a
+/// completely published (or sealed) layer leaves no write bit on its root.
+/// A writable root is refused, never repaired: a fill killed between its
+/// rename and its mode restore and an interrupted `overlay unseal` look
+/// alike, and only `overlay seal` restores both completely.
+fn check_published(root: &OwnedFd, path: &Path) -> io::Result<()> {
+    let mode = ratarmount_compositing::host_stat::fstat_named(root, path)?.st_mode;
+    if mode & 0o222 != 0 {
+        return Err(invalid(format!(
+            "cache entry {} is not a completely sealed layer (a fill killed between its rename and its mode restore, or an interrupted `overlay unseal`); run `ratarmount overlay seal {}`, which restores its sentinel and every read-only mode, or remove {} to refill it",
+            path.display(),
+            path.display(),
+            path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -1614,7 +2276,15 @@ fn run_extract_hook(hook: &'static std::thread::LocalKey<ExtractHook>, stage: &P
 /// everything after reads exactly the hashed bytes and never the original path.
 fn private_copy(bundle: &Path, cache: &Path) -> io::Result<(tempfile::NamedTempFile, String)> {
     use sha2::{Digest, Sha256};
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0081-M01","item":"ratarmount::overlay_pack::private_copy","disposition":"out-of-family","category":"patch-or-bundle-input","reason":"bundle input stream copied privately before extraction","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut source = File::open(bundle)?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0082-M01","item":"ratarmount::overlay_pack::private_copy","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut copy = tempfile::Builder::new()
         .prefix(COPY_PREFIX)
         .suffix(".tar.zst")
@@ -1648,6 +2318,21 @@ fn verify_against_view(layer: &Path, view: &Arc<dyn MountSource>) -> io::Result<
         return Ok(());
     }
     let mut paths = report.mismatched.join(", ");
+    if report.preimages_bound == Some(false) || !report.preimage_mismatched.is_empty() {
+        let mut pins = report.preimage_mismatched.clone();
+        if report.preimages_bound == Some(false) {
+            pins.insert(
+                0,
+                ratarmount_compositing::overlay_seal::PREIMAGES_UNBOUND.into(),
+            );
+        }
+        if !paths.is_empty() {
+            paths.push_str("; ");
+        }
+        // #341: the base under a path the layer changes is not the one it
+        // was sealed over, although its size and mtime may be unchanged.
+        paths.push_str(&format!("base preimage changed: {}", pins.join(", ")));
+    }
     if paths.is_empty() {
         paths = if report.sentinel_ok {
             format!("digest {} != recorded {}", report.computed, report.recorded)
@@ -1667,18 +2352,47 @@ fn marker_dir(cache: &Path, hex: &str) -> PathBuf {
 fn write_marker(cache: &Path, hex: &str, key: &str) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     let dir = marker_dir(cache, hex);
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)?;
-    match File::options()
-        .write(true)
-        .create_new(true)
-        .open(dir.join(key))
     {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e),
+        #[expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-E0126-T01","item":"ratarmount::overlay_pack::write_marker","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the private verification-marker directory builder.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0126-M01","item":"ratarmount::overlay_pack::write_marker","disposition":"support","category":"creation-builder","reason":"Construct the private verification-marker directory builder.","creation":{"policy":"none","basis":"Builder setup is separate from the recursive mode-0700 directory creation leaf."}}"###
+        )]
+        let mut __inventory_value_0 = fs::DirBuilder::new();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0127-M01","item":"ratarmount::overlay_pack::write_marker","disposition":"output-owner","category":"bundle-verification-directory","reason":"Create the private per-digest verified-marker directory under the bundle cache.","creation":{"policy":"private-recursive-directory","basis":"The recursive DirBuilder requests 0700 and preserves the existing cache verification structure."}}"###
+        )]
+        let __inventory_value_1 = __inventory_value_0.recursive(true).mode(0o700).create(&dir);
+        __inventory_value_1
+    }?;
+    {
+        let __inventory_condition_87642 = {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0083-M01","item":"ratarmount::overlay_pack::write_marker","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
+            )]
+            let mut __inventory_value_0 = File::options();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0128-M01","item":"ratarmount::overlay_pack::write_marker","disposition":"output-owner","category":"bundle-verification-marker","reason":"Configure exclusive creation of the verification marker for the checked bundle key.","creation":{"policy":"exclusive-new-file","basis":"create_new never overwrites a marker; AlreadyExists is treated as the existing completed marker and default file permissions remain unchanged."}}"###
+            )]
+            let __inventory_value_1 = __inventory_value_0.write(true).create_new(true);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0083-M02","item":"ratarmount::overlay_pack::write_marker","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_2 = __inventory_value_1.open(dir.join(key));
+            __inventory_value_2
+        };
+        match __inventory_condition_87642 {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1689,10 +2403,26 @@ pub(crate) fn cached_lower_in(
     marker_key: Option<&str>,
 ) -> io::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(cache)?;
+    {
+        #[expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-E0129-T01","item":"ratarmount::overlay_pack::cached_lower_in","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the private bundle cache-directory builder.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0129-M01","item":"ratarmount::overlay_pack::cached_lower_in","disposition":"support","category":"creation-builder","reason":"Construct the private bundle cache-directory builder.","creation":{"policy":"none","basis":"This event is setup only; the following create leaf requests a recursive 0700 cache tree."}}"###
+        )]
+        let mut __inventory_value_0 = fs::DirBuilder::new();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0130-M01","item":"ratarmount::overlay_pack::cached_lower_in","disposition":"output-owner","category":"bundle-cache-directory","reason":"Create the private bundle cache before making a validated private copy of the supplied bundle.","creation":{"policy":"private-recursive-directory","basis":"The recursive builder requests 0700; copy verification/publication and marker operations have independent approvals."}}"###
+        )]
+        let __inventory_value_1 = __inventory_value_0
+            .recursive(true)
+            .mode(0o700)
+            .create(cache);
+        __inventory_value_1
+    }?;
     let (copy, hex) = private_copy(bundle, cache)?;
     #[cfg(test)]
     AFTER_COPY.with(|hook| {
@@ -1706,21 +2436,40 @@ pub(crate) fn cached_lower_in(
         .expect("checked digest")
         .clone();
     let destination = cache.join(&hex);
+    // A hit holds the entry lock shared from before its checks until it
+    // returns the path: it waits for a publication in flight and for a
+    // finalize's sync, and returns only a completely published entry
+    // (R1c-1 ruling 1+2). Hits of a complete entry run side by side.
     let hit = |destination: &Path| -> io::Result<PathBuf> {
-        let meta = checked_meta(destination)?;
-        if meta.get("layer_digest") != Some(digest.as_str()) || meta.values() != &metadata {
-            return Err(invalid("cached layer does not match the bundle"));
-        }
-        if let Some(key) = marker_key {
-            if marker_dir(cache, &hex).join(key).try_exists()? {
-                return Ok(destination.into());
+        let entry = open_root(destination)?;
+        lock_entry(&entry, destination, EntryLock::Shared)?;
+        check_published(&entry, destination)?;
+        #[cfg(test)]
+        AFTER_HIT_CHECK.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook(destination);
             }
-        }
-        verify_against_view(destination, &view)?;
-        if let Some(key) = marker_key {
-            write_marker(cache, &hex, key)?;
-        }
-        Ok(destination.into())
+        });
+        let checked = (|| {
+            let meta = checked_meta(destination)?;
+            if meta.get("layer_digest") != Some(digest.as_str()) || meta.values() != &metadata {
+                return Err(invalid("cached layer does not match the bundle"));
+            }
+            if let Some(key) = marker_key {
+                if marker_dir(cache, &hex).join(key).try_exists()? {
+                    return Ok(());
+                }
+            }
+            verify_against_view(destination, &view)?;
+            if let Some(key) = marker_key {
+                write_marker(cache, &hex, key)?;
+            }
+            Ok(())
+        })();
+        #[cfg(test)]
+        events::record("hit", destination);
+        // The entry lock is released when `entry` drops, after this.
+        checked.map(|()| destination.into())
     };
     if destination.try_exists()? {
         return hit(&destination);
@@ -1756,6 +2505,10 @@ pub(crate) fn cached_lower_in(
 }
 
 #[cfg(test)]
+#[path = "overlay_pack_preimage_tests.rs"]
+mod preimage_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use ratarmount_compositing::FolderMountSource;
@@ -1772,6 +2525,10 @@ pub(crate) mod tests {
             let base_dir = tmp.path().join("base");
             fs::create_dir(&base_dir).unwrap();
             fs::write(base_dir.join("deleted"), b"old").unwrap();
+            // Layers recreate `deleted` with 0644; fix the base's mode so a
+            // group-writable umask (0002) does not add a mode change.
+            fs::set_permissions(base_dir.join("deleted"), fs::Permissions::from_mode(0o644))
+                .unwrap();
             fs::write(tmp.path().join("outside"), b"secret").unwrap();
             let base: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&base_dir).unwrap());
             let dir = tmp.path().join("overlay");
@@ -2067,6 +2824,12 @@ pub(crate) mod tests {
         conn.execute("UPDATE meta SET value='elsewhere' WHERE key='base_url'", [])
             .unwrap();
         drop(conn);
+        // Read-only again, so the hit's publication check (R1c-1) passes
+        // and the metadata comparison is what refuses.
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o444)).unwrap();
+        for dir in [&entry.join("layer"), &entry] {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o555));
+        }
         let error = cached_lower_in(&bundle, &cache, f.base.clone(), None)
             .unwrap_err()
             .to_string();
@@ -2116,7 +2879,8 @@ pub(crate) mod tests {
     }
 
     /// Regression: journal and base index shipping must be visible in a normal
-    /// TAR listing, while in-use markers and spool/COW temps stay out.
+    /// TAR listing, while in-use markers, spool/COW temps and the local #240
+    /// seal/commit coordination lock stay out.
     #[test]
     fn regression_pack_includes_journal_index_and_excludes_temps() {
         let f = Fixture::new(true);
@@ -2163,6 +2927,7 @@ pub(crate) mod tests {
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
         for name in [
             ".ratarmount-overlay.used",
+            ".ratarmount.overlay.seal-commit.lock",
             ".ratarmount.overlay.cow-test",
             ".ratarmount-spool-test",
         ] {
@@ -2200,6 +2965,12 @@ pub(crate) mod tests {
         ] {
             assert!(paths.iter().any(|p| p == name), "{paths:?}");
         }
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p == "layer/.ratarmount.overlay.seal-commit.lock"),
+            "the local coordination lock must not be shipped in the bundle: {paths:?}"
+        );
         assert!(!paths.iter().any(|p| omitted(p)));
     }
 
@@ -2516,6 +3287,7 @@ pub(crate) mod tests {
     /// (SHARED included, which `BEGIN IMMEDIATE` cannot see; read-only files
     /// too)? The child must exit successfully.
     fn other_process_sees_lock(db: &Path) -> bool {
+        let _processes = ratarmount_index::test_process::spawning();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -2674,9 +3446,47 @@ pub(crate) mod tests {
         }
     }
 
+    /// Extract `bundle`'s layer into the new directory `directory` and apply
+    /// its sealed modes, without verifying it: the stand-in for the child's
+    /// bundle cache in the supervisor's tests (the child verifies a bundle).
+    pub(crate) fn extract_unverified(bundle: &Path, directory: &Path) -> io::Result<()> {
+        fs::create_dir(directory)?;
+        let recorded = extract_with_limits(bundle, directory, Limits::resolve(None, None)?)?;
+        finalize_stage(directory, recorded)
+    }
+
     /// Re-tar `bundle` with the payload of one member replaced (same seal
     /// metadata, so the bundle stays self-consistent but lies about content).
-    fn retar_with(bundle: &Path, out: &Path, member: &str, payload: &[u8]) {
+    pub(crate) fn retar_with(bundle: &Path, out: &Path, member: &str, payload: &[u8]) {
+        retar(bundle, out, |path, data, _| {
+            if path == member {
+                *data = payload.to_vec();
+            }
+        });
+    }
+
+    /// Re-tar `bundle` with a `padding` member of `zeros` zero bytes before
+    /// `meta.json`, its last member: still a valid bundle (only `layer/`
+    /// members are extracted), a few KiB larger on disk and `zeros` bytes
+    /// longer to decode.
+    pub(crate) fn retar_padded(bundle: &Path, out: &Path, zeros: u64) {
+        retar(bundle, out, |path, _, builder| {
+            if path == "meta.json" {
+                let mut padding = header(0o444, 0, zeros, tar::EntryType::Regular);
+                builder
+                    .append_data(&mut padding, "padding", std::io::repeat(0).take(zeros))
+                    .unwrap();
+            }
+        });
+    }
+
+    /// Re-tar `bundle` member by member: `edit` gets each member's path and
+    /// payload before the member is written, and may append members first.
+    fn retar(
+        bundle: &Path,
+        out: &Path,
+        mut edit: impl FnMut(&str, &mut Vec<u8>, &mut tar::Builder<Vec<u8>>),
+    ) {
         let body = ratarmount_compress::open_seekable_zstd(bundle).unwrap();
         let mut archive = tar::Archive::new(body.open_reader().unwrap());
         let mut builder = tar::Builder::new(Vec::new());
@@ -2697,10 +3507,8 @@ pub(crate) mod tests {
                 .unwrap_or_default();
             let mut data = Vec::new();
             entry.read_to_end(&mut data).unwrap();
-            if path == member {
-                data = payload.to_vec();
-                header.set_size(data.len() as u64);
-            }
+            edit(&path, &mut data, &mut builder);
+            header.set_size(data.len() as u64);
             if !pax.is_empty() {
                 builder
                     .append_pax_extensions(pax.iter().map(|(k, v)| (k.as_str(), v.as_slice())))
@@ -3021,6 +3829,7 @@ pub(crate) mod tests {
     /// Another process's `BEGIN IMMEDIATE` on `db` is busy (the child must
     /// exit successfully).
     pub(crate) fn pack_db_lock_busy_in_child(db: &Path) -> bool {
+        let _processes = ratarmount_index::test_process::spawning();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -3703,8 +4512,14 @@ pub(crate) mod tests {
             argv.extend_from_slice(extra);
             argv.push("a.tar");
             let args = crate::Args::try_parse_from(argv).unwrap();
-            let key =
-                crate::lower_key_for(&args, false, std::slice::from_ref(&archive), Some(&index));
+            let key = crate::lower_key_for(
+                &args,
+                false,
+                std::slice::from_ref(&archive),
+                Some(&index),
+                false,
+            )
+            .unwrap();
             assert!(key.is_some());
             let before = verify_calls();
             crate::MountLowerStack::open_in(
@@ -3965,8 +4780,12 @@ pub(crate) mod tests {
         assert!(error.contains("lf"), "{error}");
     }
 
-    /// A directory base without `--base-digest` has only a weak identity, so no
-    /// marker is trusted: a same-size edit with the mtime restored is caught.
+    /// Regression: a directory base has no trusted verification marker, so each
+    /// use recomputes the change set. Making the base equal the replacement
+    /// removes its change row and is caught even with size/mtime preserved.
+    /// A third, different base payload leaves the modified row unchanged
+    /// (canonical rows omit base hashes): before #341 that was accepted; the
+    /// seal's preimage pins now refuse it, naming the path.
     #[test]
     fn regression_lower_cache_weak_directory_base_always_reverifies() {
         let f = Fixture::new(true);
@@ -4012,13 +4831,17 @@ pub(crate) mod tests {
         assert_eq!(verify_calls() - before, 2);
         let target = base_dir.join("deleted");
         let mtime = fs::metadata(&target).unwrap().modified().unwrap();
-        fs::write(&target, b"new").unwrap();
-        File::options()
-            .write(true)
-            .open(&target)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(mtime))
-            .unwrap();
+        let rewrite = |bytes: &[u8]| {
+            fs::write(&target, bytes).unwrap();
+            File::options()
+                .write(true)
+                .open(&target)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(mtime))
+                .unwrap();
+        };
+        // #341: a third value of the same size keeps the `modified` row.
+        rewrite(b"alt");
         let error = crate::MountLowerStack::open_in(
             f.base.clone(),
             key.as_deref(),
@@ -4028,7 +4851,20 @@ pub(crate) mod tests {
             &crate::lower_stack_services(),
         )
         .err()
-        .expect("edited base must fail closed");
+        .expect("a same-size base edit under a modified row must fail closed");
+        assert!(error.contains("deleted"), "{error}");
+        assert!(error.contains("base preimage changed"), "{error}");
+        rewrite(b"new");
+        let error = crate::MountLowerStack::open_in(
+            f.base.clone(),
+            key.as_deref(),
+            &paths,
+            false,
+            Some(&cache),
+            &crate::lower_stack_services(),
+        )
+        .err()
+        .expect("base edit removing the sealed change row must fail closed");
         assert!(error.contains("deleted"), "{error}");
         // A directory has no computed strong digest, and a supplied
         // `--base-digest` is only a claim: still no marker.

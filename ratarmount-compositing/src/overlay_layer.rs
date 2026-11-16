@@ -101,6 +101,14 @@ impl ReadOnlyOverlayLayer {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| database_error(&root, e))?;
+        // Read the marker and rows in the same snapshot, including when an
+        // immutable lower changed after the supervisor's preflight.
+        let marker = crate::relaxed_durability::read_marker(&tx).map_err(|error| match error {
+            crate::OverlayError::Sqlite(error) => database_error(&root, error),
+            other => io::Error::other(other),
+        })?;
+        crate::relaxed_durability::refuse_unclean_marker(marker.as_deref())
+            .map_err(|e| io::Error::other(format!("overlay {}: {e}", root.display())))?;
         let tables: Vec<String> = tx
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")
             .and_then(|mut stmt| stmt.query_map([], |r| r.get(0))?.collect())
@@ -323,10 +331,22 @@ impl ReadOnlyOverlayLayer {
             use std::os::unix::fs::OpenOptionsExt;
             // Pin each parent descriptor: checking symlink_metadata alone
             // leaves a race if an unsealed layer swaps a directory for a link.
-            let mut file = open_options_nofollow()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-                .open(&self.root)?;
+            let mut file = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0149-M01","item":"<ratarmount_compositing::overlay_layer::ReadOnlyOverlayLayer>::open_host","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"O_DIRECTORY | O_NOFOLLOW descriptor of the layer root that pins the openat walk; reads no file content"}"###
+                )]
+                let mut __inventory_value_0 = open_options_nofollow();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0149-M02","item":"<ratarmount_compositing::overlay_layer::ReadOnlyOverlayLayer>::open_host","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY | O_NOFOLLOW descriptor of the layer root that pins the openat walk; reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
+                let __inventory_value_1 = __inventory_value_0
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                    .open(&self.root);
+                __inventory_value_1
+            }?;
             let path = normpath(path);
             let mut parts = path.trim_start_matches('/').split('/').peekable();
             while let Some(part) = parts.next() {
@@ -341,17 +361,31 @@ impl ReadOnlyOverlayLayer {
                     };
                 // Admitted (R10-C): another name of an open overlay database
                 // is refused without a descriptor of it being closed.
-                file = File::from(ratarmount_core::db_inodes::openat_admitted(
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0151-M01","item":"<ratarmount_compositing::overlay_layer::ReadOnlyOverlayLayer>::open_host","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
+                let __inventory_assigned = File::from(ratarmount_core::db_inodes::openat_admitted(
                     Some(std::os::fd::AsFd::as_fd(&file)),
                     Path::new(part),
                     flags,
                     0,
                 )?);
+                file = __inventory_assigned;
             }
             Ok(file)
         }
         #[cfg(not(unix))]
-        open_options_nofollow().read(true).open(host)
+        {
+            let mut options = open_options_nofollow();
+            options.read(true);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0152-I01","disposition":"residual","family":"payload-admitted-readers","issue":"#196","reason":"non-Unix overlay payload open (no admitted open off Unix); payload ownership needs the excluded coordinator","item":"<ratarmount_compositing::overlay_layer::ReadOnlyOverlayLayer>::open_host","native_observed":false,"creation":{"policy":"none","basis":"Existing non-Unix overlay payload opened read-only; there is no creation request."},"category":"overlay-payload"}"###
+            )]
+            let opened = options.open(host);
+            opened
+        }
     }
 
     fn attrs(&self, fi: &FileInfo) -> BTreeMap<String, Vec<u8>> {

@@ -1,5 +1,14 @@
 # Benchmarks
 
+Linux `ratarmount sandbox bench --manifest tasks.json --dry-run` emits a
+deterministic JSONL schedule with admission checks. Execution with
+`--out DIR --runtime PATH --runtime-kind docker|stub` runs native lifecycles for
+qualified warm `tar.zst-single-frame` cells and writes batch records (stub output
+is fixture-only); `ratarmount sandbox bench summarize DIR` summarizes them. FUSE
+execution is not yet available. See the
+[sandbox benchmark guide](../docs/sandbox-benchmarking.md) for selections,
+qualification, ordering, records and summaries.
+
 ## Format sweep
 
 [`compare-formats.sh`](compare-formats.sh) measures the Rust binary across 21

@@ -258,14 +258,14 @@ ratarmount -u mnt
 | **EXT4 / SquashFS MVP** | Need `debugfs` / `unsquashfs` on `PATH`; otherwise soft-fail |
 | **Daemonize** | Background uses `fork`/`setsid`; use `-f` if mount-ready probing misbehaves |
 | **Unmount** | Darwin path only (not Linux `fusermount`) |
-| **CI** | GHA `macos-14` cannot load macFUSE kexts; unit tests always; FUSE smoke best-effort (FUSE-T) |
+| **CI** | GHA `macos-15` cannot load macFUSE kexts; unit tests always; FUSE smoke best-effort (FUSE-T) |
 | **Tahoe 26.3.x** | Prefer current macFUSE 5.3+ or FUSE-T + `backend=fskit`; not yet hand-verified on every point release |
 
 ---
 
 ## 7. CI / releases
 
-- **PR CI:** `macos-14` — clippy + `cargo test --workspace` (`.github/workflows/ci.yml`)  
+- **PR CI:** `macos-15` — clippy + `cargo test --workspace` (`.github/workflows/ci.yml`)  
 - **Tags:** `packages.yml` builds `ratarmount-<ver>-macos-arm64.tar.gz` (Intel deferred), cosign-signs, attaches to the GitHub Release
 - **Homebrew:** tap cask [`packaging/homebrew/Casks/ratarmount.rb`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/Casks/ratarmount.rb) pins that tarball + sha256; bump version/sha256 when cutting a release. Homebrew-core is out of v1.  
 

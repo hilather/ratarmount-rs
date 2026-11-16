@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use ratarmount_index::{peek_archive_digest, ArchiveDigestStamp};
+use ratarmount_index::{peek_archive_digest_for_open, ArchiveDigestStamp};
 use rusqlite::Connection;
 
 use crate::overlay_identity::{ActualBase, BaseKind, BaseLocation, ClassifiedBase};
@@ -93,6 +93,9 @@ pub enum Verdict {
     /// Same kind at the same place (or a local move): compare content.
     Content,
     Refuse(String),
+    /// A selected prepared index could not be read safely; this is not a base
+    /// mismatch and cannot be overridden with force-base-mismatch.
+    PreparationError(String),
 }
 
 impl Verdict {
@@ -164,11 +167,21 @@ pub fn shape_verdict(
             Some(supplied) => Some(supplied) == recorded_digest,
             None => match actual.location() {
                 Some(BaseLocation::Local(path)) => {
-                    peek_archive_digest(path, actual.index_for_peek())
-                        .ok()
-                        .flatten()
-                        .as_deref()
-                        == recorded_digest
+                    let cached = peek_archive_digest_for_open(
+                        path,
+                        actual.index_for_peek(),
+                        actual.read_only_index(),
+                    );
+                    let cached = match cached {
+                        Ok(cached) => cached,
+                        Err(error) if actual.read_only_index() => {
+                            return Verdict::PreparationError(format!(
+                                "cannot read prepared base digest cache: {error}"
+                            ));
+                        }
+                        Err(_) => None,
+                    };
+                    cached.as_deref() == recorded_digest
                 }
                 _ => false,
             },
@@ -198,6 +211,7 @@ fn content_probe<'a>(
         git_tree: actual.git_tree(),
         supplied: probe.supplied,
         index: actual.index_for_peek(),
+        read_only_index: actual.read_only_index(),
         extra_excludes: probe.extra_excludes,
     }
 }
@@ -230,6 +244,7 @@ pub fn compare_base_identity(
             ..Default::default()
         }),
         Verdict::Content => overlay_meta::compare_content(meta, &content_probe(actual, probe)),
+        Verdict::PreparationError(reason) => Err(reason),
     }
 }
 
@@ -471,16 +486,20 @@ pub fn verify_base(dir: &Path, base: &ClassifiedBase) -> BaseCheck {
         supplied: None,
         extra_excludes: &[],
     };
-    if let Verdict::Refuse(current) = shape_verdict(meta.as_ref(), actual, &probe) {
-        return BaseCheck::Mismatch {
-            recorded: meta
-                .as_ref()
-                .and_then(|m| m.get("base_kind"))
-                .unwrap_or("unknown")
-                .to_owned(),
-            current,
-            strength: BaseStrength::Strong,
-        };
+    match shape_verdict(meta.as_ref(), actual, &probe) {
+        Verdict::Refuse(current) => {
+            return BaseCheck::Mismatch {
+                recorded: meta
+                    .as_ref()
+                    .and_then(|m| m.get("base_kind"))
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                current,
+                strength: BaseStrength::Strong,
+            };
+        }
+        Verdict::PreparationError(reason) => return BaseCheck::Skipped { reason },
+        _ => {}
     }
     match (actual.kind(), actual.location()) {
         (BaseKind::Git, _) => BaseCheck::Skipped {
@@ -519,7 +538,7 @@ fn owned_journal(
     CommitBaseRefusal,
 > {
     let refuse = |why: String| {
-        CommitBaseRefusal(format!(
+        CommitBaseRefusal::new(format!(
             "base mismatch: {why}; the commit was not written. Restore the archive, \
              or use --force-base-mismatch to accept the new base"
         ))
@@ -585,7 +604,32 @@ fn names_recorded_base(
 
 /// Why a commit was refused before it wrote anything.
 #[derive(Debug)]
-pub(crate) struct CommitBaseRefusal(pub String);
+pub(crate) struct CommitBaseRefusal(pub String, Option<std::io::Error>);
+
+impl CommitBaseRefusal {
+    fn new(message: String) -> Self {
+        Self(message, None)
+    }
+
+    fn policy(error: std::io::Error) -> Self {
+        Self(error.to_string(), Some(error))
+    }
+
+    pub(crate) fn is_policy(&self) -> bool {
+        self.1.is_some()
+    }
+
+    pub(crate) fn into_overlay_error(self) -> crate::OverlayError {
+        match self.1 {
+            Some(error) => crate::OverlayError::Io(error),
+            None => crate::OverlayError::Msg(self.0),
+        }
+    }
+
+    pub(crate) fn into_io(self) -> std::io::Error {
+        self.1.unwrap_or_else(|| std::io::Error::other(self.0))
+    }
+}
 
 impl std::fmt::Display for CommitBaseRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -648,7 +692,7 @@ pub(crate) fn check_commit_base_with(
     required: bool,
 ) -> std::result::Result<Option<std::fs::Metadata>, CommitBaseRefusal> {
     let refuse = |why: String| {
-        CommitBaseRefusal(format!(
+        CommitBaseRefusal::new(format!(
             "base mismatch: {why}; the commit was not written. Restore the archive, \
              or use --force-base-mismatch to accept the new base"
         ))
@@ -657,8 +701,13 @@ pub(crate) fn check_commit_base_with(
     // The recorded kind and the Unknown gate come first, under every digest
     // kind: a `none` directory overlay must not commit into an unrelated
     // archive, and a record with no usable kind never commits without force.
-    let meta = OverlayMeta::from_connection_required(conn, required)
-        .map_err(|e| refuse(format!("cannot read overlay metadata: {e}")))?;
+    let meta = OverlayMeta::from_connection_required(conn, required).map_err(|e| {
+        if crate::overlay_db::is_overlay_state_error(&e) {
+            CommitBaseRefusal::policy(std::io::Error::other(e))
+        } else {
+            refuse(format!("cannot read overlay metadata: {e}"))
+        }
+    })?;
     match Recorded::from_meta(meta.as_ref()) {
         Recorded::Unknown => {
             return Err(refuse(
@@ -835,9 +884,10 @@ pub(crate) fn check_commit_base_offline_with(
     )>,
 ) -> std::result::Result<Option<std::fs::Metadata>, CommitBaseRefusal> {
     let db = overlay.join(HIDDEN_DB);
+    crate::overlay_db::validate_overlay_state(&db).map_err(CommitBaseRefusal::policy)?;
     let marked_before = !crate::write_overlay::overlay_markers(overlay)
         .map_err(|e| {
-            CommitBaseRefusal(format!(
+            CommitBaseRefusal::new(format!(
                 "cannot read the markers of {}: {e}",
                 overlay.display()
             ))
@@ -845,22 +895,40 @@ pub(crate) fn check_commit_base_offline_with(
         .is_empty();
     let conn = crate::overlay_db::open_overlay_db_required(
         &db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
         crate::DbName::Path,
         marked_before,
     )
-    .map_err(|e| CommitBaseRefusal(format!("cannot open {}: {e}", db.display())))?;
+    .map_err(|e| {
+        if crate::overlay_db::is_overlay_state_error(&e) {
+            CommitBaseRefusal::policy(e.into())
+        } else {
+            CommitBaseRefusal::new(format!("cannot open {}: {e}", db.display()))
+        }
+    })?;
     let marked = marked_before
         || conn.required_record()
         || !crate::write_overlay::overlay_markers(overlay)
             .map_err(|e| {
-                CommitBaseRefusal(format!(
+                CommitBaseRefusal::new(format!(
                     "cannot read the markers of {}: {e}",
                     overlay.display()
                 ))
             })?
             .is_empty();
-    check_commit_base_with(&conn, base, archive, locked, marked)
+    let result = check_commit_base_with(&conn, base, archive, locked, marked);
+    if result.is_err() {
+        // SQLite's Connection::path is UTF-8-only; this boundary retains the
+        // original OS path even when a failed metadata read cannot name it.
+        ratarmount_index::checked_open::refuse_symlink(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|error| CommitBaseRefusal::policy(std::io::Error::other(error)))?;
+    }
+    result
 }
 
 #[cfg(test)]
@@ -1205,6 +1273,7 @@ mod tests {
             location: Some(ServedLocation::Local(place.archive.clone())),
             index: IndexProvenance::None,
             sidecar_candidate: Some(index),
+            read_only_index: false,
             fetched: false,
             keep_alive: Box::new(()),
         })

@@ -17,23 +17,23 @@
 
 macro_rules! println {
     () => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stdout().lock());
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stdout().lock());
     }};
     ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stdout().lock(), $($arg)*);
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stdout().lock(), $($arg)*);
     }};
 }
 
 macro_rules! eprintln {
     () => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr().lock());
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr().lock());
     }};
     ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr().lock(), $($arg)*);
     }};
 }
 
@@ -47,6 +47,7 @@ mod tests {
     /// (exit 101) once the reader of stdout/stderr went away.
     #[test]
     fn quiet_print_survives_dead_stdout_and_stderr() {
+        let _processes = ratarmount_index::test_process::spawning();
         if std::env::var_os(CHILD_ENV).is_some() {
             // Live stdio so far (libtest printed its banner). Now widow both.
             let (r1, w1) = std::io::pipe().unwrap();
@@ -89,5 +90,32 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).contains("running 1 test"),
             "child must have run the test"
         );
+    }
+}
+
+#[cfg(test)]
+mod hygiene_tests {
+    /// Regression: the quiet printers must ignore write/writeln macros defined
+    /// by their caller, for both empty and formatted arms.
+    #[test]
+    fn regression_quiet_print_macro_shadowing() {
+        macro_rules! write {
+            (@mark_used) => {};
+            ($($arg:tt)*) => {
+                compile_error!("quiet print resolved the caller's write macro");
+            };
+        }
+        macro_rules! writeln {
+            (@mark_used) => {};
+            ($($arg:tt)*) => {
+                compile_error!("quiet print resolved the caller's writeln macro");
+            };
+        }
+        write!(@mark_used);
+        writeln!(@mark_used);
+        println!();
+        println!("{}", "");
+        eprintln!();
+        eprintln!("{}", "");
     }
 }

@@ -152,24 +152,35 @@ pub fn spawn_signal_fuse_unmount(mp: PathBuf) {
         .expect("fuse signal unmount thread");
 }
 
-/// Logs a failure once per distinct message. A commit refused because the
-/// base changed is retried on every tick; the same refusal every second would
-/// flood the log, while a new observed stamp is new information.
+/// Logs the first failure at error level and warns on power-of-two occurrences.
+/// A commit refusal is retried every tick; persistent failures need reminders
+/// without flooding the log, while a changed message starts a new sequence.
 #[derive(Default)]
-struct RepeatedFailure(Option<String>);
+struct RepeatedFailure {
+    message: Option<String>,
+    occurrences: u64,
+}
 
 impl RepeatedFailure {
     /// `true` when `message` differs from the previous failure.
     fn is_new(&mut self, message: &str) -> bool {
-        let new = self.0.as_deref() != Some(message);
+        let new = self.message.as_deref() != Some(message);
         if new {
-            self.0 = Some(message.to_owned());
+            self.message = Some(message.to_owned());
+            self.occurrences = 1;
+        } else {
+            self.occurrences = self.occurrences.saturating_add(1);
         }
         new
     }
 
+    fn should_warn(&self) -> bool {
+        self.occurrences > 1 && self.occurrences.is_power_of_two()
+    }
+
     fn clear(&mut self) {
-        self.0 = None;
+        self.message = None;
+        self.occurrences = 0;
     }
 }
 
@@ -353,6 +364,11 @@ pub fn spawn_interval_commits(
                         let message = e.to_string();
                         if failures.is_new(&message) {
                             log::error!("interval overlay commit failed: {message}");
+                        } else if failures.should_warn() {
+                            log::warn!(
+                                "interval overlay commit failed again (occurrence {}): {message}",
+                                failures.occurrences
+                            );
                         } else {
                             log::debug!("interval overlay commit failed again: {message}");
                         }
@@ -835,7 +851,8 @@ fn install_hf_live_commit(
             state.ready()?;
             let mut range = state.repo.open_file(&state.repo.location.path)
                 .map_err(|e| OverlayError::Msg(e.to_string()))?;
-            let mut file = tempfile::NamedTempFile::new()?;
+            #[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0038-M01","item":"ratarmount::overlay_commit::install_hf_live_commit","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###)]
+let mut file = tempfile::NamedTempFile::new()?;
             let len = std::io::copy(&mut range, &mut file)?;
             if len != range.len() {
                 return Err(OverlayError::Msg("short Hub archive download".into()));
@@ -861,6 +878,10 @@ fn install_hf_live_commit(
 /// (the staged file may be open as a database in this process; a raw `File`
 /// close would release that connection's locks).
 fn staged_zstd_blocks(staged: &Path) -> Result<Vec<(i64, i64)>, String> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0039-M01","item":"ratarmount::overlay_commit::staged_zstd_blocks","disposition":"managed-read","regression":"regression_live_commit_zstd_blocks_keep_staged_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut cursor = ratarmount_index::managed_read::ManagedReadCursor::open(staged)
         .map_err(|e| e.to_string())?;
     let blocks = ratarmount_compress::export_zstd_blocks_from_reader(&mut cursor)
@@ -886,6 +907,10 @@ fn publish_hf(
     }
     // Build a fresh snapshot without mutating the index still used by the pinned base.
     // Even :memory: mounts publish all three names, and a failed upload leaves the old index usable.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0040-M01","item":"ratarmount::overlay_commit::publish_hf","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let dir = tempfile::tempdir().map_err(|e| retryable(e.to_string()))?;
     let sidecar = dir.path().join("index.sqlite");
     let mut index_opts = opts.clone();
@@ -942,6 +967,10 @@ fn publish_hf(
         .map_err(|e| retryable(e.to_string()))?;
     let json = index_pointer_to_json(&pointer).map_err(|e| retryable(e.to_string()))?;
     // Managed (#151): the sidecar is the mount's own index.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0041-M01","item":"ratarmount::overlay_commit::publish_hf","disposition":"managed-read","regression":"regression_live_commit_hf_reads_keep_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let blob =
         ratarmount_index::managed_read::read(&sidecar).map_err(|e| retryable(e.to_string()))?;
     let blob_path = format!(
@@ -1134,6 +1163,10 @@ fn publish_s3(
         );
         let put = if len <= S3_PUT_SINGLE_MAX {
             // Managed (#151): the staged archive may be a database open here.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0042-M01","item":"ratarmount::overlay_commit::publish_s3","disposition":"managed-read","regression":"regression_live_commit_s3_single_put_body_keeps_archive_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let body = ratarmount_index::managed_read::read(&req.staged)
                 .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
             ratarmount_remote::put_s3_object(&loc, &body, etag, Some("application/octet-stream"))
@@ -1321,6 +1354,10 @@ fn publish_gcs(
         }
     };
     // Managed (#151): the sidecar is the mount's own index.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0043-M01","item":"ratarmount::overlay_commit::publish_gcs","disposition":"managed-read","regression":"regression_live_commit_gcs_reads_keep_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let blob = match ratarmount_index::managed_read::read(&sidecar) {
         Ok(b) => b,
         Err(e) => {
@@ -1648,9 +1685,8 @@ pub(crate) fn term_flag_test_lock() -> &'static std::sync::Mutex<()> {
 
 #[cfg(test)]
 mod tests {
-    /// A refused interval commit is retried every tick; it logs once per
-    /// distinct message (a new observed stamp is new information) and again
-    /// after a success.
+    /// A refused interval commit is retried every tick; its first error is
+    /// reported again after a changed message or a success.
     #[test]
     fn regression_interval_refusal_logs_once_per_distinct_message() {
         let mut failures = RepeatedFailure::default();
@@ -1659,6 +1695,39 @@ mod tests {
         assert!(failures.is_new("base mismatch: size=2"));
         failures.clear();
         assert!(failures.is_new("base mismatch: size=2"));
+    }
+
+    /// Regression: repeated interval failures must remain visible with warnings
+    /// at occurrences 2, 4, 8, ... and restart after a changed message or success.
+    #[test]
+    fn regression_254_interval_repeat_warn_schedule() {
+        let mut failures = RepeatedFailure::default();
+        assert!(!failures.should_warn());
+        for occurrence in 1..=17 {
+            assert_eq!(failures.is_new("base mismatch: size=1"), occurrence == 1);
+            assert_eq!(failures.occurrences, occurrence);
+            assert_eq!(
+                failures.should_warn(),
+                matches!(occurrence, 2 | 4 | 8 | 16),
+                "occurrence {occurrence}"
+            );
+        }
+        assert!(failures.is_new("base mismatch: size=2"));
+        assert_eq!(failures.occurrences, 1);
+        assert!(!failures.should_warn());
+        assert!(!failures.is_new("base mismatch: size=2"));
+        assert!(failures.should_warn());
+        assert!(failures.is_new("base mismatch: size=1"));
+        assert_eq!(failures.occurrences, 1);
+        assert!(!failures.should_warn());
+        failures.clear();
+        assert_eq!(failures.occurrences, 0);
+        assert!(!failures.should_warn());
+        assert!(failures.is_new("base mismatch: size=1"));
+        assert_eq!(failures.occurrences, 1);
+        assert!(!failures.should_warn());
+        assert!(!failures.is_new("base mismatch: size=1"));
+        assert!(failures.should_warn());
     }
 
     use super::*;
@@ -1752,15 +1821,17 @@ mod tests {
     #[test]
     fn regression_hf_live_atomic_archive_index_pointer_and_repinned_reads() {
         use crate::publish_index::tests::{PublishEnv, PublishServer};
+        let have_tar = {
+            let _processes = ratarmount_index::test_process::spawning();
+            ["gtar", "gnutar", "tar"].iter().any(|name| {
+                std::process::Command::new(name)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("GNU tar"))
+            })
+        };
         for compressed in [false, true] {
-            if !compressed
-                && !["gtar", "gnutar", "tar"].iter().any(|name| {
-                    std::process::Command::new(name)
-                        .arg("--version")
-                        .output()
-                        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("GNU tar"))
-                })
-            {
+            if !compressed && !have_tar {
                 eprintln!("skip: GNU tar unavailable; tar.zst core regression still runs");
                 continue;
             }
@@ -1778,6 +1849,8 @@ mod tests {
                     dir.path().join("trees").to_str().unwrap(),
                 ),
             ]);
+            // Cross-test serialization precedes the process guard (#242).
+            let _processes = ratarmount_index::test_process::spawning();
             let name = if compressed { "a.tar.zst" } else { "a.tar" };
             let url = format!("hf://datasets/org/data@main/{name}");
             let overlay = hf_test_overlay(&url, &dir.path().join("ov"), false);
@@ -2536,6 +2609,7 @@ mod tests {
     /// without `-c` is warm (tarstats match; no prefix-frame decode).
     #[test]
     fn live_commit_on_exit_remount_uses_patched_sidecar() {
+        let _processes = ratarmount_index::test_process::spawning();
         let dir = tempfile::tempdir().unwrap();
         let prefix = b"keep-prefix\n";
         let last = b"last-frame\n";
@@ -2618,6 +2692,7 @@ mod tests {
     /// persist then commit_atomic remaining — same plan is not spliced twice.
     #[test]
     fn overlay_commit_on_exit_waits_for_interval_inflight() {
+        let _processes = ratarmount_index::test_process::spawning();
         let dir = tempfile::tempdir().unwrap();
         let extra = b"on-exit-wait\n";
         let archive = dir.path().join("a.tar.zst");
@@ -3554,6 +3629,7 @@ mod rolling_tests {
     /// Regression: rolling must build/patch a distinct index and manifest for each generation.
     #[test]
     fn rolling_per_archive_sidecars_and_on_exit_patch() {
+        let _processes = ratarmount_index::test_process::spawning();
         for suffix in ["tar", "tar.zst"] {
             let dir = tempfile::tempdir().unwrap();
             let base = dir.path().join(format!("traces.{suffix}"));

@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! FAT12/16/32 filesystem image mount source.
 //!
 //! Python uses `pyfatfs` for random access. This crate uses the pure-Rust [`fatfs`]
@@ -279,6 +282,10 @@ impl FatMountSource {
         }
         // Validate we can open with fatfs (FileSystem is !Sync, so we reopen per op).
         {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0312-M01","item":"<ratarmount_formats_fat::FatMountSource>::open_with_offset","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let file = File::open(path)?;
             let _fs = FileSystem::new(RoDisk::from_file(file, partition_offset), FsOptions::new())
                 .map_err(|e| {
@@ -376,6 +383,10 @@ impl FatMountSource {
                 path,
                 partition_offset,
             } => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0313-M01","item":"<ratarmount_formats_fat::FatMountSource>::with_fs","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
                 let file = File::open(path)?;
                 RoDisk::from_file(file, *partition_offset)
             }
@@ -568,7 +579,14 @@ pub fn looks_like_fat(path: &Path) -> bool {
 /// `.fat32` / `.vfat` (extension fallback preserved for convenience when magic
 /// is not yet readable, matching the previous detector behavior).
 pub fn looks_like_fat_at(path: &Path, partition_offset: u64) -> bool {
-    if let Ok(mut f) = File::open(path) {
+    if let Ok(mut f) = {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0314-M01","item":"ratarmount_formats_fat::looks_like_fat_at","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = File::open(path);
+        __inventory_value_0
+    } {
         if looks_like_fat_reader_at(&mut f, partition_offset) {
             return true;
         }

@@ -49,6 +49,23 @@ impl AttributeMapping {
     pub fn mode(self, mode: u32) -> u32 {
         mode & !self.umask
     }
+
+    /// Drop requested owner IDs that equal the owner this entry is already
+    /// presented with (`raw_uid` / `raw_gid` after the mapping). A chown to
+    /// the shown owner (`cp -p`, `sed -i`, `rsync -a`) is then a no-op, while
+    /// a real ownership change is still passed on and refused.
+    pub fn drop_presented_owner(
+        self,
+        raw_uid: u32,
+        raw_gid: u32,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> (Option<u32>, Option<u32>) {
+        (
+            uid.filter(|uid| *uid != self.uid(raw_uid)),
+            gid.filter(|gid| *gid != self.gid(raw_gid)),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -83,5 +100,44 @@ mod tests {
         ] {
             assert!(AttributeMapping::parse(option).is_err(), "{option}");
         }
+    }
+
+    /// Regression: `cp -p` into a write mount failed with EPERM because a
+    /// chown to the owner already shown was refused (#327).
+    #[test]
+    fn regression_same_owner_chown_is_dropped() {
+        let plain = AttributeMapping::default();
+        let mapped = AttributeMapping::parse("uid=0,gid=0").unwrap();
+        // Unmapped: compare with the raw owner.
+        assert_eq!(
+            plain.drop_presented_owner(1000, 1000, Some(1000), Some(1000)),
+            (None, None)
+        );
+        assert_eq!(
+            plain.drop_presented_owner(1000, 1000, Some(0), Some(1000)),
+            (Some(0), None)
+        );
+        assert_eq!(
+            plain.drop_presented_owner(1000, 1000, None, Some(5)),
+            (None, Some(5))
+        );
+        // Mapped: compare with the presented owner, not the stored one.
+        assert_eq!(
+            mapped.drop_presented_owner(1000, 1000, Some(0), Some(0)),
+            (None, None)
+        );
+        assert_eq!(
+            mapped.drop_presented_owner(1000, 1000, Some(1000), None),
+            (Some(1000), None)
+        );
+        let gid_only = AttributeMapping::parse("gid=7").unwrap();
+        assert_eq!(
+            gid_only.drop_presented_owner(1000, 1000, Some(1000), Some(7)),
+            (None, None)
+        );
+        assert_eq!(
+            gid_only.drop_presented_owner(1000, 1000, Some(1000), Some(1000)),
+            (None, Some(1000))
+        );
     }
 }

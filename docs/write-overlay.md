@@ -40,6 +40,11 @@ and is never content-hashed by a mount (an archive base is hashed in the backgro
 a strong one. `import_in_progress` is set only while `overlay import` is writing;
 a leftover row means the import was killed (`overlay fsck` reports `import_incomplete`
 and `seal` refuses).
+`relaxed_durability` is set while a mount with `--overlay-durability=relaxed`
+(no database fsyncs; for throwaway overlays) is open; a leftover row from an
+earlier boot means the machine went down meanwhile, and the overlay is refused
+until `overlay fsck --repair` (see
+[Relaxed overlay durability](sandbox.md#relaxed-overlay-durability)).
 Copy-on-write stages each copy in a `.ratarmount.overlay.cow-*` temp next to
 its destination, hidden the same way (ASCII case ignored); `--commit-overlay`
 never picks a temp up, an archive member with that prefix is hidden but stays in
@@ -99,6 +104,14 @@ ratarmount --commit-overlay --yes -w ./changes --commit-manifest archive.tar.zst
 | `.tar.zst` (multi-frame or seek table) | Spliced from the first affected frame to the end, including deletes in earlier frames |
 | `.zip` | Fully rebuilt (encrypted and multi-part ZIPs are not supported) |
 | Remote URLs (`s3://`, `hf://`, ...) | Not offline; exits 2. Use the live commits below |
+
+Deletes, renames and replacements in ordinary single-stream TARs (uncompressed,
+gzip, bzip2 or xz) avoid GNU tar 1.35's `--delete --ignore-zeros` failure
+(`lseek: Value too large for defined data type` on Ubuntu 26.04 and Debian 13).
+Concatenated TARs and layouts the check does not recognize, including base-256
+or PAX sizes and sparse members, retain `--ignore-zeros` and still need a fixed
+GNU tar on those systems. A GNU tar delete failure leaves the original archive
+unchanged. (#280)
 
 Successful local commits refresh the overlay's base size, mtime and digest,
 update its stack digest, and record `meta.base_committed_at`. Strong digests

@@ -1,0 +1,556 @@
+{
+  "x86_64-pc-windows-gnu": {
+    "measured_packages": 48,
+    "passed": [
+      "ratarmount-core",
+      "ratarmount-volume-plugin",
+      "ratarmount-csi",
+      "ratarmount-formats-fat",
+      "ratarmount-formats-exfat",
+      "ratarmount-formats-ntfs",
+      "ratarmount-formats-udf",
+      "ratarmount-formats-wim"
+    ],
+    "failed": [
+      {
+        "package": "ratarmount-index",
+        "cause": "ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 15.952468252000017
+      },
+      {
+        "package": "ratarmount-session",
+        "cause": "aws-lc-sys v0.46.0: missing MinGW C compiler",
+        "wall_including_lock_seconds": 6.898599012999966
+      },
+      {
+        "package": "ratarmount-python",
+        "cause": "libz-sys v1.1.29: missing MinGW C compiler, cross pkg-config/sysroot unavailable",
+        "wall_including_lock_seconds": 6.220555355000215
+      },
+      {
+        "package": "ratarmount-fuse",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 17.47439914100005
+      },
+      {
+        "package": "ratarmount-compress",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.429402649000167
+      },
+      {
+        "package": "ratarmount-formats-tar",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.2316402670003299
+      },
+      {
+        "package": "ratarmount-formats-zip",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 2.675415687000168
+      },
+      {
+        "package": "ratarmount-formats-ar",
+        "cause": "ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.3306782849999763
+      },
+      {
+        "package": "ratarmount-formats-tensors",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.21969797600013408
+      },
+      {
+        "package": "ratarmount-formats-cpio",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7, ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.22326508000014655
+      },
+      {
+        "package": "ratarmount-formats-iso9660",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7, ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.21953028600000835
+      },
+      {
+        "package": "ratarmount-formats-warc",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.22534530300026745
+      },
+      {
+        "package": "ratarmount-formats-xar",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.21505931199999395
+      },
+      {
+        "package": "ratarmount-formats-cab",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.21086748599964267
+      },
+      {
+        "package": "ratarmount-formats-libarchive",
+        "cause": "ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.2729918790000738
+      },
+      {
+        "package": "ratarmount-formats-sevenzip",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.2191418409997823
+      },
+      {
+        "package": "ratarmount-formats-sqlar",
+        "cause": "ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.35997551499986
+      },
+      {
+        "package": "ratarmount-formats-squashfs",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.28042642299988074
+      },
+      {
+        "package": "ratarmount-formats-ext4",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.3136475360001896
+      },
+      {
+        "package": "ratarmount-formats-block",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7, ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.2421393990002798
+      },
+      {
+        "package": "ratarmount-formats-dmg",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 3.2400503600001684
+      },
+      {
+        "package": "ratarmount-formats-qcow2",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7, ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.2443035559999771
+      },
+      {
+        "package": "ratarmount-formats-vhd",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7, ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.23632600100017953
+      },
+      {
+        "package": "ratarmount-formats-vmdk",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7, ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.24370510300013848
+      },
+      {
+        "package": "ratarmount-formats-asar",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.22048655199978384
+      },
+      {
+        "package": "ratarmount-formats-ogg",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7, ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.21962256799997704
+      },
+      {
+        "package": "ratarmount-formats-html",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.2220900550000806
+      },
+      {
+        "package": "ratarmount-formats-pdf",
+        "cause": "ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.36112101800017626
+      },
+      {
+        "package": "ratarmount-formats-git",
+        "cause": "libz-sys v1.1.29: missing MinGW C compiler, cross pkg-config/sysroot unavailable",
+        "wall_including_lock_seconds": 0.34912923100000626
+      },
+      {
+        "package": "ratarmount-formats-restic",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.23078886999974202
+      },
+      {
+        "package": "ratarmount-remote",
+        "cause": "aws-lc-sys v0.46.0: missing MinGW C compiler",
+        "wall_including_lock_seconds": 3.724553029999697
+      },
+      {
+        "package": "ratarmount-compositing",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7, ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.23870375800015609
+      },
+      {
+        "package": "ratarmount-nfs",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 3.3390718959999504
+      },
+      {
+        "package": "ratarmount-export-core",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7, ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.2415239830002065
+      },
+      {
+        "package": "ratarmount-http",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7, ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.24520418399970367
+      },
+      {
+        "package": "ratarmount-smb",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.2714071089999379
+      },
+      {
+        "package": "ratarmount-9p",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7, ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.24509424600000784
+      },
+      {
+        "package": "ratarmount-sftp",
+        "cause": "ring v0.17.14: missing MinGW C compiler",
+        "wall_including_lock_seconds": 5.180006950000006
+      },
+      {
+        "package": "ratarmount-checked-open-fixture",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: missing MinGW C compiler",
+        "wall_including_lock_seconds": 0.22899545700011004
+      },
+      {
+        "package": "ratarmount",
+        "cause": "libz-sys v1.1.29, aws-lc-sys v0.46.0: missing MinGW C compiler, cross pkg-config/sysroot unavailable",
+        "wall_including_lock_seconds": 0.5255871170002138
+      }
+    ],
+    "workspace_probe": 23.37040005699987,
+    "per_package_sweep_including_lock_seconds": 188.94150158700222,
+    "dependency_cached_group_relint": {
+      "target": "x86_64-pc-windows-gnu",
+      "package": null,
+      "profile": "dependencies-cached-relint",
+      "command": [
+        "flock",
+        "/tmp/muse-cargo.lock",
+        "cargo",
+        "clippy",
+        "--target",
+        "x86_64-pc-windows-gnu",
+        "-p",
+        "ratarmount-core",
+        "-p",
+        "ratarmount-volume-plugin",
+        "-p",
+        "ratarmount-csi",
+        "-p",
+        "ratarmount-formats-fat",
+        "-p",
+        "ratarmount-formats-exfat",
+        "-p",
+        "ratarmount-formats-ntfs",
+        "-p",
+        "ratarmount-formats-udf",
+        "-p",
+        "ratarmount-formats-wim",
+        "--lib",
+        "--bins",
+        "--all-features",
+        "--message-format=json",
+        "--",
+        "-D",
+        "warnings",
+        "-D",
+        "unfulfilled_lint_expectations",
+        "--cfg",
+        "internal_read_inventory",
+        "--check-cfg=cfg(internal_read_inventory)",
+        "--force-warn",
+        "clippy::disallowed_methods",
+        "--force-warn",
+        "clippy::disallowed_types"
+      ],
+      "environment": {
+        "CARGO_BUILD_JOBS": "2",
+        "CARGO_TARGET_DIR": "/tmp/rrs201-xtarget",
+        "RUSTFLAGS": "",
+        "CLIPPY_CONF_DIR": "/home/brewerm/git/muse-worktrees/plans/rrs-201/clippy/match/implementation-config"
+      },
+      "start_utc": "2026-10-24T23:49:38.476175+00:00",
+      "elapsed_including_lock_seconds": 1.1822639700003492,
+      "lock_queue_approx_seconds": 0.010751678000360698,
+      "after_lock_seconds": 1.1715122919999885,
+      "exit_code": 0,
+      "inventory_diagnostics": 34,
+      "errors": [],
+      "stdout_file": "/home/brewerm/git/muse-worktrees/plans/rrs-201/clippy/match/keystone/x86_64-pc-windows-gnu--dependencies-cached-relint.jsonl",
+      "stderr_file": "/home/brewerm/git/muse-worktrees/plans/rrs-201/clippy/match/keystone/x86_64-pc-windows-gnu--dependencies-cached-relint.stderr"
+    }
+  },
+  "aarch64-apple-darwin": {
+    "measured_packages": 48,
+    "passed": [
+      "ratarmount-core",
+      "ratarmount-volume-plugin",
+      "ratarmount-csi",
+      "ratarmount-formats-fat",
+      "ratarmount-formats-exfat",
+      "ratarmount-formats-ntfs",
+      "ratarmount-formats-udf",
+      "ratarmount-formats-wim"
+    ],
+    "failed": [
+      {
+        "package": "ratarmount-index",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 4.6106741130001865
+      },
+      {
+        "package": "ratarmount-session",
+        "cause": "libz-sys v1.1.29, aws-lc-sys v0.46.0: host cc rejects Darwin flags; target C compiler/SDK absent, cross pkg-config/sysroot unavailable",
+        "wall_including_lock_seconds": 4.896675053999843
+      },
+      {
+        "package": "ratarmount-python",
+        "cause": "libz-sys v1.1.29: host cc rejects Darwin flags; target C compiler/SDK absent, cross pkg-config/sysroot unavailable",
+        "wall_including_lock_seconds": 2.3797182690000227
+      },
+      {
+        "package": "ratarmount-fuse",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7, ring v0.17.14: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 4.30305152100027
+      },
+      {
+        "package": "ratarmount-compress",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7, lzma-sys v0.1.20: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 6.819691000999683
+      },
+      {
+        "package": "ratarmount-formats-tar",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.331816108000112
+      },
+      {
+        "package": "ratarmount-formats-zip",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.4260376990000623
+      },
+      {
+        "package": "ratarmount-formats-ar",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3326211370003875
+      },
+      {
+        "package": "ratarmount-formats-tensors",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.318556531000013
+      },
+      {
+        "package": "ratarmount-formats-cpio",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.323923397999806
+      },
+      {
+        "package": "ratarmount-formats-iso9660",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3190300470000693
+      },
+      {
+        "package": "ratarmount-formats-warc",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3176704919997064
+      },
+      {
+        "package": "ratarmount-formats-xar",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3262772300004144
+      },
+      {
+        "package": "ratarmount-formats-cab",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3193769140002587
+      },
+      {
+        "package": "ratarmount-formats-libarchive",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3247004099998776
+      },
+      {
+        "package": "ratarmount-formats-sevenzip",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.331684575000054
+      },
+      {
+        "package": "ratarmount-formats-sqlar",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.44362047300001
+      },
+      {
+        "package": "ratarmount-formats-squashfs",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3561037849999593
+      },
+      {
+        "package": "ratarmount-formats-ext4",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3697044219998133
+      },
+      {
+        "package": "ratarmount-formats-block",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3412493079999876
+      },
+      {
+        "package": "ratarmount-formats-dmg",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 6.536244577999696
+      },
+      {
+        "package": "ratarmount-formats-qcow2",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3376374879999275
+      },
+      {
+        "package": "ratarmount-formats-vhd",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3408207239999683
+      },
+      {
+        "package": "ratarmount-formats-vmdk",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.338011010000173
+      },
+      {
+        "package": "ratarmount-formats-asar",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3249658469999304
+      },
+      {
+        "package": "ratarmount-formats-ogg",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3165363650000472
+      },
+      {
+        "package": "ratarmount-formats-html",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.320110592999754
+      },
+      {
+        "package": "ratarmount-formats-pdf",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.383368912000151
+      },
+      {
+        "package": "ratarmount-formats-git",
+        "cause": "libz-sys v1.1.29, openssl-sys v0.9.117: host cc rejects Darwin flags; target C compiler/SDK absent, cross pkg-config/sysroot unavailable",
+        "wall_including_lock_seconds": 13.020629012999962
+      },
+      {
+        "package": "ratarmount-formats-restic",
+        "cause": "zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.948919539000144
+      },
+      {
+        "package": "ratarmount-remote",
+        "cause": "aws-lc-sys v0.46.0, ring v0.17.14: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 7.82330266200006
+      },
+      {
+        "package": "ratarmount-compositing",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.34305741199978
+      },
+      {
+        "package": "ratarmount-nfs",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.377756194000085
+      },
+      {
+        "package": "ratarmount-export-core",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3575232119997054
+      },
+      {
+        "package": "ratarmount-http",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.331937168999957
+      },
+      {
+        "package": "ratarmount-smb",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.4554778719998467
+      },
+      {
+        "package": "ratarmount-9p",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3358173870001337
+      },
+      {
+        "package": "ratarmount-sftp",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 11.280257300000358
+      },
+      {
+        "package": "ratarmount-checked-open-fixture",
+        "cause": "ring v0.17.14, zstd-sys v2.1.0+zstd.1.5.7: host cc rejects Darwin flags; target C compiler/SDK absent",
+        "wall_including_lock_seconds": 3.3138434190000225
+      },
+      {
+        "package": "ratarmount",
+        "cause": "libz-sys v1.1.29, aws-lc-sys v0.46.0: host cc rejects Darwin flags; target C compiler/SDK absent, cross pkg-config/sysroot unavailable",
+        "wall_including_lock_seconds": 4.878687044999879
+      }
+    ],
+    "workspace_probe": 11.690981612999849,
+    "per_package_sweep_including_lock_seconds": 189.23088571999915,
+    "dependency_cached_group_relint": {
+      "target": "aarch64-apple-darwin",
+      "package": null,
+      "profile": "dependencies-cached-relint",
+      "command": [
+        "flock",
+        "/tmp/muse-cargo.lock",
+        "cargo",
+        "clippy",
+        "--target",
+        "aarch64-apple-darwin",
+        "-p",
+        "ratarmount-core",
+        "-p",
+        "ratarmount-volume-plugin",
+        "-p",
+        "ratarmount-csi",
+        "-p",
+        "ratarmount-formats-fat",
+        "-p",
+        "ratarmount-formats-exfat",
+        "-p",
+        "ratarmount-formats-ntfs",
+        "-p",
+        "ratarmount-formats-udf",
+        "-p",
+        "ratarmount-formats-wim",
+        "--lib",
+        "--bins",
+        "--all-features",
+        "--message-format=json",
+        "--",
+        "-D",
+        "warnings",
+        "-D",
+        "unfulfilled_lint_expectations",
+        "--cfg",
+        "internal_read_inventory",
+        "--check-cfg=cfg(internal_read_inventory)",
+        "--force-warn",
+        "clippy::disallowed_methods",
+        "--force-warn",
+        "clippy::disallowed_types"
+      ],
+      "environment": {
+        "CARGO_BUILD_JOBS": "2",
+        "CARGO_TARGET_DIR": "/tmp/rrs201-xtarget",
+        "RUSTFLAGS": "",
+        "CLIPPY_CONF_DIR": "/home/brewerm/git/muse-worktrees/plans/rrs-201/clippy/match/implementation-config"
+      },
+      "start_utc": "2026-10-24T23:49:39.844298+00:00",
+      "elapsed_including_lock_seconds": 1.2019705459997567,
+      "lock_queue_approx_seconds": 0.010740744000031555,
+      "after_lock_seconds": 1.1912298019997252,
+      "exit_code": 0,
+      "inventory_diagnostics": 37,
+      "errors": [],
+      "stdout_file": "/home/brewerm/git/muse-worktrees/plans/rrs-201/clippy/match/keystone/aarch64-apple-darwin--dependencies-cached-relint.jsonl",
+      "stderr_file": "/home/brewerm/git/muse-worktrees/plans/rrs-201/clippy/match/keystone/aarch64-apple-darwin--dependencies-cached-relint.stderr"
+    }
+  }
+}

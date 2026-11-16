@@ -10,9 +10,11 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  # Linux host CI jobs pinned to ubuntu-24.04 while hilather/ratarmount-rs#280
+  # (ubuntu-26.04 GNU tar lseek EOVERFLOW; hilather/ratarmount-rs#73/#79).
   check:
     name: fmt + clippy + test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # hilather/ratarmount-rs#280
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -30,9 +32,15 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          # The policy runner keeps strict/collection targets in separate
+          # keyed subdirectories; keep both plus the pinned Clippy-only build.
+          cache-directories: |
+            target/internal-read-policy
+            ~/.cargo/internal-read-clippy
 
       - name: cargo fmt
-        run: cargo fmt --all -- --check
+        run: CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo fmt --all -- --check
 
       - name: windows-lib workflow + stable Windows API guard
         run: ./packaging/test-windows-lib-ci.sh
@@ -40,8 +48,14 @@ jobs:
       - name: workspace lock version matches Cargo.toml
         run: bash packaging/test-workspace-lock-version.sh
 
+      - name: zstd advisory floors
+        run: bash packaging/test-zstd-advisory-floor.sh
+
       - name: portable deps allowlist self-test
         run: bash packaging/test-portable-deps-selftest.sh
+
+      - name: rpm deps guard self-test
+        run: bash packaging/test-rpm-deps-selftest.sh
 
       - name: canonical hash reference self-test
         run: python3 -I test-harness/canonical-hash/reference.py --self-test
@@ -49,18 +63,44 @@ jobs:
       - name: wheel export audit self-test
         run: python3 -I packaging/audit_native_exports.py --self-test
 
+      - name: macOS deps checker regression (SIGPIPE-safe minos probe)
+        run: ./test-harness/test-build-macos-deps-check.sh
+
       - name: wheel blake3 no_neon feature graph (#199)
         run: bash packaging/test-wheel-blake3-no-neon.sh
 
-      - name: internal-read inventory (#151)
+      - name: internal-read CI contract
         run: |
-          python3 -I packaging/test-internal-read-inventory.py --self-test
-          python3 -I packaging/test-internal-read-inventory.py
-          # `unchanged-from-e6ca64e` creates must exist unchanged at the baseline.
-          git fetch --no-tags --depth=1 origin e6ca64e3a3d2c509840ca147fcf0d71703546318
-          mkdir -p "$RUNNER_TEMP/inventory-baseline"
-          git archive FETCH_HEAD | tar -x -C "$RUNNER_TEMP/inventory-baseline"
-          python3 -I packaging/test-internal-read-inventory.py --verify-baseline "$RUNNER_TEMP/inventory-baseline"
+          python3 -I packaging/internal-read-clippy/test_ci.py
+          python3 -I packaging/internal-read-clippy/test_native.py
+
+      - name: Native Clippy fixture controls (Linux)
+        run: python3 -I packaging/internal-read-clippy/native.py --fixtures
+
+      - name: Pinned policy toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --component clippy
+
+      - name: Build pinned Clippy-only policy driver
+        run: python3 -I packaging/internal-read-clippy/compiler/build.py
+
+      - name: internal-read compiler and manifest regressions
+        run: |
+          DRIVER="$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver"
+          EVIDENCE="$RUNNER_TEMP/internal-read-regressions"
+          python3 -I packaging/internal-read-clippy/compiler/test_driver.py --driver "$DRIVER" --output "$EVIDENCE/compiler"
+          python3 -I packaging/internal-read-clippy/syntax/test_compiled.py --driver "$DRIVER" --output "$EVIDENCE/syntax"
+          CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR="$HOME/.cargo/internal-read-clippy/grammar-target" flock /tmp/muse-cargo.lock cargo +1.98.0 test --locked --manifest-path packaging/internal-read-clippy/syntax/Cargo.toml
+          python3 -I packaging/internal-read-clippy/controls/run.py --driver "$DRIVER" --output "$EVIDENCE/controls.json"
+          python3 -I packaging/internal-read-clippy/test_policy.py
+          python3 -I packaging/internal-read-clippy/test_manifest.py --driver "$DRIVER" --output "$EVIDENCE/manifest"
+          python3 -I packaging/internal-read-clippy/test_diagnostics.py --driver "$DRIVER" --output "$EVIDENCE/diagnostics"
+          python3 -I packaging/internal-read-clippy/test_dispatch.py --driver "$DRIVER" --output "$EVIDENCE/dispatch"
+          python3 -I packaging/internal-read-clippy/witnesses/test_provenance.py
+          python3 -I packaging/internal-read-clippy/witnesses/run.py --driver "$DRIVER" --output "$EVIDENCE/api"
+          python3 -I packaging/internal-read-clippy/witnesses/test_journal_protocol.py --driver "$DRIVER" --output "$EVIDENCE/journal"
+
+      - name: Production Clippy and reviewed manifest diff
+        run: python3 -I packaging/internal-read-clippy/policy.py
 
       - name: aarch64 checked-open CI contract
         run: |
@@ -68,12 +108,12 @@ jobs:
           ./test-harness/test-aarch64-checked-open-ci.sh --self-test
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test
         env:
           RATARMOUNT_REQUIRE_XORRISO: "1"
-        run: cargo test --workspace
+        run: CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test --workspace --no-fail-fast
 
       - name: packaging systemd/autofs helper
         run: |
@@ -119,7 +159,7 @@ jobs:
   # cannot go stale. Soft-skip is not allowed for the unit tests.
   nfsv4:
     name: nfsv4 feature tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # hilather/ratarmount-rs#280
     steps:
       - uses: actions/checkout@v4
 
@@ -162,7 +202,7 @@ jobs:
   # (`RATARMOUNT_TEST_LSD` / `RATARMOUNT_TEST_MAGNET` stay unset).
   bittorrent:
     name: bittorrent feature tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # hilather/ratarmount-rs#280
     timeout-minutes: 30
     env:
       # Same as packages.yml: -Dwarnings on this job would also cover
@@ -196,7 +236,7 @@ jobs:
   # No /dev/fuse and no Python required at runtime (--no-mount only).
   benchmark-gates:
     name: benchmark gates (cold index)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # hilather/ratarmount-rs#280
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -235,7 +275,7 @@ jobs:
   # Also runnable via workflow_dispatch for ad-hoc full checks.
   benchmark-gates-full:
     name: benchmark gates (full ratios, soft-skip)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # hilather/ratarmount-rs#280
     timeout-minutes: 45
     # Always on PR/push like the cold job, but soft on ratio availability.
     steps:
@@ -270,7 +310,7 @@ jobs:
 
   fuse-harness:
     name: FUSE phase allowlists
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # hilather/ratarmount-rs#280
     needs: check
     timeout-minutes: 45
     steps:
@@ -319,7 +359,7 @@ jobs:
   # -------------------------------------------------------------------------
   macos:
     name: macOS (build + test)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     env:
       # Workflow-level RUSTFLAGS=-Dwarnings also applies to *dependencies*.
@@ -407,7 +447,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # Bump when macOS toolchain / macFUSE link env changes.
-          key: macos-14-v3
+          key: macos-15-v1
 
       - name: cargo build (fuse smoke compile)
         # Surface link/build errors before clippy. Emit ::error:: annotations so
@@ -482,6 +522,9 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "14.0"
           CARGO_TARGET_DIR: target/macos-deployment-14
         run: |
+          bin="$(cargo test -p ratarmount-index --lib --no-run --message-format=json \
+            | python3 -I -c 'import json, sys; print(next(m["executable"] for m in map(json.loads, sys.stdin) if m.get("reason") == "compiler-artifact" and m.get("executable") and m["package_id"].find("ratarmount-index") >= 0))')"
+          ./test-harness/check-macos-init-offsets.sh "$bin"
           cargo test -p ratarmount-index --lib checked_open
           cargo test -p ratarmount-checked-open-fixture --test dso
 
@@ -539,7 +582,7 @@ jobs:
   # the declared toolchain.
   msrv:
     name: msrv
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # hilather/ratarmount-rs#280
     steps:
       - uses: actions/checkout@v4
 

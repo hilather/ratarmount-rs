@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 #![cfg(target_os = "linux")]
 #![allow(clippy::result_large_err)]
 
@@ -14,6 +16,10 @@ pub use service::Driver;
 use options::MountSpec;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[expect(
+    clippy::disallowed_types,
+    reason = r###"internal-read:v1 {"id":"IR-E0029-T01","item":"ratarmount_csi","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for the CSI journal and lifetime lock files.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+)]
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -43,17 +49,30 @@ struct Journal {
 
 impl Journal {
     fn open(dir: &Path) -> Result<Self, Status> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0030-M01","item":"<ratarmount_csi::Journal>::open","disposition":"output-owner","category":"runtime-state-directory","reason":"Create the CSI state tree before protecting it and opening the lifetime lock.","creation":{"policy":"recursive-directory","basis":"Journal::open applies 0700 to the state directory immediately after creation; intermediate directory defaults remain unchanged."}}"###
+        )]
         fs::create_dir_all(dir).map_err(|_| Status::internal("cannot create state directory"))?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
             .map_err(|_| Status::internal("cannot protect state directory"))?;
-        let lock = OpenOptions::new()
+        let lock = {
+#[expect(clippy::disallowed_types, reason = r###"internal-read:v1 {"id":"IR-B0285-T01","item":"<ratarmount_csi::Journal>::open","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###)]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0285-M01","item":"<ratarmount_csi::Journal>::open","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###)]
+let mut __inventory_value_0 = OpenOptions::new();
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0031-M01","item":"<ratarmount_csi::Journal>::open","disposition":"output-owner","category":"runtime-lock","reason":"Allow creating the CSI lifetime lock without truncating a pre-existing lock.","creation":{"policy":"create-or-open","basis":"The journal lock is read/write, no-follow, mode 0600 and truncate(false), and is retained for the driver lifetime."}}"###)]
+let __inventory_value_1 = __inventory_value_0
             .read(true)
             .write(true)
-            .create(true)
+            .create(true);
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0285-M02","item":"<ratarmount_csi::Journal>::open","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###)]
+let __inventory_value_2 = __inventory_value_1
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(dir.join("lock"))
+            .open(dir.join("lock"));
+__inventory_value_2
+}
             .map_err(|_| Status::internal("cannot open state lock"))?;
         lock.try_lock()
             .map_err(|_| Status::failed_precondition("state directory is already locked"))?;
@@ -64,24 +83,57 @@ impl Journal {
     }
 
     fn load(&self) -> Result<BTreeMap<String, Entry>, Status> {
-        match fs::read(self.dir.join("journal.json")) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
-                Status::internal("invalid CSI journal; refusing to discard mount ownership")
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-            Err(_) => Err(Status::internal("cannot read CSI journal")),
+        {
+            let __inventory_condition_5296 = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0286-M01","item":"<ratarmount_csi::Journal>::load","disposition":"out-of-family","category":"structured-control-record","reason":"daemon state journal","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
+                let __inventory_value_0 = fs::read(self.dir.join("journal.json"));
+                __inventory_value_0
+            };
+            match __inventory_condition_5296 {
+                Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
+                    Status::internal("invalid CSI journal; refusing to discard mount ownership")
+                }),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+                Err(_) => Err(Status::internal("cannot read CSI journal")),
+            }
         }
     }
 
     fn save(&self, entries: &BTreeMap<String, Entry>) -> Result<(), Status> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0288-M01","item":"<ratarmount_csi::Journal>::save","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let result = (|| -> std::io::Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(self.dir.join("journal.tmp"))?;
+            let mut file = {
+                #[expect(
+                    clippy::disallowed_types,
+                    reason = r###"internal-read:v1 {"id":"IR-B0287-T01","item":"<ratarmount_csi::Journal>::save","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+                )]
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0287-M01","item":"<ratarmount_csi::Journal>::save","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
+                )]
+                let mut __inventory_value_0 = OpenOptions::new();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0032-M01","item":"<ratarmount_csi::Journal>::save","disposition":"output-owner","category":"structured-control-record","reason":"Configure CSI journal.tmp replacement output before serializing, syncing and renaming it.","creation":{"policy":"create-or-truncate","basis":"The temporary journal uses no-follow and mode 0600; completed output replaces journal.json only after fsync."}}"###
+                )]
+                let __inventory_value_1 = __inventory_value_0.write(true).create(true);
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0287-M02","item":"<ratarmount_csi::Journal>::save","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )]
+                let __inventory_value_2 = __inventory_value_1
+                    .truncate(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(self.dir.join("journal.tmp"));
+                __inventory_value_2
+            }?;
             file.write_all(&serde_json::to_vec(entries)?)?;
             file.sync_all()?;
             fs::rename(self.dir.join("journal.tmp"), self.dir.join("journal.json"))?;
@@ -195,6 +247,10 @@ impl State {
         // Write intent before mkdir/spawn so restart handles every crash window.
         self.journal.save(&next)?;
         self.entries = next;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0033-M01","item":"<ratarmount_csi::State>::publish","disposition":"output-owner","category":"mountpoint-directory","reason":"Create the CSI publish target after durable mount intent is written and before checking emptiness.","creation":{"policy":"recursive-directory","basis":"The requested target tree uses current directory defaults; the empty-directory check and mounter own later publication."}}"###
+        )]
         fs::create_dir_all(&spec.target)
             .map_err(|_| Status::internal("cannot create target directory"))?;
         if fs::read_dir(&spec.target)

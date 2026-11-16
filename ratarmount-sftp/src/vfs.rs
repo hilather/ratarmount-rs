@@ -256,6 +256,10 @@ impl RatarmountSftp {
         let fd = ov
             .open_overlay_fd(&path, flags)
             .map_err(|e| io_to_errno(&overlay_to_io(e)))?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0544-M01","item":"<ratarmount_sftp::vfs::RatarmountSftp>::write","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
         let wrote = ov.write_all_at(&file, &path, offset, data);
         ov.finish_owned_write_fd(file);
@@ -326,11 +330,28 @@ impl RatarmountSftp {
         attrs: &ratarmount_compositing::OverlayMetadata,
     ) -> Result<(), i32> {
         let ov = self.overlay()?;
+        let requested = size.is_some() || !attrs.is_empty();
+        let filtered;
+        let attrs = if attrs.uid.is_some() || attrs.gid.is_some() {
+            // A chown to the owner already presented is a no-op (#327).
+            let mut out = attrs.clone();
+            if let Ok(fi) = self.file_info_at(path) {
+                (out.uid, out.gid) = self
+                    .attribute_mapping
+                    .drop_presented_owner(fi.uid, fi.gid, attrs.uid, attrs.gid);
+            }
+            filtered = out;
+            &filtered
+        } else {
+            attrs
+        };
         let path = self.realpath(path);
-        ov.set_attributes(&path, size, attrs).map_err(|e| {
-            let e = overlay_to_io(e);
-            e.raw_os_error().unwrap_or_else(|| io_to_errno(&e))
-        })?;
+        if requested {
+            ov.set_attributes(&path, size, attrs).map_err(|e| {
+                let e = overlay_to_io(e);
+                e.raw_os_error().unwrap_or_else(|| io_to_errno(&e))
+            })?;
+        }
         let id = self.inodes.id_for_path(&path);
         self.bump(id);
         Ok(())
@@ -432,6 +453,99 @@ mod tests {
 
     use ratarmount_core::{create_root_file_info, ListResult, S_IFREG};
     use ratarmount_export_core::fill_read;
+
+    /// Regression: SFTP must retain read-only denials after filtering chown,
+    /// and refuse a real owner change before applying a combined truncate (#327).
+    #[test]
+    fn regression_327_chown_preserves_policy_and_readonly() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("member"), b"base").unwrap();
+        let source = Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+        for protected in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut ov =
+                crate::test_overlay::new_overlay(source.clone(), directory.path()).unwrap();
+            let rules = Arc::new(ratarmount_compositing::ReadOnlyGlobs::new(["member"]).unwrap());
+            if protected {
+                ov.set_policy(Some(rules.clone()));
+            }
+            let ov = Arc::new(ov);
+            for writable in [true, false] {
+                let fs =
+                    RatarmountSftp::with_overlay(ov.clone(), 0, 8, writable.then(|| ov.clone()))
+                        .with_attribute_mapping(
+                            ratarmount_core::AttributeMapping::parse("uid=12345,gid=23456")
+                                .unwrap(),
+                        );
+                let id = fs.id_for_path("/member");
+                let chown = |size: Option<u64>, uid| {
+                    let attrs = ratarmount_compositing::OverlayMetadata {
+                        uid: Some(uid),
+                        gid: Some(23456),
+                        ..Default::default()
+                    };
+                    fs.setstat(&fs.path_for_id(id).unwrap(), size, &attrs)
+                };
+                if !writable || protected {
+                    assert_eq!(chown(None, 12345).unwrap_err(), libc::EROFS);
+                } else {
+                    assert!(chown(None, 12345).is_ok());
+                    assert_eq!(chown(Some(0), 12346).unwrap_err(), libc::EPERM);
+                }
+                if writable {
+                    // An empty request did not attempt an ownership change.
+                    fs.setstat_metadata(
+                        "/member",
+                        &ratarmount_compositing::OverlayMetadata::default(),
+                    )
+                    .unwrap();
+                }
+                assert!(!ov.has_file("/member"));
+                assert_eq!(ov.lookup("/member", 0).unwrap().size, 4);
+            }
+            assert_eq!(rules.erofs_denied(), u64::from(protected));
+        }
+    }
+
+    /// Regression: `cp -p` over SFTP failed because a SETSTAT to the owner
+    /// already presented was refused with EPERM (#327).
+    #[test]
+    fn regression_sftp_setstat_same_owner_chown_is_noop() {
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        for (mapping, shown) in [("", (uid, gid)), ("uid=12345,gid=23456", (12345, 23456))] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::write(base.path().join("member"), b"base").unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let source =
+                Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+            let ov = Arc::new(crate::test_overlay::new_overlay(source, directory.path()).unwrap());
+            let fs = RatarmountSftp::with_overlay(ov.clone(), 0, 8, Some(ov))
+                .with_attribute_mapping(ratarmount_core::AttributeMapping::parse(mapping).unwrap());
+            let chown = |uid: Option<u32>, gid: Option<u32>| {
+                fs.setstat_metadata(
+                    "/member",
+                    &ratarmount_compositing::OverlayMetadata {
+                        uid,
+                        gid,
+                        ..Default::default()
+                    },
+                )
+            };
+            assert_eq!(chown(Some(shown.0), Some(shown.1)), Ok(()), "{mapping}");
+            assert_eq!(chown(Some(shown.0), None), Ok(()), "{mapping}");
+            assert_eq!(chown(None, Some(shown.1)), Ok(()), "{mapping}");
+            assert_eq!(
+                chown(Some(shown.0.wrapping_add(1)), None),
+                Err(libc::EPERM),
+                "{mapping}"
+            );
+            assert_eq!(
+                chown(None, Some(shown.1.wrapping_add(1))),
+                Err(libc::EPERM),
+                "{mapping}"
+            );
+        }
+    }
 
     /// Regression: SFTP SETSTAT mode and times must not be silently discarded.
     #[test]
@@ -700,6 +814,24 @@ mod tests {
         assert_eq!(fs.rmdir("/d").unwrap_err(), libc::EROFS);
         assert_eq!(fs.rename("/a", "/b").unwrap_err(), libc::EROFS);
         assert_eq!(fs.setstat_size("/x", 0).unwrap_err(), libc::EROFS);
+    }
+
+    /// Regression (#316): SFTP MKDIR of an existing directory changed its
+    /// mode instead of failing; it is EEXIST (SSH_FX_FAILURE on the wire in
+    /// SFTP v3) and the mode is kept.
+    #[test]
+    fn regression_316_mkdir_existing_is_eexist() {
+        let td = tempfile::tempdir().unwrap();
+        let ov = Arc::new(
+            crate::test_overlay::new_overlay(Arc::new(EmptyFs) as Arc<dyn MountSource>, td.path())
+                .expect("overlay"),
+        );
+        let fs = RatarmountSftp::with_overlay(ov.clone(), 0, 8, Some(ov));
+        fs.mkdir("/d", 0o750).expect("mkdir");
+        let before = fs.file_info_at("/d").unwrap().mode;
+        assert_eq!(fs.mkdir("/d", 0o700).unwrap_err(), libc::EEXIST);
+        assert_eq!(fs.file_info_at("/d").unwrap().mode, before);
+        assert_eq!(before & 0o7777, 0o750);
     }
 
     #[test]

@@ -75,6 +75,10 @@ fn blob_id(entry: &Option<Entry>) -> io::Result<String> {
 fn literal(out: &mut dyn Write, entry: &Option<Entry>) -> io::Result<()> {
     // Spool compressed data, never the uncompressed payload. This keeps a
     // size-fallback literal bounded even for a multi-gigabyte file.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0105-M01","item":"ratarmount::diff::patch::literal","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut zlib = ZlibEncoder::new(tempfile::tempfile()?, Compression::default());
     let size = entry.as_ref().map_or(0, |e| e.size);
     if let Some(entry) = entry {

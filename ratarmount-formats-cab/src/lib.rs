@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! Microsoft CAB MountSource (`backendName=CABMountSource`).
 //!
 //! | `typeCompress` | Name | Native open |
@@ -227,6 +230,10 @@ impl CabMountSource {
         recreate: bool,
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0299-M01","item":"<ratarmount_formats_cab::CabMountSource>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = File::open(&archive_path)?;
         Self::open_from_reader(
             file,
@@ -309,6 +316,7 @@ impl CabMountSource {
                         Arc::clone(&archive_io),
                     ) {
                         Ok(s) => return Ok(s),
+                        Err(e) if options.read_only_index => return Err(e),
                         Err(e) => eprintln!("info: could not load cab index ({e}); rebuilding"),
                     }
                 }
@@ -334,7 +342,7 @@ impl CabMountSource {
         folders: Vec<CfFolder>,
         archive_io: SharedArchiveIo,
     ) -> Result<Self> {
-        let index = SqliteIndex::open_read_only(index_path)?;
+        let index = SqliteIndex::open_read_only_for_open(index_path, options)?;
         index.check_backend_name(BACKEND_NAME)?;
         // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
         // Missing tarstats still Ok (legacy indexes).
@@ -876,7 +884,14 @@ fn userdata(fi: &FileInfo) -> Option<&SQLiteIndexedTarUserData> {
 }
 
 pub fn looks_like_cab(path: &Path) -> bool {
-    if let Ok(mut f) = File::open(path) {
+    if let Ok(mut f) = {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0300-M01","item":"ratarmount_formats_cab::looks_like_cab","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = File::open(path);
+        __inventory_value_0
+    } {
         let mut magic = [0u8; 4];
         if f.read(&mut magic).ok() == Some(4) && &magic == b"MSCF" {
             return true;
@@ -909,6 +924,52 @@ fn store_stats_for_label(index: &SqliteIndex, path: &Path, size: u64) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn prepared_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect()
+    }
+
+    /// Regression: a strict warm worker must read members without changing its prepared sidecar.
+    #[test]
+    fn regression_prepared_index_warm_open_is_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.cab");
+        let index = dir.path().join("index.sqlite");
+        let fixture = synthetic_store_cab("hello.txt", b"worker base");
+        std::fs::write(&archive, &fixture).unwrap();
+        drop(
+            CabMountSource::open(
+                &archive,
+                Some(&index),
+                &OpenOptions::default(),
+                "test",
+                true,
+            )
+            .unwrap(),
+        );
+        SqliteIndex::finalize_prepared(&index).unwrap();
+        let before = prepared_snapshot(dir.path());
+        let options = OpenOptions {
+            read_only_index: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let source = CabMountSource::open(&archive, Some(&index), &options, "test", false).unwrap();
+        let member = "/hello.txt".to_owned();
+        let info = source.lookup(&member, 0).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut source.open(&info, 0).unwrap(), &mut bytes).unwrap();
+        assert_eq!(bytes, b"worker base");
+        assert_eq!(prepared_snapshot(dir.path()), before);
+        drop(source);
+        assert_eq!(prepared_snapshot(dir.path()), before);
+    }
+
     use flate2::{Compress, Compression, FlushCompress};
     use std::io::Cursor;
 

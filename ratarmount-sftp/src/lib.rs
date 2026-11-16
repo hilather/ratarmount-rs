@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! Userspace SFTP export of a [`ratarmount_core::MountSource`] (P-10).
 //!
 //! Listen on `127.0.0.1:20222` (unprivileged; well-known 22 is residual).

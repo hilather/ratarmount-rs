@@ -190,6 +190,10 @@ fn export_git(args: &GitSnapshotArgs, output: &mut impl Write) -> Result<i32> {
     let source = open_git_base(&args.git_base)?;
     let mut entries = BTreeMap::new();
     collect_git_entries(&source, "", &mut entries)?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0098-M01","item":"ratarmount::snapshot::export_git","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tar = tempfile::tempfile()?;
     {
         let mut writer = BufWriter::new(&mut tar);
@@ -227,6 +231,10 @@ fn export_git(args: &GitSnapshotArgs, output: &mut impl Write) -> Result<i32> {
     }
     let len = tar.metadata()?.len();
     tar.seek(SeekFrom::Start(0))?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0099-M01","item":"ratarmount::snapshot::export_git","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut encoded =
         tempfile::NamedTempFile::new_in(archive.parent().ok_or("missing output parent")?)?;
     {
@@ -246,6 +254,9 @@ fn export_git(args: &GitSnapshotArgs, output: &mut impl Write) -> Result<i32> {
             crate::shard::index_request(&archive, &index),
             Default::default(),
         )?;
+        // The job drops its readers before returning, but compression metadata
+        // may still be in WAL. Hand consumers a completed immutable artifact.
+        ratarmount_index::SqliteIndex::finalize_prepared(&index)?;
     }
     let archive_digest = format!("sha256:{}", crate::shard::sha256(&archive)?);
     let base_digest = format!("git-tree:{}", source.tree_id());
@@ -419,11 +430,19 @@ fn materialize_tree(source: &GitMountSource, path: &str, destination: &Path) -> 
         let target = destination.join(&name);
         match info.mode & S_IFMT {
             S_IFDIR => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0142-M01","item":"ratarmount::snapshot::materialize_tree","disposition":"output-owner","category":"snapshot-output-directory","reason":"Materialize a Git snapshot directory entry in the caller-owned output tree.","creation":{"policy":"exclusive-directory","basis":"create_dir refuses collisions; recursive materialization owns the output and retains existing directory permissions."}}"###
+                )]
                 fs::create_dir(&target)?;
                 materialize_tree(source, &format!("{path}/{name}"), &target)?;
             }
             S_IFLNK => std::os::unix::fs::symlink(&info.linkname, target)?,
             S_IFREG => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0100-M01","item":"ratarmount::snapshot::materialize_tree","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )]
                 let mut file = fs::File::create(&target)?;
                 io::copy(&mut source.open(&info, 0)?, &mut file)?;
                 // Preserve the restic convenience export's existing read-only modes.
@@ -482,7 +501,12 @@ pub(super) fn run(args: &SnapshotArgs, output: &mut impl Write) -> Result<i32> {
             let temporary;
             let mut tags = args.tags.clone();
             let dir = if let Some(spec) = &args.git {
-                temporary = tempfile::tempdir()?;
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0101-M01","item":"ratarmount::snapshot::run","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )]
+                let __inventory_assigned = tempfile::tempdir()?;
+                temporary = __inventory_assigned;
                 tags.extend(git_tree(spec, temporary.path())?);
                 temporary.path().to_owned()
             } else {
@@ -560,12 +584,14 @@ mod tests {
         for name in ["summarize", "mark"] {
             check(journal.find_subcommand(name).unwrap().clone());
         }
-        check(
-            crate::sandbox::SandboxArgs::command()
-                .find_subcommand("run")
-                .unwrap()
-                .clone(),
-        );
+        for name in ["run", "finalize"] {
+            check(
+                crate::sandbox::SandboxArgs::command()
+                    .find_subcommand(name)
+                    .unwrap()
+                    .clone(),
+            );
+        }
         let snapshot = SnapshotArgs::command();
         for name in ["add", "list"] {
             check(snapshot.find_subcommand(name).unwrap().clone());
@@ -713,6 +739,64 @@ mod tests {
         ] {
             assert!(crate::parse_args_from(std::iter::once("ratarmount").chain(args)).is_err());
         }
+    }
+
+    /// Regression: snapshot --with-index must checkpoint seek metadata before strict readers start.
+    #[test]
+    fn regression_prepared_index_snapshot_export_finishes_handoff() {
+        let (temp, spec, _) = export_fixture(1234567890);
+        let archive = temp.path().join("prepared.tar.zst");
+        let index = temp.path().join("prepared.tar.zst.index.sqlite");
+        assert_eq!(
+            run(
+                &parse(&[
+                    &spec,
+                    archive.to_str().unwrap(),
+                    "--with-index",
+                    "--frame-size",
+                    "1K",
+                ]),
+                &mut Vec::new()
+            )
+            .unwrap(),
+            0
+        );
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!PathBuf::from(format!("{}{suffix}", index.display())).exists());
+        }
+        let snapshot = || -> BTreeMap<_, _> {
+            fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.is_file())
+                .map(|path| (path.clone(), fs::read(path).unwrap()))
+                .collect()
+        };
+        let before = snapshot();
+        let catalog = ratarmount_index::SqliteIndex::open_prepared(&index).unwrap();
+        assert!(catalog.get_zstd_blocks().unwrap().len() > 2);
+        let source = ratarmount_session::factory::open_path(
+            &archive,
+            &ratarmount_core::OpenOptions {
+                read_only_index: true,
+                write_index: false,
+                index_file_path: Some(index),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+        let member = source.lookup("/plain", 0).unwrap();
+        let mut bytes = Vec::new();
+        source
+            .open(&member, 0)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, vec![42; 32768]);
+        assert_eq!(snapshot(), before);
+        drop((source, catalog));
+        assert_eq!(snapshot(), before);
     }
 
     /// Regression: indexed snapshots must equal the pinned Git view, preserve modes, and open warm.
@@ -863,6 +947,7 @@ mod tests {
     /// Regression: --with-index progress banners must not corrupt snapshot JSON stdout.
     #[test]
     fn regression_snapshot_git_stdout_has_no_index_banners() {
+        let _processes = ratarmount_index::test_process::spawning();
         if let Ok(spec) = std::env::var("RATARMOUNT_SNAPSHOT_STDOUT_FIXTURE") {
             let archive = std::env::var("RATARMOUNT_SNAPSHOT_STDOUT_ARCHIVE").unwrap();
             assert_eq!(
@@ -1108,6 +1193,7 @@ mod tests {
     /// Regression: init is opt-in, and init/backup/list failures must preserve restic exit codes.
     #[test]
     fn regression_snapshot_exit_codes_and_init_opt_in() {
+        let _processes = ratarmount_index::test_process::spawning();
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         let input = temp.path().join("input");
@@ -1205,6 +1291,7 @@ mod tests {
     /// Regression: two near-identical snapshots must deduplicate and round-trip through Session.
     #[test]
     fn regression_snapshot_restic_dedup_roundtrip() {
+        let _processes = ratarmount_index::test_process::spawning();
         if Command::new("restic").arg("version").output().is_err() {
             eprintln!("skip: restic is not on PATH");
             return;
@@ -1294,7 +1381,7 @@ mod tests {
         assert!(listing.contains("[\"one\"]"));
         assert!(listing.contains("[\"two\"]"));
         // Isolate reader credentials in a subprocess instead of mutating the test runner's env.
-        let status = Command::new(std::env::current_exe().unwrap())
+        let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "snapshot::tests::snapshot_restic_reader_child",
@@ -1309,9 +1396,16 @@ mod tests {
             .env("AI_SNAP_TEST_SHARED", temp.path().join("one/shared.bin"))
             .env_remove("RESTIC_PASSWORD")
             .env("RESTIC_PASSWORD_FILE", &password)
-            .status()
+            .env(crate::child_helpers::SNAPSHOT_RESTIC_READER_CHILD, "1")
+            .output()
             .unwrap();
-        assert!(status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("restic reader verified"),
+            "{stdout}\n{stderr}"
+        );
     }
 
     #[test]
@@ -1320,6 +1414,13 @@ mod tests {
         use ratarmount_session::{
             IndexPolicy, OpenRequest, ReadRequest, Recreate, Session, SourceSpec,
         };
+        if !crate::child_helpers::spawned_by_parent(
+            crate::child_helpers::SNAPSHOT_RESTIC_READER_CHILD,
+            "snapshot_restic_reader_child",
+            "regression_snapshot_restic_dedup_roundtrip",
+        ) {
+            return;
+        }
         let repo = std::env::var_os("AI_SNAP_TEST_REPO").expect("reader subprocess repository");
         let session = Session::open(OpenRequest {
             source: SourceSpec::Url(format!("restic:{}", Path::new(&repo).display())),
@@ -1354,5 +1455,6 @@ mod tests {
                 assert_eq!(bytes, expected);
             }
         }
+        println!("restic reader verified");
     }
 }

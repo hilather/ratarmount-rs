@@ -57,7 +57,9 @@ ratarmount --publish-index-to 'hf://datasets/your-name/your-dataset@main/shards/
 ```
 
 The destination archive must already have matching bytes. Local destinations
-retain the existing `--publish-index-to PATH` sidecar-copy behavior.
+use a WAL-complete `VACUUM INTO` snapshot pin and a separate copy with
+`--publish-index-to PATH`. Local publication is Unix-only, refuses an existing
+destination, and requires its directory to exist. See [indexes](../formats.md#indexes).
 
 The same blob-before-pointer protocol works with `s3://`, `gs://`, and `az://`
 archive URLs, using their existing credential environment variables. Anonymous

@@ -1,5 +1,8 @@
-use super::process::{self, MountState, Mounter, ProcessMounter};
+use super::lowers;
+use super::process::{self, MountState, Mounter, ProcessMounter, SpawnSpec};
 use super::protocol::*;
+use super::requests::{self, RequestLog, Status};
+use ratarmount_compositing::LowerLayerRecord;
 use ratarmount_session::factory;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -20,6 +23,12 @@ fn invalid(message: impl Into<String>) -> ApiError {
     ApiError::new("invalid_request", message)
 }
 
+/// An `io` error that names its step and path: no sandbox error is a bare io
+/// error (Keystone note (1)).
+pub(super) fn io_error(step: &str, path: &Path, error: impl std::fmt::Display) -> ApiError {
+    ApiError::new("io", format!("{step}: {}: {error}", path.display()))
+}
+
 pub fn validate_name(name: &str) -> Result<()> {
     if name.len() > 128
         || !name
@@ -35,11 +44,30 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn private_dir(path: &Path) -> Result<()> {
-    match fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.into()),
+pub(super) fn private_dir(path: &Path) -> Result<()> {
+    {
+        let __inventory_condition_1232 = {
+            #[expect(
+                clippy::disallowed_types,
+                reason = r###"internal-read:v1 {"id":"IR-E0133-T01","item":"ratarmount::sandbox::daemon::private_dir","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the sandbox private-directory builder.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+            )]
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0133-M01","item":"ratarmount::sandbox::daemon::private_dir","disposition":"support","category":"creation-builder","reason":"Construct the sandbox private-directory builder.","creation":{"policy":"none","basis":"The builder constructor opens nothing; create and post-creation ownership/private-mode checks are separate."}}"###
+            )]
+            let mut __inventory_value_0 = fs::DirBuilder::new();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0134-M01","item":"ratarmount::sandbox::daemon::private_dir","disposition":"output-owner","category":"sandbox-state-directory","reason":"Create an owned private sandbox directory or validate an existing one.","creation":{"policy":"private-directory","basis":"DirBuilder requests 0700; symlink_metadata then requires a real directory owned by euid with no group/other permissions."}}"###
+            )]
+            let __inventory_value_1 = __inventory_value_0.mode(0o700).create(path);
+            __inventory_value_1
+        };
+        match __inventory_condition_1232 {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     let meta = fs::symlink_metadata(path)?;
     if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
@@ -54,15 +82,37 @@ fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// A concurrently spawned child can retain this lock after its guard is dropped
+// until the child execs or exits, normally briefly. O_CLOEXEC confines this to
+// fork-to-exec; the lock is never released early, and the worst case is a
+// spurious "busy" response.
 pub fn lock(path: &Path) -> Result<File> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
+    let file = {
+        #[expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-B0106-T01","item":"ratarmount::sandbox::daemon::lock","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0106-M01","item":"ratarmount::sandbox::daemon::lock","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
+        )]
+        let mut __inventory_value_0 = fs::OpenOptions::new();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0135-M01","item":"ratarmount::sandbox::daemon::lock","disposition":"output-owner","category":"runtime-lock","reason":"Permit creating the sandbox daemon lock while preserving an existing lock inode.","creation":{"policy":"create-or-open","basis":"The lock uses 0600, NOFOLLOW/CLOEXEC and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor."}}"###
+        )]
+        let __inventory_value_1 = __inventory_value_0.read(true).write(true).create(true);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0106-M02","item":"ratarmount::sandbox::daemon::lock","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
+        let __inventory_value_2 = __inventory_value_1
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path);
+        __inventory_value_2
+    }?;
     let meta = file.metadata()?;
     if !meta.is_file()
         || meta.uid() != unsafe { libc::geteuid() }
@@ -170,6 +220,10 @@ fn socket_alive(path: &Path) -> io::Result<bool> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0107-M01","item":"ratarmount::sandbox::daemon::socket_alive","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"socket descriptor probe","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
     if unsafe {
@@ -236,12 +290,30 @@ struct State {
 
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().expect("state path has parent");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0108-M01","item":"ratarmount::sandbox::daemon::atomic_json","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer(&mut file, value).map_err(|e| invalid(e.to_string()))?;
     file.as_file().sync_all()?;
     file.persist(path).map_err(|e| ApiError::from(e.error))?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0109-M01","item":"ratarmount::sandbox::daemon::atomic_json","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+/// Test-only deterministic attempt IDs: each drawn directory is renamed to the
+/// next queued name, else to the next `attempt-NNNNNN`. The production draw and
+/// its reviewed statement are unchanged.
+#[cfg(test)]
+#[derive(Default)]
+pub struct TestIds {
+    pub queue: std::collections::VecDeque<String>,
+    pub next: u32,
 }
 
 pub struct Supervisor<M: Mounter> {
@@ -251,10 +323,77 @@ pub struct Supervisor<M: Mounter> {
     bases: BTreeMap<String, Base>,
     ram_root: Option<PathBuf>,
     max_attempts: usize,
-    timeout: Duration,
+    pub(super) timeout: Duration,
     pub stopping: bool,
+    pub requests: RequestLog,
+    /// Layered attempts: `None` from before the spawn until the re-check once
+    /// mounted passes (an attempt a failed rollback kept stays `None`), then
+    /// the layers its child composed. Plain attempts have no entry.
+    pub taken_lowers: BTreeMap<String, Option<Vec<LowerLayerRecord>>>,
+    /// Decoded bytes the bundle lowers of one `new` share
+    /// (`lowers::MAX_BUNDLE_DECODED_BYTES`; tests lower it).
+    pub lower_decode_budget: u64,
+    /// What R1c-1 keeps per live attempt (§5.7): its instance and plan,
+    /// written before its spawn, and its finalize state. `destroy` removes
+    /// it with the attempt, so an ID drawn again starts clean.
+    pub attempt_state: BTreeMap<String, AttemptState>,
+    /// Keys of the attempt instances (OS-seeded) and a counter that only
+    /// increases: an instance is never derived from an ID, a time or an
+    /// inode number.
+    instance_keys: std::collections::hash_map::RandomState,
+    instance_counter: u64,
+    /// Devices a failed fsync of step S poisoned (§5.6):
+    /// every later finalize that would sync anything there answers `io`
+    /// until a restart. Never persisted.
+    pub poisoned: std::collections::BTreeSet<u64>,
+    /// Served retained attempts, by ID.
+    pub retained: BTreeMap<String, super::retained::RetainedEntry>,
+    pub retained_log: super::retained::RetainedLog,
+    /// Names found under `retained/` at start without a live record: kept,
+    /// never entered or served.
+    pub bare_retained: std::collections::BTreeSet<String>,
+    /// `--max-retained` (set after `open`; `retained::MAX_RETAINED` by default).
+    pub max_retained: usize,
+    #[cfg(test)]
+    pub test_ids: Option<TestIds>,
+    #[cfg(test)]
+    pub seams: super::finalize::Seams,
     _lock: File,
 }
+
+/// What the supervisor keeps per live attempt ID (R1c-1 §5.7).
+#[derive(Default)]
+pub struct AttemptState {
+    /// 32 lowercase hex digits drawn at `new`; with the ID it names one
+    /// attempt (ruling 5).
+    pub instance: String,
+    /// Created with `retain`: a successful finalize commits it to `retained/`.
+    pub retain: bool,
+    /// Created with a journal (`attempts/ID/journal.jsonl`).
+    pub journal: bool,
+    /// The IDs whose `retained/<ID>/overlay` it took as lowers, in order.
+    pub over: Vec<String>,
+    pub finalize: FinalizeState,
+}
+
+/// A finalize's progress across its tries (§5.4).
+#[derive(Default)]
+pub struct FinalizeState {
+    pub progress: super::finalize::FinalizeProgress,
+    /// The first `bytes_written` measurement.
+    pub bytes_written: Option<u64>,
+    /// The last `erofs_denied` read while the child served.
+    pub erofs_denied: Option<u64>,
+    /// The stop answered `Detaching`: a retry checks the child once.
+    pub detaching: bool,
+    /// The journal-shutdown refusal of step 4b, answered to every retry.
+    pub journal_failure: Option<String>,
+    /// The report of a finalized attempt.
+    pub report: Option<Value>,
+}
+
+/// Consecutive reserved attempt-ID draws before a `new` gives up (§5.6).
+const RESERVED_DRAWS: usize = 16;
 
 impl<M: Mounter> Supervisor<M> {
     pub fn open(root: &Path, max_attempts: usize, timeout: Duration, mounter: M) -> Result<Self> {
@@ -266,6 +405,10 @@ impl<M: Mounter> Supervisor<M> {
         let guard = lock(&root.join("daemon.lock"))?;
         private_dir(&root.join("attempts"))?;
         private_dir(&root.join("indexes"))?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0110-M01","item":"<ratarmount::sandbox::daemon::Supervisor<T0>>::open","disposition":"out-of-family","category":"structured-control-record","reason":"sandbox supervisor/run state or attempt log","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let bases = match fs::read(root.join("bases.json")) {
             Ok(bytes) => {
                 let state: State = serde_json::from_slice(&bytes)
@@ -288,6 +431,10 @@ impl<M: Mounter> Supervisor<M> {
             Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(e.into()),
         };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0111-M01","item":"<ratarmount::sandbox::daemon::Supervisor<T0>>::open","disposition":"out-of-family","category":"structured-control-record","reason":"sandbox supervisor/run state or attempt log","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let ram_root: Option<PathBuf> = match fs::read(root.join("ram-root.json")) {
             Ok(bytes) => Some(serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -305,6 +452,11 @@ impl<M: Mounter> Supervisor<M> {
                 verify_tmpfs(ram)?;
             }
         }
+        // Refusals of the request log come before reconcile touches attempts.
+        let requests = RequestLog::open(&root, requests::limits())?;
+        // Then `retained/` and its log, also before reconcile, which never
+        // enters `retained/`.
+        let (retained_log, bare_retained) = Self::open_retained(&root)?;
         let mut supervisor = Self {
             root,
             mounter,
@@ -314,13 +466,105 @@ impl<M: Mounter> Supervisor<M> {
             max_attempts,
             timeout,
             stopping: false,
+            requests,
+            taken_lowers: BTreeMap::new(),
+            lower_decode_budget: lowers::MAX_BUNDLE_DECODED_BYTES,
+            attempt_state: BTreeMap::new(),
+            instance_keys: Default::default(),
+            instance_counter: 0,
+            poisoned: Default::default(),
+            retained: BTreeMap::new(),
+            retained_log,
+            bare_retained,
+            max_retained: super::retained::MAX_RETAINED,
+            #[cfg(test)]
+            test_ids: None,
+            #[cfg(test)]
+            seams: super::retained::TEST_STARTUP_SEAMS
+                .with(|seams| seams.take().unwrap_or_default()),
             _lock: guard,
         };
+        supervisor.restore_retained();
         supervisor.reconcile()?;
+        // Every attempt is gone now; only a retained attempt's target still
+        // exists: its finalize records stay pinned (approval note (a)). A live
+        // record pins its ID and instance; a bare name every instance.
+        supervisor.requests.set_pins(requests::Pins {
+            targets: supervisor
+                .retained_log
+                .live_ids()
+                .filter_map(|id| supervisor.retained_log.live(id))
+                .map(|record| requests::Target {
+                    id: record.id.clone(),
+                    instance: record.instance.clone(),
+                })
+                .collect(),
+            ids: supervisor.bare_retained.iter().cloned().collect(),
+        });
+        // Every attempt is gone now, so a request a restart cut off is resolved.
+        supervisor.requests.resolve_interrupted()?;
         Ok(supervisor)
     }
 
-    fn indexes(&self, base: &str) -> PathBuf {
+    /// A fresh attempt instance (ruling 5): 32 lowercase hex digits from two
+    /// hashes, under the supervisor's OS-seeded keys, of a counter that only
+    /// increases.
+    fn draw_instance(&mut self) -> String {
+        use std::hash::BuildHasher;
+        self.instance_counter += 1;
+        let counter = self.instance_counter;
+        format!(
+            "{:016x}{:016x}",
+            self.instance_keys.hash_one((counter, 0u8)),
+            self.instance_keys.hash_one((counter, 1u8))
+        )
+    }
+
+    /// The target of the live attempt `id`, if it is one.
+    pub(super) fn attempt_target(&self, id: &str) -> Option<requests::Target> {
+        self.attempts.get(id)?;
+        self.attempt_state.get(id).map(|state| requests::Target {
+            id: id.into(),
+            instance: state.instance.clone(),
+        })
+    }
+
+    /// Ruling 7: finalize and retain run on Linux only. `serve` refuses to
+    /// start elsewhere already; this guards in-process callers.
+    pub(super) fn platform_rule(&self) -> Result<()> {
+        #[cfg(test)]
+        let linux = cfg!(target_os = "linux") && !self.seams.not_linux;
+        #[cfg(not(test))]
+        let linux = cfg!(target_os = "linux");
+        if linux {
+            Ok(())
+        } else {
+            Err(invalid(
+                "finalize and retain are supported on Linux only; the sandbox supervisor is Linux only",
+            ))
+        }
+    }
+
+    #[cfg(test)]
+    fn test_attempt_dir(&mut self, dir: PathBuf) -> PathBuf {
+        let Some(ids) = &mut self.test_ids else {
+            return dir;
+        };
+        let name = ids.queue.pop_front().unwrap_or_else(|| {
+            ids.next += 1;
+            format!("attempt-{:06}", ids.next)
+        });
+        let renamed = dir.with_file_name(name);
+        assert!(
+            fs::symlink_metadata(&renamed).is_err(),
+            "test attempt ID {} already exists",
+            renamed.display()
+        );
+        fs::rename(&dir, &renamed).unwrap();
+        renamed
+    }
+
+    pub(super) fn indexes(&self, base: &str) -> PathBuf {
         self.root.join("indexes").join(base)
     }
 
@@ -349,7 +593,9 @@ impl<M: Mounter> Supervisor<M> {
                 return Err(invalid("unsafe stale mountpoint"));
             }
             self.mounter.cleanup(&path)?;
-            fs::remove_dir_all(entry.path())?;
+            // Through descriptors: a sealed attempt has no write bits.
+            crate::overlay_pack::remove_tree(&entry.path())
+                .map_err(|e| io_error("reconcile: removing a stale attempt", &entry.path(), e))?;
         }
         if let Some(ram) = &self.ram_root {
             if ram.exists() {
@@ -362,16 +608,20 @@ impl<M: Mounter> Supervisor<M> {
                         .map_err(|_| invalid("invalid RAM attempt name"))?;
                     validate_name(&id)?;
                     private_dir(&entry.path())?;
-                    fs::remove_dir_all(entry.path())?;
+                    crate::overlay_pack::remove_tree(&entry.path()).map_err(|e| {
+                        io_error("reconcile: removing a stale RAM overlay", &entry.path(), e)
+                    })?;
                 }
             }
         }
         Ok(())
     }
 
+    /// Polls `starting` and `ready` attempts only: a `crashed` one stays
+    /// crashed, and `finalizing` and `finalized` ones belong to finalize.
     pub fn supervise(&mut self) {
         for attempt in self.attempts.values_mut() {
-            if attempt.status == "crashed" {
+            if !matches!(attempt.status.as_str(), "starting" | "ready") {
                 continue;
             }
             match self.mounter.poll(attempt) {
@@ -382,8 +632,56 @@ impl<M: Mounter> Supervisor<M> {
         }
     }
 
-    pub fn handle(&mut self, operation: Operation) -> Result<Value> {
+    /// Runs a v1 operation, or for a v2 one the same v1 operation; a v2 `new`
+    /// with a `request_id` goes through the request-ID layer (§5.3), and every
+    /// v2 `new` passes its `lowers`, `journal` and `retain` on: without them,
+    /// and without a `request_id`, it is a v1 `new`.
+    pub fn handle(&mut self, operation: impl Into<Op>) -> Result<Value> {
         self.supervise();
+        let operation = match operation.into() {
+            Op::V1(operation) => operation,
+            Op::V2(OperationV2::Finalize {
+                id,
+                pack,
+                request_id,
+            }) => return self.finalize(id, pack, request_id),
+            Op::V2(
+                operation @ OperationV2::New {
+                    request_id: Some(_),
+                    ..
+                },
+            ) => return self.new_with_request_id(operation),
+            Op::V2(OperationV2::New {
+                base,
+                count,
+                overlay,
+                quota,
+                readonly_globs,
+                request_id: None,
+                lowers,
+                journal,
+                retain,
+                overlay_durability,
+            }) => {
+                return self
+                    .new_attempts(
+                        &base,
+                        count,
+                        overlay,
+                        quota,
+                        readonly_globs,
+                        &lowers,
+                        journal.as_ref(),
+                        retain,
+                        overlay_durability,
+                        None,
+                    )
+                    .map(|(_, result)| result)
+                    .map_err(|failed| failed.error)
+            }
+            Op::V2(OperationV2::List { base, all: true }) => return self.list_all(base),
+            Op::V2(operation) => operation.into_v1(),
+        };
         match operation {
             Operation::CreateBase {
                 name,
@@ -409,6 +707,7 @@ impl<M: Mounter> Supervisor<M> {
                         "base already exists; choose a new name",
                     ));
                 }
+                check_base_source_kind(&base)?;
                 private_dir(&indexes)?;
                 self.mounter.prepare(&base, &indexes, self.timeout)?;
                 self.bases.insert(base.name.clone(), base.clone());
@@ -424,7 +723,21 @@ impl<M: Mounter> Supervisor<M> {
                 overlay,
                 quota,
                 readonly_globs,
-            } => self.new_attempts(&base, count, overlay, quota, readonly_globs),
+            } => self
+                .new_attempts(
+                    &base,
+                    count,
+                    overlay,
+                    quota,
+                    readonly_globs,
+                    &[],
+                    None,
+                    false,
+                    OverlayDurability::Full,
+                    None,
+                )
+                .map(|(_, result)| result)
+                .map_err(|failed| failed.error),
             Operation::List { base } => {
                 if let Some(name) = &base {
                     self.base(name)?;
@@ -436,17 +749,58 @@ impl<M: Mounter> Supervisor<M> {
                     .collect::<Vec<_>>()))
             }
             Operation::Diff { id, git } => {
-                let attempt = self.attempt(&id)?.clone();
+                let (attempt, lowers) = self.served(&id)?;
+                // A layered attempt is rendered against base + lowers, never
+                // against the bare base (§5.5).
+                let layers = match lowers {
+                    None => Vec::new(),
+                    Some(None) => {
+                        return Err(ApiError::new(
+                            "diff_failed",
+                            format!("lower stack of attempt {id} was never verified; destroy it"),
+                        ))
+                    }
+                    Some(Some(records)) => lowers::recorded_layers(&records)
+                        .map_err(|e| ApiError::new("diff_failed", e))?,
+                };
                 let deleted = self.mounter.deleted_paths(&attempt)?;
-                let base = self.base(&attempt.base)?;
-                let source = open_base(base, &self.indexes(&base.name))?;
+                if deleted.is_none() {
+                    super::inspection::check_offline_durability(&attempt.overlay_dir)
+                        .map_err(|e| ApiError::new("diff_failed", e.to_string()))?;
+                }
+                let base = self.base(&attempt.base)?.clone();
+                let indexes = self.indexes(&base.name);
+                // A finalized or retained attempt is read offline, after its
+                // base was classified and gated (which writes nothing), as
+                // the CLI `diff` gates (R1c-1 §5.7).
+                let (_keep, source) = if matches!(attempt.status.as_str(), "finalized" | "retained")
+                {
+                    let classified = super::finalize::classify_supervised(&base, &indexes)
+                        .map_err(|e| ApiError::new("base_open_failed", e))?;
+                    let recorded =
+                        ratarmount_compositing::OverlayMeta::read_no_recovery(&attempt.overlay_dir)
+                            .map_err(|e| ApiError::new("diff_failed", e.to_string()))?;
+                    crate::overlay_cmd::gate_base(
+                        &attempt.overlay_dir,
+                        recorded.as_ref(),
+                        &classified,
+                        &crate::overlay_cmd::BaseIdentityArgs::default(),
+                    )
+                    .map_err(|e| ApiError::new("diff_failed", e))?;
+                    let source = classified.source();
+                    (Some(classified), source)
+                } else {
+                    (None, open_base(&base, &indexes)?.source)
+                };
+                let composed = crate::MountLowerStack::compose_layers(source, &layers)
+                    .map_err(|e| ApiError::new("diff_failed", e.to_string()))?;
                 let patch = crate::diff::render_source(
                     &crate::diff::DiffArgs {
                         directory: attempt.overlay_dir.clone(),
                         git,
                         ..Default::default()
                     },
-                    source.source.clone(),
+                    composed,
                     deleted,
                 )
                 .map_err(|e| ApiError::new("diff_failed", e))?;
@@ -455,13 +809,25 @@ impl<M: Mounter> Supervisor<M> {
                 Ok(serde_json::Value::Object(response))
             }
             Operation::Stats { id } => {
-                let attempt = self.attempt(&id)?.clone();
-                let stats = if let Some(deleted) = self.mounter.deleted_paths(&attempt)? {
+                let (attempt, _) = self.served(&id)?;
+                let deleted = self.mounter.deleted_paths(&attempt)?;
+                if deleted.is_none() {
+                    super::inspection::check_offline_durability(&attempt.overlay_dir)
+                        .map_err(|e| ApiError::new("stats_failed", e.to_string()))?;
+                }
+                let stats = if let Some(deleted) = deleted {
+                    // Named, never a bare io error (Keystone note (1)).
+                    let usage = ratarmount_compositing::OverlayUsage::scan(&attempt.overlay_dir)
+                        .map_err(|e| {
+                            io_error(
+                                &format!("stats of attempt {id}: scanning its overlay"),
+                                &attempt.overlay_dir,
+                                e,
+                            )
+                        })?;
                     crate::overlay_stats::render(
                         ratarmount_compositing::OverlayStats {
-                            usage: ratarmount_compositing::OverlayUsage::scan(
-                                &attempt.overlay_dir,
-                            )?,
+                            usage,
                             files_deleted: deleted.len() as u64,
                         },
                         true,
@@ -504,12 +870,110 @@ impl<M: Mounter> Supervisor<M> {
         }
     }
 
-    fn base(&self, name: &str) -> Result<&Base> {
+    /// The request-ID layer of a v2 `new` (§5.3), serial under `daemon.lock`.
+    /// An ID is bound to the body it first arrived with for as long as its
+    /// record lives: another body is `idempotency_conflict` in every state,
+    /// `done` and `failed` answer what they stored without doing anything, and
+    /// a `retryable` record or a new ID runs, with `running` logged first.
+    fn new_with_request_id(&mut self, operation: OperationV2) -> Result<Value> {
+        let OperationV2::New {
+            base,
+            count,
+            overlay,
+            quota,
+            readonly_globs,
+            request_id: Some(id),
+            lowers,
+            journal,
+            retain,
+            overlay_durability,
+        } = &operation
+        else {
+            unreachable!("only a v2 new with a request_id is routed here");
+        };
+        // Ruling 7, before anything is looked up or recorded: it needs only
+        // the request body.
+        if *retain {
+            self.platform_rule()?;
+        }
+        // A malformed ID is refused before anything is recorded.
+        validate_name(id).map_err(|_| {
+            invalid("request_id must start with an ASCII letter or digit, then letters, digits, dot, underscore or hyphen (max 128)")
+        })?;
+        let hash = requests::op_hash(&operation);
+        match self.requests.lookup(id) {
+            Some((_, recorded)) if recorded != hash => {
+                return Err(ApiError::new(
+                    "idempotency_conflict",
+                    "request_id was first used with another request body; use a new request_id",
+                ))
+            }
+            Some((Status::Done | Status::Failed, _)) => return self.requests.stored(id),
+            // A record stays running only while the log is Broken.
+            Some((Status::Running, _)) => return Err(self.requests.unavailable()),
+            Some((Status::Retryable, _)) | None => {}
+        }
+        self.requests.begin(id, &hash)?;
+        let outcome = self.new_attempts(
+            base,
+            *count,
+            *overlay,
+            *quota,
+            readonly_globs.clone(),
+            lowers,
+            journal.as_ref(),
+            *retain,
+            *overlay_durability,
+            Some((id, &hash)),
+        );
+        self.requests.finish(id, &hash, outcome)
+    }
+
+    /// Refuses with `capacity`, before any attempt exists, a batch whose future
+    /// `done` line would pass the per-record cap (§5.5 preflight). The line is
+    /// measured by serializing it with the real state and RAM paths and
+    /// placeholder IDs of the drawn IDs' fixed length, so escapes count.
+    fn record_preflight(
+        &self,
+        (id, op_hash): (&str, &str),
+        name: &str,
+        count: usize,
+        ram: Option<&Path>,
+    ) -> Result<()> {
+        const PLACEHOLDER: &str = "attempt-000000";
+        let dir = self.root.join("attempts").join(PLACEHOLDER);
+        let attempt = Attempt {
+            id: PLACEHOLDER.into(),
+            base: name.into(),
+            path: dir.join("mnt"),
+            overlay_dir: ram.map_or_else(|| dir.join("overlay"), |p| p.join(PLACEHOLDER)),
+            status: "ready".into(),
+        };
+        let line = requests::done_line(
+            id,
+            op_hash,
+            &vec![attempt.id.clone(); count],
+            &json!(vec![attempt; count]),
+        );
+        let cap = self.requests.limits().record_bytes();
+        if line.len() as u64 > cap {
+            return Err(ApiError::new(
+                "capacity",
+                format!(
+                    "the request record would take {} bytes, over its {cap}-byte cap; use a smaller count or shorter state and RAM paths",
+                    line.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn base(&self, name: &str) -> Result<&Base> {
         self.bases
             .get(name)
             .ok_or_else(|| ApiError::new("not_found", "unknown base"))
     }
-    fn attempt(&self, id: &str) -> Result<&Attempt> {
+    pub(super) fn attempt(&self, id: &str) -> Result<&Attempt> {
         self.attempts
             .get(id)
             .ok_or_else(|| ApiError::new("not_found", "unknown attempt"))
@@ -542,6 +1006,13 @@ impl<M: Mounter> Supervisor<M> {
         ))
     }
 
+    /// Starts a batch. With a `request` (its ID and `op_hash`) the future
+    /// `done` line is measured first. Success returns the batch's attempt IDs
+    /// with the result; an error returns the IDs its failed rollback kept, in
+    /// structured form, besides naming them in the unchanged v1 message.
+    /// `lowers` are validated before anything exists and re-checked once every
+    /// child is ready (§5.2–§5.4); a `journal` goes to `attempts/ID/journal.jsonl`.
+    #[allow(clippy::too_many_arguments)]
     fn new_attempts(
         &mut self,
         name: &str,
@@ -549,13 +1020,23 @@ impl<M: Mounter> Supervisor<M> {
         overlay: Overlay,
         quota: Option<u64>,
         readonly: Vec<String>,
-    ) -> Result<Value> {
+        lowers: &[String],
+        journal: Option<&JournalSpec>,
+        retain: bool,
+        durability: OverlayDurability,
+        request: Option<(&str, &str)>,
+    ) -> requests::Outcome {
+        if retain {
+            // Ruling 7: before anything is resolved (an ID-less `new`).
+            self.platform_rule()?;
+        }
         let base = self.base(name)?.clone();
         if count == 0 || count > self.max_attempts.saturating_sub(self.attempts.len()) {
             return Err(ApiError::new(
                 "capacity",
                 "count must be positive and fit --max-attempts (including crashed attempts)",
-            ));
+            )
+            .into());
         }
         // Attempt policy can only tighten the base policy.
         let quota = match (base.options.quota, quota) {
@@ -571,23 +1052,124 @@ impl<M: Mounter> Supervisor<M> {
             .collect();
         ratarmount_compositing::ReadOnlyGlobs::with_allow(&readonly, &base.options.allow_globs)
             .map_err(|e| invalid(e.to_string()))?;
+        let indexes = self.indexes(name);
+        // R1c-1 §5.5: the scope, platform and durability rules of `retain`,
+        // before any lower is read, the RAM root, any attempt directory or
+        // child.
+        if retain {
+            self.retain_preflight(&base, overlay, count)?;
+        }
+        // Before the RAM root, any attempt directory or child (§5.2).
+        let layered = if lowers.is_empty() {
+            Vec::new()
+        } else {
+            lowers::validate(
+                &base,
+                lowers,
+                &lowers::Roots {
+                    state: &self.root,
+                    ram: self.ram_root.as_deref(),
+                    retained: &self.retained_lowers(),
+                },
+                self.lower_decode_budget,
+            )?
+        };
+        // The retained attempts the stack names, by the paths requested
+        // (ruling 3: never by digest).
+        let over = self.over(&layered);
+        let bundle_cache = if retain {
+            self.retain_lower_preflight(&base, &layered, &over)?
+        } else {
+            None
+        };
+        let lower_paths: Vec<PathBuf> = layered.iter().map(|lower| lower.path.clone()).collect();
+        // A relaxed attempt's flag goes through the parser too: before the
+        // RAM root, any attempt directory or child.
+        if !layered.is_empty() || journal.is_some() || !durability.is_full() {
+            // The parser takes these, but no argv can carry them: spawning
+            // the child would fail only once its attempt exists.
+            let unspawnable = journal.and_then(|spec| {
+                spec.exclude
+                    .iter()
+                    .find_map(|glob| process::unspawnable_exclude(glob).map(|why| (glob, why)))
+            });
+            if let Some((glob, why)) = unspawnable {
+                return Err(invalid(format!(
+                    "journal exclude glob {:?} {why}",
+                    lowers::excerpt(glob, lowers::SHOWN_BYTES)
+                ))
+                .into());
+            }
+            let argv = journal.map_or(0, |spec| process::excludes_argv_bytes(&spec.exclude));
+            if argv > process::MAX_EXCLUDE_ARGV_BYTES {
+                return Err(invalid(format!(
+                    "journal exclude globs take {argv} bytes of the child's arguments, more than {}",
+                    process::MAX_EXCLUDE_ARGV_BYTES
+                ))
+                .into());
+            }
+            // The flags the child will get, through the mount CLI's parser.
+            let probe = Path::new("/unused/journal.jsonl");
+            check_spawn_args(
+                &base,
+                &indexes,
+                &SpawnSpec {
+                    quota,
+                    readonly: &readonly,
+                    lowers: &lower_paths,
+                    bundle_cache: bundle_cache.as_deref(),
+                    journal: journal.map(|spec| (probe, spec)),
+                    durability,
+                },
+            )?;
+        }
         let ram = match overlay {
             Overlay::Disk => None,
             Overlay::Tmpfs => Some(self.ram_root()?),
         };
-        let indexes = self.indexes(name);
+        if let Some(request) = request {
+            self.record_preflight(request, name, count, ram.as_deref())?;
+        }
         let mut ids = Vec::new();
+        let held = self.held();
         let deadline = Instant::now() + self.timeout;
         let result = (|| {
             for _ in 0..count {
                 if Instant::now() >= deadline {
                     return Err(ApiError::new("timeout", "attempt batch startup timed out"));
                 }
-                let dir = tempfile::Builder::new()
-                    .prefix("attempt-")
-                    .permissions(fs::Permissions::from_mode(0o700))
-                    .tempdir_in(self.root.join("attempts"))?
-                    .keep();
+                // tempfile avoids only names present in attempts/; an ID a
+                // request record names is redrawn, so a replay never names
+                // another request's attempt (§5.6).
+                let mut reserved = 0;
+                let dir = loop {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0112-M01","item":"<ratarmount::sandbox::daemon::Supervisor<T0>>::new_attempts","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                    )]
+                    let dir = tempfile::Builder::new()
+                        .prefix("attempt-")
+                        .permissions(fs::Permissions::from_mode(0o700))
+                        .tempdir_in(self.root.join("attempts"))?
+                        .keep();
+                    #[cfg(test)]
+                    let dir = self.test_attempt_dir(dir);
+                    let drawn = dir.file_name().and_then(|name| name.to_str());
+                    // Also never an ID a retained record or name holds
+                    // (R1c-1 §5.7).
+                    if !drawn.is_some_and(|id| self.requests.is_reserved(id) || held.contains(id)) {
+                        break dir;
+                    }
+                    // Still empty, and never recorded as an attempt.
+                    fs::remove_dir(&dir)?;
+                    reserved += 1;
+                    if reserved == RESERVED_DRAWS {
+                        return Err(ApiError::new(
+                            "io",
+                            "could not allocate a unique attempt ID",
+                        ));
+                    }
+                };
                 let id = dir.file_name().unwrap().to_str().unwrap().to_owned();
                 let attempt = Attempt {
                     id: id.clone(),
@@ -600,18 +1182,58 @@ impl<M: Mounter> Supervisor<M> {
                 };
                 // Record before spawning so partial batches and initialization errors clean up.
                 ids.push(id.clone());
+                if !layered.is_empty() {
+                    self.taken_lowers.insert(id.clone(), None);
+                }
+                // The attempt's instance and plan, before its spawn; its
+                // finalize records are never evicted while it exists.
+                let instance = self.draw_instance();
+                self.requests.pin(requests::Target {
+                    id: id.clone(),
+                    instance: instance.clone(),
+                });
+                self.attempt_state.insert(
+                    id.clone(),
+                    AttemptState {
+                        instance,
+                        retain,
+                        journal: journal.is_some(),
+                        over: over.clone(),
+                        finalize: Default::default(),
+                    },
+                );
                 self.attempts.insert(id, attempt.clone());
                 private_dir(&attempt.path)?;
                 private_dir(&attempt.overlay_dir)?;
-                self.mounter
-                    .spawn(&base, &indexes, &attempt, quota, &readonly)?;
+                // Outside the mountpoint and the overlay, for disk and tmpfs tops.
+                let journal_path = dir.join("journal.jsonl");
+                self.mounter.spawn(
+                    &base,
+                    &indexes,
+                    &attempt,
+                    &SpawnSpec {
+                        quota,
+                        readonly: &readonly,
+                        lowers: &lower_paths,
+                        bundle_cache: bundle_cache.as_deref(),
+                        journal: journal.map(|spec| (journal_path.as_path(), spec)),
+                        durability,
+                    },
+                )?;
             }
             loop {
                 self.supervise();
                 if let Some(id) = ids.iter().find(|id| self.attempts[*id].status == "crashed") {
                     let log = self.attempts[id].path.parent().unwrap().join("mount.log");
                     let mut diagnostic = String::new();
-                    if let Ok(file) = File::open(log) {
+                    if let Ok(file) = {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-B0113-M01","item":"<ratarmount::sandbox::daemon::Supervisor<T0>>::new_attempts","disposition":"out-of-family","category":"structured-control-record","reason":"sandbox supervisor/run state or attempt log","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                        )]
+                        let __inventory_value_0 = File::open(log);
+                        __inventory_value_0
+                    } {
                         let _ = file.take(8192).read_to_string(&mut diagnostic);
                     }
                     return Err(ApiError::new(
@@ -629,6 +1251,9 @@ impl<M: Mounter> Supervisor<M> {
                     ));
                 }
                 thread::sleep(Duration::from_millis(20));
+            }
+            if !layered.is_empty() {
+                self.recheck_lowers(&ids, &layered, deadline)?;
             }
             Ok(json!(ids
                 .iter()
@@ -648,19 +1273,92 @@ impl<M: Mounter> Supervisor<M> {
                     retained.join(", ")
                 ));
             }
-            return Err(error);
+            return Err(requests::BatchError {
+                error,
+                kept: retained,
+            });
         }
-        result
+        Ok((ids, result?))
+    }
+
+    /// Re-check once mounted (Keystone #3): after every child of a layered
+    /// batch is ready, each reports the layers it took and what it composed is
+    /// read again; both must equal `layered`, within the batch deadline. A
+    /// step that completes after the deadline is a `timeout` like one that
+    /// does not complete.
+    fn recheck_lowers(
+        &mut self,
+        ids: &[String],
+        layered: &[lowers::Lower],
+        deadline: Instant,
+    ) -> Result<()> {
+        let timed_out = || ApiError::new("timeout", "lower re-check timed out");
+        let in_time = || {
+            if Instant::now() >= deadline {
+                Err(timed_out())
+            } else {
+                Ok(())
+            }
+        };
+        for id in ids {
+            in_time()?;
+            let left = deadline.saturating_duration_since(Instant::now());
+            let attempt = self.attempts[id].clone();
+            let records = self
+                .mounter
+                .lower_layers(&attempt, left.min(Duration::from_secs(5)))
+                .map_err(|error| {
+                    if Instant::now() >= deadline {
+                        timed_out()
+                    } else {
+                        // A reply of the wrong type is quoted by serde.
+                        let message = format!(
+                            "attempt {id}: cannot read the lower layers it mounted: {}",
+                            error.message
+                        );
+                        ApiError::new(
+                            "mount_failed",
+                            lowers::excerpt(&message, lowers::MESSAGE_BYTES),
+                        )
+                    }
+                })?;
+            in_time()?;
+            lowers::recheck(id, layered, &records)?;
+            in_time()?;
+            self.taken_lowers.insert(id.clone(), Some(records));
+        }
+        Ok(())
     }
 
     pub fn destroy(&mut self, id: &str) -> Result<()> {
+        // A retained attempt, or an ID a retained record holds, is never
+        // destroyed (R1c-1 §5.6).
+        self.refuse_retained_destroy(id)?;
         let attempt = self.attempt(id)?.clone();
         self.mounter.cleanup(&attempt.path)?;
-        if attempt.overlay_dir.exists() {
-            fs::remove_dir_all(&attempt.overlay_dir)?;
+        let root = attempt.path.parent().expect("attempt root");
+        // A RAM overlay lives outside the attempt root. Removal goes through
+        // descriptors: a finalized (sealed) tree has no write bits.
+        if !attempt.overlay_dir.starts_with(root) {
+            crate::overlay_pack::remove_tree(&attempt.overlay_dir).map_err(|e| {
+                io_error(
+                    &format!("destroy of attempt {id}: removing its overlay"),
+                    &attempt.overlay_dir,
+                    e,
+                )
+            })?;
         }
-        fs::remove_dir_all(attempt.path.parent().expect("attempt root"))?;
+        // The attempt root holds its journal.jsonl too.
+        crate::overlay_pack::remove_tree(root)
+            .map_err(|e| io_error(&format!("destroy of attempt {id}: removing it"), root, e))?;
         self.attempts.remove(id);
+        self.taken_lowers.remove(id);
+        if let Some(state) = self.attempt_state.remove(id) {
+            self.requests.unpin(&requests::Target {
+                id: id.into(),
+                instance: state.instance,
+            });
+        }
         Ok(())
     }
 
@@ -701,6 +1399,33 @@ fn verify_tmpfs(_path: &Path) -> Result<()> {
     Err(ApiError::new("unsupported", "tmpfs overlays require Linux"))
 }
 
+/// The filesystem type (`fstatfs` `f_type`) of a descriptor, which
+/// finalize's durability rule judges (R1c-1 §5.5, §5.6).
+#[cfg(target_os = "linux")]
+pub(super) fn fs_type(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<i64> {
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: fstatfs fills the zeroed struct for a live descriptor.
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    #[allow(clippy::unnecessary_cast)]
+    Ok(fs_magic(stat.f_type as i64))
+}
+
+/// A filesystem magic from `statfs`'s `f_type`: its low 32 bits. On 32-bit
+/// glibc `f_type` is an `i32`, so a magic with the top bit set (btrfs's
+/// `0x9123683E`) arrives sign-extended. Only the Linux `fs_type` reads it.
+#[allow(dead_code)]
+pub(super) fn fs_magic(raw: i64) -> i64 {
+    i64::from(raw as u32)
+}
+/// Off Linux the type is unknown, which the allowlist refuses (finalize is
+/// Linux only, and refused before this is reached).
+#[cfg(not(target_os = "linux"))]
+pub(super) fn fs_type(_fd: std::os::fd::BorrowedFd<'_>) -> io::Result<i64> {
+    Ok(super::finalize::UNKNOWN_FS)
+}
+
 fn absolute_source(source: &str) -> Result<String> {
     if ratarmount_formats_git::parse_git_url(source)
         .map_err(|e| invalid(e.to_string()))?
@@ -726,11 +1451,74 @@ fn absolute_source(source: &str) -> Result<String> {
         .map_err(|_| invalid("source path must be UTF-8"))
 }
 
+/// Refuse special local sources before prepare can open them (and block on a
+/// FIFO). Decode file URLs only for inspection, keeping the registered source.
+fn check_base_source_kind(base: &Base) -> Result<()> {
+    let source = &base.source;
+    if ratarmount_formats_git::parse_git_url(source)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return Ok(());
+    }
+    let path = if source
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("file"))
+    {
+        let Some(path) = url::Url::parse(source)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+        else {
+            return Ok(());
+        };
+        path
+    } else {
+        // Match absolute_source's scheme-only predicate: a joined local path
+        // containing rclone+ must not be treated as a remote URL.
+        let remote = source
+            .get(..7)
+            .is_some_and(|s| s.eq_ignore_ascii_case("restic:"))
+            || source.split_once("://").is_some_and(|(scheme, _)| {
+                scheme.is_ascii() && ratarmount_remote::is_remote_url(&format!("{scheme}://"))
+            });
+        if remote {
+            return Ok(());
+        }
+        PathBuf::from(source)
+    };
+    // Leave stat failures to prepare, including missing inline Git revisions.
+    if let Ok(meta) = fs::metadata(&path) {
+        if let Some(kind) = super::finalize::special_source_kind(&meta) {
+            return Err(invalid(format!(
+                "base {} source {source} is a {kind}, neither a regular file nor a directory; create-base supports regular files and directories",
+                base.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_base(base: &Base, indexes: &Path) -> Result<()> {
     validate_name(&base.name)?;
     if base.source.is_empty() || base.source.contains('\0') {
         return Err(invalid("source must not be empty or contain NUL"));
     }
+    check_spawn_args(
+        base,
+        indexes,
+        &SpawnSpec {
+            quota: base.options.quota,
+            readonly: &base.options.readonly_globs,
+            ..Default::default()
+        },
+    )
+}
+
+/// Parses a child's argv over probe paths with the mount CLI's own parser,
+/// so policy, binds, lowers and journal flags it would refuse are refused
+/// before anything exists.
+fn check_spawn_args(base: &Base, indexes: &Path, spec: &SpawnSpec<'_>) -> Result<()> {
     let attempt = Attempt {
         id: "validate".into(),
         base: base.name.clone(),
@@ -738,31 +1526,34 @@ fn validate_base(base: &Base, indexes: &Path) -> Result<()> {
         overlay_dir: PathBuf::from("/unused/overlay"),
         status: "starting".into(),
     };
-    // Reuse the mount CLI's option validation, including readonly patterns and binds.
-    crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(
-        process::mount_args(
-            base,
-            indexes,
-            &attempt,
-            base.options.quota,
-            &base.options.readonly_globs,
-        ),
-    ))
+    crate::parse_args_from(
+        std::iter::once(OsString::from("ratarmount"))
+            .chain(process::mount_args(base, indexes, &attempt, spec)),
+    )
     .map_err(|e| invalid(e.to_string()))?;
     Ok(())
 }
 use std::ffi::OsString;
 
-fn open_base(base: &Base, indexes: &Path) -> Result<factory::MountBundle> {
-    let mut options = ratarmount_core::OpenOptions {
+/// The options the supervisor opens a base with, for `diff` and `stats` and
+/// for finalize's classification: the read-only prepared index, no journal
+/// recovery, no GNU incremental decoding.
+pub(super) fn base_open_options(base: &Base, indexes: &Path) -> ratarmount_core::OpenOptions {
+    ratarmount_core::OpenOptions {
         index_folders: vec![indexes.into()],
         write_index: false,
+        read_only_index: true,
+        recover_journals: false,
         git_synthetic_head: base.options.git_synthetic_head,
         recursive: base.options.recursive,
         recursion_depth: base.options.recursive.then_some(-1),
         gnu_incremental: Some(false),
         ..Default::default()
-    };
+    }
+}
+
+fn open_base(base: &Base, indexes: &Path) -> Result<factory::MountBundle> {
+    let mut options = base_open_options(base, indexes);
     let binds = base
         .options
         .binds
@@ -792,23 +1583,54 @@ struct Connection {
     active: Instant,
 }
 
-fn send(stream: &mut UnixStream, response: Response) -> io::Result<()> {
-    let mut bytes = serde_json::to_vec(&response)?;
-    if bytes.len() + 1 > MAX_RESPONSE {
-        bytes = serde_json::to_vec(&Response::from_result(Err(ApiError::new(
-            "response_too_large",
-            "response exceeds 64 MiB; export the diff locally",
-        ))))?;
+/// Answers one request line (§5.2), for `serve` and the tests. A reply sent
+/// before version 1 or 2 is known (a line over 1 MiB, invalid JSON, another
+/// version) is version 1; every other reply carries the request's version.
+pub fn respond<M: Mounter>(supervisor: &mut Supervisor<M>, line: &[u8]) -> Vec<u8> {
+    let (version, result) = if line.len() > MAX_REQUEST {
+        (VERSION, Err(invalid("request exceeds 1 MiB")))
+    } else {
+        match Request::parse(line) {
+            Ok(request) => (request.version, supervisor.handle(request.operation)),
+            Err(rejection) => (rejection.version, Err(rejection.error)),
+        }
+    };
+    encode(&Response::from_result(version, result), MAX_RESPONSE)
+}
+
+/// One response line. A reply over `limit` becomes `response_too_large` with
+/// the reply's own version.
+pub fn encode(response: &Response, limit: usize) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(response).expect("responses serialize to JSON");
+    if bytes.len() + 1 > limit {
+        bytes = serde_json::to_vec(&Response::from_result(
+            response.version,
+            Err(ApiError::new(
+                "response_too_large",
+                "response exceeds 64 MiB; export the diff locally",
+            )),
+        ))
+        .expect("responses serialize to JSON");
     }
     bytes.push(b'\n');
+    bytes
+}
+
+fn send(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let result = stream.write_all(&bytes);
+    let result = stream.write_all(bytes);
     stream.set_nonblocking(true)?;
     result
 }
 
-pub fn serve(socket: &Path, root: &Path, limit: usize, timeout: Duration) -> Result<()> {
+pub fn serve(
+    socket: &Path,
+    root: &Path,
+    limit: usize,
+    timeout: Duration,
+    max_retained: usize,
+) -> Result<()> {
     if !cfg!(target_os = "linux") {
         return Err(ApiError::new(
             "unsupported",
@@ -825,6 +1647,8 @@ pub fn serve(socket: &Path, root: &Path, limit: usize, timeout: Duration) -> Res
         timeout,
         ProcessMounter::new(std::env::current_exe()?),
     )?;
+    // `Supervisor::open`'s signature is R1a's; the cap is set after it.
+    supervisor.max_retained = max_retained;
     crate::overlay_commit::install_term_signal_flag();
     let mut connections: Vec<Connection> = Vec::new();
     while !supervisor.stopping && !crate::overlay_commit::term_requested() {
@@ -858,20 +1682,18 @@ pub fn serve(socket: &Path, root: &Path, limit: usize, timeout: Duration) -> Res
                 Err(_) => return false,
             }
             if let Some(end) = connection.input.iter().position(|c| *c == b'\n') {
-                let result = if end > MAX_REQUEST {
-                    Err(invalid("request exceeds 1 MiB"))
-                } else {
-                    Request::parse(&connection.input[..end])
-                        .and_then(|r| supervisor.handle(r.operation))
-                };
+                let response = respond(&mut supervisor, &connection.input[..end]);
                 connection.input.drain(..=end);
                 connection.active = Instant::now();
-                return send(&mut connection.stream, Response::from_result(result)).is_ok();
+                return send(&mut connection.stream, &response).is_ok();
             }
             if connection.input.len() > MAX_REQUEST {
                 let _ = send(
                     &mut connection.stream,
-                    Response::from_result(Err(invalid("request exceeds 1 MiB"))),
+                    &encode(
+                        &Response::from_result(VERSION, Err(invalid("request exceeds 1 MiB"))),
+                        MAX_RESPONSE,
+                    ),
                 );
                 return false;
             }

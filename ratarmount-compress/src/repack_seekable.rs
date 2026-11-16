@@ -38,8 +38,8 @@ use crate::zstd_seek::{
     build_seek_table_skippable, encode_zstd_frame_to, scan_zstd_frames, ZstdFrameMap,
 };
 use crate::{
-    detect_compression_extension, detect_compression_magic, CompressError, CompressionFormat,
-    Result,
+    detect_compression_extension, detect_compression_magic, refine_skippable_format, CompressError,
+    CompressionFormat, Result,
 };
 
 /// Default uncompressed frame size (8 MiB). Matches `split -b 8M` in
@@ -231,6 +231,10 @@ fn output_family(path: &Path) -> Result<Dest> {
 }
 
 fn classify_input(path: &Path) -> Result<InputKind> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0250-M01","item":"ratarmount_compress::repack_seekable::classify_input","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut file = File::open(path)?;
     let mut buf = [0u8; 16];
     let n = file.read(&mut buf)?;
@@ -239,7 +243,8 @@ fn classify_input(path: &Path) -> Result<InputKind> {
     if is_zip_or_7z(magic) {
         return Err(v1_reads_err());
     }
-    match detect_compression_magic(magic)? {
+    let by_magic = detect_compression_magic(magic)?;
+    match refine_skippable_format(&mut file, by_magic, magic)? {
         CompressionFormat::Zstd => Ok(InputKind::Zstd),
         CompressionFormat::Gzip => Ok(InputKind::Gzip),
         CompressionFormat::None => match detect_compression_extension(path) {
@@ -375,6 +380,10 @@ fn repack_zstd_dest(
 ) -> Result<RepackReport> {
     let input_len = fs::metadata(input)?.len();
     if kind == InputKind::Zstd {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0251-M01","item":"ratarmount_compress::repack_seekable::repack_zstd_dest","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut src = File::open(input)?;
         let map = scan_zstd_frames(&mut src).map_err(|e| {
             CompressError::Msg(format!(
@@ -448,6 +457,10 @@ fn repack_gzip_dest(
 
     // Temps are durable before any final name is replaced. An index error
     // drops the temps and leaves the previous archive and sidecars.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0252-M01","item":"ratarmount_compress::repack_seekable::repack_gzip_dest","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut body = NamedTempFile::new_in(parent)?;
     copy_path(input, body.as_file_mut())?;
     body.as_file_mut().flush()?;
@@ -460,6 +473,10 @@ fn repack_gzip_dest(
 
     let mut sides = Vec::with_capacity(blobs.len());
     for (ext, blob) in gzip_sidecar_exts(opts.gzip_sidecar).iter().zip(blobs) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0253-M01","item":"ratarmount_compress::repack_seekable::repack_gzip_dest","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
         let mut side = NamedTempFile::new_in(parent)?;
         side.write_all(&blob)?;
         side.as_file_mut().flush()?;
@@ -581,6 +598,10 @@ fn move_aside(path: &Path) -> Result<Option<PathBuf>> {
         Err(e) => return Err(e.into()),
         Ok(_) => {}
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0254-M01","item":"ratarmount_compress::repack_seekable::move_aside","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let (file, bak) = NamedTempFile::new_in(parent_dir(path))?
         .keep()
         .map_err(|e| {
@@ -645,12 +666,20 @@ fn recompress_kind(
 ) -> Result<(u32, u64)> {
     match kind {
         InputKind::Zstd => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0255-M01","item":"ratarmount_compress::repack_seekable::recompress_kind","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let file = File::open(input)?;
             let mut dec = zstd::stream::read::Decoder::new(file)
                 .map_err(|e| CompressError::Msg(e.to_string()))?;
             recompress_read_to_zstd(&mut dec, out, opts.frame_size, opts.zstd_level)
         }
         InputKind::Gzip => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0256-M01","item":"ratarmount_compress::repack_seekable::recompress_kind","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let file = File::open(input)?;
             // Multi-member: a single gzip decoder stops at the first member and
             // would drop the rest of the input byte stream.
@@ -658,6 +687,10 @@ fn recompress_kind(
             recompress_read_to_zstd(&mut dec, out, opts.frame_size, opts.zstd_level)
         }
         InputKind::Plain => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0257-M01","item":"ratarmount_compress::repack_seekable::recompress_kind","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let mut file = File::open(input)?;
             recompress_read_to_zstd(&mut file, out, opts.frame_size, opts.zstd_level)
         }
@@ -754,12 +787,20 @@ fn sum_uncompressed(map: &ZstdFrameMap) -> Result<u64> {
 }
 
 fn copy_path(input: &Path, out: &mut File) -> Result<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0258-M01","item":"ratarmount_compress::repack_seekable::copy_path","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut src = File::open(input)?;
     io::copy(&mut src, out)?;
     Ok(())
 }
 
 fn write_atomic(output: &Path, write_body: impl FnOnce(&mut File) -> Result<()>) -> Result<u64> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0259-M01","item":"ratarmount_compress::repack_seekable::write_atomic","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new_in(parent_dir(output))?;
     write_body(tmp.as_file_mut())?;
     tmp.as_file_mut().flush()?;
@@ -972,6 +1013,95 @@ mod tests {
         let mut buf = vec![0u8; b"BBBB-second".len()];
         reader.read_exact(&mut buf).unwrap();
         assert_eq!(buf, b"BBBB-second");
+    }
+
+    /// Regression: #257 leading and interleaved skippables must preserve TAR bytes and offsets.
+    #[test]
+    fn regression_257_repack_prefixed_multiframe_tar() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("prefixed.tar.zst");
+        let output = dir.path().join("copied.tar.zst");
+        let tar = two_member_tar();
+        let first = encode_zstd_frame(&tar[..1024], 1).unwrap();
+        let second = encode_zstd_frame(&tar[1024..], 1).unwrap();
+        let skip = b"\x50\x2a\x4d\x18\x04\0\0\0skip";
+        let bytes = [skip.as_slice(), &first, skip, &second].concat();
+        fs::write(&input, &bytes).unwrap();
+
+        assert_eq!(
+            crate::detect_compression(&input).unwrap(),
+            CompressionFormat::Zstd
+        );
+        let map = scan_zstd_frames(&mut std::io::Cursor::new(&bytes)).unwrap();
+        assert_eq!(map.frames.len(), 2);
+        assert_eq!(map.frames[0].compressed_offset, skip.len() as u64);
+        assert_eq!(
+            map.frames[1].compressed_offset,
+            (2 * skip.len() + first.len()) as u64
+        );
+        assert_eq!(map.frames[1].uncompressed_offset, 1024);
+        assert!(map.seek_table.is_none());
+        // This is the detect-then-open body path used for top-level local mounts.
+        let body = open_seekable_zstd(&input).unwrap();
+        assert_eq!(body.kind(), "zstd-frames");
+        let mut reader = body.open_reader().unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, tar);
+        assert_eq!(ustar_names(&actual), ["a.txt", "b.txt"]);
+        reader.seek(SeekFrom::Start(1020)).unwrap();
+        let mut boundary = [0u8; 16];
+        reader.read_exact(&mut boundary).unwrap();
+        assert_eq!(boundary, tar[1020..1036]);
+        reader.seek(SeekFrom::Start(1536)).unwrap();
+        let mut member = [0u8; 13];
+        reader.read_exact(&mut member).unwrap();
+        assert_eq!(&member, b"bravo-payload");
+
+        let report = repack_seekable(&input, &output, &RepackOptions::default()).unwrap();
+        assert_eq!(report.action, RepackAction::CopiedWithoutFooter);
+        assert_eq!(report.uncompressed_len, tar.len() as u64);
+        assert_eq!(fs::read(&output).unwrap(), bytes);
+    }
+
+    /// Regression: #257 a single prefixed zstd frame must mount and repack by recompressing.
+    #[test]
+    fn regression_257_repack_prefixed_single_frame_tar() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("prefixed.tar.zst");
+        let output = dir.path().join("repacked.tar.zst");
+        let tar = two_member_tar();
+        let mut bytes = b"\x50\x2a\x4d\x18\x04\0\0\0skip".to_vec();
+        bytes.extend(encode_zstd_frame(&tar, 1).unwrap());
+        fs::write(&input, bytes).unwrap();
+        assert_eq!(
+            crate::detect_compression(&input).unwrap(),
+            CompressionFormat::Zstd
+        );
+        let body = open_seekable_zstd(&input).unwrap();
+        let mut actual = Vec::new();
+        body.open_reader()
+            .unwrap()
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(actual, tar);
+
+        let opts = RepackOptions {
+            frame_size: 512,
+            ..Default::default()
+        };
+        let report = repack_seekable(&input, &output, &opts).unwrap();
+        assert_eq!(report.action, RepackAction::Recompressed { frames: 6 });
+        let body = open_seekable_zstd(&output).unwrap();
+        assert_eq!(body.kind(), "zstd-seek-table");
+        let mut reader = body.open_reader().unwrap();
+        actual.clear();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, tar);
+        reader.seek(SeekFrom::Start(508)).unwrap();
+        let mut boundary = [0u8; 16];
+        reader.read_exact(&mut boundary).unwrap();
+        assert_eq!(boundary, tar[508..524]);
     }
 
     /// Regression: single-frame zstd recompress round-trips; a random read matches

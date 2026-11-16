@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "macos": {
+    "packages": "restricted_packages",
+    "excluded_features": ["gzip-rapidgzip-isal"],
+    "reason": "Existing native macOS workspace build supports the 40 restricted packages; ISA-L requires an additional native library and remains in the Linux all-features policy profile."
+  },
+  "windows": {
+    "packages": ["ratarmount-index", "ratarmount-formats-tar", "ratarmount-formats-zip"],
+    "excluded_features": [],
+    "reason": "These restricted packages are already required by windows-lib on native MSVC. Other restricted packages retain N4 protection until native build support is established; no cross-target probing or soft skips."
+  }
+}

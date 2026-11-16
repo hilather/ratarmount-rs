@@ -886,7 +886,7 @@ fn regression_hf_range_read_unauthorized_mentions_hf_token() {
     assert!(!err.contains("RATARMOUNT_HTTP"), "{err}");
 }
 
-/// Regression: ureq transport Display exposed cached CDN signatures in read errors.
+/// Regression: HTTP transport Display exposed cached CDN signatures in read errors.
 #[test]
 fn regression_http_cached_redirect_transport_error_redacts_signature() {
     let cdn = Server::new(|req| range_response(&req, b"abc"));
@@ -921,8 +921,8 @@ fn regression_http_cached_redirect_transport_error_redacts_signature() {
     assert_eq!(hub.count(""), 1, "error must come from the cached target");
     let url = "https://user:password@cdn.example/data?Signature=secret-signature#token";
     assert_eq!(http_pool::redacted_url(url), "https://cdn.example/data");
-    let response = ureq::Response::new(401, "Unauthorized", "").unwrap();
-    let err = crate::map_ureq_http_error(ureq::Error::Status(401, response), url).to_string();
+    let response = HttpResponse::for_test(401, url, &[], "");
+    let err = crate::map_http_client_error(HttpError::Status(401, response), url).to_string();
     for secret in ["password", "secret-signature", "#token"] {
         assert!(!err.contains(secret), "{err}");
     }

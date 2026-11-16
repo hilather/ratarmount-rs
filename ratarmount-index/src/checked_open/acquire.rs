@@ -554,7 +554,41 @@ pub(crate) struct Request {
     pub(crate) flags: OpenFlags,
 }
 
-/// Open `path` and prove which inode SQLite acquired.
+/// Recheck a failed nofollow acquisition or metadata read for a named symlink.
+///
+/// Like the writable index opener's refusal check, this inspects names only:
+/// opening and closing an alias could release this process's SQLite locks.
+/// Missing or uninspectable entries do not replace the original failure, and
+/// never prevent inspection of the other literal companion names. Parent
+/// symlinks are permitted; the final component is never resolved.
+pub fn refuse_symlink(path: &Path, flags: OpenFlags) -> rusqlite::Result<()> {
+    if !flags.contains(OpenFlags::SQLITE_OPEN_NOFOLLOW) {
+        return Ok(());
+    }
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let name = Path::new(&name);
+        if std::fs::symlink_metadata(name).is_ok_and(|metadata| metadata.is_symlink()) {
+            let label = if suffix.is_empty() {
+                "database"
+            } else {
+                "database companion"
+            };
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK),
+                Some(format!(
+                    "{label} {} is a symlink; it must be a regular file",
+                    name.display()
+                )),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Open `path` and prove which inode SQLite acquired. Every failure rechecks
+/// the named state with [`refuse_symlink`] before returning its refusal.
 pub fn open_checked(
     path: &Path,
     flags: OpenFlags,
@@ -565,23 +599,31 @@ pub fn open_checked(
         error,
         retained_fd: None,
     };
-    let request = request(path, flags, mode, expect).map_err(refuse)?;
-    #[cfg(windows)]
-    return path_type_only::open(&request, expect);
-    #[cfg(not(windows))]
-    {
-        if let Err(status) = super::install::installed() {
-            return Err(refuse(AcquireError::Unavailable(status)));
+    let acquired = (|| {
+        let request = request(path, flags, mode, expect).map_err(refuse)?;
+        #[cfg(windows)]
+        return path_type_only::open(&request, expect);
+        #[cfg(not(windows))]
+        {
+            if let Err(status) = super::install::installed() {
+                return Err(refuse(AcquireError::Unavailable(status)));
+            }
+            // F6 (r11 S6): the VFS and the two syscall slots still hold what the
+            // installation left; checked before arming, never repaired.
+            if let Err(reason) = super::install::hooks_intact() {
+                return Err(refuse(AcquireError::Unavailable(
+                    super::install::InstallStatus::HooksReplaced(reason),
+                )));
+            }
+            imp::open(&request.name, request.flags, expect)
         }
-        // F6 (r11 S6): the VFS and the two syscall slots still hold what the
-        // installation left; checked before arming, never repaired.
-        if let Err(reason) = super::install::hooks_intact() {
-            return Err(refuse(AcquireError::Unavailable(
-                super::install::InstallStatus::HooksReplaced(reason),
-            )));
+    })();
+    acquired.map_err(|mut refusal| {
+        if let Err(error) = refuse_symlink(path, flags) {
+            refusal.error = AcquireError::Sqlite(error);
         }
-        imp::open(&request.name, request.flags, expect)
-    }
+        refusal
+    })
 }
 
 /// Windows (design §9): no syscall hook, so pathname type checks before and
@@ -889,6 +931,10 @@ pub(crate) mod imp {
         let saved = errno();
         loop {
             // SAFETY: a constant C string; the descriptor is ours.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0470-M01","item":"ratarmount_index::checked_open::acquire::imp::fill_low_descriptors","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"/dev/null placeholder for standard descriptors","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
             if fd < 0 {
                 break;
@@ -904,8 +950,16 @@ pub(crate) mod imp {
     fn set_cloexec(fd: c_int) {
         // SAFETY: plain fcntl on a descriptor we hold.
         unsafe {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0052-M01","item":"ratarmount_index::checked_open::acquire::imp::set_cloexec","disposition":"out-of-family","category":"descriptor-control","reason":"Read descriptor flags before retaining a checked-open descriptor across internal close handling.","creation":{"policy":"none","basis":"F_GETFD reads an already-owned descriptor and performs no acquisition."}}"###
+            )]
             let f = libc::fcntl(fd, libc::F_GETFD);
             if f >= 0 {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0053-M01","item":"ratarmount_index::checked_open::acquire::imp::set_cloexec","disposition":"out-of-family","category":"descriptor-control","reason":"Set close-on-exec on the descriptor retained by checked-open refusal handling.","creation":{"policy":"none","basis":"F_SETFD changes the existing descriptor flags; it neither opens nor duplicates a file."}}"###
+                )]
                 libc::fcntl(fd, libc::F_SETFD, f | libc::FD_CLOEXEC);
             }
         }
@@ -917,8 +971,21 @@ pub(crate) mod imp {
     fn repoint_to_devnull(fd: c_int) {
         // SAFETY: plain syscalls on descriptors of this process.
         unsafe {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0471-M01","item":"ratarmount_index::checked_open::acquire::imp::repoint_to_devnull","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"/dev/null placeholder for standard descriptors","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
-            if null < 0 || libc::dup2(null, fd) < 0 {
+            if null < 0
+                || {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0472-M01","item":"ratarmount_index::checked_open::acquire::imp::repoint_to_devnull","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )]
+                    let __inventory_value_0 = libc::dup2(null, fd);
+                    __inventory_value_0
+                } < 0
+            {
                 libc::_exit(127);
             }
             libc::close(null);
@@ -1025,6 +1092,10 @@ pub(crate) mod imp {
             }
             set_cloexec(fd);
             // SAFETY: duplicate a descriptor we hold.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0473-M01","item":"ratarmount_index::checked_open::acquire::imp::armed_open","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"checked open moves the descriptor SQLite's open landed on a standard slot (0-2) above it; the low slot stays open and reported; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let hi = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
             if hi < 0 {
                 a.low = Some(Low {
@@ -1060,8 +1131,24 @@ pub(crate) mod imp {
         };
         if flags & libc::O_NONBLOCK == 0 {
             // SAFETY: plain fcntl on a descriptor we hold.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0054-M01","item":"ratarmount_index::checked_open::acquire::imp::armed_open","disposition":"out-of-family","category":"descriptor-control","reason":"Read flags from the descriptor just acquired by the checked-open VFS wrapper.","creation":{"policy":"none","basis":"F_GETFL operates on the acquired fd before clearing the temporary NONBLOCK bit."}}"###
+            )]
             let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if fl < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK) } < 0 {
+            if fl < 0
+                || unsafe {
+                    {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-E0055-M01","item":"ratarmount_index::checked_open::acquire::imp::armed_open","disposition":"out-of-family","category":"descriptor-control","reason":"Restore the checked-open descriptor blocking mode when the original request did not specify NONBLOCK.","creation":{"policy":"none","basis":"F_SETFL updates the existing fd; failures retain the fd with CLOEXEC and fail acquisition closed."}}"###
+                        )]
+                        let __inventory_value_0 =
+                            libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK);
+                        __inventory_value_0
+                    }
+                } < 0
+            {
                 a.latch(Mismatch::DescriptorFlags(errno()));
                 set_cloexec(fd);
                 a.retained = Some(fd);

@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! TAR indexing and open-by-offset (Phase 1–3).
 //!
 //! `backendName` must be exactly `SQLiteIndexedTar` for Python interop.
@@ -143,10 +146,10 @@ pub type Result<T> = std::result::Result<T, TarError>;
 
 mod write;
 pub use write::{
-    find_first_valid_header_from, find_last_tar_eof, normalize_archive_rel_path,
-    rewrite_tar_suffix, tar_append_offset, window_has_member_boundary, write_tar_eof,
-    write_ustar_members, RewriteTarSuffix, RewriteTarSuffixStats, TarMemberCursor, TarRawMember,
-    UstarMember, UstarPayload,
+    find_first_valid_header_from, find_last_tar_eof, is_single_tar_stream,
+    normalize_archive_rel_path, rewrite_tar_suffix, tar_append_offset, window_has_member_boundary,
+    write_tar_eof, write_ustar_members, RewriteTarSuffix, RewriteTarSuffixStats, TarMemberCursor,
+    TarRawMember, UstarMember, UstarPayload,
 };
 
 /// File reader with a private logical cursor and no shared seek state or lock.
@@ -355,10 +358,14 @@ impl SqliteIndexedTar {
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
         let data_path = data_path.as_ref().to_path_buf();
-        let index = SqliteIndex::open_read_only(index_path.as_ref())?;
+        let index = SqliteIndex::open_read_only_for_open(index_path.as_ref(), &options)?;
         index.check_backend_name(BACKEND_NAME)?;
         // Reject sibling indexes for a replaced archive (size/mtime fingerprint).
         index.check_tarstats_matches_archive(&archive_path)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0361-M01","item":"<ratarmount_formats_tar::SqliteIndexedTar>::open_with_existing_index","disposition":"residual","reason":"long-lived plain TAR backend and backing-extent owner","family":"plain-tar-backend","issue":"#196","category":"plain-tar-backend","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let data_file = File::open(&data_path)?;
         Ok(Self {
             archive_path,
@@ -381,7 +388,7 @@ impl SqliteIndexedTar {
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
         let data_path = gzip.path().to_path_buf();
-        let index = SqliteIndex::open_read_only(index_path.as_ref())?;
+        let index = SqliteIndex::open_read_only_for_open(index_path.as_ref(), &options)?;
         index.check_backend_name(BACKEND_NAME)?;
         index.check_tarstats_matches_archive(&archive_path)?;
         Ok(Self {
@@ -407,7 +414,15 @@ impl SqliteIndexedTar {
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
         let data_path = data_path.as_ref().to_path_buf();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0362-M01","item":"<ratarmount_formats_tar::SqliteIndexedTar>::create_index","disposition":"residual","reason":"long-lived plain TAR backend and backing-extent owner","family":"plain-tar-backend","issue":"#196","category":"plain-tar-backend","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut file = File::open(&data_path)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0363-M01","item":"<ratarmount_formats_tar::SqliteIndexedTar>::create_index","disposition":"residual","reason":"long-lived plain TAR backend and backing-extent owner","family":"plain-tar-backend","issue":"#196","category":"plain-tar-backend","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let backend = ContentBackend::File {
             file: Arc::new(file.try_clone()?),
             _keep: materialised.take(),
@@ -455,7 +470,7 @@ impl SqliteIndexedTar {
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
         let data_path = body.path().to_path_buf();
-        let index = SqliteIndex::open_read_only(index_path.as_ref())?;
+        let index = SqliteIndex::open_read_only_for_open(index_path.as_ref(), &options)?;
         index.check_backend_name(BACKEND_NAME)?;
         index.check_tarstats_matches_archive(&archive_path)?;
         Ok(Self {
@@ -638,7 +653,7 @@ impl SqliteIndexedTar {
     {
         let archive_path = archive_label.as_ref().to_path_buf();
         let data_path = archive_path.clone();
-        let index = SqliteIndex::open_read_only(index_path.as_ref())?;
+        let index = SqliteIndex::open_read_only_for_open(index_path.as_ref(), &options)?;
         index.check_backend_name(BACKEND_NAME)?;
         // Virtual labels that are not real paths skip the fingerprint (no host file).
         index.check_tarstats_matches_archive(&archive_path)?;
@@ -966,7 +981,11 @@ impl MountSource for SqliteIndexedTar {
             return None;
         }
         Some(ratarmount_core::BackingExtent {
-            file: file.as_ref().try_clone().ok()?,
+            file: {
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0364-M01","item":"<ratarmount_formats_tar::SqliteIndexedTar as ratarmount_core::MountSource<ratarmount_formats_tar::SqliteIndexedTar>>::backing_extent","disposition":"residual","reason":"long-lived plain TAR backend and backing-extent owner","family":"plain-tar-backend","issue":"#196","category":"plain-tar-backend","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
+let __inventory_value_0 = file.as_ref().try_clone();
+__inventory_value_0
+}.ok()?,
             offset: ud.offset,
             len: fi.size,
         })
@@ -3218,6 +3237,10 @@ impl MountSource for SingleFileMountSource {
         }
         match &self.backend {
             SingleFileBackend::Path { path, .. } => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0365-M01","item":"<ratarmount_formats_tar::SingleFileMountSource as ratarmount_core::MountSource<ratarmount_formats_tar::SingleFileMountSource>>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
                 let file = File::open(path)?;
                 Ok(Box::new(StenciledFile::new(file, vec![(0, self.size)])))
             }
@@ -3236,6 +3259,59 @@ impl MountSource for SingleFileMountSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn prepared_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect()
+    }
+
+    /// Regression: strict TAR warm opens preserve the prepared catalog and directory entries.
+    #[test]
+    fn regression_prepared_index_warm_open_is_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        let index = dir.path().join("index.sqlite");
+        std::fs::write(&archive, synthetic_ustar("hello.txt", b"worker base")).unwrap();
+        let mut materialized = None;
+        drop(
+            SqliteIndexedTar::create_index(
+                &archive,
+                &archive,
+                Some(&index),
+                &OpenOptions::default(),
+                "test",
+                &mut materialized,
+            )
+            .unwrap(),
+        );
+        SqliteIndex::finalize_prepared(&index).unwrap();
+        let before = prepared_snapshot(dir.path());
+        let options = OpenOptions {
+            read_only_index: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let source = SqliteIndexedTar::open_with_existing_index(
+            &archive,
+            &archive,
+            &index,
+            options,
+            &mut materialized,
+        )
+        .unwrap();
+        let info = source.lookup("/hello.txt", 0).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut source.open(&info, 0).unwrap(), &mut bytes).unwrap();
+        assert_eq!(bytes, b"worker base");
+        assert_eq!(prepared_snapshot(dir.path()), before);
+        drop(source);
+        assert_eq!(prepared_snapshot(dir.path()), before);
+    }
+
     use std::io::{Read, Seek, Write};
     use std::process::Command;
 

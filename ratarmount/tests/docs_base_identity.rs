@@ -24,6 +24,52 @@ fn require(sentences: &[&str]) {
     }
 }
 
+/// Regression: #180 claimed every pack/commit open used database-inode
+/// admission, hiding ordinary bundle reads and staging-lock acquisitions.
+#[test]
+fn regression_docs_db_inode_admission_scope() {
+    let module = read("ratarmount-core/src/db_inodes.rs").replace("//! ", "");
+    for sentence in [
+        "Overlay payload opens, the ZIP and TAR commit readers, the seal and pack sentinels and the pack lock and member reads",
+        "opens that never call this module",
+        "`overlay pack`/`unpack`'s bundle and lock files",
+    ] {
+        assert!(module.contains(sentence), "db_inodes module lost: {sentence}");
+    }
+    assert!(
+        !module.contains("Every payload, sentinel, pack and commit open goes through"),
+        "db_inodes must not claim universal admission coverage"
+    );
+    let docs = read("docs/sandbox.md");
+    for sentence in [
+        "Not every `overlay pack` / `unpack` open is checked either:",
+        "reads of a bundle file (`overlay unpack`, a bundle `--lower` and the sandbox supervisor's lower checks)",
+        "the `--lower` bundle cache's private copy of it",
+        "the `<staging directory>.lock` file",
+        "cache fill create (or reuse) beside their staging directory use ordinary opens.",
+    ] {
+        assert!(docs.contains(sentence), "docs/sandbox.md lost: {sentence}");
+    }
+}
+
+/// Regression: #180 described unpack finalization as opening only directories,
+/// although chmod_entry_at also opens regular-file O_PATH pins on Linux.
+#[test]
+fn regression_docs_db_inode_unpack_finalization() {
+    let docs = read("docs/sandbox.md");
+    assert!(
+        !docs.contains("unpack finalization opens only directories"),
+        "unpack finalization also opens regular-file O_PATH pins on Linux"
+    );
+    for sentence in [
+        "Unpack finalization opens directories for metadata updates; its regular-file mode pass uses the lock-preserving `O_PATH` pins on Linux and no data descriptor elsewhere, as described above (#149).",
+        "the unpack stage's mode pass change modes through an `O_PATH` pin on Linux",
+        "by name with `AT_SYMLINK_NOFOLLOW` elsewhere, where a swap of the name between the check and the change is not detected",
+    ] {
+        assert!(docs.contains(sentence), "docs/sandbox.md lost: {sentence}");
+    }
+}
+
 /// Decision 3: a forced kind change drops to kind-only; `none` accepts copies.
 #[test]
 fn regression_docs_state_forced_kind_only_and_none_accepts_copies() {
@@ -88,6 +134,34 @@ fn regression_docs_state_failed_replacement_and_locator_rules() {
     }
 }
 
+/// Regression: #168 omitted the unchecked operation-log writer from the
+/// overlay-database hard-link residuals, hiding its append and lock-release risks.
+#[test]
+fn regression_docs_168_operation_log_unchecked_open() {
+    let docs = read("docs/sandbox.md");
+    let hard_links = docs
+        .split_once("### Hard links of the overlay database ")
+        .expect("missing overlay-database hard-link section")
+        .1
+        .split("### ")
+        .next()
+        .unwrap();
+    for sentence in [
+        "The `--journal` operation log is not checked either",
+        "for appending (creating it if absent) after any overlay database is open",
+        "Its path must lie outside the mount point and the overlay directory",
+        "another hard link of the overlay database elsewhere is not refused",
+        "the journal's lines would be appended to the database file",
+        "closing the descriptor (when the journal is finished at unmount, when its writer fails, or when the journal open fails after the file was opened) would release this process's locks on the database",
+        "Do not point `--journal` at a link of an overlay database.",
+    ] {
+        assert!(
+            hard_links.contains(sentence),
+            "docs/sandbox.md lost the #168 residual: {sentence}"
+        );
+    }
+}
+
 /// Regression: R11-S5 (#151, #183): the lock guarantees are scoped to processes that keep
 /// the database open (a daemonized mount holds no lock after its fork), the
 /// platform table is present, and the swap-back exclusion closed by the
@@ -96,8 +170,9 @@ fn regression_docs_state_failed_replacement_and_locator_rules() {
 fn regression_docs_scope_lock_claims_and_platform_matrix() {
     let text = read("docs/sandbox.md");
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Every "in use" lock claim is scoped to a foreground mount (#183).
-    const SCOPE: &str = "(a foreground `-f` mount; a daemonized mount holds no lock, #183)";
+    // Every "in use" lock claim covers a daemonized mount too, until its
+    // serving process exits (#183).
+    const SCOPE: &str = "(foreground or daemonized, until the serving process exits; #183)";
     for claim in [
         "A mounted overlay's exclusive database lock is reported as \"in use\"",
         "may fail with “in use” if another mount holds the database",
@@ -107,7 +182,7 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
     ] {
         assert!(
             flat.contains(&format!("{claim} {SCOPE}")),
-            "docs/sandbox.md lock claim not scoped to #183: {claim}"
+            "docs/sandbox.md lock claim lost its #183 scope: {claim}"
         );
     }
     for sentence in [
@@ -129,15 +204,19 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
         "docs/python.md lost the #154 paragraph"
     );
     for sentence in [
-        "A daemonized ratarmount (the default without `-f`, for a FUSE mount and for an export server alike) currently holds no kernel lock on its overlay database at all",
-        "(#183). Until that is fixed, run with `-f` when another process may open the same overlay.",
+        "so it holds the overlay database's exclusive lock and the index's shared lock for its whole life (#183)",
+        "is refused with \"in use\" and changes nothing; a reader can no longer roll back the mount's in-flight journal. Wait for the serving process to exit (or retry on \"in use\") before running them right after an unmount",
         "| Platform / host | Installation | Checked open |",
         "labeled `LegacyUnverified`",
         "external-alias epoch cap",
         "opening one database file through both at once in one process is unsupported (#154",
     ] {
-        assert!(text.contains(sentence), "docs/sandbox.md lost: {sentence}");
+        assert!(flat.contains(sentence), "docs/sandbox.md lost: {sentence}");
     }
+    assert!(
+        !flat.contains("currently holds no kernel lock"),
+        "docs/sandbox.md still says a daemonized mount holds no lock (#183)"
+    );
     assert!(
         !text.contains("swapped away and back at its path during its own open"),
         "docs/sandbox.md still lists the swap-back exclusion the checked open closed"
@@ -145,6 +224,64 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
     let changelog = read("CHANGELOG.md");
     assert!(changelog
         .contains("still holds no kernel lock on its overlay database after it forks (#183)"));
+    assert!(changelog.contains("now forks before it opens any database"));
+}
+
+/// Regression: #169 listed only the commit journal's archive opens, omitting
+/// the ZIP and TAR format probes from the unchecked-open inventory.
+#[test]
+fn regression_docs_169_names_unchecked_commit_probes() {
+    let docs = read("docs/sandbox.md");
+    assert!(
+        docs.contains("do not go through the check: the journal file `overlay pack --include-journal` reads (a JSON log, not a database) and the commit path's opens of the archive itself (the commit journal's, and the `is_zip_archive` and `is_uncompressed_tar` format probes that pick the commit method)."),
+        "docs/sandbox.md must name both commit format probes alongside the journal's unchecked archive opens"
+    );
+}
+
+/// Regression: unmount recipes ran offline verbs before the server released
+/// its lock, and a bare BEGIN IMMEDIATE probe could itself hold a reservation.
+#[test]
+fn regression_docs_daemon_wait() {
+    let sandbox = read("docs/sandbox.md");
+    for required in [
+        "wait \"$attempt_pid\"",
+        "BEGIN IMMEDIATE; ROLLBACK;",
+        "CLI exit codes alone do not",
+        "zero busy timeout",
+        "`pgrep -f MOUNTPOINT` is not a",
+    ] {
+        assert!(
+            sandbox.contains(required),
+            "missing daemon wait guidance: {required}"
+        );
+    }
+    for path in ["docs/provenance.md", "docs/getting-started.md"] {
+        assert!(
+            read(path).contains("wait \"$mount_pid\""),
+            "{path}: offline access precedes server exit"
+        );
+    }
+    assert!(read("docs/mount-options-parity.md")
+        .contains("daemonized mounts detach standard streams while continuing to log"));
+}
+
+/// Regression: the pin documentation overstated --no-base-check and omitted
+/// which reuse paths and legacy seals do (and do not) check preimages.
+#[test]
+fn regression_docs_preimage_scope_and_legacy_visibility() {
+    let docs = read("docs/sandbox.md");
+    for required in [
+        "every `overlay pack`",
+        "supervisor finalize",
+        "supervisor diff after retained restore",
+        "including non-UTF-8 target bytes",
+        "Duplicate pin paths and a missing table with a remaining binding are refused.",
+        "`preimages_bound: null` explicitly means an older, unpinned seal",
+        "It still opens the base to recompute changes and check preimage pins.",
+    ] {
+        assert!(docs.contains(required), "missing pin contract: {required}");
+    }
+    assert!(read("CHANGELOG.md").contains("ordinary packs, supervisor diff"));
 }
 
 /// Regression: required-session wording and offline no-recovery rules survive reconciliation.
@@ -161,5 +298,59 @@ fn regression_docs_required_record_latch_and_offline_no_recovery() {
         "never recover:",
     ] {
         assert!(text.contains(expected), "missing {expected}");
+    }
+}
+
+/// Regression: #239 offline DB and companion symlink refusal must replace the obsolete follow/exit-2 promises.
+#[test]
+fn regression_docs_state_offline_symlink_refusal() {
+    require(&[
+        "Offline commit and recovery refuse a symlinked overlay database or any `-wal`, `-journal`, or `-shm` companion with exit 1.",
+        "`--force-base-mismatch` cannot bypass this refusal.",
+        "Before any write, refusal leaves the archive, symlink targets, database and recovery state unchanged.",
+    ]);
+    for file in ["docs/sandbox.md", "CHANGELOG.md", "AGENTS.md"] {
+        let text = read(file);
+        for obsolete in [
+            "A symlink to a regular database file keeps working",
+            "The offline overlay's database may be a symlink to a regular file",
+            "--commit-overlay` with a symlink to a 0-byte database exits 2",
+            "regression_offline_recovery_follows_a_symlinked_database",
+            "empty or a dangling symlink is a lost record",
+            "the offline owner reads through the symlink",
+        ] {
+            assert!(
+                !text.contains(obsolete),
+                "{file} retains obsolete rule: {obsolete}"
+            );
+        }
+    }
+}
+
+/// Regression: publication docs preserve WAL limitations and the old-pin recovery instructions.
+#[test]
+fn regression_docs_state_index_wal_and_pin_limits() {
+    let formats = read("docs/formats.md");
+    for sentence in [
+        "A read-only mount can leave an empty `-wal` and a 32 KiB `-shm` beside the index; they hold no data and are harmless.",
+        "Side tables written after a publication can stay in the live index's `-wal` until the next writer checkpoints; they are not in the published pin (remaining limitation).",
+        "Copying the live `X.index.sqlite` without its `-wal` loses rows; copy the pin or use `--publish-index-to` instead.",
+        "`--publish-index-to PATH` refuses an existing `PATH`, except when `PATH` is the index being published itself (the same path under another spelling, or a symlink that resolves to it); a hard link or a bind mount of that index and a `PATH` with a pin name are refused.",
+        "ratarmount creates no directory for a publication: the directory of `--publish-index-to PATH` must exist.",
+        "ratarmount never opens an index file without a write permission bit for writing, also as root.",
+        "Local index publication is Unix-only.",
+        "An interrupted publication can leave files named `.ratarmount-index-snap-*.tmp`; they are not part of any published index.",
+    ] {assert!(formats.contains(sentence),"docs/formats.md lost {sentence}");}
+    let changelog = read("CHANGELOG.md");
+    for sentence in [
+        "Pins written by earlier releases are hard links of the live index (or of the `--publish-index-to` copy); they may already lack rows or no longer match the id in their name, and they are not migrated.",
+        "Re-publish with `ratarmount --no-mount --publish-index ARCHIVE` and use the new `index_id` from `ARCHIVE.index.ptr`.",
+        "`--publish-index-to PATH` refuses an existing `PATH`, except when `PATH` is the index being published itself (the same path under another spelling, or a symlink that resolves to it); a hard link or a bind mount of that index and a `PATH` with a pin name are refused.",
+    ] {assert!(changelog.contains(sentence),"CHANGELOG.md lost {sentence}");}
+    for (name, text) in [("docs/formats.md", formats), ("CHANGELOG.md", changelog)] {
+        assert!(
+            !text.contains("-links +1"),
+            "{name} must not identify invalid pins by link count"
+        );
     }
 }

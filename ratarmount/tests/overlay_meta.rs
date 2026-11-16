@@ -10,6 +10,10 @@ use sha2::{Digest, Sha256};
 mod http_tar;
 use http_tar::serve_tar_stub;
 
+#[cfg(target_os = "linux")]
+#[path = "support/unmount.rs"]
+mod unmount;
+
 fn open(overlay: &Path, base: &Path, flags: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ratarmount"))
         .args(["--no-mount", "--index-file", ":memory:", "-w"])
@@ -265,17 +269,10 @@ fn regression_mount_1gib_directory_base_reads_no_content_without_base_digest() {
         std::thread::sleep(Duration::from_millis(20));
     };
     let read = rchar(child.id());
-    let unmount = || {
-        let _ = Command::new("fusermount3").arg("-u").arg(&mnt).status();
-    };
     let Some(ready_after) = ready else {
-        unmount();
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("not ready within 20 s (the mount hashes the base)");
+        fail_mount_not_ready(&mnt, &mut child);
     };
-    unmount();
-    let status = child.wait().unwrap();
+    stop_mount(&mnt, &mut child, "mount_1gib");
     let read = read.expect("/proc/<pid>/io readable");
     assert!(
         read < 4 << 20,
@@ -287,7 +284,6 @@ fn regression_mount_1gib_directory_base_reads_no_content_without_base_digest() {
             "ready after {ready_after:?}"
         );
     }
-    let _ = status;
     let mut info = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
     private_env(&mut info, root.path());
     let output = info
@@ -436,6 +432,99 @@ fn regression_overlay_meta_cli_directory_remount_refuses_edit() {
     assert_success(&open(&overlay, &base, &["--force-base-mismatch"]));
 }
 
+/// Regression: #215, observe daemon exit without an unbounded wait, including
+/// one final observation at the deadline before declaring a timeout.
+#[cfg(target_os = "linux")]
+fn poll_child_exit(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return child.try_wait();
+        }
+        std::thread::sleep(Duration::from_millis(20).min(deadline - now));
+    }
+}
+
+/// Regression: #215, preserve shutdown failures even if forced cleanup reaps
+/// the daemon. Cleanup mechanics return diagnostics and never panic in Drop.
+#[cfg(target_os = "linux")]
+fn finish_stop_mount(
+    child: &mut std::process::Child,
+    label: &str,
+    unmounted: Result<(), String>,
+    exit_limit: std::time::Duration,
+) -> Result<(), String> {
+    let pid = child.id();
+    let mut errors = Vec::new();
+    if let Err(error) = &unmounted {
+        errors.push(format!("{label}: mount stayed busy: {error}"));
+    }
+    let exited = match poll_child_exit(child, exit_limit) {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            if unmounted.is_ok() {
+                errors.push(format!(
+                    "{label}: daemon did not exit after a successful unmount within {exit_limit:?} (pid {pid})"
+                ));
+            }
+            false
+        }
+        Err(error) => {
+            errors.push(format!("{label}: polling daemon {pid} failed: {error}"));
+            false
+        }
+    };
+    if !exited {
+        if let Err(error) = child.kill() {
+            errors.push(format!("{label}: killing daemon {pid} failed: {error}"));
+        }
+        match poll_child_exit(child, std::time::Duration::from_secs(1)) {
+            Ok(Some(_)) => {}
+            Ok(None) => errors.push(format!(
+                "{label}: daemon {pid} was not reaped within 1s after kill"
+            )),
+            Err(error) => errors.push(format!(
+                "{label}: reaping daemon {pid} after kill failed: {error}"
+            )),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// Regression: #215, retry transient busy mounts and fail persistent unmount
+/// or daemon-exit problems with a reason after bounded cleanup, rather than hang.
+#[cfg(target_os = "linux")]
+fn stop_mount(mnt: &Path, child: &mut std::process::Child, label: &str) {
+    use std::time::Duration;
+    let unmounted = unmount::unmount_within(mnt, Duration::from_secs(5), label);
+    if let Err(error) = finish_stop_mount(child, label, unmounted, Duration::from_secs(10)) {
+        panic!("{error}");
+    }
+}
+
+/// Regression: #215, readiness cleanup must retain the original failure reason
+/// while bounding reaping even when unmounting fails.
+#[cfg(target_os = "linux")]
+fn fail_mount_not_ready(mnt: &Path, child: &mut std::process::Child) -> ! {
+    use std::time::Duration;
+    let _ = unmount::unmount_within(mnt, Duration::from_secs(5), "mount_1gib not ready");
+    let _ = child.kill();
+    let _ = poll_child_exit(child, Duration::from_secs(1));
+    panic!("not ready within 20 s (the mount hashes the base)");
+}
+
 /// A foreground `-w` mount of a tar whose background digest hash is held at a
 /// gate file the test creates to release it. Linux with /dev/fuse only.
 #[cfg(target_os = "linux")]
@@ -544,11 +633,7 @@ impl GatedMount {
     }
 
     fn unmount(&mut self) {
-        let _ = Command::new("fusermount3")
-            .arg("-u")
-            .arg(&self.mnt)
-            .status();
-        let _ = self.child.wait();
+        stop_mount(&self.mnt, &mut self.child, "GatedMount::unmount");
     }
 }
 
@@ -556,13 +641,17 @@ impl GatedMount {
 impl Drop for GatedMount {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = Command::new("fusermount3")
-                .arg("-u")
-                .arg(&self.mnt)
-                .status();
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            let unmounted = unmount::unmount_within(
+                &self.mnt,
+                std::time::Duration::from_secs(5),
+                "GatedMount::drop",
+            );
+            let _ = finish_stop_mount(
+                &mut self.child,
+                "GatedMount::drop",
+                unmounted,
+                std::time::Duration::from_secs(10),
+            );
         }
     }
 }
@@ -839,11 +928,7 @@ impl LoggedMount {
     }
 
     fn unmount(&mut self) {
-        let _ = Command::new("fusermount3")
-            .arg("-u")
-            .arg(&self.mnt)
-            .status();
-        let _ = self.child.wait();
+        stop_mount(&self.mnt, &mut self.child, "LoggedMount::unmount");
     }
 }
 
@@ -851,13 +936,17 @@ impl LoggedMount {
 impl Drop for LoggedMount {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = Command::new("fusermount3")
-                .arg("-u")
-                .arg(&self.mnt)
-                .status();
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            let unmounted = unmount::unmount_within(
+                &self.mnt,
+                std::time::Duration::from_secs(5),
+                "LoggedMount::drop",
+            );
+            let _ = finish_stop_mount(
+                &mut self.child,
+                "LoggedMount::drop",
+                unmounted,
+                std::time::Duration::from_secs(10),
+            );
         }
     }
 }
@@ -1017,4 +1106,374 @@ fn regression_digest_once_no_writable_cache_stays_pending() {
         assert_eq!(meta.base_digest_kind(), Some("pending"));
     }
     assert_eq!(hash_lines(&log), 0, "{:?}", std::fs::read_to_string(&log));
+}
+#[cfg(target_os = "linux")]
+mod shutdown_regression {
+    use super::*;
+    use std::fs::File;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::process::Child;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    struct DirectChild(Option<Child>);
+
+    impl DirectChild {
+        fn sleep(seconds: &str) -> Self {
+            Self(Some(Command::new("sleep").arg(seconds).spawn().unwrap()))
+        }
+
+        fn child(&mut self) -> &mut Child {
+            self.0.as_mut().unwrap()
+        }
+
+        fn into_reaped(mut self) -> Child {
+            assert!(poll_child_exit(self.child(), Duration::from_secs(1))
+                .unwrap()
+                .is_some());
+            self.0.take().unwrap()
+        }
+    }
+
+    impl Drop for DirectChild {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = child.kill();
+                    let _ = poll_child_exit(child, Duration::from_secs(1));
+                }
+            }
+        }
+    }
+
+    // Wake the releaser on unwinding too; its only wait has a finite timeout.
+    struct RootReleaser {
+        release: mpsc::Sender<()>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl RootReleaser {
+        fn after(root: File, delay: Duration) -> Self {
+            let (release, received) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let _ = received.recv_timeout(delay);
+                drop(root);
+            });
+            Self {
+                release,
+                thread: Some(thread),
+            }
+        }
+
+        fn join_within(&mut self) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished())
+            {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if let Some(thread) = self.thread.take() {
+                thread.join().is_ok()
+            } else {
+                true
+            }
+        }
+    }
+
+    impl Drop for RootReleaser {
+        fn drop(&mut self) {
+            let _ = self.release.send(());
+            let _ = self.join_within();
+        }
+    }
+
+    fn fuse_available() -> bool {
+        if !Path::new("/dev/fuse").exists() {
+            eprintln!("skip: #215 real-FUSE regression requires /dev/fuse");
+            return false;
+        }
+        for tool in ["fusermount3", "tar"] {
+            if !Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|out| out.status.success())
+            {
+                eprintln!("skip: #215 real-FUSE regression requires {tool}");
+                return false;
+            }
+        }
+        true
+    }
+
+    fn logged_mount(root: &Path) -> Option<LoggedMount> {
+        if !fuse_available() {
+            return None;
+        }
+        let (archive, index) = logged_fixture(root)?;
+        let log = root.join("hash.log");
+        let hold = root.join("release-hash");
+        let mut mount =
+            LoggedMount::spawn_held(root, 0, &archive, Some(&index), &log, 0, Some(&hold));
+        wait_until("#215 logged mount serving", || mount.serving());
+        wait_until("#215 hash held", || hash_lines(&log) == 1);
+        std::fs::write(&hold, b"go").unwrap();
+        wait_until("#215 hash released", || {
+            !mount.xattr("base_digest").is_empty()
+        });
+        Some(mount)
+    }
+
+    fn assert_detached(mnt: &Path) {
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert!(
+            !mountinfo.lines().any(|line| {
+                line.split_whitespace().nth(4).is_some_and(|path| {
+                    let path = path
+                        .replace("\\040", " ")
+                        .replace("\\011", "\t")
+                        .replace("\\012", "\n")
+                        .replace("\\134", "\\");
+                    Path::new(&path) == mnt
+                })
+            }),
+            "exact mountpoint still attached: {}",
+            mnt.display()
+        );
+    }
+
+    fn start_time(pid: u32) -> Option<String> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, fields) = stat.rsplit_once(") ")?;
+        fields.split_whitespace().nth(19).map(str::to_owned)
+    }
+
+    fn child_identity(child: &Child) -> (u32, String) {
+        let pid = child.id();
+        (
+            pid,
+            start_time(pid).expect("live daemon has a process start time"),
+        )
+    }
+
+    fn assert_reaped((pid, started): (u32, String)) {
+        assert_ne!(
+            start_time(pid).as_deref(),
+            Some(started.as_str()),
+            "daemon {pid} still exists (including an unreaped zombie)"
+        );
+    }
+
+    fn panic_message(result: std::thread::Result<()>) -> String {
+        let panic = result.expect_err("shutdown must fail after cleanup");
+        if let Some(message) = panic.downcast_ref::<String>() {
+            message.clone()
+        } else if let Some(message) = panic.downcast_ref::<&str>() {
+            (*message).to_owned()
+        } else {
+            panic!("shutdown panic did not contain a diagnostic");
+        }
+    }
+
+    /// Regression: #215 transient root-directory holders made one-shot unmount hang.
+    #[test]
+    fn regression_stop_mount_retries_transient_busy() {
+        let root = tempfile::tempdir().unwrap();
+        let Some(mut mount) = logged_mount(root.path()) else {
+            return;
+        };
+        let held = File::open(&mount.mnt).unwrap();
+        assert!(!Command::new("fusermount3")
+            .arg("-u")
+            .arg(&mount.mnt)
+            .status()
+            .unwrap()
+            .success());
+        let mut releaser = RootReleaser::after(held, Duration::from_millis(250));
+        stop_mount(&mount.mnt, &mut mount.child, "transient busy");
+        assert!(releaser.join_within(), "root-FD releaser did not finish");
+        drop(releaser);
+        assert_detached(&mount.mnt);
+        assert!(mount.child.try_wait().unwrap().is_some());
+    }
+
+    /// Regression: #215 lazy cleanup or child exit must not erase a busy unmount error.
+    #[test]
+    fn regression_busy_unmount_remains_failure() {
+        for seconds in ["0", "60"] {
+            let mut child = DirectChild::sleep(seconds);
+            if seconds == "0" {
+                assert!(poll_child_exit(child.child(), Duration::from_secs(1))
+                    .unwrap()
+                    .is_some());
+            }
+            let error = finish_stop_mount(
+                child.child(),
+                "synthetic busy",
+                Err("synthetic EBUSY after lazy detach".to_owned()),
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("synthetic busy: mount stayed busy"),
+                "{error}"
+            );
+            assert!(
+                error.contains("synthetic EBUSY after lazy detach"),
+                "{error}"
+            );
+            assert!(child.child().try_wait().unwrap().is_some());
+        }
+    }
+
+    /// Regression: #215 persistent holders must fail even after lazy detachment.
+    #[test]
+    fn regression_persistent_busy_unmount_fails_after_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let Some(mut mount) = logged_mount(root.path()) else {
+            return;
+        };
+        let held = File::open(&mount.mnt).unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            stop_mount(&mount.mnt, &mut mount.child, "persistent busy");
+        }));
+        drop(held);
+        let message = panic_message(result);
+        assert!(
+            message.contains("persistent busy: mount stayed busy"),
+            "{message}"
+        );
+        assert_detached(&mount.mnt);
+        assert!(mount.child.try_wait().unwrap().is_some());
+    }
+
+    /// Regression: #215 a daemon stuck after successful unmount must be killed and reaped.
+    #[test]
+    fn regression_successful_unmount_kills_stuck_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let mut child = DirectChild::sleep("60");
+        let started = Instant::now();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            stop_mount(root.path(), child.child(), "stuck daemon");
+        }));
+        let elapsed = started.elapsed();
+        let message = panic_message(result);
+        assert!(
+            message.contains("stuck daemon: daemon did not exit after a successful unmount"),
+            "{message}"
+        );
+        assert!(elapsed >= Duration::from_secs(10), "{elapsed:?}");
+        assert!(child.child().try_wait().unwrap().is_some());
+
+        let mut naturally_exiting = DirectChild::sleep("0.05");
+        assert!(finish_stop_mount(
+            naturally_exiting.child(),
+            "naturally exited",
+            Ok(()),
+            Duration::from_secs(1),
+        )
+        .is_ok());
+        assert!(naturally_exiting
+            .child()
+            .try_wait()
+            .unwrap()
+            .is_some_and(|status| status.success()));
+    }
+
+    /// Regression: #215 GatedMount Drop must detach a busy mount without panicking.
+    #[test]
+    fn regression_gated_drop_busy_cleanup_never_panics() {
+        if !fuse_available() {
+            return;
+        }
+        let Some(mount) = GatedMount::start() else {
+            return;
+        };
+        mount.release();
+        let mnt = mount.mnt.clone();
+        let identity = child_identity(&mount.child);
+        let held = File::open(&mnt).unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| drop(mount)));
+        drop(held);
+        assert!(
+            result.is_ok(),
+            "GatedMount Drop panicked during busy cleanup"
+        );
+        assert_detached(&mnt);
+        assert_reaped(identity);
+    }
+
+    /// Regression: #215 LoggedMount Drop must detach a busy mount without panicking.
+    #[test]
+    fn regression_logged_drop_busy_cleanup_never_panics() {
+        let root = tempfile::tempdir().unwrap();
+        let Some(mount) = logged_mount(root.path()) else {
+            return;
+        };
+        let mnt = mount.mnt.clone();
+        let identity = child_identity(&mount.child);
+        let held = File::open(&mnt).unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| drop(mount)));
+        drop(held);
+        assert!(
+            result.is_ok(),
+            "LoggedMount Drop panicked during busy cleanup"
+        );
+        assert_detached(&mnt);
+        assert_reaped(identity);
+    }
+
+    /// Regression: #215 an already-reaped guard must not unmount another owned daemon.
+    #[test]
+    fn regression_drop_reaped_child_is_noop() {
+        let root = tempfile::tempdir().unwrap();
+        let Some(mut owner) = logged_mount(root.path()) else {
+            return;
+        };
+        let inert_root = tempfile::tempdir().unwrap();
+        let inert = GatedMount {
+            archive: inert_root.path().join("unused.tar"),
+            overlay: inert_root.path().join("unused-overlay"),
+            gate: inert_root.path().join("unused-gate"),
+            root: inert_root,
+            mnt: owner.mnt.clone(),
+            child: DirectChild::sleep("0").into_reaped(),
+        };
+        drop(inert);
+        assert!(
+            owner.serving(),
+            "reaped GatedMount guard unmounted live owner"
+        );
+        let inert = LoggedMount {
+            mnt: owner.mnt.clone(),
+            child: DirectChild::sleep("0").into_reaped(),
+        };
+        drop(inert);
+        assert!(
+            owner.serving(),
+            "reaped LoggedMount guard unmounted live owner"
+        );
+        owner.unmount();
+        assert_detached(&owner.mnt);
+        assert!(owner.child.try_wait().unwrap().is_some());
+    }
+
+    /// Regression: #215 readiness cleanup must reap its child and retain the startup reason.
+    #[test]
+    fn regression_readiness_failure_cleanup_preserves_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let mut child = DirectChild::sleep("60");
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            fail_mount_not_ready(root.path(), child.child());
+        }));
+        assert_eq!(
+            panic_message(result),
+            "not ready within 20 s (the mount hashes the base)"
+        );
+        assert!(child.child().try_wait().unwrap().is_some());
+    }
 }

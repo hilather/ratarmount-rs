@@ -2,7 +2,7 @@
 # Build a ratarmount AppImage (optional tooling).
 #
 # Prerequisites on the build host:
-#   - cargo + fuse3 + libarchive development packages
+#   - cargo + libarchive development packages; host fuse3 at runtime
 #   - linuxdeploy + appimagetool on PATH (or downloaded next to this script)
 #   - For optional format helpers inside the image: e2fsprogs (debugfs), squashfs-tools
 #
@@ -117,7 +117,7 @@ if command_exists linuxdeploy; then
     elif [[ -f "$APPDIR/ratarmount.svg" ]]; then
         LINUXDEPLOY_ARGS+=(--icon-file="$APPDIR/ratarmount.svg")
     fi
-    # Pull in dynamically linked libs (libarchive, libfuse3, …)
+    # Pull in linked libs (libarchive, …); runtime-loaded libfuse3 requires host fuse3.
     (
         cd "$OUT_DIR"
         linuxdeploy "${LINUXDEPLOY_ARGS[@]}"

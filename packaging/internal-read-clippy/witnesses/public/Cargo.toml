@@ -1,0 +1,16 @@
+[package]
+name = "internal-read-api-witnesses"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[lib]
+path = "lib.rs"
+[dependencies]
+libc = "=0.2.189"
+rustix = { version = "=1.1.5", features = ["fs", "shm"] }
+tempfile = "=3.27.0"
+nix = { version = "=0.29.0", features = ["fs", "dir", "mman", "mqueue", "feature"] }
+tokio = { version = "=1.53.1", features = ["fs", "net"] }
+git2 = { version = "=0.19.0", default-features = false }
+lopdf = "=0.34.0"
+[workspace]

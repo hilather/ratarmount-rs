@@ -108,6 +108,9 @@ for cmd in (
         fail(f"ci.yml macOS checked-open step does not run {cmd!r}")
 if "if:" in mac or "continue-on-error" in mac:
     fail("ci.yml macOS checked-open step must not be conditional or allowed to fail")
+# macOS 15 runner: the linked lib test must really use `__init_offsets`.
+if "./test-harness/check-macos-init-offsets.sh" not in mac:
+    fail("ci.yml macOS checked-open step does not run check-macos-init-offsets.sh")
 print(f"ok: checked open runs natively on {', '.join(arches)} (wheel, installed wheel, Rust)"
       f" and on macOS at deployment target {wheel_target.group(1)}")
 PY
@@ -154,6 +157,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
         "s.replace('$mac_step', '$mac_step        continue-on-error: true\n')"
     mutate "macOS step made conditional" .github/workflows/ci.yml \
         "s.replace('$mac_step', '$mac_step        if: github.event_name == \'push\'\n')"
+    mutate "macOS step lost the init-offsets check" .github/workflows/ci.yml \
+        "s.replace('          ./test-harness/check-macos-init-offsets.sh \"\$bin\"\n', '')"
     echo "ok: self-test detected every mutation"
     exit 0
 fi

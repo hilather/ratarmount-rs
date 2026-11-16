@@ -1,40 +1,273 @@
 use super::*;
 use daemon::{SocketGuard, Supervisor};
-use process::{MountState, Mounter};
+use process::{MountState, Mounter, SpawnSpec, StopOutcome};
 use protocol::{ApiError, Attempt, Base};
+use ratarmount_compositing::{LowerLayerRecord, OverlayMeta};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-fn private_tempdir() -> tempfile::TempDir {
-    tempfile::Builder::new()
+pub(super) fn private_tempdir() -> tempfile::TempDir {
+    // TMPDIR selects the root; a relative one is no root.
+    let requested = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    private_tempdir_in(&requested)
+}
+
+/// `private_tempdir` at `requested`. `Supervisor::open` canonicalizes the
+/// state root, so room for attempts/ID/inspect.sock within Darwin's 104-byte
+/// `sun_path` is judged on the resolved path: a short `TMPDIR` symlink to a
+/// long directory (macOS /var/folders resolves under /private) would
+/// otherwise pass the check and overflow the socket path. Falls back to
+/// `/tmp` (resolved) when the resolved root leaves no room.
+fn private_tempdir_in(requested: &Path) -> tempfile::TempDir {
+    let resolved = requested
+        .canonicalize()
+        .unwrap_or_else(|_| requested.to_path_buf());
+    // tempfile names each directory `.tmp` + 6 characters.
+    let socket = "/.tmpXXXXXX/attempts/attempt-000000/inspect.sock".len();
+    let root = if resolved.as_os_str().len() + socket < 104 {
+        resolved
+    } else {
+        Path::new("/tmp")
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    };
+    let dir = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
-        // Leave room for attempts/ID/inspect.sock within Darwin's 104-byte sun_path.
-        .tempdir_in("/tmp")
-        .unwrap()
+        .tempdir_in(&root)
+        .unwrap();
+    assert!(
+        dir.path()
+            .join("attempts/attempt-000000/inspect.sock")
+            .as_os_str()
+            .len()
+            < 104,
+        "temporary root {} leaves no room for attempts/ID/inspect.sock within a 104-byte sun_path ({})",
+        root.display(),
+        dir.path().display()
+    );
+    dir
+}
+
+/// Regression (sweep 5 review): the socket-length check measured `TMPDIR` as
+/// written, but `Supervisor::open` canonicalizes the state root, so a short
+/// `TMPDIR` symlink to a long directory passed the check and the real socket
+/// path overflowed `sun_path` (macOS /var/folders -> /private/var/folders).
+/// The check must use the resolved path and fall back to `/tmp`.
+#[test]
+fn regression_private_tempdir_judges_the_resolved_root() {
+    let anchor = private_tempdir();
+    let mut long = anchor.path().canonicalize().unwrap();
+    while long.as_os_str().len() < 120 {
+        long.push("a_long_directory_component");
+    }
+    fs::create_dir_all(&long).unwrap();
+    let short = anchor.path().join("s");
+    symlink(&long, &short).unwrap();
+    let dir = private_tempdir_in(&short);
+    let resolved = dir.path().canonicalize().unwrap();
+    assert!(
+        !resolved.starts_with(&long),
+        "{resolved:?} is under the long dir"
+    );
+    assert!(
+        resolved
+            .join("attempts/attempt-000000/inspect.sock")
+            .as_os_str()
+            .len()
+            < 104,
+        "{resolved:?}"
+    );
+    // Use a known-short root, even when the caller's TMPDIR is 45–55 bytes.
+    let direct = private_tempdir_in(Path::new("/tmp"));
+    let dir = private_tempdir_in(direct.path());
+    assert!(
+        dir.path()
+            .starts_with(direct.path().canonicalize().unwrap()),
+        "{:?} not under {:?}",
+        dir.path(),
+        direct.path()
+    );
+    // At these lengths the first tempdir fits, but adding another tempdir
+    // does not. The second call must use the fallback rather than assume it
+    // can stay under the first one.
+    for length in 45..=55 {
+        let name = "m".repeat(length - direct.path().as_os_str().len() - 1);
+        let mid = direct.path().join(name);
+        fs::create_dir(&mid).unwrap();
+        let first = private_tempdir_in(&mid);
+        assert!(first.path().starts_with(&mid));
+        let second = private_tempdir_in(first.path());
+        assert!(!second.path().starts_with(first.path()));
+        assert!(second
+            .path()
+            .starts_with(Path::new("/tmp").canonicalize().unwrap()));
+    }
 }
 
 #[derive(Default)]
-struct FakeState {
-    mounts: BTreeMap<PathBuf, MountState>,
-    fail_spawn: Option<usize>,
-    spawns: usize,
-    first_poll_spawns: Option<usize>,
-    stuck: bool,
-    refuse_cleanup: bool,
-    inspection: bool,
-    cleaned: Vec<PathBuf>,
-    policies: Vec<(Option<u64>, Vec<String>)>,
+pub(super) struct FakeState {
+    pub(super) mounts: BTreeMap<PathBuf, MountState>,
+    pub(super) fail_spawn: Option<usize>,
+    pub(super) spawns: usize,
+    pub(super) prepares: usize,
+    pub(super) first_poll_spawns: Option<usize>,
+    pub(super) stuck: bool,
+    pub(super) refuse_cleanup: bool,
+    pub(super) inspection: bool,
+    /// Write a `spawned` marker into each attempt directory on spawn.
+    pub(super) marker: bool,
+    pub(super) cleaned: Vec<PathBuf>,
+    pub(super) policies: Vec<(Option<u64>, Vec<String>)>,
+    /// Every spawn's spec.
+    pub(super) specs: Vec<SpawnRecord>,
+    /// A child's cache: bundle lowers are extracted below it.
+    pub(super) bundle_cache: Option<PathBuf>,
+    /// Resolve bundle lowers as a real child does, through
+    /// `overlay_pack::cached_lower_in` into this cache over this base view
+    /// (publication, entry lock and hit included), instead of extracting
+    /// them unverified.
+    pub(super) real_cache: Option<(PathBuf, Arc<dyn ratarmount_core::MountSource>)>,
+    /// The lower records each attempt's child took, by attempt path.
+    pub(super) records: BTreeMap<PathBuf, Vec<LowerLayerRecord>>,
+    /// Run once around a child's two opens of its lowers.
+    pub(super) before_capture: Option<Hook>,
+    pub(super) between_capture_and_compose: Option<Hook>,
+    pub(super) after_compose: Option<Hook>,
+    pub(super) fail_lower_layers: bool,
+    pub(super) lower_layer_calls: usize,
+    /// How long `lower_layers` takes to answer, whatever its timeout.
+    pub(super) lower_layers_delay: Option<Duration>,
+    /// Every timeout `lower_layers` was given.
+    pub(super) lower_layer_timeouts: Vec<Duration>,
+    /// Scripted `stop` answers, consumed one per call; when empty a stop
+    /// unmounts and reports the attempt's kept exit status.
+    pub(super) stop_outcomes: std::collections::VecDeque<StopOutcome>,
+    /// The kept exit status `stop` reports per attempt path (`exit 0` when
+    /// unset; `None` for "never recorded").
+    pub(super) exits: BTreeMap<PathBuf, Option<std::process::ExitStatus>>,
+    /// Every `stop` call: the attempt path and the wait it was given.
+    pub(super) stops: Vec<(PathBuf, Duration)>,
+    /// `status` answers this count, or fails when `None`.
+    pub(super) erofs_denied: Option<u64>,
+    pub(super) status_calls: usize,
+    /// Every timeout `status` was given.
+    pub(super) status_timeouts: Vec<Duration>,
+    /// `status` reads the attempt's inspection socket through
+    /// `ProcessMounter::status`, as the daemon does, instead of answering
+    /// `erofs_denied`.
+    pub(super) process_status: bool,
+    /// How long each `process_status` read took.
+    pub(super) status_held: Vec<Duration>,
+    /// Children still alive after a `Detaching` stop.
+    pub(super) alive: BTreeSet<PathBuf>,
+    /// Every mount point `forget_child` dropped (R1c-1: the retained
+    /// attempt's mount table entry, removed when its tree is renamed).
+    pub(super) forgotten: Vec<PathBuf>,
+    /// Mount points besides the attempts' own (the durability preflight's
+    /// mount check).
+    pub(super) extra_mounts: Vec<PathBuf>,
+}
+
+/// An exit status for the Fake (`code` 0..=255).
+pub(super) fn exit(code: i32) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(code << 8)
+}
+
+pub(super) type Hook = Box<dyn FnOnce() + Send>;
+
+/// An owned `SpawnSpec`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SpawnRecord {
+    pub(super) quota: Option<u64>,
+    pub(super) readonly: Vec<String>,
+    pub(super) lowers: Vec<PathBuf>,
+    pub(super) bundle_cache: Option<PathBuf>,
+    pub(super) journal: Option<(PathBuf, protocol::JournalSpec)>,
+    pub(super) durability: protocol::OverlayDurability,
 }
 
 #[derive(Clone, Default)]
-struct Fake(Arc<Mutex<FakeState>>);
+pub(super) struct Fake(pub(super) Arc<Mutex<FakeState>>);
+
+impl Fake {
+    fn run(&self, hook: fn(&mut FakeState) -> &mut Option<Hook>) {
+        let hook = hook(&mut self.0.lock().unwrap()).take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// A child's two opens of its lowers: it captures each lower's metadata
+    /// (a bundle is first extracted into its cache, unverified), then
+    /// composes them, which the Fake does not need to do.
+    fn capture(
+        &self,
+        lowers: &[PathBuf],
+        preflight_cache: Option<&Path>,
+    ) -> Result<Vec<LowerLayerRecord>, String> {
+        self.run(|state| &mut state.before_capture);
+        let cache = self.0.lock().unwrap().bundle_cache.clone();
+        let real = self.0.lock().unwrap().real_cache.clone();
+        let mut records: Vec<LowerLayerRecord> = Vec::new();
+        for lower in lowers {
+            let path = if let (true, Some((cache, base))) = (lower.is_file(), &real) {
+                let layers: Vec<_> = records
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.path.clone(),
+                            ratarmount_compositing::Immutability::Immutable,
+                        )
+                    })
+                    .collect();
+                let view = ratarmount_compositing::compose_stack(base.clone(), &layers)
+                    .map_err(|e| e.to_string())?;
+                crate::overlay_pack::cached_lower_in(
+                    lower,
+                    preflight_cache.unwrap_or(cache),
+                    view,
+                    None,
+                )
+                .map_err(|e| e.to_string())?
+                .canonicalize()
+                .unwrap()
+            } else if lower.is_file() {
+                let cache = cache.as_ref().expect("bundle lowers need a bundle cache");
+                let layer = cache.join(format!("layer-{}", fs::read_dir(cache).unwrap().count()));
+                crate::overlay_pack::tests::extract_unverified(lower, &layer)
+                    .map_err(|e| e.to_string())?;
+                layer.canonicalize().unwrap()
+            } else {
+                // As the child does (`LowerStack::open`).
+                lower.canonicalize().map_err(|e| e.to_string())?
+            };
+            let meta = OverlayMeta::read_no_recovery(&path)
+                .map_err(|e| e.to_string())?
+                .ok_or("no overlay metadata")?;
+            records.push(LowerLayerRecord {
+                path,
+                layer_digest: meta.get("layer_digest").unwrap_or("").into(),
+                sealed_at: meta.get("sealed_at").unwrap_or("").into(),
+            });
+        }
+        self.run(|state| &mut state.between_capture_and_compose);
+        self.run(|state| &mut state.after_compose);
+        Ok(records)
+    }
+}
 
 impl Mounter for Fake {
     fn prepare(&mut self, _: &Base, _: &Path, _: Duration) -> Result<(), ApiError> {
+        self.0.lock().unwrap().prepares += 1;
         Ok(())
     }
     fn spawn(
@@ -42,21 +275,48 @@ impl Mounter for Fake {
         _: &Base,
         _: &Path,
         attempt: &Attempt,
-        quota: Option<u64>,
-        readonly: &[String],
+        spec: &SpawnSpec<'_>,
     ) -> Result<(), ApiError> {
         let mut state = self.0.lock().unwrap();
         state.spawns += 1;
+        if state.marker {
+            fs::write(attempt.path.parent().unwrap().join("spawned"), b"").unwrap();
+        }
         if state.fail_spawn == Some(state.spawns) {
             return Err(ApiError::new("spawn_failed", "injected"));
         }
-        let status = if state.stuck {
+        let mut status = if state.stuck {
             MountState::Starting
         } else {
             MountState::Ready
         };
-        state.mounts.insert(attempt.path.clone(), status);
-        state.policies.push((quota, readonly.into()));
+        state.policies.push((spec.quota, spec.readonly.into()));
+        state.specs.push(SpawnRecord {
+            quota: spec.quota,
+            readonly: spec.readonly.into(),
+            lowers: spec.lowers.into(),
+            bundle_cache: spec.bundle_cache.map(Path::to_path_buf),
+            journal: spec
+                .journal
+                .map(|(path, journal)| (path.into(), journal.clone())),
+            durability: spec.durability,
+        });
+        drop(state);
+        if !spec.lowers.is_empty() {
+            match self.capture(spec.lowers, spec.bundle_cache) {
+                Ok(records) => {
+                    let mut state = self.0.lock().unwrap();
+                    state.records.insert(attempt.path.clone(), records);
+                }
+                // A child that cannot open its lowers exits.
+                Err(_) => status = MountState::Crashed,
+            }
+        }
+        self.0
+            .lock()
+            .unwrap()
+            .mounts
+            .insert(attempt.path.clone(), status);
         Ok(())
     }
     fn poll(&mut self, attempt: &Attempt) -> Result<MountState, ApiError> {
@@ -70,7 +330,17 @@ impl Mounter for Fake {
             .copied()
             .unwrap_or(MountState::Crashed))
     }
+    /// `ProcessMounter`'s rule: the socket while the child serves (`starting`,
+    /// `ready`, a `finalizing` attempt whose child is alive), else offline.
     fn deleted_paths(&mut self, attempt: &Attempt) -> Result<Option<Vec<String>>, ApiError> {
+        let serving = match attempt.status.as_str() {
+            "starting" | "ready" => true,
+            "finalizing" => self.0.lock().unwrap().alive.contains(&attempt.path),
+            _ => false,
+        };
+        if !serving {
+            return Ok(None);
+        }
         if self.0.lock().unwrap().inspection {
             super::inspection::deleted_paths(attempt)
                 .map(Some)
@@ -80,18 +350,111 @@ impl Mounter for Fake {
         }
     }
 
+    fn lower_layers(
+        &mut self,
+        attempt: &Attempt,
+        timeout: Duration,
+    ) -> Result<Vec<LowerLayerRecord>, ApiError> {
+        let mut state = self.0.lock().unwrap();
+        state.lower_layer_calls += 1;
+        state.lower_layer_timeouts.push(timeout);
+        if state.fail_lower_layers {
+            return Err(ApiError::new("io", "injected"));
+        }
+        let records = state
+            .records
+            .get(&attempt.path)
+            .cloned()
+            .unwrap_or_default();
+        let delay = state.lower_layers_delay;
+        drop(state);
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
+        Ok(records)
+    }
+
     fn cleanup(&mut self, path: &Path) -> Result<(), ApiError> {
         let mut state = self.0.lock().unwrap();
         if state.refuse_cleanup {
             return Err(ApiError::new("unmount_failed", "injected"));
         }
         state.mounts.remove(path);
+        state.alive.remove(path);
         state.cleaned.push(path.into());
         Ok(())
     }
+
+    fn stop(&mut self, attempt: &Attempt, wait: Duration) -> Result<StopOutcome, ApiError> {
+        let mut state = self.0.lock().unwrap();
+        state.stops.push((attempt.path.clone(), wait));
+        let outcome = state.stop_outcomes.pop_front().unwrap_or_else(|| {
+            if state.alive.contains(&attempt.path) {
+                StopOutcome::Detaching
+            } else {
+                StopOutcome::Stopped {
+                    exit: state
+                        .exits
+                        .get(&attempt.path)
+                        .copied()
+                        .unwrap_or(Some(exit(0))),
+                }
+            }
+        });
+        match &outcome {
+            StopOutcome::Stopped { .. } => {
+                state.mounts.remove(&attempt.path);
+                state.alive.remove(&attempt.path);
+            }
+            StopOutcome::Detaching => {
+                state.mounts.remove(&attempt.path);
+                state.alive.insert(attempt.path.clone());
+            }
+            StopOutcome::Busy | StopOutcome::Failed { .. } => {}
+        }
+        Ok(outcome)
+    }
+
+    fn status(&mut self, attempt: &Attempt, timeout: Duration) -> Result<u64, ApiError> {
+        let mut state = self.0.lock().unwrap();
+        state.status_calls += 1;
+        state.status_timeouts.push(timeout);
+        if state.process_status {
+            drop(state);
+            let started = std::time::Instant::now();
+            let answer = process::ProcessMounter::new(PathBuf::from("/nonexistent/ratarmount"))
+                .status(attempt, timeout);
+            self.0.lock().unwrap().status_held.push(started.elapsed());
+            return answer;
+        }
+        state
+            .erofs_denied
+            .ok_or_else(|| ApiError::new("io", "injected: no status"))
+    }
+
+    fn child_alive(&mut self, attempt: &Attempt) -> bool {
+        self.0.lock().unwrap().alive.contains(&attempt.path)
+    }
+
+    fn forget_child(&mut self, path: &Path) {
+        let mut state = self.0.lock().unwrap();
+        state.forgotten.push(path.into());
+        state.alive.remove(path);
+    }
+
+    fn mount_points(&self) -> Result<Vec<PathBuf>, ApiError> {
+        let state = self.0.lock().unwrap();
+        Ok(state
+            .mounts
+            .iter()
+            .filter(|(_, mount)| **mount == MountState::Ready)
+            .map(|(path, _)| path.clone())
+            .chain(state.extra_mounts.iter().cloned())
+            .collect())
+    }
 }
 
-fn setup(limit: usize) -> (tempfile::TempDir, Supervisor<Fake>, Fake) {
+pub(super) fn setup(limit: usize) -> (tempfile::TempDir, Supervisor<Fake>, Fake) {
     let root = private_tempdir();
     let fake = Fake::default();
     let mut supervisor =
@@ -118,9 +481,9 @@ fn new(count: usize) -> Operation {
 /// Regression: version negotiation, unknown fields and invalid JSON return structured errors.
 #[test]
 fn regression_protocol_rejects_unknown_fields_and_versions() {
-    for line in [r#"{}"#, r#"{"version":2,"op":"list"}"#] {
+    for line in [r#"{}"#, r#"{"version":3,"op":"list"}"#] {
         assert_eq!(
-            Request::parse(line.as_bytes()).unwrap_err().code,
+            Request::parse(line.as_bytes()).unwrap_err().error.code,
             "unsupported_version"
         );
     }
@@ -130,7 +493,12 @@ fn regression_protocol_rejects_unknown_fields_and_versions() {
         "{",
         r#"{"version":1,"op":"create_base","name":"a","source":"x","options":{"bad":true}}"#,
     ] {
-        let response = Response::from_result(Request::parse(line.as_bytes()).map(|_| json!(null)));
+        let response = Response::from_result(
+            VERSION,
+            Request::parse(line.as_bytes())
+                .map(|_| json!(null))
+                .map_err(|rejection| rejection.error),
+        );
         assert!(!response.ok);
         let encoded = serde_json::to_vec(&response).unwrap();
         let decoded: Response = serde_json::from_slice(&encoded).unwrap();
@@ -151,7 +519,7 @@ fn regression_protocol_rejects_unknown_fields_and_versions() {
     ] {
         let request = Request {
             version: VERSION,
-            operation,
+            operation: operation.into(),
         };
         let bytes = serde_json::to_vec(&request).unwrap();
         let parsed = Request::parse(&bytes).unwrap();
@@ -306,6 +674,8 @@ fn regression_cleanup_failure_keeps_attempt_data() {
 /// Regression: restart removes stale attempts only after unmount, retains bases, and excludes another daemon.
 #[test]
 fn regression_restart_reconciles_stale_mounts_and_locks_state() {
+    // Regression: a parallel child can retain daemon.lock until exec/exit (#242).
+    let _processes = ratarmount_index::test_process::exclusive();
     let (root, mut supervisor, fake) = setup(8);
     supervisor.handle(new(2)).unwrap();
     assert!(Supervisor::open(root.path(), 8, Duration::from_secs(1), fake.clone()).is_err());
@@ -332,6 +702,7 @@ fn regression_restart_reconciles_stale_mounts_and_locks_state() {
 /// Regression: a stale mount cleanup error must stop restart without deleting its backing files.
 #[test]
 fn regression_restart_failed_unmount_preserves_state() {
+    let _processes = ratarmount_index::test_process::exclusive();
     let (root, mut supervisor, fake) = setup(8);
     supervisor.handle(new(1)).unwrap();
     let path = supervisor
@@ -351,6 +722,7 @@ fn regression_restart_failed_unmount_preserves_state() {
 /// Regression: socket symlinks, foreign ownership and regular files are never replaced; sockets are 0600.
 #[test]
 fn regression_socket_permissions_and_unsafe_paths() {
+    let _processes = ratarmount_index::test_process::spawning();
     // Socket creation briefly changes umask before the daemon starts threads.
     // Run that startup code in its own process, away from parallel unit tests.
     if std::env::var_os("RATARMOUNT_SANDBOX_SOCKET_TEST").is_none() {
@@ -448,8 +820,11 @@ fn regression_base_policy_and_mount_options_forwarded() {
         &base,
         Path::new("/index,with-comma"),
         attempt,
-        Some(10),
-        &["tests/**".into()],
+        &SpawnSpec {
+            quota: Some(10),
+            readonly: &["tests/**".into()],
+            ..Default::default()
+        },
     );
     let parsed =
         crate::parse_args_from(std::iter::once(std::ffi::OsString::from("ratarmount")).chain(args))
@@ -474,7 +849,7 @@ fn regression_base_allow_globs_optional_v1() {
     ] {
         let request = json!({"version": 1, "op": "create_base", "name": "task", "source": "x", "options": options});
         let parsed = Request::parse(&serde_json::to_vec(&request).unwrap()).unwrap();
-        let Operation::CreateBase { options, .. } = parsed.operation else {
+        let protocol::Op::V1(Operation::CreateBase { options, .. }) = parsed.operation else {
             panic!("create_base");
         };
         assert_eq!(options.allow_globs, expected);
@@ -618,7 +993,7 @@ fn regression_live_diff_and_stats_do_not_reopen_locked_database() {
     );
     overlay.unlink("/gone").unwrap();
     let inspector =
-        super::start_inspection(&super::inspection::socket_path(&attempt), &overlay).unwrap();
+        super::start_inspection(&super::inspection::socket_path(&attempt), &overlay, None).unwrap();
     fake.0.lock().unwrap().inspection = true;
     fs::create_dir(attempt.overlay_dir.join("repo")).unwrap();
     fs::write(attempt.overlay_dir.join("repo/original"), "edited\n").unwrap();
@@ -654,6 +1029,7 @@ fn regression_live_diff_and_stats_do_not_reopen_locked_database() {
 #[cfg(target_os = "linux")]
 #[test]
 fn regression_tmpfs_overlay_path_and_restart_cleanup() {
+    let _processes = ratarmount_index::test_process::exclusive();
     use sha2::{Digest, Sha256};
     let root = private_tempdir();
     let ram_parent = private_tempdir();
@@ -769,4 +1145,1432 @@ fn regression_sandbox_socket_path_reports_platform_limit() {
         .contains(&format!("shorter than {limit} bytes")));
     let nul = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/a\0b"));
     assert!(super::inspection::validate_socket_path(nul).is_err());
+}
+
+/// Regression: strict worker policy is a parsed option before the source separator.
+#[test]
+fn regression_prepared_index_sandbox_worker_argv() {
+    let (root, mut supervisor, _) = setup(8);
+    supervisor.handle(new(1)).unwrap();
+    let base = &Base {
+        name: "task".into(),
+        source: "/fake.tar".into(),
+        options: BaseOptions::default(),
+    };
+    let attempt = supervisor.attempts.values().next().unwrap();
+    let args = process::mount_args(base, root.path(), attempt, &SpawnSpec::default());
+    let policy = args
+        .iter()
+        .position(|a| a == "--no-recreate-index")
+        .unwrap();
+    assert!(policy < args.iter().position(|a| a == "--").unwrap());
+    let parsed =
+        crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(args)).unwrap();
+    assert!(parsed.no_recreate_index);
+    assert!(!parsed.commit_overlay && !parsed.commit_overlay_on_exit);
+    assert_eq!(parsed.commit_overlay_interval, "0");
+    let prepare = process::base_args(base, root.path()).into_iter().chain([
+        OsString::from("--no-mount"),
+        OsString::from("--"),
+        OsString::from(&base.source),
+    ]);
+    let parsed =
+        crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(prepare))
+            .unwrap();
+    assert!(parsed.no_mount);
+    assert!(!parsed.no_recreate_index);
+    assert!(parsed.write_overlay.is_none());
+}
+
+/// Regression (R1b L2, skeptic-6 N3): an empty spec keeps the child argv of
+/// R1a's head, literally; a layered spec adds `--lower` per lower, bottom
+/// first, and the journal flags before `--`, never `--allow-unsealed-lower`
+/// or `--force-stack-mismatch`, and the mount CLI parses them back.
+#[test]
+fn regression_supervisor_lower_spawn_args() {
+    use protocol::{JournalReads, JournalSpec};
+    let base = Base {
+        name: "task".into(),
+        source: "/srv/base.tar".into(),
+        options: BaseOptions::default(),
+    };
+    let attempt = Attempt {
+        id: "attempt-1".into(),
+        base: "task".into(),
+        path: "/state/attempts/attempt-1/mnt".into(),
+        overlay_dir: "/state/attempts/attempt-1/overlay".into(),
+        status: "starting".into(),
+    };
+    let indexes = Path::new("/state/indexes/task");
+    let ownership = format!(
+        "noatime,uid={},gid={}",
+        unsafe { libc::geteuid() },
+        unsafe { libc::getegid() }
+    );
+    // The argv of R1a's head, with `policy` and then `extra` before `--`.
+    let argv = |policy: &[&str]| -> Vec<OsString> {
+        let mut argv = vec![
+            "--foreground",
+            "--no-file-versions",
+            "--index-folders",
+            r#"["/state/indexes/task"]"#,
+            "-o",
+            ownership.as_str(),
+            "--no-recreate-index",
+            "--sandbox-inspection-socket",
+            "/state/attempts/attempt-1/inspect.sock",
+            "-w",
+            "/state/attempts/attempt-1/overlay",
+        ];
+        argv.extend(policy);
+        argv.extend(["--", "/srv/base.tar", "/state/attempts/attempt-1/mnt"]);
+        argv.into_iter().map(OsString::from).collect()
+    };
+    let spawn = |spec: &SpawnSpec| process::mount_args(&base, indexes, &attempt, spec);
+    assert_eq!(spawn(&SpawnSpec::default()), argv(&[]));
+    let readonly = ["tests/**".to_owned()];
+    let policy = SpawnSpec {
+        quota: Some(10),
+        readonly: &readonly,
+        ..Default::default()
+    };
+    assert_eq!(
+        spawn(&policy),
+        argv(&["--overlay-quota", "10", "--overlay-readonly", "tests/**"])
+    );
+    let lowers = [
+        PathBuf::from("/layers/a"),
+        PathBuf::from("/layers/b.tar.zst"),
+    ];
+    let journal = JournalSpec {
+        exclude: vec!["x/**".into(), ".git/**".into()],
+        reads: JournalReads::First,
+        sync: true,
+    };
+    let journal_path = Path::new("/state/attempts/attempt-1/journal.jsonl");
+    let args = spawn(&SpawnSpec {
+        lowers: &lowers,
+        journal: Some((journal_path, &journal)),
+        ..policy
+    });
+    assert_eq!(
+        args,
+        argv(&[
+            "--overlay-quota",
+            "10",
+            "--overlay-readonly",
+            "tests/**",
+            "--lower",
+            "/layers/a",
+            "--lower",
+            "/layers/b.tar.zst",
+            "--journal",
+            "/state/attempts/attempt-1/journal.jsonl",
+            "--journal-exclude=x/**",
+            "--journal-exclude=.git/**",
+            "--journal-reads",
+            "first",
+            "--journal-sync",
+        ])
+    );
+    for flag in ["--allow-unsealed-lower", "--force-stack-mismatch"] {
+        assert!(!args.contains(&OsString::from(flag)), "{flag}");
+    }
+    let parsed =
+        crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(args)).unwrap();
+    assert_eq!(parsed.lower, lowers);
+    assert_eq!(parsed.journal.as_deref(), Some(journal_path));
+    assert_eq!(parsed.journal_exclude, journal.exclude);
+    assert_eq!(parsed.journal_reads, "first");
+    assert!(parsed.journal_sync);
+    let (inputs, mountpoint) = crate::split_bound_inputs_mountpoint(&parsed);
+    assert_eq!(inputs, [PathBuf::from("/srv/base.tar")]);
+    assert_eq!(mountpoint, Some(attempt.path.clone()));
+    // The default journal (`reads: all`, no sync, no excludes) adds one flag.
+    let default = JournalSpec::default();
+    let args = spawn(&SpawnSpec {
+        journal: Some((journal_path, &default)),
+        ..Default::default()
+    });
+    assert_eq!(
+        args,
+        argv(&["--journal", "/state/attempts/attempt-1/journal.jsonl"])
+    );
+    let parsed =
+        crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(args)).unwrap();
+    assert_eq!(parsed.journal_reads, "all");
+    assert!(!parsed.journal_sync && parsed.journal_exclude.is_empty());
+    // Regression (sweep 3): as a separate argument, a glob starting with `-`
+    // was parsed as another option ("a value is required").
+    let unusual = JournalSpec {
+        exclude: vec!["-cache/**".into(), "a=b/**".into(), "--x".into()],
+        ..Default::default()
+    };
+    let args = spawn(&SpawnSpec {
+        journal: Some((journal_path, &unusual)),
+        ..Default::default()
+    });
+    assert_eq!(
+        args,
+        argv(&[
+            "--journal",
+            "/state/attempts/attempt-1/journal.jsonl",
+            "--journal-exclude=-cache/**",
+            "--journal-exclude=a=b/**",
+            "--journal-exclude=--x",
+        ])
+    );
+    let parsed =
+        crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(args)).unwrap();
+    assert_eq!(parsed.journal_exclude, unusual.exclude);
+}
+
+/// Regression (R1b L9): a journal goes to `attempts/ID/journal.jsonl`, chosen
+/// by the supervisor, outside the mountpoint and the overlay of disk and
+/// tmpfs tops, with the request's excludes, reads and sync; it needs no
+/// lowers, makes no lower inspection, and goes with `destroy`. An exclude
+/// starting with `-` is accepted (sweep 3: it was refused by the parser).
+#[test]
+fn regression_supervisor_journal_spawn_and_location() {
+    use protocol::{JournalReads, JournalSpec};
+    let request = |overlay: &str| {
+        serde_json::to_vec(&json!({
+            "version": 2,
+            "op": "new",
+            "base": "task",
+            "count": 2,
+            "overlay": overlay,
+            "journal": {"exclude": ["skip/**", ".git/**", "-cache/**"], "reads": "first", "sync": true}
+        }))
+        .unwrap()
+    };
+    let expected = JournalSpec {
+        exclude: vec!["skip/**".into(), ".git/**".into(), "-cache/**".into()],
+        reads: JournalReads::First,
+        sync: true,
+    };
+    let check = |supervisor: &mut Supervisor<Fake>, fake: &Fake, overlay: &str| -> bool {
+        let reply: serde_json::Value =
+            serde_json::from_slice(&daemon::respond(supervisor, &request(overlay))).unwrap();
+        if reply["error"]["code"] == "unsupported" {
+            eprintln!("skip: test temporary directory is not tmpfs: {reply}");
+            return false;
+        }
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["version"], 2);
+        let attempts = reply["result"].as_array().unwrap();
+        let specs = fake.0.lock().unwrap().specs.clone();
+        let specs = &specs[specs.len() - 2..];
+        for (attempt, spec) in attempts.iter().zip(specs) {
+            // Results keep the v1 attempt shape.
+            let keys: Vec<_> = attempt.as_object().unwrap().keys().cloned().collect();
+            assert_eq!(keys, ["base", "id", "overlay_dir", "path", "status"]);
+            let mount = PathBuf::from(attempt["path"].as_str().unwrap());
+            let top = PathBuf::from(attempt["overlay_dir"].as_str().unwrap());
+            let (journal, options) = spec.journal.clone().unwrap();
+            assert_eq!(journal, mount.parent().unwrap().join("journal.jsonl"));
+            assert!(!journal.starts_with(&mount) && !journal.starts_with(&top));
+            assert_eq!(options, expected);
+            assert!(spec.lowers.is_empty());
+            // The child appends it; destroy removes it with the attempt.
+            fs::write(&journal, b"{\"journal\":1}\n").unwrap();
+            let id = attempt["id"].as_str().unwrap();
+            assert!(!supervisor.taken_lowers.contains_key(id));
+            supervisor.destroy(id).unwrap();
+            assert!(!journal.exists());
+            assert!(!mount.parent().unwrap().exists());
+        }
+        assert_eq!(fake.0.lock().unwrap().lower_layer_calls, 0);
+        true
+    };
+    let (_root, mut supervisor, fake) = setup(8);
+    assert!(check(&mut supervisor, &fake, "disk"));
+    // Without a journal the child gets none.
+    supervisor.handle(new(1)).unwrap();
+    assert_eq!(fake.0.lock().unwrap().specs.last().unwrap().journal, None);
+    supervisor.destroy_all().unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        use sha2::{Digest, Sha256};
+        let root = private_tempdir();
+        let ram_parent = private_tempdir();
+        let ram = ram_parent.path().join(format!(
+            "ratarmount-sandbox-{:x}",
+            Sha256::digest(
+                fs::canonicalize(root.path())
+                    .unwrap()
+                    .as_os_str()
+                    .as_encoded_bytes()
+            )
+        ));
+        fs::write(
+            root.path().join("ram-root.json"),
+            serde_json::to_vec(&ram).unwrap(),
+        )
+        .unwrap();
+        let fake = Fake::default();
+        let mut supervisor =
+            Supervisor::open(root.path(), 8, Duration::from_secs(1), fake.clone()).unwrap();
+        supervisor
+            .handle(Operation::CreateBase {
+                name: "task".into(),
+                source: "/fake.tar".into(),
+                options: BaseOptions::default(),
+            })
+            .unwrap();
+        check(&mut supervisor, &fake, "tmpfs");
+    }
+}
+
+/// Regression: a registered base is prepared once across worker batches and reloads.
+#[test]
+fn regression_prepared_index_sandbox_prepares_once_across_batches() {
+    let _processes = ratarmount_index::test_process::exclusive();
+    let (root, mut supervisor, fake) = setup(8);
+    assert_eq!(fake.0.lock().unwrap().prepares, 1);
+    for _ in 0..2 {
+        supervisor.handle(new(3)).unwrap();
+        supervisor.destroy_all().unwrap();
+    }
+    drop(supervisor);
+    let mut supervisor =
+        Supervisor::open(root.path(), 8, Duration::from_secs(1), fake.clone()).unwrap();
+    supervisor.handle(new(3)).unwrap();
+    supervisor.destroy_all().unwrap();
+    assert_eq!(fake.0.lock().unwrap().prepares, 1);
+}
+
+/// Regression: API diff must refuse an invalid selected index without repairing it.
+#[test]
+fn regression_prepared_index_sandbox_diff_refuses_invalid_cache() {
+    use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
+    let root = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let base = root.path().join("base.tar");
+    let mut file = fs::File::create(&base).unwrap();
+    write_ustar_members(
+        &mut file,
+        &[UstarMember {
+            path: "f",
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            xattrs: &[],
+            payload: UstarPayload::File { bytes: b"original" },
+        }],
+    )
+    .unwrap();
+    write_tar_eof(&mut file).unwrap();
+    drop(file);
+    let mut supervisor =
+        Supervisor::open(root.path(), 8, Duration::from_secs(1), Fake::default()).unwrap();
+    supervisor
+        .handle(Operation::CreateBase {
+            name: "task".into(),
+            source: base.to_string_lossy().into(),
+            options: BaseOptions::default(),
+        })
+        .unwrap();
+    let cache = root.path().join("indexes/task");
+    let opts = ratarmount_core::OpenOptions {
+        index_folders: vec![cache.clone()],
+        ..Default::default()
+    };
+    drop(ratarmount_session::factory::open_path(&base, &opts, false).unwrap());
+    let index = fs::read_dir(&cache)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "sqlite"))
+        .unwrap();
+    fs::write(&index, b"invalid prepared catalog").unwrap();
+    let before = fs::read(&index).unwrap();
+    supervisor.handle(new(1)).unwrap();
+    let id = supervisor.attempts.keys().next().unwrap().clone();
+    let error = supervisor
+        .handle(Operation::Diff { id, git: true })
+        .unwrap_err();
+    assert_eq!(error.code, "base_open_failed", "{}", error.message);
+    assert!(
+        error.message.contains("index") || error.message.contains("prepar"),
+        "{}",
+        error.message
+    );
+    assert_eq!(fs::read(index).unwrap(), before);
+    supervisor.destroy_all().unwrap();
+}
+
+const GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/sandbox/testdata/v1-golden.jsonl"
+);
+const CLI_V1_REQUESTS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/sandbox/testdata/cli-v1-requests.jsonl"
+);
+
+/// The v1 transcript. `request` lines and overlay paths use `$STATE` (the
+/// canonical state root) and `$BASE` (the base path as sent). `generated`
+/// stands for a line of that many `x` bytes, too large to store. Envelope
+/// errors carry no path and are replayed against the real daemon as well
+/// (`ratarmount/tests/sandbox.rs`).
+fn golden_script() -> Vec<serde_json::Value> {
+    let request = |line: &str| json!({ "request": line });
+    let envelope = |line: &str| json!({ "request": line, "envelope": true });
+    let overlay = "$STATE/attempts/attempt-000001/overlay";
+    vec![
+        request(r#"{"version":1,"op":"create_base","name":"task","source":"$BASE"}"#),
+        request(r#"{"version":1,"op":"create_base","name":"task","source":"$BASE"}"#),
+        request(
+            r#"{"version":1,"op":"create_base","name":"other","source":"$BASE","options":{"bogus":true}}"#,
+        ),
+        request(r#"{"version":1,"op":"new","base":"task","count":2}"#),
+        request(r#"{"version":1,"op":"new","base":"task","count":0}"#),
+        request(r#"{"version":1,"op":"new","base":"task","count":2}"#),
+        request(r#"{"version":1,"op":"new","base":"missing"}"#),
+        request(r#"{"version":1,"op":"new","base":"task","request_id":"r1"}"#),
+        request(r#"{"version":1,"op":"new","base":"task","lowers":["layer"]}"#),
+        request(r#"{"version":1,"op":"list"}"#),
+        request(r#"{"version":1,"op":"list","base":"task"}"#),
+        request(r#"{"version":1,"op":"list","base":"missing"}"#),
+        json!({ "mkdir": format!("{overlay}/sub"), "mode": "0755" }),
+        json!({ "write": format!("{overlay}/original.txt"), "mode": "0644", "content": "edited\n" }),
+        json!({ "write": format!("{overlay}/new.txt"), "mode": "0640", "content": "added\n" }),
+        json!({ "write": format!("{overlay}/sub/keep.txt"), "mode": "0755", "content": "keep\n" }),
+        request(r#"{"version":1,"op":"diff","id":"attempt-000001","git":false}"#),
+        request(r#"{"version":1,"op":"diff","id":"attempt-000001","git":true}"#),
+        request(r#"{"version":1,"op":"stats","id":"attempt-000001"}"#),
+        request(r#"{"version":1,"op":"destroy","id":"attempt-000002","base":"task"}"#),
+        request(r#"{"version":1,"op":"destroy"}"#),
+        request(r#"{"version":1,"op":"destroy","id":"attempt-999999"}"#),
+        request(r#"{"version":1,"op":"destroy","id":"attempt-000002"}"#),
+        request(r#"{"version":1,"op":"destroy","base":"task"}"#),
+        request(r#"{"version":1,"op":"list"}"#),
+        envelope(r#"{}"#),
+        envelope(r#"{"version":3,"op":"list"}"#),
+        envelope(r#"{"version":"1","op":"list"}"#),
+        envelope(r#"{"version":1.0,"op":"list"}"#),
+        envelope("{bad}"),
+        json!({ "generated": protocol::MAX_REQUEST, "envelope": true }),
+        json!({ "generated": protocol::MAX_REQUEST + 1, "envelope": true }),
+        request(r#"{"version":1,"op":"shutdown"}"#),
+        // v1 ignores extra keys on its unit `shutdown` and executes it (§4 row 21).
+        request(r#"{"version":1,"op":"shutdown","x":1}"#),
+    ]
+}
+
+/// A fresh supervisor over a fixed directory base, with deterministic IDs.
+struct Golden {
+    supervisor: Supervisor<Fake>,
+    state: String,
+    base: String,
+    _dirs: [tempfile::TempDir; 2],
+}
+
+impl Golden {
+    fn new() -> Self {
+        let state = private_tempdir();
+        let parent = private_tempdir();
+        let base = parent.path().join("base");
+        // Explicit modes keep the umask out of non-git diff headers.
+        for (path, content, mode) in [
+            (base.clone(), None, 0o755),
+            (base.join("original.txt"), Some("base\n"), 0o644),
+            (base.join("sub"), None, 0o755),
+            (base.join("sub/keep.txt"), Some("keep\n"), 0o644),
+        ] {
+            match content {
+                Some(content) => fs::write(&path, content).unwrap(),
+                None => fs::create_dir(&path).unwrap(),
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let mut supervisor =
+            Supervisor::open(state.path(), 3, Duration::from_secs(30), Fake::default()).unwrap();
+        supervisor.test_ids = Some(daemon::TestIds::default());
+        Self {
+            state: supervisor.root.to_str().unwrap().into(),
+            base: base.to_str().unwrap().into(),
+            supervisor,
+            _dirs: [state, parent],
+        }
+    }
+
+    fn fill(&self, text: &str) -> String {
+        text.replace("$STATE", &self.state)
+            .replace("$BASE", &self.base)
+    }
+
+    fn template(&self, text: &str) -> String {
+        text.replace(&self.state, "$STATE")
+            .replace(&self.base, "$BASE")
+    }
+
+    /// Runs one entry: a request returns its response line, a file write `None`.
+    fn step(
+        &mut self,
+        entry: &serde_json::Value,
+        respond: fn(&mut Supervisor<Fake>, &[u8]) -> Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        let mode = || u32::from_str_radix(entry["mode"].as_str().unwrap(), 8).unwrap();
+        if let Some(path) = entry["mkdir"].as_str() {
+            let path = self.fill(path);
+            fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode())).unwrap();
+            None
+        } else if let Some(path) = entry["write"].as_str() {
+            let path = self.fill(path);
+            fs::write(&path, entry["content"].as_str().unwrap()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode())).unwrap();
+            None
+        } else if let Some(size) = entry["generated"].as_u64() {
+            Some(respond(&mut self.supervisor, &vec![b'x'; size as usize]))
+        } else {
+            let line = self.fill(entry["request"].as_str().unwrap());
+            Some(respond(&mut self.supervisor, line.as_bytes()))
+        }
+    }
+}
+
+fn golden_respond(supervisor: &mut Supervisor<Fake>, line: &[u8]) -> Vec<u8> {
+    daemon::respond(supervisor, line)
+}
+
+/// Writes `testdata/v1-golden.jsonl` through `daemon::respond`. The committed
+/// fixture was generated from the baseline per-line path (`serve` and `send`
+/// at 2b96837). Regenerate only on purpose, with the reason in the commit
+/// message: a serde_json upgrade that changes the pinned parse-error texts is
+/// such an intentional regeneration.
+#[test]
+#[ignore = "fixture generator: cargo test -p ratarmount --bin ratarmount generate_v1_golden -- --ignored"]
+fn generate_v1_golden() {
+    let mut golden = Golden::new();
+    let mut output = String::new();
+    for mut entry in golden_script() {
+        if let Some(response) = golden.step(&entry, golden_respond) {
+            let response = golden.template(std::str::from_utf8(&response).unwrap());
+            entry["response"] = json!(response);
+        }
+        output.push_str(&serde_json::to_string(&entry).unwrap());
+        output.push('\n');
+    }
+    fs::write(GOLDEN, output).unwrap();
+}
+
+/// Regression: protocol v1 replies change no byte (Keystone #7). The golden
+/// transcript was generated from the baseline per-line path; every reply of
+/// the production `respond()` must match after `$STATE`/`$BASE` substitution,
+/// with no entry skipped.
+#[test]
+fn regression_v1_golden_transcript_byte_identical() {
+    let mut golden = Golden::new();
+    let text = fs::read_to_string(GOLDEN).unwrap();
+    let mut replies = 0;
+    for (number, line) in text.lines().enumerate() {
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(!line.contains(r#"\"version\":2"#), "version 2 is not v1");
+        let reply = golden.step(&entry, golden_respond);
+        match (reply, entry["response"].as_str()) {
+            (Some(reply), Some(expected)) => {
+                assert_eq!(
+                    String::from_utf8(reply).unwrap(),
+                    golden.fill(expected),
+                    "golden line {}",
+                    number + 1
+                );
+                replies += 1;
+            }
+            (None, None) => {}
+            other => panic!("golden line {}: {other:?}", number + 1),
+        }
+    }
+    assert_eq!(
+        replies,
+        golden_script()
+            .iter()
+            .filter(|e| e.get("request").is_some() || e.get("generated").is_some())
+            .count()
+    );
+    assert!(golden.supervisor.stopping);
+}
+
+/// Regression: version 2 is dispatched separately; an answer carries its
+/// request's version, and one refused before a version is known is v1. v2
+/// refuses unknown fields on every operation, `shutdown` included, and a
+/// `request_id` anywhere but `new` (§5.1, §5.2, Codex sweep 4 B1).
+#[test]
+fn regression_protocol_v2_dispatch_and_envelope_versions() {
+    use protocol::{Op, OperationV2, VERSION_2};
+    for (line, version, code) in [
+        ("{", 1, "invalid_request"),
+        ("[]", 1, "unsupported_version"),
+        ("{}", 1, "unsupported_version"),
+        (r#"{"op":"list"}"#, 1, "unsupported_version"),
+        (r#"{"version":"1","op":"list"}"#, 1, "unsupported_version"),
+        (r#"{"version":"2","op":"list"}"#, 1, "unsupported_version"),
+        (r#"{"version":1.0,"op":"list"}"#, 1, "unsupported_version"),
+        (r#"{"version":2.0,"op":"list"}"#, 1, "unsupported_version"),
+        (r#"{"version":3,"op":"list"}"#, 1, "unsupported_version"),
+        (r#"{"version":-1,"op":"list"}"#, 1, "unsupported_version"),
+        (r#"{"version":null,"op":"list"}"#, 1, "unsupported_version"),
+        (
+            r#"{"version":1,"op":"list","typo":true}"#,
+            1,
+            "invalid_request",
+        ),
+        (
+            r#"{"version":1,"op":"new","base":"t","request_id":"r"}"#,
+            1,
+            "invalid_request",
+        ),
+        (r#"{"version":2}"#, 2, "invalid_request"),
+        (
+            r#"{"version":2,"op":"list","typo":true}"#,
+            2,
+            "invalid_request",
+        ),
+        // R1c-1 defines `finalize` and `retain`: an unknown operation and
+        // an unknown `new` field stay refused.
+        (r#"{"version":2,"op":"bogus"}"#, 2, "invalid_request"),
+        (
+            r#"{"version":2,"op":"new","base":"t","bogus":1}"#,
+            2,
+            "invalid_request",
+        ),
+        // `finalize` takes no field but `id`, `pack` and `request_id`.
+        (
+            r#"{"version":2,"op":"finalize","id":"a","bogus":1}"#,
+            2,
+            "invalid_request",
+        ),
+        (
+            r#"{"version":2,"op":"finalize","id":"a","request_id":null}"#,
+            2,
+            "invalid_request",
+        ),
+        (
+            r#"{"version":2,"op":"new","base":"t","allow_globs":["a"]}"#,
+            2,
+            "invalid_request",
+        ),
+        (r#"{"version":2,"op":"diff"}"#, 2, "invalid_request"),
+        (
+            r#"{"version":2,"op":"new","base":"t","request_id":null}"#,
+            2,
+            "invalid_request",
+        ),
+        (
+            r#"{"version":2,"op":"new","base":"t","request_id":7}"#,
+            2,
+            "invalid_request",
+        ),
+        // Only `new` takes a request ID (N2).
+        (
+            r#"{"version":2,"op":"create_base","name":"a","source":"x","request_id":"r"}"#,
+            2,
+            "invalid_request",
+        ),
+        (
+            r#"{"version":2,"op":"destroy","id":"a","request_id":"r"}"#,
+            2,
+            "invalid_request",
+        ),
+        (
+            r#"{"version":2,"op":"list","request_id":"r"}"#,
+            2,
+            "invalid_request",
+        ),
+        (
+            r#"{"version":2,"op":"diff","id":"a","request_id":"r"}"#,
+            2,
+            "invalid_request",
+        ),
+        (
+            r#"{"version":2,"op":"stats","id":"a","request_id":"r"}"#,
+            2,
+            "invalid_request",
+        ),
+        (
+            r#"{"version":2,"op":"shutdown","request_id":"r"}"#,
+            2,
+            "invalid_request",
+        ),
+        (
+            r#"{"version":2,"op":"shutdown","extra":1}"#,
+            2,
+            "invalid_request",
+        ),
+    ] {
+        let rejection = Request::parse(line.as_bytes()).unwrap_err();
+        assert_eq!(
+            (rejection.version, rejection.error.code.as_str()),
+            (version, code),
+            "{line}: {}",
+            rejection.error.message
+        );
+    }
+    assert_eq!(
+        Request::parse(b"{}").unwrap_err().error.message,
+        "version must be 1"
+    );
+    let parsed =
+        Request::parse(br#"{"version":2,"op":"new","base":"t","request_id":"r"}"#).unwrap();
+    assert_eq!(parsed.version, VERSION_2);
+    assert!(matches!(
+        parsed.operation,
+        Op::V2(OperationV2::New { request_id: Some(ref id), count: 1, .. }) if id == "r"
+    ));
+    assert!(matches!(
+        Request::parse(br#"{"version":1,"op":"list"}"#)
+            .unwrap()
+            .operation,
+        Op::V1(Operation::List { base: None })
+    ));
+    assert!(matches!(
+        Request::parse(br#"{"version":2,"op":"shutdown"}"#)
+            .unwrap()
+            .operation,
+        Op::V2(OperationV2::Shutdown {})
+    ));
+    assert_eq!(
+        serde_json::to_string(&Request::new(OperationV2::Shutdown {})).unwrap(),
+        r#"{"version":2,"op":"shutdown"}"#
+    );
+    // Through respond(): a refused v2 shutdown executes nothing.
+    let (_root, mut supervisor, _) = setup(8);
+    supervisor.handle(new(2)).unwrap();
+    for line in [
+        r#"{"version":2,"op":"shutdown","request_id":"r"}"#,
+        r#"{"version":2,"op":"shutdown","extra":1}"#,
+    ] {
+        let reply: serde_json::Value =
+            serde_json::from_slice(&daemon::respond(&mut supervisor, line.as_bytes())).unwrap();
+        assert_eq!(reply["version"], 2, "{reply}");
+        assert_eq!(reply["error"]["code"], "invalid_request");
+        assert_eq!(supervisor.attempts.len(), 2);
+        assert!(!supervisor.stopping);
+    }
+    for (line, version, ok) in [
+        (r#"{"version":1,"op":"list"}"#, 1, true),
+        (r#"{"version":1,"op":"stats","id":"missing"}"#, 1, false),
+        (r#"{"version":2,"op":"list"}"#, 2, true),
+        (r#"{"version":2,"op":"stats","id":"missing"}"#, 2, false),
+        (r#"{"version":2,"op":"bogus"}"#, 2, false),
+        (r#"{"version":9,"op":"list"}"#, 1, false),
+    ] {
+        let reply: serde_json::Value =
+            serde_json::from_slice(&daemon::respond(&mut supervisor, line.as_bytes())).unwrap();
+        assert_eq!(
+            (reply["version"].as_u64(), reply["ok"].as_bool()),
+            (Some(version), Some(ok)),
+            "{line}"
+        );
+    }
+    let reply = daemon::respond(&mut supervisor, &vec![b'x'; protocol::MAX_REQUEST + 1]);
+    assert!(reply.starts_with(b"{\"version\":1,\"ok\":false"));
+    supervisor.destroy_all().unwrap();
+    // encode() substitutes an oversize reply with the reply's own version.
+    for version in [VERSION, VERSION_2] {
+        let large = Response::from_result(version, Ok(json!("x".repeat(100))));
+        assert_eq!(
+            String::from_utf8(daemon::encode(&large, 64)).unwrap(),
+            format!("{{\"version\":{version},\"ok\":false,\"error\":{{\"code\":\"response_too_large\",\"message\":\"response exceeds 64 MiB; export the diff locally\"}}}}\n")
+        );
+        let small = Response::from_result(version, Ok(json!(1)));
+        assert_eq!(
+            String::from_utf8(daemon::encode(&small, 64)).unwrap(),
+            format!("{{\"version\":{version},\"ok\":true,\"result\":1}}\n")
+        );
+    }
+    // v2 list, diff, stats and destroy answer what v1 answers on the same state.
+    let mut golden = Golden::new();
+    let mut result = |line: String| {
+        let reply: serde_json::Value =
+            serde_json::from_slice(&daemon::respond(&mut golden.supervisor, line.as_bytes()))
+                .unwrap();
+        assert_eq!(reply["ok"], true, "{line}: {reply}");
+        reply["result"].clone()
+    };
+    result(format!(
+        r#"{{"version":1,"op":"create_base","name":"task","source":"{}"}}"#,
+        golden.base
+    ));
+    result(r#"{"version":1,"op":"new","base":"task","count":2}"#.into());
+    fs::write(
+        format!(
+            "{}/attempts/attempt-000001/overlay/original.txt",
+            golden.state
+        ),
+        "edited\n",
+    )
+    .unwrap();
+    for body in [
+        r#""op":"list""#,
+        r#""op":"list","base":"task""#,
+        r#""op":"diff","id":"attempt-000001""#,
+        r#""op":"diff","id":"attempt-000001","git":true"#,
+        r#""op":"stats","id":"attempt-000001""#,
+    ] {
+        let v1 = result(format!(r#"{{"version":1,{body}}}"#));
+        let v2 = result(format!(r#"{{"version":2,{body}}}"#));
+        assert_eq!(v1, v2, "{body}");
+    }
+    let v1 = result(r#"{"version":1,"op":"destroy","id":"attempt-000001"}"#.into());
+    let v2 = result(r#"{"version":2,"op":"destroy","id":"attempt-000002"}"#.into());
+    assert_eq!(v1, v2);
+    let v1 = result(r#"{"version":1,"op":"destroy","base":"task"}"#.into());
+    let v2 = result(r#"{"version":2,"op":"destroy","base":"task"}"#.into());
+    assert_eq!(v1, v2);
+    assert_eq!(result(r#"{"version":2,"op":"list"}"#.into()), json!([]));
+    // create_base keeps every option through the v2 mapping (sweep 1).
+    let options = r#""options":{"recursive":true,"umask":"027","readonly_globs":["sub/**"],"allow_globs":["sub/open/**"],"quota":7,"passthrough":"off"}"#;
+    let create = |version: u32, name: &str| {
+        format!(
+            r#"{{"version":{version},"op":"create_base","name":"{name}","source":"{}",{options}}}"#,
+            golden.base
+        )
+    };
+    let (one, two) = (create(1, "one"), create(2, "two"));
+    let mut v1 = result(one);
+    let v2 = result(two);
+    assert_eq!(v1["options"]["allow_globs"], json!(["sub/open/**"]));
+    v1["name"] = json!("two");
+    assert_eq!(v1, v2);
+    result(r#"{"version":2,"op":"list","base":"two"}"#.into());
+    // A v2 shutdown executes and answers in a v2 envelope.
+    assert!(!golden.supervisor.stopping);
+    assert_eq!(
+        daemon::respond(&mut golden.supervisor, br#"{"version":2,"op":"shutdown"}"#),
+        b"{\"version\":2,\"ok\":true,\"result\":{\"shutdown\":true}}\n"
+    );
+    assert!(golden.supervisor.stopping);
+}
+
+/// v1 CLI subcommands; the socket comes from the recording listener.
+const CLI_V1_ARGVS: &[&[&str]] = &[
+    &["create-base", "task", "/srv/base.tar"],
+    &[
+        "create-base",
+        "task",
+        "/srv/base.tar",
+        "--options",
+        r#"{"quota":2147483648,"readonly_globs":["tests/**"],"git_synthetic_head":true,"binds":["/data=/srv/data.tar"]}"#,
+    ],
+    &["new", "task"],
+    &[
+        "new",
+        "task",
+        "--count",
+        "8",
+        "--overlay",
+        "tmpfs",
+        "--quota",
+        "2G",
+        "--readonly",
+        "a,b",
+    ],
+    &["new", "task", "--readonly", "a", "--readonly", "b/**"],
+    &["list"],
+    &["list", "--base", "task"],
+    &["diff", "attempt-ABC123"],
+    &["diff", "attempt-ABC123", "--git"],
+    &["stats", "attempt-ABC123"],
+    &["destroy", "attempt-ABC123"],
+    &["destroy", "--base", "task"],
+    &["shutdown"],
+];
+
+/// A listener thread that records one request line per connection and sends
+/// the next reply. The listener is owned by its thread: a panic there drops
+/// it, so a waiting `call` sees EOF at once instead of its 3600 s timeout.
+struct Recorder {
+    socket: PathBuf,
+    lines: std::sync::mpsc::Receiver<Vec<u8>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    _dir: tempfile::TempDir,
+}
+
+impl Recorder {
+    fn start(replies: Vec<Vec<u8>>) -> Self {
+        let dir = private_tempdir();
+        let socket = dir.path().join("record.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (sender, lines) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let listener = listener;
+            for reply in replies {
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline, "no client");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept: {e}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = Vec::new();
+                reader.read_until(b'\n', &mut line).unwrap();
+                sender.send(line).unwrap();
+                reader.get_mut().write_all(&reply).unwrap();
+            }
+        });
+        Self {
+            socket,
+            lines,
+            thread: Some(thread),
+            _dir: dir,
+        }
+    }
+
+    fn args(&self, argv: &[&str]) -> SandboxArgs {
+        SandboxArgs::try_parse_from(
+            ["sandbox", "--socket", self.socket.to_str().unwrap()]
+                .into_iter()
+                .chain(argv.iter().copied()),
+        )
+        .unwrap()
+    }
+
+    fn line(&self) -> Vec<u8> {
+        self.lines.recv_timeout(Duration::from_secs(30)).unwrap()
+    }
+
+    /// Joins the listener thread with a bounded wait.
+    fn finish(mut self) {
+        let thread = self.thread.take().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !thread.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "recorder hung");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        thread.join().unwrap();
+    }
+}
+
+const RECORDER_OK: &[u8] = b"{\"version\":1,\"ok\":true,\"result\":null}\n";
+
+/// Drives `sandbox::run` for every v1 argv against the recording listener.
+fn record_cli_v1_requests() -> Vec<serde_json::Value> {
+    let recorder = Recorder::start(vec![RECORDER_OK.to_vec(); CLI_V1_ARGVS.len()]);
+    let mut entries = Vec::new();
+    for argv in CLI_V1_ARGVS {
+        run(&recorder.args(argv)).unwrap();
+        let line = String::from_utf8(recorder.line()).unwrap();
+        eprintln!("{argv:?} -> {}", line.trim_end());
+        entries.push(json!({ "argv": argv, "request": line }));
+    }
+    recorder.finish();
+    entries
+}
+
+/// Writes `testdata/cli-v1-requests.jsonl` from the CLI's own requests.
+/// Regenerate only on purpose, with the reason in the commit message.
+#[test]
+#[ignore = "fixture generator: cargo test -p ratarmount --bin ratarmount generate_cli_v1_requests -- --ignored"]
+fn generate_cli_v1_requests() {
+    let mut output = String::new();
+    for entry in record_cli_v1_requests() {
+        output.push_str(&serde_json::to_string(&entry).unwrap());
+        output.push('\n');
+    }
+    fs::write(CLI_V1_REQUESTS, output).unwrap();
+}
+
+/// Regression: every v1 CLI subcommand still sends the baseline bytes;
+/// `new --request-id`, `--lower`, `--journal` and `--retain`, `finalize` and
+/// `list --all` send v2 (R1b C1, R1c-1 C1), and `call` accepts only its
+/// request's version, or a v1 error answering v2 (how an older daemon refuses
+/// v2).
+#[test]
+fn regression_cli_v1_request_bytes_unchanged() {
+    let expected: Vec<serde_json::Value> = fs::read_to_string(CLI_V1_REQUESTS)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(record_cli_v1_requests(), expected);
+    let v2_new = ["new", "task", "--count", "2", "--request-id", "r"];
+    let recorder = Recorder::start(vec![
+        b"{\"version\":2,\"ok\":true,\"result\":null}\n".to_vec()
+    ]);
+    run(&recorder.args(&v2_new)).unwrap();
+    assert_eq!(
+        String::from_utf8(recorder.line()).unwrap(),
+        "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":2,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"request_id\":\"r\"}\n"
+    );
+    recorder.finish();
+    // R1b (C1): --lower and --journal send v2; paths go unchanged, a relative
+    // one included (the daemon refuses it).
+    for (argv, line) in [
+        (
+            &[
+                "new",
+                "task",
+                "--lower",
+                "/a",
+                "--lower",
+                "/b",
+                "--journal",
+                "--journal-exclude",
+                "x/**",
+                "--journal-reads",
+                "first",
+                "--journal-sync",
+            ][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"lowers\":[\"/a\",\"/b\"],\"journal\":{\"exclude\":[\"x/**\"],\"reads\":\"first\",\"sync\":true}}\n",
+        ),
+        (
+            &["new", "task", "--journal"][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"journal\":{\"exclude\":[],\"reads\":\"all\",\"sync\":false}}\n",
+        ),
+        (
+            &["new", "task", "--lower", "relative/layer"][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"lowers\":[\"relative/layer\"]}\n",
+        ),
+    ] {
+        let recorder = Recorder::start(vec![
+            b"{\"version\":2,\"ok\":true,\"result\":null}\n".to_vec()
+        ]);
+        run(&recorder.args(argv)).unwrap();
+        assert_eq!(String::from_utf8(recorder.line()).unwrap(), line);
+        recorder.finish();
+    }
+    // R1c-1 (C1): --retain, finalize and list --all send v2; the v1 argv
+    // above keep their fixture bytes.
+    for (argv, line) in [
+        (
+            &["new", "task", "--retain"][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"retain\":true}\n",
+        ),
+        (
+            &["finalize", "attempt-a1B2c3", "--pack", "--request-id", "r"][..],
+            "{\"version\":2,\"op\":\"finalize\",\"id\":\"attempt-a1B2c3\",\"pack\":true,\"request_id\":\"r\"}\n",
+        ),
+        (
+            &["finalize", "attempt-a1B2c3"][..],
+            "{\"version\":2,\"op\":\"finalize\",\"id\":\"attempt-a1B2c3\"}\n",
+        ),
+        (
+            &["list", "--all"][..],
+            "{\"version\":2,\"op\":\"list\",\"base\":null,\"all\":true}\n",
+        ),
+    ] {
+        let recorder = Recorder::start(vec![
+            b"{\"version\":2,\"ok\":true,\"result\":null}\n".to_vec()
+        ]);
+        run(&recorder.args(argv)).unwrap();
+        assert_eq!(String::from_utf8(recorder.line()).unwrap(), line, "{argv:?}");
+        recorder.finish();
+    }
+    // The journal options need --journal (as on the mount CLI).
+    for argv in [
+        &["new", "task", "--journal-reads", "first"][..],
+        &["new", "task", "--journal-exclude", "x/**"][..],
+        &["new", "task", "--journal-sync"][..],
+    ] {
+        assert!(
+            SandboxArgs::try_parse_from(
+                ["sandbox", "--socket", "/tmp/sock"]
+                    .into_iter()
+                    .chain(argv.iter().copied())
+            )
+            .is_err(),
+            "{argv:?}"
+        );
+    }
+    const FAILED: &str = "request failed (see JSON error)";
+    const VERSION_ERROR: &str = "unsupported response version";
+    let v1_error = r#"{"version":1,"ok":false,"error":{"code":"unsupported_version","message":"version must be 1"}}"#;
+    let v2_error =
+        r#"{"version":2,"ok":false,"error":{"code":"not_found","message":"unknown base"}}"#;
+    for (argv, reply, expected) in [
+        (
+            &v2_new[..],
+            r#"{"version":2,"ok":true,"result":null}"#,
+            Ok(()),
+        ),
+        (&v2_new[..], v2_error, Err(FAILED)),
+        (&v2_new[..], v1_error, Err(FAILED)),
+        (
+            &v2_new[..],
+            r#"{"version":1,"ok":true,"result":null}"#,
+            Err(VERSION_ERROR),
+        ),
+        (
+            &v2_new[..],
+            r#"{"version":3,"ok":false,"error":{"code":"x","message":"y"}}"#,
+            Err(VERSION_ERROR),
+        ),
+        (
+            &["list"][..],
+            r#"{"version":1,"ok":true,"result":[]}"#,
+            Ok(()),
+        ),
+        (&["list"][..], v1_error, Err(FAILED)),
+        (
+            &["list"][..],
+            r#"{"version":2,"ok":true,"result":[]}"#,
+            Err(VERSION_ERROR),
+        ),
+        (&["list"][..], v2_error, Err(VERSION_ERROR)),
+    ] {
+        let recorder = Recorder::start(vec![format!("{reply}\n").into_bytes()]);
+        let outcome = run(&recorder.args(argv));
+        assert_eq!(
+            outcome,
+            expected.map_err(String::from),
+            "{argv:?} <- {reply}"
+        );
+        recorder.line();
+        recorder.finish();
+    }
+    // call() itself returns an older daemon's v1 error answering v2.
+    let recorder = Recorder::start(vec![format!("{v1_error}\n").into_bytes()]);
+    let response = call(
+        &recorder.socket,
+        Request::new(protocol::OperationV2::New {
+            base: "task".into(),
+            count: 1,
+            overlay: Overlay::Disk,
+            quota: None,
+            readonly_globs: vec![],
+            request_id: Some("r".into()),
+            lowers: vec![],
+            journal: None,
+            retain: false,
+            overlay_durability: Default::default(),
+        }),
+    )
+    .unwrap();
+    assert_eq!((response.version, response.ok), (VERSION, false));
+    assert_eq!(response.error.unwrap().code, "unsupported_version");
+    recorder.line();
+    recorder.finish();
+}
+
+/// Regression (#328): v2 `new` takes `overlay_durability` as the string
+/// `"full"` or `"relaxed"` only (absent is `full`); `null`, the map form,
+/// another case and unknown values are `invalid_request` in a v2 answer, and
+/// v1 `new` refuses the field as unknown. `full` is never serialized, so an
+/// explicit `full` reads and hashes as an absent field; `relaxed` hashes as
+/// another request, and has no v1 form.
+#[test]
+fn regression_supervisor_overlay_durability_protocol() {
+    use protocol::{Op, OperationV2, OverlayDurability, VERSION_2};
+    let parse = |line: &str| Request::parse(line.as_bytes());
+    let durability = |line: &str| match parse(line).unwrap().operation {
+        Op::V2(OperationV2::New {
+            overlay_durability, ..
+        }) => overlay_durability,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        durability(r#"{"version":2,"op":"new","base":"task"}"#),
+        OverlayDurability::Full
+    );
+    assert_eq!(
+        durability(r#"{"version":2,"op":"new","base":"task","overlay_durability":"full"}"#),
+        OverlayDurability::Full
+    );
+    assert_eq!(
+        durability(r#"{"version":2,"op":"new","base":"task","overlay_durability":"relaxed"}"#),
+        OverlayDurability::Relaxed
+    );
+    for value in [
+        "null",
+        r#"{"relaxed":null}"#,
+        r#""Relaxed""#,
+        r#""off""#,
+        r#""""#,
+        "true",
+        "1",
+    ] {
+        let line =
+            format!(r#"{{"version":2,"op":"new","base":"task","overlay_durability":{value}}}"#);
+        let rejection = parse(&line).unwrap_err();
+        assert_eq!(
+            (rejection.version, rejection.error.code.as_str()),
+            (VERSION_2, "invalid_request"),
+            "{value}: {}",
+            rejection.error.message
+        );
+    }
+    let rejection =
+        parse(r#"{"version":2,"op":"new","base":"task","overlay_durability":"off"}"#).unwrap_err();
+    assert!(
+        rejection
+            .error
+            .message
+            .contains("unknown variant `off`, expected `full` or `relaxed`"),
+        "{}",
+        rejection.error.message
+    );
+    // Only `new` takes it, and only in version 2.
+    for line in [
+        r#"{"version":1,"op":"new","base":"task","overlay_durability":"relaxed"}"#,
+        r#"{"version":2,"op":"finalize","id":"a","overlay_durability":"relaxed"}"#,
+        r#"{"version":2,"op":"create_base","name":"a","source":"/x","options":{"overlay_durability":"relaxed"}}"#,
+    ] {
+        assert_eq!(
+            parse(line).unwrap_err().error.code,
+            "invalid_request",
+            "{line}"
+        );
+    }
+    // Serialization omits `full`; the hash ignores it.
+    let hash = |line: &str| {
+        let Op::V2(operation) = parse(line).unwrap().operation else {
+            panic!("v2 line");
+        };
+        requests::op_hash(&operation)
+    };
+    let plain = hash(r#"{"version":2,"op":"new","base":"task","request_id":"r"}"#);
+    assert_eq!(
+        plain, "sha256:7c90b0d547f54b6b875948f96f3781758eb2820c17b9a32d2a8dd2536ebc135e",
+        "R1a's golden digest"
+    );
+    assert_eq!(
+        hash(
+            r#"{"version":2,"op":"new","base":"task","request_id":"r","overlay_durability":"full"}"#
+        ),
+        plain
+    );
+    let relaxed = hash(
+        r#"{"version":2,"op":"new","base":"task","request_id":"r","overlay_durability":"relaxed"}"#,
+    );
+    assert_ne!(relaxed, plain);
+    assert_eq!(
+        hash(
+            r#"{"overlay_durability":"relaxed","request_id":"other","base":"task","op":"new","version":2}"#
+        ),
+        relaxed
+    );
+    let full =
+        parse(r#"{"version":2,"op":"new","base":"task","overlay_durability":"full"}"#).unwrap();
+    assert!(!serde_json::to_string(&full)
+        .unwrap()
+        .contains("overlay_durability"));
+    let relaxed_request =
+        parse(r#"{"version":2,"op":"new","base":"task","overlay_durability":"relaxed"}"#).unwrap();
+    assert!(serde_json::to_string(&relaxed_request)
+        .unwrap()
+        .contains(r#""overlay_durability":"relaxed""#));
+}
+
+/// Regression (#328): only a relaxed attempt's child gets
+/// `--overlay-durability=relaxed` (one argument, before `--`), which the mount
+/// CLI parses back; `full` keeps R1a's argv. The supervisor never passes an
+/// archive-commit flag, the only thing the mount refuses with relaxed.
+#[test]
+fn regression_supervisor_overlay_durability_spawn_args() {
+    use protocol::OverlayDurability;
+    let base = Base {
+        name: "task".into(),
+        source: "/srv/base.tar".into(),
+        options: BaseOptions::default(),
+    };
+    let attempt = Attempt {
+        id: "attempt-1".into(),
+        base: "task".into(),
+        path: "/state/attempts/attempt-1/mnt".into(),
+        overlay_dir: "/state/attempts/attempt-1/overlay".into(),
+        status: "starting".into(),
+    };
+    let indexes = Path::new("/state/indexes/task");
+    let full = process::mount_args(&base, indexes, &attempt, &SpawnSpec::default());
+    let readonly = ["tests/**".to_owned()];
+    let relaxed_spec = SpawnSpec {
+        quota: Some(10),
+        readonly: &readonly,
+        durability: OverlayDurability::Relaxed,
+        ..Default::default()
+    };
+    let relaxed = process::mount_args(&base, indexes, &attempt, &relaxed_spec);
+    let flag = OsString::from("--overlay-durability=relaxed");
+    assert!(!full
+        .iter()
+        .any(|arg| arg.to_str().unwrap().starts_with("--overlay-durability")));
+    assert_eq!(relaxed.iter().filter(|arg| **arg == flag).count(), 1);
+    let at = relaxed.iter().position(|arg| *arg == flag).unwrap();
+    let separator = relaxed.iter().position(|arg| arg == "--").unwrap();
+    assert!(at < separator);
+    let mut without = relaxed.clone();
+    without.remove(at);
+    assert_eq!(
+        without,
+        process::mount_args(
+            &base,
+            indexes,
+            &attempt,
+            &SpawnSpec {
+                durability: OverlayDurability::Full,
+                ..relaxed_spec
+            }
+        )
+    );
+    for arg in &relaxed {
+        let arg = arg.to_str().unwrap();
+        assert!(
+            !arg.starts_with("--commit-overlay") && !arg.starts_with("--roll-every"),
+            "{arg}"
+        );
+    }
+    let parsed =
+        crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(relaxed))
+            .unwrap();
+    assert_eq!(parsed.overlay_durability, "relaxed");
+    let parsed =
+        crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(full)).unwrap();
+    assert_eq!(parsed.overlay_durability, "full");
+}
+
+/// Regression (#328): a v2 `new` with `relaxed` starts the attempts (disk
+/// and tmpfs tops) with the flag, through the request-ID layer too, and a
+/// refused body (unknown value, a v1 `new` naming it) creates no attempt
+/// directory, RAM root, child or request record.
+#[test]
+fn regression_supervisor_overlay_durability_new() {
+    use protocol::OverlayDurability;
+    let (root, mut supervisor, fake) = setup(8);
+    let respond = |supervisor: &mut Supervisor<Fake>, body: serde_json::Value| {
+        serde_json::from_slice::<serde_json::Value>(&daemon::respond(
+            supervisor,
+            &serde_json::to_vec(&body).unwrap(),
+        ))
+        .unwrap()
+    };
+    for body in [
+        json!({"version": 2, "op": "new", "base": "task", "overlay_durability": "fast"}),
+        json!({"version": 2, "op": "new", "base": "task", "overlay_durability": null, "request_id": "bad"}),
+        json!({"version": 1, "op": "new", "base": "task", "overlay_durability": "relaxed"}),
+    ] {
+        let reply = respond(&mut supervisor, body.clone());
+        assert_eq!(reply["error"]["code"], "invalid_request", "{body}: {reply}");
+        assert_eq!(
+            fs::read_dir(root.path().join("attempts")).unwrap().count(),
+            0
+        );
+        assert_eq!(fake.0.lock().unwrap().spawns, 0);
+        assert!(!root.path().join("ram-root.json").exists());
+        assert!(supervisor.requests.lookup("bad").is_none());
+    }
+    // Without a request ID, then with one (a retry replays, one batch).
+    let reply = respond(
+        &mut supervisor,
+        json!({"version": 2, "op": "new", "base": "task", "count": 2, "overlay_durability": "relaxed"}),
+    );
+    assert_eq!(
+        (reply["ok"].clone(), reply["version"].clone()),
+        (json!(true), json!(2)),
+        "{reply}"
+    );
+    let body = json!({"version": 2, "op": "new", "base": "task", "overlay_durability": "relaxed", "request_id": "r"});
+    let first = respond(&mut supervisor, body.clone());
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(respond(&mut supervisor, body), first);
+    // The same ID with `full` is another body.
+    let conflict = respond(
+        &mut supervisor,
+        json!({"version": 2, "op": "new", "base": "task", "request_id": "r"}),
+    );
+    assert_eq!(
+        conflict["error"]["code"], "idempotency_conflict",
+        "{conflict}"
+    );
+    // A v1 `new` and a v2 `new` naming `full` spawn without the flag.
+    supervisor.handle(new(1)).unwrap();
+    let full = respond(
+        &mut supervisor,
+        json!({"version": 2, "op": "new", "base": "task", "overlay_durability": "full"}),
+    );
+    assert_eq!(full["ok"], true, "{full}");
+    let specs: Vec<_> = fake
+        .0
+        .lock()
+        .unwrap()
+        .specs
+        .iter()
+        .map(|spec| spec.durability)
+        .collect();
+    assert_eq!(
+        specs,
+        [
+            OverlayDurability::Relaxed,
+            OverlayDurability::Relaxed,
+            OverlayDurability::Relaxed,
+            OverlayDurability::Full,
+            OverlayDurability::Full,
+        ]
+    );
+    supervisor.destroy_all().unwrap();
+    // A tmpfs top takes it too (it changes nothing that matters there).
+    let reply = respond(
+        &mut supervisor,
+        json!({"version": 2, "op": "new", "base": "task", "overlay": "tmpfs", "overlay_durability": "relaxed"}),
+    );
+    if reply["error"]["code"] == "unsupported" {
+        eprintln!("skip: tmpfs row: no writable tmpfs: {reply}");
+    } else {
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(
+            fake.0.lock().unwrap().specs.last().unwrap().durability,
+            OverlayDurability::Relaxed
+        );
+        supervisor.destroy_all().unwrap();
+    }
+}
+
+/// Regression (#328): `sandbox new --overlay-durability relaxed` sends v2
+/// with the field; `full` (explicit or absent) sends R1a's v1 bytes; an
+/// unknown value is a usage error.
+#[test]
+fn regression_cli_overlay_durability() {
+    for (argv, line) in [
+        (
+            &["new", "task", "--overlay-durability", "relaxed"][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"overlay_durability\":\"relaxed\"}\n",
+        ),
+        (
+            &["new", "task", "--overlay-durability", "relaxed", "--request-id", "r", "--retain"][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"request_id\":\"r\",\"retain\":true,\"overlay_durability\":\"relaxed\"}\n",
+        ),
+        (
+            &["new", "task", "--overlay-durability", "full"][..],
+            "{\"version\":1,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[]}\n",
+        ),
+        (
+            &["new", "task", "--overlay-durability=full", "--request-id", "r"][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"request_id\":\"r\"}\n",
+        ),
+    ] {
+        let version = if line.starts_with("{\"version\":2") { 2 } else { 1 };
+        let recorder = Recorder::start(vec![format!(
+            "{{\"version\":{version},\"ok\":true,\"result\":null}}\n"
+        )
+        .into_bytes()]);
+        run(&recorder.args(argv)).unwrap();
+        assert_eq!(String::from_utf8(recorder.line()).unwrap(), line, "{argv:?}");
+        recorder.finish();
+    }
+    let error = SandboxArgs::try_parse_from([
+        "sandbox",
+        "--socket",
+        "/x.sock",
+        "new",
+        "task",
+        "--overlay-durability",
+        "off",
+    ])
+    .expect_err("unknown value refused");
+    assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
 }

@@ -1,7 +1,8 @@
 //! Private read-only child channel: SQLite intentionally permits only its owner.
 
 use super::protocol::{Attempt, MAX_RESPONSE};
-use ratarmount_compositing::WriteOverlay;
+use ratarmount_compositing::relaxed_durability;
+use ratarmount_compositing::{LowerLayerRecord, OverlayQuota, WriteOverlay};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -10,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) struct Inspector {
     stop: Arc<AtomicBool>,
@@ -55,7 +56,44 @@ fn configure_accepted_stream(stream: &UnixStream) -> io::Result<()> {
     stream.set_nonblocking(false)
 }
 
-pub(crate) fn start(path: &Path, overlay: &Arc<WriteOverlay>) -> io::Result<Inspector> {
+/// The reply to `status`: one JSON line, which the client decodes as such.
+#[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Status {
+    /// Writes the mount's read-only rules refused (0 without a policy).
+    pub erofs_denied: u64,
+}
+
+/// Keep the successful private-channel reply as an array. A refusal carries
+/// its reason instead of returning tombstones from an unclean database.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+enum DeletedPaths {
+    Paths(Vec<String>),
+    Refused { error: String },
+}
+
+/// Detached attempts can be inspected directly, without recovering or
+/// changing their database. Live attempts use the owner's connection below.
+pub(super) fn check_offline_durability(dir: &Path) -> io::Result<()> {
+    let meta = ratarmount_compositing::OverlayMeta::read_no_recovery(dir).map_err(|error| {
+        let kind = if error.is_locked() {
+            io::ErrorKind::WouldBlock
+        } else {
+            io::ErrorKind::Other
+        };
+        io::Error::new(kind, format!("overlay {}: {error}", dir.display()))
+    })?;
+    relaxed_durability::refuse_unclean(meta.as_ref()).map_err(io::Error::other)
+}
+
+/// Serves `deleted_paths`, `lower_layers` and `status` for the mount's
+/// overlay. `quota` is the mount's quota and policy handle, when it has one.
+pub(crate) fn start(
+    path: &Path,
+    overlay: &Arc<WriteOverlay>,
+    quota: Option<Arc<OverlayQuota>>,
+) -> io::Result<Inspector> {
     validate_socket_path(path)?;
     let parent = fs::symlink_metadata(
         path.parent()
@@ -90,17 +128,46 @@ pub(crate) fn start(path: &Path, overlay: &Arc<WriteOverlay>) -> io::Result<Insp
                         .take(64)
                         .read_line(&mut command)
                         .is_err()
-                        || command != "deleted_paths\n"
+                        || !matches!(
+                            command.as_str(),
+                            "deleted_paths\n" | "lower_layers\n" | "status\n"
+                        )
                     {
                         continue;
                     }
                     let Some(overlay) = overlay.upgrade() else {
                         break;
                     };
-                    let mut deleted: Vec<_> = overlay.load_tombstone_paths().into_iter().collect();
-                    deleted.sort();
+                    let reply = if command == "deleted_paths\n" {
+                        let checked = overlay
+                            .meta_value(relaxed_durability::RELAXED_DURABILITY_KEY)
+                            .and_then(|marker| {
+                                relaxed_durability::refuse_unclean_marker(marker.as_deref())
+                            });
+                        let reply = match checked {
+                            Ok(()) => {
+                                let mut deleted: Vec<_> =
+                                    overlay.load_tombstone_paths().into_iter().collect();
+                                deleted.sort();
+                                DeletedPaths::Paths(deleted)
+                            }
+                            Err(error) => DeletedPaths::Refused {
+                                error: error.to_string(),
+                            },
+                        };
+                        serde_json::to_vec(&reply).ok()
+                    } else if command == "status\n" {
+                        let erofs_denied = quota.as_ref().map_or(0, |q| q.usage().erofs_denied);
+                        serde_json::to_vec(&Status { erofs_denied }).ok()
+                    } else {
+                        // The layers this mount composed, through its own connection.
+                        overlay
+                            .meta_value("lower_layers")
+                            .ok()
+                            .map(|layers| layers.unwrap_or_else(|| "[]".into()).into_bytes())
+                    };
                     drop(overlay);
-                    if let Ok(mut reply) = serde_json::to_vec(&deleted) {
+                    if let Some(mut reply) = reply {
                         if reply.len() < MAX_RESPONSE {
                             reply.push(b'\n');
                             let _ = stream.write_all(&reply);
@@ -122,20 +189,98 @@ pub(crate) fn start(path: &Path, overlay: &Arc<WriteOverlay>) -> io::Result<Insp
 }
 
 pub fn deleted_paths(attempt: &Attempt) -> io::Result<Vec<String>> {
-    let mut stream = UnixStream::connect(socket_path(attempt))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    stream.write_all(b"deleted_paths\n")?;
-    let mut line = Vec::new();
-    BufReader::new(stream)
-        .take((MAX_RESPONSE + 1) as u64)
-        .read_until(b'\n', &mut line)?;
-    if line.len() > MAX_RESPONSE || !line.ends_with(b"\n") {
-        return Err(io::Error::other(
-            "incomplete or oversized inspection response",
-        ));
+    match request(attempt, b"deleted_paths\n", Duration::from_secs(5))? {
+        DeletedPaths::Paths(paths) => Ok(paths),
+        DeletedPaths::Refused { error } => Err(io::Error::other(error)),
     }
-    serde_json::from_slice(&line).map_err(io::Error::other)
+}
+
+/// The child's recorded `lower_layers` (`[]` when it has none), within
+/// `timeout` (§5.4).
+pub fn lower_layers(attempt: &Attempt, timeout: Duration) -> io::Result<Vec<LowerLayerRecord>> {
+    request(attempt, b"lower_layers\n", timeout)
+}
+
+/// The child's `erofs_denied` count (R1c-1 §5.4 step 4), within `timeout`.
+/// A child whose overlay was dropped ends the connection without an answer,
+/// which is an error.
+pub fn status(attempt: &Attempt, timeout: Duration) -> io::Result<Status> {
+    request(attempt, b"status\n", timeout)
+}
+
+/// Sends `command` and reads the one-line reply, all within `timeout` from
+/// now, the connect included: each step gets only the time left, so a reply
+/// trickled in small pieces cannot stretch the exchange past it.
+fn request<T: serde::de::DeserializeOwned>(
+    attempt: &Attempt,
+    command: &[u8],
+    timeout: Duration,
+) -> io::Result<T> {
+    let deadline = Instant::now() + timeout;
+    let left = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "inspection timed out"))
+    };
+    let mut stream = connect(&socket_path(attempt), &left)?;
+    stream.set_write_timeout(Some(left()?))?;
+    stream.write_all(command)?;
+    let mut reply = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let end = loop {
+        stream.set_read_timeout(Some(left()?))?;
+        let n = match stream.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if n == 0 {
+            return Err(io::Error::other("incomplete inspection response"));
+        }
+        let start = reply.len();
+        reply.extend_from_slice(&chunk[..n]);
+        if let Some(at) = reply[start..].iter().position(|&b| b == b'\n') {
+            break start + at + 1;
+        }
+        if reply.len() >= MAX_RESPONSE {
+            return Err(io::Error::other("oversized inspection response"));
+        }
+    };
+    if end > MAX_RESPONSE {
+        return Err(io::Error::other("oversized inspection response"));
+    }
+    serde_json::from_slice(&reply[..end]).map_err(io::Error::other)
+}
+
+/// Connects to the inspection socket at `path` within the time `left` gives.
+/// On Linux a connect to a listener whose backlog is full (a child that
+/// stopped accepting, with earlier connects still queued) waits until the
+/// listener accepts or closes, for as long as the socket's send timeout
+/// allows, so that timeout is set before connecting. The socket comes from
+/// `process::stream_socket` for the CLOEXEC alternative's reviewed reasons.
+fn connect(path: &Path, left: &dyn Fn() -> io::Result<Duration>) -> io::Result<UnixStream> {
+    use rustix::net::{sockopt, SocketAddrUnix};
+    let address = SocketAddrUnix::new(path)?;
+    let socket = super::process::stream_socket()?;
+    loop {
+        sockopt::set_socket_timeout(&socket, sockopt::Timeout::Send, Some(left()?))?;
+        match rustix::net::connect(&socket, &address) {
+            Ok(()) => return Ok(UnixStream::from(socket)),
+            Err(rustix::io::Errno::INTR) => continue,
+            // The send timeout passed with the backlog still full.
+            Err(rustix::io::Errno::AGAIN) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "inspection timed out: {} accepted no connection",
+                        path.display()
+                    ),
+                ))
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 #[cfg(test)]

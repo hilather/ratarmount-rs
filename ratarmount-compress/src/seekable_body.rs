@@ -60,6 +60,14 @@ impl std::ops::Deref for MemoryBody {
 }
 
 impl DecodedBody {
+    /// Private spool pathname, if this body spilled to a file.
+    pub fn temp_path(&self) -> Option<&Path> {
+        match &self.inner {
+            DecodedInner::Temp(tmp) => Some(tmp.path()),
+            DecodedInner::Memory(_) => None,
+        }
+    }
+
     /// Decode `reader` fully into memory (if ≤ `memory_cap`) or a temp file.
     pub fn from_decoder(
         path: &Path,
@@ -67,6 +75,10 @@ impl DecodedBody {
         mut decoder: impl Read,
         memory_cap: u64,
     ) -> Result<Arc<Self>> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0260-M01","item":"<ratarmount_compress::seekable_body::DecodedBody>::from_decoder","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
         let mut tmp = NamedTempFile::new()?;
         let size = copy(&mut decoder, &mut tmp)?;
         tmp.flush()?;
@@ -139,6 +151,10 @@ impl SeekableBody for DecodedBody {
                 pos: 0,
             })),
             DecodedInner::Temp(tmp) => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0261-M01","item":"<ratarmount_compress::seekable_body::DecodedBody as ratarmount_compress::seekable_body::SeekableBody<ratarmount_compress::seekable_body::DecodedBody>>::open_reader","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
                 let f = File::open(tmp.path())?;
                 Ok(Box::new(f))
             }
