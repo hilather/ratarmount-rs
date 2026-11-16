@@ -297,7 +297,9 @@ fn apply(
     }
     match &entry.kind {
         Kind::Directory { children, opaque } => {
-            if path != "/" {
+            // mkdir of a visible directory is EEXIST (#316); the upperdir
+            // mode is applied after the children.
+            if path != "/" && overlay.lookup(path, 0).is_none() {
                 overlay
                     .mkdir(path, 0o700)
                     .map_err(|e| format!("{path}: {e}"))?;

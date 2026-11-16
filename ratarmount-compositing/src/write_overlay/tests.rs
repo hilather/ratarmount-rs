@@ -13442,3 +13442,74 @@ fn regression_328_rowless_file_live_and_interval_commit() {
         assert_eq!(deleted_flag(&ov, "/tool.sh"), Some(0), "idle={idle}");
     }
 }
+
+/// Regression (#316): mkdir of an existing directory changed its mode
+/// instead of failing. POSIX mkdir fails with EEXIST for any existing entry
+/// (base or overlay directory, file, `/`) and leaves it as it was; a base
+/// directory is not materialized on the host. EEXIST is returned before a
+/// read-only rule's EROFS, as Linux mkdir(2) does on a read-only mount, and
+/// mkdir over a tombstoned base directory still succeeds.
+#[test]
+fn regression_316_mkdir_existing_entry_is_eexist_and_keeps_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut base = MemBase::with(&[("/bfile", b"base")]);
+    base.files.extend(MemBase::with_dir("/based").files);
+    let root = dir.path().join("ov");
+    let mut ov = WriteOverlay::new_for_tests(Arc::new(base), &root).unwrap();
+    ov.mkdir("/mine", 0o750).unwrap();
+    put_overlay_bytes(&ov, "/ofile", b"overlay");
+    let before: Vec<_> = ["/", "/based", "/mine", "/bfile", "/ofile"]
+        .iter()
+        .map(|p| mode(&ov, p))
+        .collect();
+    fn mode(ov: &WriteOverlay, p: &str) -> u32 {
+        ov.lookup(p, 0).unwrap().mode
+    }
+    let eexist = |r: Result<()>| {
+        assert!(
+            matches!(&r, Err(OverlayError::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists),
+            "{r:?}"
+        )
+    };
+    for p in ["/", "/based", "/mine", "/bfile", "/ofile", "/based/"] {
+        eexist(ov.mkdir(p, 0o700));
+    }
+    let after: Vec<_> = ["/", "/based", "/mine", "/bfile", "/ofile"]
+        .iter()
+        .map(|p| mode(&ov, p))
+        .collect();
+    assert_eq!(after, before, "no entry changed");
+    assert_eq!(mode(&ov, "/based"), ratarmount_core::S_IFDIR | 0o755);
+    assert_eq!(
+        mode(&ov, "/bfile") & ratarmount_core::S_IFMT,
+        ratarmount_core::S_IFREG
+    );
+    assert!(
+        fs::symlink_metadata(root.join("based")).is_err(),
+        "a refused mkdir materializes nothing"
+    );
+    assert!(fs::symlink_metadata(root.join("bfile")).is_err());
+    assert_eq!(
+        fs::metadata(root.join("mine"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o750
+    );
+
+    let rules = Arc::new(crate::ReadOnlyGlobs::new(["based", "newro"]).unwrap());
+    ov.set_policy(Some(rules.clone()));
+    eexist(ov.mkdir("/based", 0o700));
+    assert_eq!(rules.erofs_denied(), 0, "EEXIST precedes EROFS");
+    assert!(matches!(ov.mkdir("/newro", 0o700),
+        Err(OverlayError::Io(e)) if e.kind() == io::ErrorKind::ReadOnlyFilesystem));
+    assert_eq!(rules.erofs_denied(), 1);
+    ov.set_policy(None);
+
+    ov.rmdir("/based").unwrap();
+    assert!(ov.lookup("/based", 0).is_none());
+    ov.mkdir("/based", 0o700).unwrap();
+    assert_eq!(mode(&ov, "/based"), ratarmount_core::S_IFDIR | 0o700);
+}

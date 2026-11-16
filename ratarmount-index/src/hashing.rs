@@ -881,36 +881,15 @@ mod tests {
         );
     }
 
-    // Capture actual emitted warnings/reports on this test thread only.
-    thread_local! { static MESSAGES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; }
-    struct TestLog;
-    impl log::Log for TestLog {
-        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-            true
-        }
-        fn log(&self, record: &log::Record<'_>) {
-            MESSAGES.with(|m| m.borrow_mut().push(record.args().to_string()));
-        }
-        fn flush(&self) {}
-    }
-    fn capture_logs() {
-        static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| {
-            log::set_logger(&TestLog).unwrap();
-            log::set_max_level(log::LevelFilter::Info);
-        });
-        MESSAGES.with(|m| m.borrow_mut().clear());
-    }
+    use crate::test_log::{capture_logs, MESSAGES};
     fn assert_remedy() {
-        MESSAGES.with(|m| {
-            assert!(
-                m.borrow()
-                    .iter()
-                    .any(|s| s.contains("--recreate-index --hashes sha256,crc32")),
-                "{:?}",
-                m.borrow()
-            )
-        });
+        let messages = crate::test_log::messages();
+        assert!(
+            messages
+                .iter()
+                .any(|s| s.contains("--recreate-index --hashes sha256,crc32")),
+            "{messages:?}"
+        );
     }
 
     /// Regression: outer compression must not change any member digest.

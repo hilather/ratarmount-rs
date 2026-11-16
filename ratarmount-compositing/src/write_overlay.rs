@@ -2682,15 +2682,27 @@ impl WriteOverlay {
         }
     }
 
+    /// Create the directory `path` (POSIX `mkdir`).
+    ///
+    /// Any visible entry at `path` (a base or overlay directory, a file, a
+    /// symlink, or `/`) fails with `AlreadyExists` (EEXIST) and is left as it
+    /// was (#316). A tombstoned base entry is not visible, so mkdir over it
+    /// succeeds. As in Linux `mkdir(2)` on a read-only mount, EEXIST takes
+    /// precedence over a read-only policy rule's EROFS for an existing path;
+    /// reserved names are still refused first.
     pub fn mkdir(&self, path: &str, mode: u32) -> Result<()> {
         if is_overlay_internal_path(path) {
             return Err(internal_name_refused(path));
         }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
+        self.refuse_control_path(path)?;
+        self.refuse_existing_mkdir(path)?;
         self.check_mutation(OverlayMutation::Mkdir, &[path])?;
         self.ensure_parent(path)?;
         let _parents = self.parent_lock();
+        // Without a policy nothing above serializes two mkdirs of one name.
+        self.refuse_existing_mkdir(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
         #[expect(
@@ -2704,6 +2716,16 @@ impl WriteOverlay {
             fs::set_permissions(&real, fs::Permissions::from_mode(mode & 0o7777))?;
         }
         self.mark_present(path, mode | ratarmount_core::S_IFDIR)?;
+        Ok(())
+    }
+
+    fn refuse_existing_mkdir(&self, path: &str) -> Result<()> {
+        if MountSource::lookup(self, path, 0).is_some() {
+            return Err(OverlayError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("mkdir destination exists: {}", normpath(path)),
+            )));
+        }
         Ok(())
     }
 

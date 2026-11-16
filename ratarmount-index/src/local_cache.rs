@@ -90,7 +90,7 @@ impl LocalIndexCache {
         }
         self.touch(&key, &id);
         // WHY: allocate evicts before the sqlite body exists; remounts must trim.
-        let _ = self.enforce_budget();
+        self.enforce_budget_best_effort();
         debug!("local-index-v1 hit {key} -> {}", sqlite.display());
         Some(sqlite)
     }
@@ -132,7 +132,23 @@ impl LocalIndexCache {
         let Some(budget) = self.budget else {
             return Ok(());
         };
+        #[cfg(test)]
+        if FAIL_ENFORCE_BUDGET.with(|f| f.get()) {
+            return Err(io::Error::other("injected enforce_budget failure"));
+        }
         self.evict_until(budget, None)
+    }
+
+    /// [`Self::enforce_budget`] for callers that must not fail on it: the
+    /// eviction is a best-effort LRU, so an error is logged at debug level
+    /// and the open goes on (#316).
+    fn enforce_budget_best_effort(&self) {
+        if let Err(e) = self.enforce_budget() {
+            debug!(
+                "local-index-v1 budget enforcement in {} failed: {e}",
+                self.dir.display()
+            );
+        }
     }
 
     fn sqlite_path(&self, key: &str) -> PathBuf {
@@ -361,7 +377,13 @@ pub fn enforce_local_index_budget_if_path(path: &Path) {
     if !is_local_index_cache_path(path) {
         return;
     }
-    let _ = LocalIndexCache::from_env().enforce_budget();
+    LocalIndexCache::from_env().enforce_budget_best_effort();
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`LocalIndexCache::enforce_budget`] fail on this thread.
+    static FAIL_ENFORCE_BUDGET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn find_existing_extra_dir_index(archive: &Path, extra_dirs: &[PathBuf]) -> Option<PathBuf> {
@@ -623,6 +645,41 @@ mod tests {
             serde_json::from_slice(&fs::read(cache.json_path(hex)).unwrap()).unwrap();
         hdr.last_open_unix = ts;
         fs::write(cache.json_path(hex), serde_json::to_vec(&hdr).unwrap()).unwrap();
+    }
+
+    /// Regression (#316): an `enforce_budget` error was thrown away with
+    /// `let _ =`. A cache hit and the post-publish trim still succeed (the
+    /// eviction is best effort), and the error is logged at debug level with
+    /// the cache directory.
+    #[test]
+    fn regression_316_enforce_budget_failure_is_logged_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path(), LOCAL_INDEX_CACHE_BYTES_DEFAULT);
+        let archive = write_archive(dir.path(), "a.tar", b"archive");
+        let sqlite = cache.allocate(&archive).unwrap();
+        fs::write(&sqlite, b"idx").unwrap();
+        crate::test_log::capture_logs();
+        FAIL_ENFORCE_BUDGET.with(|f| f.set(true));
+        let hit = cache.lookup(&archive);
+        let direct = cache.enforce_budget();
+        cache.enforce_budget_best_effort();
+        FAIL_ENFORCE_BUDGET.with(|f| f.set(false));
+        assert!(direct.is_err(), "the seam must make enforcement fail");
+        assert_eq!(
+            hit.as_deref(),
+            Some(sqlite.as_path()),
+            "the hit is not lost"
+        );
+        let messages = crate::test_log::messages();
+        let expected = format!(
+            "local-index-v1 budget enforcement in {} failed: injected enforce_budget failure",
+            cache.dir.display()
+        );
+        assert_eq!(
+            messages.iter().filter(|m| **m == expected).count(),
+            2,
+            "lookup and the best-effort trim each log once: {messages:?}"
+        );
     }
 
     /// Regression: LRU cap deletes oldest `last_open_unix` `{hex}.sqlite`+`.json` pairs.

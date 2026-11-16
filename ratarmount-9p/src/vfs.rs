@@ -776,6 +776,24 @@ mod tests {
         (td, fs)
     }
 
+    /// Regression (#316): 9P TMKDIR of an existing directory changed its
+    /// mode instead of failing; it is EEXIST and the mode is kept.
+    #[test]
+    fn regression_316_mkdir_existing_is_eexist() {
+        use std::os::unix::fs::MetadataExt;
+        let (td, fs) = overlay_fs();
+        let (id, _) = fs.mkdir(ROOT_FILEID, "d", 0o750).expect("mkdir");
+        let before = fs.getattr(id).unwrap().mode;
+        assert_eq!(fs.mkdir(ROOT_FILEID, "d", 0o700).unwrap_err(), libc::EEXIST);
+        assert_eq!(fs.getattr(id).unwrap().mode, before);
+        assert_eq!(
+            std::fs::metadata(td.path().join("d")).unwrap().mode() & 0o7777,
+            0o750
+        );
+        fs.lcreate(ROOT_FILEID, "f", 0o644).expect("create");
+        assert_eq!(fs.mkdir(ROOT_FILEID, "f", 0o700).unwrap_err(), libc::EEXIST);
+    }
+
     /// Regression: write-then-cat empty when 9P READ used a stale size-0
     /// inode cache instead of re-lookup. Production path is `read`.
     #[test]

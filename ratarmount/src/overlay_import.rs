@@ -855,9 +855,12 @@ fn restore(
         {
             overlay.unlink(&full).map_err(|e| format!("{path}: {e}"))?;
         }
-        overlay
-            .mkdir(&full, 0o755)
-            .map_err(|e| format!("{path}: {e}"))?;
+        // mkdir of a visible directory is EEXIST (#316); its mode is set below.
+        if overlay.lookup(&full, 0).is_none() {
+            overlay
+                .mkdir(&full, 0o755)
+                .map_err(|e| format!("{path}: {e}"))?;
+        }
         // Restore affected children, including implicit parents of written
         // paths. Unchanged lower files need no copying or preimage reads.
         let prefix = format!("{path}/");
