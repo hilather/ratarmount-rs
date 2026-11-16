@@ -48,8 +48,8 @@ pub use digest_cache::{
 pub use dirent_order::{cmp_offset_then_name, DirentOrder, VisibleMember};
 pub use hashing::{
     compute_hashes_limited, fill_content_hashes, hash_hex, normalize_algorithm, sha256_hex,
-    sha256_hex_stream, sha256_stream_calls_this_thread, FillReport, HASH_STREAM_CHUNK,
-    SUPPORTED_HASH_ALGORITHMS,
+    sha256_hex_stream, sha256_stream_calls_this_thread, shared_xattr_slots_sql, FillReport,
+    HASH_STREAM_CHUNK, SEVENZIP_MEMBER_XATTR_BASE, SUPPORTED_HASH_ALGORITHMS,
 };
 pub use local_cache::{
     enforce_local_index_budget_if_path, find_existing_user_cache_index, is_local_index_cache_path,

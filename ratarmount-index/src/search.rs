@@ -226,8 +226,11 @@ fn ensure_files_fts_table(conn: &Connection) -> Result<()> {
 }
 
 fn fill_files_fts(conn: &Connection) -> Result<()> {
+    // #320: a hash in a slot several members share belongs to none of them.
+    let shared = crate::shared_xattr_slots_sql(conn)?;
     conn.execute(
-        r#"
+        &format!(
+            r#"
             INSERT INTO "files_fts" (fullpath, hashes, path, name, offsetheader)
             SELECT
               CASE
@@ -239,6 +242,7 @@ fn fill_files_fts(conn: &Connection) -> Result<()> {
                 FROM "xattrs" x
                 WHERE x."offsetheader" IS f."offsetheader"
                   AND x."key" LIKE 'user.hash.%'
+                  AND (f."offsetheader" IS NULL OR f."offsetheader" NOT IN ({shared}))
               ), ''),
               f."path",
               f."name",
@@ -247,7 +251,8 @@ fn fill_files_fts(conn: &Connection) -> Result<()> {
             WHERE COALESCE(f."isgenerated", 0) = 0
               AND COALESCE(f."linkname", '') != ?1
               AND f."name" != ''
-            "#,
+            "#
+        ),
         params![DUMPDIR_DELETE_LINKNAME],
     )?;
     Ok(())
@@ -431,6 +436,19 @@ fn fill_hit_hashes(conn: &Connection, hits: &mut [SearchHit]) -> Result<()> {
             hashes.push(row?);
         }
         hit.hashes = hashes;
+    }
+    // #320: a hash in a slot several members share belongs to none of them.
+    // One scan of `files`, and only when some hit has a stored hash.
+    if hits.iter().any(|hit| !hit.hashes.is_empty()) {
+        let shared = conn
+            .prepare(crate::shared_xattr_slots_sql(conn)?)?
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<std::collections::HashSet<i64>>>()?;
+        for hit in hits.iter_mut() {
+            if hit.offsetheader.is_some_and(|oh| shared.contains(&oh)) {
+                hit.hashes.clear();
+            }
+        }
     }
     Ok(())
 }
@@ -741,6 +759,53 @@ mod tests {
         assert!(idx.search("nope").unwrap().is_empty());
         assert!(idx.search("").unwrap().is_empty());
         assert_eq!(INDEX_VERSION, "0.7.0");
+    }
+
+    /// Regression: #320 a hash stored under an `offsetheader` several members
+    /// share (solid 7z) is attributed to none of them by `find --hashes` or FTS.
+    #[test]
+    fn regression_320_shared_slot_hashes_are_not_reported() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        idx.insert_files_batch(&[
+            file_row("", "b.txt", 32, false),
+            file_row("", "text.txt", 32, false),
+            file_row("", "own.txt", 64, false),
+        ])
+        .unwrap();
+        idx.commit_write().unwrap();
+        idx.insert_xattr(32, "user.hash.sha256", b"stalesolidslot")
+            .unwrap();
+        idx.insert_xattr(64, "user.hash.sha256", b"ownmemberslot")
+            .unwrap();
+
+        let q = SearchQuery {
+            include_hashes: true,
+            ..SearchQuery::glob("*.txt")
+        };
+        let hits = idx.search_query(&q).unwrap();
+        let hashes: Vec<_> = hits
+            .iter()
+            .map(|h| (h.name.as_str(), h.hashes.clone()))
+            .collect();
+        assert_eq!(
+            hashes,
+            vec![
+                ("b.txt", vec![]),
+                (
+                    "own.txt",
+                    vec![("user.hash.sha256".into(), "ownmemberslot".into())]
+                ),
+                ("text.txt", vec![]),
+            ]
+        );
+
+        idx.ensure_fts5().unwrap();
+        assert!(idx.search_fts("stalesolidslot").unwrap().is_empty());
+        assert_eq!(
+            hit_paths(&idx.search_fts("ownmemberslot").unwrap()),
+            vec!["/own.txt"]
+        );
     }
 
     /// Regression: FTS5 MATCH on path + `user.hash.*` payload under default features.

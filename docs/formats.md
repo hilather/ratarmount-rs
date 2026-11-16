@@ -298,7 +298,13 @@ The complete status against the Python original is in the
 3. **7z solids.** AES+LZMA2 and BCJ/Delta+LZMA2 solids are progressive with a
    window cache but have no dictionary-reset resume; BCJ2 and multi-pack
    folders still decompress whole. The first read of a late member in a
-   multi-GB solid archive is slow.
+   multi-GB solid archive is slow. `--hashes` digests of members of a solid
+   folder are reported by the mount (`getfattr`, the payload cache) but not by
+   `find --hashes`, FTS search or `export-index`, whose index rows share one
+   `offsetheader` per solid folder. An index built with `--hashes` before the
+   #320 fix holds the last member's digest for the whole folder; it is not
+   reported, and `ratarmount --recreate-index --hashes sha256 ARCHIVE` stores
+   each member's own digest.
 4. **Writes.** ZIP commits rebuild the archive and cannot handle encrypted or
    multi-part ZIPs. Live commits cover uncompressed TAR and `.tar.zst` only
    and refuse to touch members in earlier zstd frames; the offline commit is
