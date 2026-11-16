@@ -658,6 +658,121 @@ fn supplied_strong_base_digest_and_verify_base_check() {
     assert_eq!(json["base_ok"], false, "{json}");
 }
 
+/// #341: a layer written through FUSE over a weak directory base records
+/// preimage pins at seal (diff, fsck, seal, verify, pack and unpack still
+/// agree on one hash). A same-size edit of a base file the layer modifies,
+/// with its mtime restored, passes the weak manifest, but `overlay verify`
+/// names it and a read-only `--lower` mount refuses it; restoring the base
+/// is accepted again.
+#[test]
+fn preimage_pins_weak_directory_base_and_lower_reuse() {
+    if !available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _writable = Writable(tmp.path());
+    let root = tmp.path();
+    let cache = root.join("cache");
+    let base = base_dir(root);
+    let overlay = root.join("overlay");
+    let mount = Mount::start(&base, &overlay, &root.join("mnt"));
+    edit(&root.join("mnt"));
+    mount.unmount();
+    let hash = agree(root, &overlay, &cache, &[]);
+    assert!(meta_get(&overlay, "base_preimage_digest").is_some());
+    let lower_mount = |name: &str| {
+        Mount::start_with(
+            &base,
+            None,
+            &[std::ffi::OsStr::new("--lower"), overlay.as_os_str()],
+            &[],
+            &root.join(name),
+            "new.txt",
+        )
+    };
+    let mount = lower_mount("lower1");
+    assert_eq!(
+        fs::read(root.join("lower1/src/a.c")).unwrap(),
+        b"int a(void) { return 10; }\n"
+    );
+    mount.unmount();
+    // An unsealed top over the pinned lower: `diff` over the stack (the
+    // output #341 is about) composes the lower through the same check.
+    let top = root.join("top");
+    expect(
+        reopen(&top, &base, &["--lower", overlay.to_str().unwrap()], &cache),
+        0,
+    );
+    let diff_top = || run(&[Path::new("diff"), &top, Path::new("--hash")], &cache);
+    expect(diff_top(), 0);
+
+    let file = base.join("src/a.c");
+    let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+    let rewrite = |bytes: &[u8]| {
+        fs::write(&file, bytes).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    };
+    rewrite(b"int a(void) { return 7; }\n");
+    let verify = |extra: &[&str]| {
+        let mut args = vec![Path::new("overlay"), Path::new("verify"), &overlay];
+        args.extend(extra.iter().map(Path::new));
+        run(&args, &cache)
+    };
+    let text = expect(verify(&[]), 1);
+    assert!(
+        text.contains("base preimage changed: src/a.c: content changed"),
+        "{text}"
+    );
+    let json: Value = serde_json::from_str(&expect(verify(&["--json"]), 1)).unwrap();
+    assert_eq!(json["ok"], false, "{json}");
+    assert_eq!(
+        json["computed"],
+        hash.as_str(),
+        "the canonical hash cannot see it"
+    );
+    assert_eq!(json["base_ok"], true, "the weak manifest cannot see it");
+    assert_eq!(
+        json["preimage_mismatched"],
+        json!(["src/a.c: content changed"])
+    );
+    let refused = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .env("HOME", &cache)
+        .env("XDG_CACHE_HOME", &cache)
+        .args([
+            "-f",
+            "--passthrough",
+            "off",
+            "--index-file",
+            ":memory:",
+            "--lower",
+        ])
+        .arg(&overlay)
+        .arg(&base)
+        .arg(root.join("lower2"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("src/a.c: content changed"), "{stderr}");
+    assert!(stderr.contains("--force-base-mismatch"), "{stderr}");
+
+    let refused = diff_top();
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_ne!(refused.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("src/a.c: content changed"), "{stderr}");
+
+    rewrite(b"int a(void) { return 1; }\n");
+    assert_eq!(expect(verify(&[]), 0).trim(), hash);
+    expect(diff_top(), 0);
+    lower_mount("lower3").unmount();
+}
+
 /// G5b: a journal added on a later mount joins the recorded exclusions
 /// without re-recording the digest; the hash agrees, and a journal-free
 /// remount still passes.

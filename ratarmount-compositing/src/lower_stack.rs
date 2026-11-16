@@ -16,6 +16,45 @@ use crate::{
     OverlayError, OverlayMeta, HIDDEN_DB,
 };
 
+/// Pins shown in a refusal before the rest is counted.
+const SHOWN_PINS: usize = 10;
+
+/// Refuse a sealed lower whose preimage pins (#341) no longer match the view
+/// beneath it: the base it was sealed over changed under a path the layer
+/// modifies or deletes, even when size and mtime were kept. Hashes only the
+/// pinned entries. `--force-stack-mismatch` does not bypass it: the pins say
+/// what the layer's changes are relative to, so the remedy is restoring the
+/// base or sealing the layer again over it.
+fn check_preimages(given: &Path, layer: &Path, view: Arc<dyn MountSource>) -> Result<(), String> {
+    let name = given.display();
+    let differing = crate::overlay_seal::check_preimages(layer, view)
+        .map_err(|e| format!("lower {name}: cannot check its preimage pins: {e}"))?;
+    if differing.is_empty() {
+        return Ok(());
+    }
+    let mut shown = differing
+        .iter()
+        .take(SHOWN_PINS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if differing.len() > SHOWN_PINS {
+        shown.push_str(&format!("; and {} more", differing.len() - SHOWN_PINS));
+    }
+    let reseal = if given.is_file() {
+        format!(
+            "unpack the bundle (`ratarmount overlay unpack {name} DIR`), seal DIR again over the base as it is now and pack it"
+        )
+    } else {
+        format!("seal it again over the base as it is now (`ratarmount overlay unseal --i-know {name}`, then `ratarmount overlay seal {name}`)")
+    };
+    Err(format!(
+        "lower {name} was sealed over base content that has changed under it (preimage pins; \
+         the size/mtime identity check cannot see a same-size edit): {shown}. Restore the base, \
+         or {reseal}, adding --force-base-mismatch if the base's recorded identity changed too"
+    ))
+}
+
 /// Resolves a bundle file to a layer directory.
 ///
 /// Arguments are the bundle path, the composed view beneath it, the marker key
@@ -146,6 +185,7 @@ impl MountLowerStack {
         };
         let mut view = base;
         for path in paths {
+            let given = path;
             let cached;
             let path = if path.is_file() {
                 let marker_key = base_key
@@ -206,6 +246,9 @@ impl MountLowerStack {
                     .unwrap_or("")
                     .into(),
             });
+            if sealed {
+                check_preimages(given, &path, view.clone())?;
+            }
             let immutability = if sealed {
                 Immutability::Immutable
             } else {

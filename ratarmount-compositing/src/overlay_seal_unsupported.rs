@@ -36,6 +36,23 @@ pub fn unseal(_dir: &Path) -> io::Result<()> {
     Err(unsupported())
 }
 
+/// Meta row of a layer that records preimage pins (#341).
+pub const PREIMAGE_DIGEST_KEY: &str = "base_preimage_digest";
+
+/// Preimage pins are rehashed on Unix only, as layers are sealed. A layer
+/// that records pins is refused here rather than used unchecked; one that
+/// records none has nothing to check.
+pub fn check_preimages(dir: &Path, _lower_view: Arc<dyn MountSource>) -> io::Result<Vec<String>> {
+    let meta = crate::OverlayMeta::read(dir).map_err(io::Error::other)?;
+    if meta.is_some_and(|meta| meta.get(PREIMAGE_DIGEST_KEY).is_some()) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the layer records preimage pins, which can only be checked on Unix",
+        ));
+    }
+    Ok(Vec::new())
+}
+
 pub struct SealOperation;
 
 impl SealOperation {
@@ -98,5 +115,27 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// Regression (#341): a layer with preimage pins is refused where they
+    /// cannot be rehashed; one without pins has none to check.
+    #[test]
+    fn regression_nonunix_preimage_pins_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let source: Arc<dyn MountSource> =
+            Arc::new(crate::FolderMountSource::new(dir.path()).unwrap());
+        let conn = rusqlite::Connection::open(dir.path().join(crate::HIDDEN_DB)).unwrap();
+        conn.execute_batch(crate::overlay_meta::META_SCHEMA)
+            .unwrap();
+        crate::OverlayMeta::set(&conn, "format_version", "2").unwrap();
+        drop(conn);
+        assert!(check_preimages(dir.path(), source.clone())
+            .unwrap()
+            .is_empty());
+        let conn = rusqlite::Connection::open(dir.path().join(crate::HIDDEN_DB)).unwrap();
+        crate::OverlayMeta::set(&conn, PREIMAGE_DIGEST_KEY, "sha256:x").unwrap();
+        drop(conn);
+        let error = check_preimages(dir.path(), source).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 }

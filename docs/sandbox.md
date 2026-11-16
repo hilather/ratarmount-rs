@@ -255,8 +255,10 @@ without size or mtime). The walk only reads directory entries and `lstat`s
 them: no file is opened, so a 1 GiB base mounts in milliseconds and FIFOs or
 unreadable files cannot break creation. Mode, owner and ctime are excluded.
 **A mount never hashes a base it was not asked to.** The consequence: a content
-edit that keeps a file's size and mtime is invisible to a weak digest. When a
-strong identity is needed, compute it once and supply it:
+edit that keeps a file's size and mtime is invisible to a weak digest. The one
+exception is a sealed layer's **preimage pins** (below): every reuse rehashes
+the few base files the layer modifies or deletes, never the rest of the base.
+When a strong identity of the whole base is needed, compute it once and supply it:
 
 ```bash
 digest=$(ratarmount overlay digest-base ./repo --exclude-overlay ./repo/.ov)
@@ -571,9 +573,14 @@ base's tree id with `base_git_tree`. A difference refuses the mount with
 `overlay verify PATH BASE` to compare digests, or pass --force-stack-mismatch to
 mount anyway`. A lower recorded with `--base-digest none`, or one that predates
 these keys, has no identity to compare and is accepted. A same-size edit with a
-restored mtime passes at mount; `overlay verify` (which rehashes) catches it.
+restored mtime passes this check; `overlay verify` catches it for an archive or
+a strong digest (it rehashes the base). Over a local directory base, a sealed
+lower's preimage pins are then rehashed (see "Preimage pins"), so such an edit
+of a file the lower modifies or deletes refuses the mount; an edit elsewhere in
+the base still passes.
 Offline commands (`overlay verify`, `seal`, `pack`, `diff`, `import`) do not
-apply this check.
+apply this identity check, so a byte-identical copy of the base works there; they
+do check the lowers' preimage pins, which hash content.
 
 Committing a layered stack is unsupported: `--commit-overlay`, on-exit commit,
 a nonzero commit interval, and rolling commits with `--lower` are refused with
@@ -667,11 +674,57 @@ symlinks and never follows them. `.ratarmount-sealed` contains the digest and
 is hidden from mounted listings. Sealed layers are accepted by `--lower` and
 `diff --strict`; writable mounts with `-w` are refused.
 
+**Preimage pins** (#341). A canonical row carries the layer's side only (the
+new mode and content hash), so recomputing the change set notices a base edit
+only when it makes a recorded change disappear. A base file edited to a third
+value with its size and mtime kept leaves a `modified` row unchanged, and
+neither a weak digest nor a directory's supplied strong digest (which a mount
+never rehashes) sees it. A layer sealed over a **local directory** base whose
+recorded identity is `weak` or `strong` therefore also records, in a
+`seal_preimages` table, the base side of every row that has one: a `modified`,
+`deleted` or `type_changed` path (a rename's source is a `deleted` row), as
+its type, mode (none for a symlink), size and content hash (a symlink's
+target). A base directory is not pinned; its removed descendants are. The
+hashes are the ones the seal already computes for its change set: sealing reads
+nothing more. The meta row `base_preimage_digest` binds the rows to the
+layer's `layer_digest`; a changed, added or deleted pin row fails that binding.
+Pins are not part of the canonical hash, `layer_digest`, `stack_digest` or the
+sentinel (canonical hash format stays `2`); they travel in bundles with the
+layer database and `meta.json` (bundle layout unchanged). Every reuse rehashes
+only the pinned entries in the view beneath the layer (the base and the lowers
+under it, so a nested lower's pins are checked against what its own lower view
+serves): `--lower` (directory or bundle, read-only or under a `-w` top, the
+sandbox supervisor's attempts), `diff` of a top over sealed lowers, `overlay
+verify` and `overlay unpack`, the bundle cache, and a moved or forced `overlay
+pack`. A mismatch is refused
+naming each path (`content changed`, `size changed`, `mode changed`, `type
+changed`, or `missing`) and how to recover: restore the base, or seal the layer
+again over the base as it is now (`overlay unseal --i-know`, then `overlay
+seal`, with `--force-base-mismatch` if the base's identity changed too).
+`--force-stack-mismatch` does not bypass pins. Pins include the file mode,
+so they are stricter than a strong directory digest (contents and symlink
+targets only): a byte-identical copy of the base with other mtimes passes,
+one whose pinned file has another mode does not. An mtime-only touch of a pinned
+file is accepted by the pins (they hash content); the weak manifest check at
+mount still sees the touch. Not pinned, by design: `--base-digest none` (no
+identity was asked for), archive bases (their identity is the archive's bytes;
+the cheap mount check's same-size limit for archives is described under "The
+lower must match the mounted base"), Git trees (the tree id covers content) and
+remote bases. A layer sealed before #341 records no pins and keeps the old
+behaviour; unseal and seal it again to add them. Pins guard against accidental
+or casual base edits; anyone who can rewrite the overlay database without
+resealing can also remove the table and its meta row together, and the layer
+then reads as an unpinned seal.
+
 Verify opens the top database immutable and read-only, recomputes the exact
 hash and compares both metadata and sentinel. Exit 0 means a match; exit 1
 reports differing, added, or removed paths (or a sentinel mismatch); exit 2
 means an operational error, including an unsealed overlay. `--json` also returns
-`ok`, `recorded`, `computed`, `sentinel_ok`, and `mismatched`. It works on the
+`ok`, `recorded`, `computed`, `sentinel_ok`, `mismatched`, `preimages_bound`
+(`null` when the layer records no preimage pins, `false` when its pin rows do
+not match their binding) and `preimage_mismatched` (`path: reason` per pinned
+base entry that differs; text output prints `base preimage changed: ...`
+lines); any of them failing makes `ok` false. It works on the
 read-only tree and detects unindexed host additions as well as changed bytes.
 
 Verify also compares the **base** with the digest recorded at creation (mounts
@@ -691,12 +744,14 @@ or `null` when skipped), `base_check` (`strong`, `weak` or `skipped`) and
 `base_current`, so a grader can tell what `true` means. A weak digest cannot see
 a same-size content edit whose mtime was restored (pass a strong digest from
 `overlay digest-base` for that); it does catch size changes, added or removed
-entries and a retargeted symlink. `--no-base-check` (experimental) skips the
+entries and a retargeted symlink. Under a path the layer modifies or deletes,
+the layer's preimage pins catch that edit too (`ok` false, `base_ok` still
+`true`). `--no-base-check` (experimental) skips the
 comparison and never opens the base, for bases too large to rehash.
 
 Unseal requires `--i-know` (otherwise exit 2), restores owner write permission
-on files and directories, removes the sentinel, clears the seal and per-path
-hashes, and records `unsealed_at`. Saved mode overrides stay in place. Host
+on files and directories, removes the sentinel, clears the seal, per-path
+hashes and preimage pins, and records `unsealed_at`. Saved mode overrides stay in place. Host
 permissions and SQLite cannot be changed in one transaction: after an interrupted
 seal, run unseal, fsck, and seal again. Stop direct host writers during these
 commands; chmod is not a security boundary against the owner or root. The seal

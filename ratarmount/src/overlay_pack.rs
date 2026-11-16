@@ -375,17 +375,24 @@ pub fn pack(
     };
     let changes = overlay_changes::change_set(directory, lower_view.clone(), &opts)?;
     if (options.base_rows.is_some() || options.check_change_set)
-        && ratarmount_compositing::overlay_seal::current_layer_digest(
+        && (ratarmount_compositing::overlay_seal::current_layer_digest(
             directory,
             lower_view.clone(),
         )? != digest
+            // #341: the pins must describe the base the bundle will name.
+            || !ratarmount_compositing::overlay_seal::check_preimages(
+                directory,
+                lower_view.clone(),
+            )?
+            .is_empty())
     {
         // The sealed digest covers the change set on the base the layer was
         // sealed on. Replacing only the base rows would make a bundle whose
         // unpack / verify fails against the base it names; recomputing the
         // digest would make the layer claim a seal it never had.
         return Err(invalid(
-            "the layer's change set on the base as it is now differs from the one it was sealed with; \
+            "the layer's change set on the base as it is now differs from the one it was sealed with \
+             (or the base content under a path it changes does, see its preimage pins); \
              run `overlay unseal --i-know`, then `overlay seal --force-base-mismatch` against this base, then pack",
         ));
     }
@@ -2312,6 +2319,21 @@ fn verify_against_view(layer: &Path, view: &Arc<dyn MountSource>) -> io::Result<
         return Ok(());
     }
     let mut paths = report.mismatched.join(", ");
+    if report.preimages_bound == Some(false) || !report.preimage_mismatched.is_empty() {
+        let mut pins = report.preimage_mismatched.clone();
+        if report.preimages_bound == Some(false) {
+            pins.insert(
+                0,
+                ratarmount_compositing::overlay_seal::PREIMAGES_UNBOUND.into(),
+            );
+        }
+        if !paths.is_empty() {
+            paths.push_str("; ");
+        }
+        // #341: the base under a path the layer changes is not the one it
+        // was sealed over, although its size and mtime may be unchanged.
+        paths.push_str(&format!("base preimage changed: {}", pins.join(", ")));
+    }
     if paths.is_empty() {
         paths = if report.sentinel_ok {
             format!("digest {} != recorded {}", report.computed, report.recorded)
@@ -2482,6 +2504,10 @@ pub(crate) fn cached_lower_in(
     }
     Ok(destination)
 }
+
+#[cfg(test)]
+#[path = "overlay_pack_preimage_tests.rs"]
+mod preimage_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -4758,8 +4784,9 @@ pub(crate) mod tests {
     /// Regression: a directory base has no trusted verification marker, so each
     /// use recomputes the change set. Making the base equal the replacement
     /// removes its change row and is caught even with size/mtime preserved.
-    /// This does not prove general preimage integrity: a third, different base
-    /// payload leaves the modified row unchanged (canonical rows omit base hashes).
+    /// A third, different base payload leaves the modified row unchanged
+    /// (canonical rows omit base hashes): before #341 that was accepted; the
+    /// seal's preimage pins now refuse it, naming the path.
     #[test]
     fn regression_lower_cache_weak_directory_base_always_reverifies() {
         let f = Fixture::new(true);
@@ -4805,13 +4832,30 @@ pub(crate) mod tests {
         assert_eq!(verify_calls() - before, 2);
         let target = base_dir.join("deleted");
         let mtime = fs::metadata(&target).unwrap().modified().unwrap();
-        fs::write(&target, b"new").unwrap();
-        File::options()
-            .write(true)
-            .open(&target)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(mtime))
-            .unwrap();
+        let rewrite = |bytes: &[u8]| {
+            fs::write(&target, bytes).unwrap();
+            File::options()
+                .write(true)
+                .open(&target)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(mtime))
+                .unwrap();
+        };
+        // #341: a third value of the same size keeps the `modified` row.
+        rewrite(b"alt");
+        let error = crate::MountLowerStack::open_in(
+            f.base.clone(),
+            key.as_deref(),
+            &paths,
+            false,
+            Some(&cache),
+            &crate::lower_stack_services(),
+        )
+        .err()
+        .expect("a same-size base edit under a modified row must fail closed");
+        assert!(error.contains("deleted"), "{error}");
+        assert!(error.contains("base preimage changed"), "{error}");
+        rewrite(b"new");
         let error = crate::MountLowerStack::open_in(
             f.base.clone(),
             key.as_deref(),

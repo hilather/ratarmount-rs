@@ -1149,6 +1149,20 @@ pub fn compare_paths(
     Ok(changes)
 }
 
+/// The base side of `path` in `lower` as [`compare_paths`] resolves it (no
+/// lookup through a symlinked ancestor, the same hashing), or `None` when
+/// nothing is there. Re-checks a seal's preimage pins (#341).
+pub(crate) fn base_entry(
+    lower: Arc<dyn MountSource>,
+    path: &str,
+    opts: &ChangeOptions,
+) -> io::Result<Option<Entry>> {
+    validate_relative_path(path)?;
+    safe_lookup(lower.as_ref(), path)
+        .map(|fi| entry(lower.clone(), fi, opts, true))
+        .transpose()
+}
+
 fn entry(
     source: Arc<dyn MountSource>,
     fi: FileInfo,
