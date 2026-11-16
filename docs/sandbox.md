@@ -2236,9 +2236,11 @@ reads of a bundle file (`overlay unpack`, a bundle `--lower` and the sandbox
 supervisor's lower checks), the `--lower` bundle cache's private copy of it,
 and the `<staging directory>.lock` file that `overlay pack`, `unpack` and the
 cache fill create (or reuse) beside their staging directory use ordinary opens.
-The other files they write (the bundle and its temporary files, the extracted
-members, the cache's verification markers) are created new (`O_EXCL` or
-anonymous), and the unpack finalization opens only directories. Of the checked sites, the ZIP commit
+The bundle output and its temporary files, extracted regular-file members,
+and cache verification markers are created new (`O_EXCL` or anonymous).
+Unpack finalization opens directories for metadata updates; its regular-file
+mode pass uses the lock-preserving `O_PATH` pins on Linux and no data descriptor
+elsewhere, as described above (#149). Of the checked sites, the ZIP commit
 reader, the read-only layer, live diff, the seal sentinels, the pack sentinel and lock
 reads and the macOS park share the tested helper but have no test of their
 own. Pack payload append has a direct registered-alias refusal/lock regression.

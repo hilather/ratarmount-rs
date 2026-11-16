@@ -24,6 +24,52 @@ fn require(sentences: &[&str]) {
     }
 }
 
+/// Regression: #180 claimed every pack/commit open used database-inode
+/// admission, hiding ordinary bundle reads and staging-lock acquisitions.
+#[test]
+fn regression_docs_db_inode_admission_scope() {
+    let module = read("ratarmount-core/src/db_inodes.rs").replace("//! ", "");
+    for sentence in [
+        "Overlay payload opens, the ZIP and TAR commit readers, the seal and pack sentinels and the pack lock and member reads",
+        "opens that never call this module",
+        "`overlay pack`/`unpack`'s bundle and lock files",
+    ] {
+        assert!(module.contains(sentence), "db_inodes module lost: {sentence}");
+    }
+    assert!(
+        !module.contains("Every payload, sentinel, pack and commit open goes through"),
+        "db_inodes must not claim universal admission coverage"
+    );
+    let docs = read("docs/sandbox.md");
+    for sentence in [
+        "Not every `overlay pack` / `unpack` open is checked either:",
+        "reads of a bundle file (`overlay unpack`, a bundle `--lower` and the sandbox supervisor's lower checks)",
+        "the `--lower` bundle cache's private copy of it",
+        "the `<staging directory>.lock` file",
+        "cache fill create (or reuse) beside their staging directory use ordinary opens.",
+    ] {
+        assert!(docs.contains(sentence), "docs/sandbox.md lost: {sentence}");
+    }
+}
+
+/// Regression: #180 described unpack finalization as opening only directories,
+/// although chmod_entry_at also opens regular-file O_PATH pins on Linux.
+#[test]
+fn regression_docs_db_inode_unpack_finalization() {
+    let docs = read("docs/sandbox.md");
+    assert!(
+        !docs.contains("unpack finalization opens only directories"),
+        "unpack finalization also opens regular-file O_PATH pins on Linux"
+    );
+    for sentence in [
+        "Unpack finalization opens directories for metadata updates; its regular-file mode pass uses the lock-preserving `O_PATH` pins on Linux and no data descriptor elsewhere, as described above (#149).",
+        "the unpack stage's mode pass change modes through an `O_PATH` pin on Linux",
+        "by name with `AT_SYMLINK_NOFOLLOW` elsewhere, where a swap of the name between the check and the change is not detected",
+    ] {
+        assert!(docs.contains(sentence), "docs/sandbox.md lost: {sentence}");
+    }
+}
+
 /// Decision 3: a forced kind change drops to kind-only; `none` accepts copies.
 #[test]
 fn regression_docs_state_forced_kind_only_and_none_accepts_copies() {
