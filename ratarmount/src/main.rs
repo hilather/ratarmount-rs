@@ -39,6 +39,8 @@ mod quiet_print;
 
 mod base_digest;
 mod base_identity;
+#[cfg(test)]
+mod child_helpers;
 mod corpus;
 mod daemon;
 mod diff;

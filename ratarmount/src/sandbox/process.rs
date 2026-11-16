@@ -785,7 +785,7 @@ mod tests {
                 "sandbox::process::tests::sandbox_waiting_child",
                 "--ignored",
             ])
-            .env("RATARMOUNT_SANDBOX_WAITING_CHILD", "1")
+            .env(crate::child_helpers::SANDBOX_WAITING_CHILD, "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -797,7 +797,11 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper for deadline test"]
     fn sandbox_waiting_child() {
-        if std::env::var_os("RATARMOUNT_SANDBOX_WAITING_CHILD").is_some() {
+        if crate::child_helpers::spawned_by_parent(
+            crate::child_helpers::SANDBOX_WAITING_CHILD,
+            "sandbox_waiting_child",
+            "regression_subprocess_deadline_reaps_child",
+        ) {
             thread::sleep(Duration::from_secs(30));
         }
     }
@@ -888,12 +892,17 @@ mod tests {
                 "--test-threads=1",
                 "--nocapture",
             ])
+            .env(crate::child_helpers::SANDBOX_PAUSED_FORKED_CHILD, "1")
             .stdin(Stdio::null())
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            !stderr.contains(crate::child_helpers::GUARD_SKIP),
+            "{stderr}"
+        );
         assert!(stdout.contains("#296 helper executed"), "{stdout}");
     }
 
@@ -903,6 +912,15 @@ mod tests {
     fn sandbox_paused_forked_child() {
         use std::io::{Read, Write};
         use std::os::fd::AsRawFd;
+
+        // #310: never run outside the parent's isolated subprocess.
+        if !crate::child_helpers::spawned_by_parent(
+            crate::child_helpers::SANDBOX_PAUSED_FORKED_CHILD,
+            "sandbox_paused_forked_child",
+            "regression_296_helper_exec_survives_a_paused_forked_child",
+        ) {
+            return;
+        }
 
         struct PausedChild {
             release: io::PipeWriter,

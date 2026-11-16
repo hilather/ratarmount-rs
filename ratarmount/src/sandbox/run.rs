@@ -1916,6 +1916,13 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper for regression_run_child_dies_with_supervisor"]
     fn run_child_death_probe() {
+        if !crate::child_helpers::spawned_by_parent(
+            crate::child_helpers::RUN_DEATH_PROBE_CHILD,
+            "run_child_death_probe",
+            "regression_run_child_dies_with_supervisor",
+        ) {
+            return;
+        }
         let _processes = ratarmount_index::test_process::spawning();
         let Some(marker) = std::env::var_os("RATARMOUNT_RUN_DEATH_PROBE") else {
             return;
@@ -1949,6 +1956,7 @@ mod tests {
                 "--ignored",
             ])
             .env("RATARMOUNT_RUN_DEATH_PROBE", &marker)
+            .env(crate::child_helpers::RUN_DEATH_PROBE_CHILD, "1")
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
