@@ -5484,6 +5484,142 @@ fn regression_live_recovery_refuses_a_replaced_or_lost_database() {
     }
 }
 
+/// Regression: #166: a live commit whose recovery the #150 guard refused
+/// (nothing written: the mount's database replaced at its path, or removed
+/// while its marker stays, next to a stale prepare locator) poisoned the live
+/// base: intervals stopped and base reads failed until a remount. The refusal
+/// refuses that commit only (R6-2): reads go on, the locator is kept, and once
+/// the database is back the next commit clears the locator and goes through.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_166_live_guard_refusal_refuses_one_commit() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for replaced in [true, false] {
+        let fx = Fixture::new();
+        let ov = fx.open(BaseDigestRequest::Compute, false);
+        fs::write(ov.root().join("one"), b"one").unwrap();
+        stale_prepare(&fx.archive);
+        let before = locator(&fx.archive);
+        let archive_before = fs::read(&fx.archive).unwrap();
+        let db = fx.overlay.join(HIDDEN_DB);
+        let held = fx.overlay.with_file_name("held.sqlite");
+        fs::rename(&db, &held).unwrap();
+        if replaced {
+            rusqlite::Connection::open(&db)
+                .unwrap()
+                .execute_batch("CREATE TABLE files (x)")
+                .unwrap();
+        }
+        let error = ov
+            .commit_live(&fx.archive, |p| Ok(open_tar(p)))
+            .unwrap_err()
+            .to_string();
+        let expect = if replaced {
+            "replaced while the overlay is mounted"
+        } else {
+            "missing or empty"
+        };
+        assert!(error.contains(expect), "replaced={replaced}: {error}");
+        assert!(!ov.interval_disabled(), "replaced={replaced}: poisoned");
+        assert!(ov.lookup("/first", 0).is_some(), "replaced={replaced}");
+        assert_eq!(read_member(&ov, "/first"), b"first member");
+        assert_eq!(read_member(&ov, "/one"), b"one");
+        assert_eq!(locator(&fx.archive), before, "replaced={replaced}");
+        assert_eq!(fs::read(&fx.archive).unwrap(), archive_before);
+
+        let _ = fs::remove_file(&db);
+        fs::rename(&held, &db).unwrap();
+        if !have_gnu_tar() {
+            eprintln!("skip: GNU tar unavailable (the later commit)");
+            continue;
+        }
+        assert!(
+            ov.commit_live(&fx.archive, |p| Ok(open_tar(p))).unwrap(),
+            "replaced={replaced}"
+        );
+        assert!(locator(&fx.archive).is_empty(), "replaced={replaced}");
+        assert_eq!(read_member(&ov, "/one"), b"one");
+        assert_eq!(
+            read_member(open_tar(&fx.archive).as_ref(), "/one"),
+            b"one",
+            "replaced={replaced}: committed"
+        );
+    }
+}
+
+/// Regression: #166 exempts only a pre-write refusal from failing the base
+/// closed. A rollback failing after it writes, or a completed journal failing
+/// cleanup, must still invalidate cached base entries and stop interval commits.
+/// Overlay payloads stay available so the user can recover the pending edits.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_166_live_recovery_write_failures_refuse_base() {
+    for complete in [false, true] {
+        let fx = Fixture::new();
+        let ov = fx.open(BaseDigestRequest::Compute, false);
+        let cached = ov.lookup("/first", 0).unwrap();
+        let generation = ov.commit_generation();
+        let original = fs::read(&fx.archive).unwrap();
+        fs::write(ov.root().join("one"), b"pending edit").unwrap();
+        if complete {
+            interrupt_complete(&fx.archive);
+        } else {
+            interrupt_append(&fx.archive);
+        }
+        let crashed = fs::read(&fx.archive).unwrap();
+        assert_ne!(crashed, original);
+        let journal = journal_path(&fx.archive);
+        let journal_before = fs::read(&journal).unwrap();
+        let step_to_fail = if complete {
+            "rollback unlink"
+        } else {
+            "rollback mtime"
+        };
+        fault::install(move |step| {
+            if step == step_to_fail {
+                Err(std::io::Error::other("injected recovery write failure"))
+            } else {
+                Ok(())
+            }
+        });
+        let result = ov.commit_live(&fx.archive, |_| panic!("failed recovery reopened base"));
+        fault::clear();
+        let error = result.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected recovery write failure"));
+        if complete {
+            assert!(error.to_string().contains("committed bytes"), "{error}");
+            assert!(error.to_string().contains("remount required"), "{error}");
+        } else {
+            assert!(matches!(error, crate::OverlayError::Io(_)), "{error}");
+        }
+        assert_eq!(
+            fs::read(&fx.archive).unwrap(),
+            if complete { crashed } else { original },
+            "complete={complete}: recovery wrote before failing"
+        );
+        assert_eq!(fs::read(&journal).unwrap(), journal_before);
+        assert!(!locator(&fx.archive).is_empty());
+        assert!(ov.interval_disabled(), "complete={complete}");
+        assert!(
+            ov.commit_generation() > generation,
+            "cached entries invalidated"
+        );
+        assert!(ov.lookup("/first", 0).is_none(), "complete={complete}");
+        let error = ov.read(&cached, cached.size as usize, 0).unwrap_err();
+        assert!(error.to_string().contains("remount required"), "{error}");
+        assert_eq!(read_member(&ov, "/one"), b"pending edit");
+        let error = ov
+            .commit_live_idle(&fx.archive, std::time::Duration::ZERO, |_| {
+                panic!("disabled interval reopened base")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("remount required"), "{error}");
+        assert_eq!(fs::read(&journal).unwrap(), journal_before);
+    }
+}
+
 /// Regression: #239 (R10-B, v4 T8/T13b): a complete journal of A's own
 /// commit loses its record after authorization: the database is emptied,
 /// replaced by one without a `files` table, or removed with its marker.

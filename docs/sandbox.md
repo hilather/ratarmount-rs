@@ -349,6 +349,12 @@ mount keeps serving, and `--force-base-mismatch` accepts the new base. A swap of
 the base with the same size and mtime cannot be caught without hashing; only
 `overlay verify` with a strong digest catches it (`overlay seal` of an
 already-strong base compares the stamp and does not rehash).
+A commit-journal recovery guard that refuses before recovery writes also keeps
+the mount serving and interval commits enabled. Restore the required overlay
+database state before retrying; `--force-base-mismatch` does not bypass that
+guard. During a live commit, a recovery failure that may have written disables
+later live commits and refuses base reads until a remount. Overlay payloads
+remain readable.
 `--commit-overlay` on a raw directory of files (no overlay database) has no
 identity to check and says so. Only an absent database path in an unused
 overlay counts as "no database".
