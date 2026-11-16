@@ -18,7 +18,8 @@ pub(super) struct FilePatch {
     pub delta: Option<Vec<u8>>,
     /// The `index <old>..<new>` object ids (lowercase hex), when present.
     pub index: Option<(String, String)>,
-    /// The raw `GIT binary patch` lines, for a `.rej` file.
+    /// The raw binary section, including file/rename/copy/mode/index headers,
+    /// for a `.rej` file.
     pub binary_raw: Vec<u8>,
     headers: bool,
 }
@@ -385,6 +386,13 @@ pub(super) fn walk_delta(
     source: Option<&[u8]>,
     limit: u64,
 ) -> io::Result<(u64, u64, Option<Vec<u8>>)> {
+    // Git's patch_delta rejects streams shorter than DELTA_SIZE_MIN, even
+    // when two size headers alone would describe an empty result.
+    if delta.len() < 4 {
+        return Err(invalid(
+            "delta stream is shorter than Git's minimum of 4 bytes",
+        ));
+    }
     let mut pos = 0;
     let source_size = varint(delta, &mut pos)?;
     let target_size = varint(delta, &mut pos)?;
@@ -484,35 +492,45 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Apply a forward delta to `preimage`, as `git apply` does: the preimage's
 /// blob id must match the index line's old id, and the result's the new id.
-/// An abbreviated id is a prefix of a full SHA-1 or SHA-256 id (both ids
-/// under one object format); `git apply` itself requires full ids.
+/// Both ids must be full hashes under the same object format.
 pub(super) fn apply_delta(
     preimage: &[u8],
     delta: &[u8],
     index: &(String, String),
     limit: u64,
 ) -> Result<Vec<u8>, String> {
+    let format = delta_index_format(index)?;
     let (old, new) = index;
     let before = blob_ids(preimage);
-    let formats: Vec<usize> = (0..2)
-        .filter(|&i| before[i].starts_with(old.as_str()))
-        .collect();
-    if formats.is_empty() {
+    if before[format] != *old {
         return Err(format!(
             "delta preimage blob {} does not match index {old} (sha1 information is lacking or useless)",
-            before[0]
+            before[format]
         ));
     }
     let (_, _, out) = walk_delta(delta, Some(preimage), limit).map_err(|e| e.to_string())?;
     let out = out.expect("built with a source");
     let after = blob_ids(&out);
-    if !formats.iter().any(|&i| after[i].starts_with(new.as_str())) {
+    if after[format] != *new {
         return Err(format!(
             "delta creates blob {} but index expects {new}",
-            after[formats[0]]
+            after[format]
         ));
     }
     Ok(out)
+}
+
+fn delta_index_format((old, new): &(String, String)) -> Result<usize, String> {
+    let valid =
+        |id: &str| id.bytes().all(|b| b.is_ascii_hexdigit()) && id.bytes().any(|b| b != b'0');
+    if old.len() == new.len() && valid(old) && valid(new) {
+        match old.len() {
+            40 => return Ok(0),
+            64 => return Ok(1),
+            _ => {}
+        }
+    }
+    Err("a delta binary section needs a full index line with non-zero 40-hex SHA-1 or 64-hex SHA-256 blob ids of the same format".into())
 }
 
 /// `index <old>..<new>[ <mode>]`: two hex object ids, lowercased.
@@ -552,17 +570,12 @@ fn finish(mut patch: FilePatch, patches: &mut Vec<FilePatch>) -> io::Result<()> 
                 "a delta binary section cannot be combined with text hunks",
             ));
         }
-        let Some((old, new)) = &patch.index else {
+        let Some(index) = &patch.index else {
             return Err(refuse(
-                "a delta binary section needs an index line with blob ids (sha1 information is lacking or useless)",
+                "a delta binary section needs a full index line with blob ids",
             ));
         };
-        let zero = |id: &str| id.bytes().all(|b| b == b'0');
-        if old.len() < 4 || new.len() < 4 || zero(old) || zero(new) {
-            return Err(refuse(
-                "a delta binary section needs non-zero index blob ids of at least 4 hex digits (sha1 information is lacking or useless)",
-            ));
-        }
+        delta_index_format(index).map_err(|why| refuse(&why))?;
     }
     patches.push(patch);
     Ok(())
@@ -573,6 +586,7 @@ pub(super) fn parse(input: &[u8], max_bytes: u64) -> io::Result<Vec<FilePatch>> 
     let mut patches = Vec::new();
     let mut literal_budget = max_bytes;
     let mut current: Option<FilePatch> = None;
+    let mut section_start = 0;
     let mut pos = 0;
     while pos < lines.len() {
         let line = trim_lf(lines[pos]);
@@ -581,6 +595,7 @@ pub(super) fn parse(input: &[u8], max_bytes: u64) -> io::Result<Vec<FilePatch>> 
                 finish(patch, &mut patches)?;
             }
             let (old, new) = git_paths(names)?;
+            section_start = pos;
             current = Some(FilePatch {
                 old,
                 new,
@@ -604,6 +619,7 @@ pub(super) fn parse(input: &[u8], max_bytes: u64) -> io::Result<Vec<FilePatch>> 
                 || line.starts_with(b"old mode "))
         {
             current = Some(FilePatch::default());
+            section_start = pos;
         }
         let Some(patch) = &mut current else {
             if line.starts_with(b"Binary files ") {
@@ -668,7 +684,6 @@ pub(super) fn parse(input: &[u8], max_bytes: u64) -> io::Result<Vec<FilePatch>> 
                 if patch.literal.is_some() || patch.delta.is_some() {
                     return Err(invalid("repeated binary patch for one file"));
                 }
-                let start = pos;
                 pos += 1;
                 let (kind, data) = binary_section(&lines, &mut pos, literal_budget)?;
                 literal_budget -= data.len() as u64;
@@ -690,7 +705,7 @@ pub(super) fn parse(input: &[u8], max_bytes: u64) -> io::Result<Vec<FilePatch>> 
                         walk_delta(&data, None, max_bytes)?;
                     }
                 }
-                patch.binary_raw = lines[start..pos].concat();
+                patch.binary_raw = lines[section_start..pos].concat();
                 return Ok(());
             } else if let Some(value) = line.strip_prefix(b"index ") {
                 // Only the extended header's line, before any content.
@@ -948,7 +963,27 @@ pub(super) mod tests {
         // Without a source only the declared sizes are checked.
         let (s, t, out) = walk_delta(&d, None, u64::MAX).unwrap();
         assert_eq!((s, t, out), (10, 131, None));
-        assert_eq!(apply(b"", &delta(0, 0, &[])).unwrap(), b"");
+        assert_eq!(apply(b"", &[0x80, 0, 0x80, 0]).unwrap(), b"");
+    }
+
+    /// Regression (#343): Git refuses two/three-byte empty-result deltas even
+    /// when the size headers match. Its minimum stream length is four bytes.
+    #[test]
+    fn regression_delta_minimum_stream_size() {
+        for (source, d) in [
+            (Vec::new(), delta(0, 0, &[])),
+            (vec![1; 127], delta(127, 0, &[])),
+            (vec![1; 128], delta(128, 0, &[])),
+        ] {
+            let error = apply(&source, &d).unwrap_err().to_string();
+            assert!(error.contains("minimum of 4 bytes"), "{error}");
+            assert!(walk_delta(&d, None, 1024).is_err());
+        }
+        // Do not reject valid empty results solely for lacking opcodes.
+        assert_eq!(
+            apply(&vec![1; 16_384], &delta(16_384, 0, &[])).unwrap(),
+            b""
+        );
     }
 
     /// Regression: malformed deltas are refused, never panic or over-allocate (#343).
@@ -956,16 +991,16 @@ pub(super) mod tests {
     fn regression_delta_malformed_vectors() {
         let src = b"0123456789".to_vec();
         let cases: &[(&str, Vec<u8>, &str)] = &[
-            ("opcode 0", delta(10, 1, &[0]), "reserved delta opcode 0"),
-            ("empty", Vec::new(), "truncated delta size"),
+            ("opcode 0", delta(10, 1, &[0, 0]), "reserved delta opcode 0"),
+            ("empty", Vec::new(), "minimum of 4 bytes"),
             (
                 "truncated source varint",
-                vec![0x8a],
+                vec![0x8a; 4],
                 "truncated delta size",
             ),
             (
                 "truncated target varint",
-                vec![10, 0x81],
+                vec![10, 0x81, 0x81, 0x81],
                 "truncated delta size",
             ),
             (
@@ -1020,7 +1055,7 @@ pub(super) mod tests {
             // Structural checks do not need the source.
             assert!(walk_delta(d, None, u64::MAX).is_err(), "{name}");
         }
-        let error = apply(&src, &delta(9, 0, &[])).unwrap_err().to_string();
+        let error = apply(&src, &[0x89, 0x80, 0, 0]).unwrap_err().to_string();
         assert!(
             error.contains("does not match the preimage size 10"),
             "{error}"
@@ -1068,8 +1103,8 @@ pub(super) mod tests {
         patch
     }
 
-    /// Regression: blob ids are checked like `git apply` (full SHA-1 or SHA-256,
-    /// or a prefix of either); a missing or zero index line refuses the delta (#343).
+    /// Regression: blob ids are checked like `git apply` (full SHA-1 or SHA-256);
+    /// a missing or zero index line refuses the delta (#343).
     #[test]
     fn regression_delta_index_blob_ids() {
         let pre = b"\x00preimage bytes".to_vec();
@@ -1088,9 +1123,7 @@ pub(super) mod tests {
         );
         for (old, new) in [
             (old1.clone(), new1.clone()),
-            (old1[..7].to_string(), new1[..7].to_string()),
             (old256.clone(), new256.clone()),
-            (old256[..50].to_string(), new256[..50].to_string()),
             (old1.to_uppercase(), new1.to_uppercase()),
         ] {
             let patch = delta_patch(Some(&format!("{old}..{new}")), &d);
@@ -1143,22 +1176,57 @@ pub(super) mod tests {
         }
     }
 
+    /// Regression (#343): prefixes (including 40 digits of SHA-256) and mixed
+    /// object formats must not weaken a delta's preimage/postimage check.
+    #[test]
+    fn regression_delta_requires_full_index() {
+        let pre = b"\0before";
+        let post = b"\0after";
+        let d = make_delta(pre, post);
+        let before = blob_ids(pre);
+        let after = blob_ids(post);
+        for (old, new) in [
+            (&before[0][..4], &after[0][..4]),
+            (&before[0][..7], &after[0][..7]),
+            (&before[0][..39], &after[0][..39]),
+            (&before[1][..40], &after[1][..40]),
+            (&before[1][..63], &after[1][..63]),
+            (before[0].as_str(), after[1].as_str()),
+            (before[1].as_str(), after[0].as_str()),
+        ] {
+            let index = (old.to_string(), new.to_string());
+            assert!(apply_delta(pre, &d, &index, 1024).is_err(), "{index:?}");
+            // Forty hex digits are a syntactically valid SHA-1 id, even when
+            // obtained by truncating SHA-256; only the content check catches it.
+            if old.len() != 40 || new.len() != 40 {
+                let error = parse(&delta_patch(Some(&format!("{old}..{new}")), &d), 1024)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains("bin:") && error.contains("full index"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
     /// Regression: a delta's declared target over --max-patch-bytes is refused at
     /// parse time, before any target allocation; the delta stream is charged to
     /// the decoded-literal budget, and a reverse delta is validated (#343).
     #[test]
     fn regression_delta_budget_and_reverse_section() {
+        let index = format!("{}..{}", "a".repeat(40), "b".repeat(40));
         let d = delta(4, 1 << 40, &[0x80 | 0x40, 1]);
-        let patch = delta_patch(Some("abcd..ef01"), &d);
+        let patch = delta_patch(Some(&index), &d);
         let error = parse(&patch, 1 << 20).unwrap_err().to_string();
         assert!(error.contains("exceeds --max-patch-bytes"), "{error}");
         let small = delta(4, 2, &[0x90, 2]);
-        let patch = delta_patch(Some("abcd..ef01"), &small);
+        let patch = delta_patch(Some(&index), &small);
         parse(&patch, 1 << 20).unwrap();
         // The retained delta itself counts toward the budget.
         assert!(parse(&patch, small.len() as u64 - 1).is_err());
         let mut two = patch.clone();
-        two.extend(&delta_patch(Some("abcd..ef01"), &small)["diff --git a/bin b/bin\n".len()..]);
+        two.extend(&delta_patch(Some(&index), &small)["diff --git a/bin b/bin\n".len()..]);
         assert!(parse(&two, 1 << 20)
             .unwrap_err()
             .to_string()
@@ -1168,11 +1236,47 @@ pub(super) mod tests {
         ok.extend(format!("delta {}\n", small.len()).as_bytes());
         ok.extend(encode85(&zlib(&small)));
         assert!(parse(&ok, 1 << 20).unwrap()[0].delta.is_some());
-        let bad = delta(4, 2, &[0]);
+        let bad = delta(4, 2, &[0, 0]);
         let mut ko = patch;
         ko.extend(format!("delta {}\n", bad.len()).as_bytes());
         ko.extend(encode85(&zlib(&bad)));
         let error = parse(&ko, 1 << 20).unwrap_err().to_string();
         assert!(error.contains("bin: reserved delta opcode 0"), "{error}");
+    }
+
+    /// Regression (#343): mixed files share the decoded-stream budget; a small
+    /// declared section cannot inflate unbounded data or hide trailing zlib bytes.
+    #[test]
+    fn regression_delta_cumulative_budget_and_bounded_inflate() {
+        let index = format!("{}..{}", "a".repeat(40), "b".repeat(40));
+        let d = make_delta(&[], &vec![7; 8192]);
+        let delta_patch = delta_patch(Some(&index), &d);
+        let literal_patch = binary_patch(&zlib(&[3; 8192]), 8192);
+        let limit = (d.len() + 8192) as u64;
+        for patches in [
+            [&delta_patch, &literal_patch, &delta_patch],
+            [&literal_patch, &delta_patch, &literal_patch],
+        ] {
+            let two = [patches[0].as_slice(), patches[1].as_slice()].concat();
+            assert_eq!(parse(&two, limit).unwrap().len(), 2);
+            let three = [two, patches[2].clone()].concat();
+            let error = parse(&three, limit).unwrap_err().to_string();
+            assert!(error.contains("exceeds --max-patch-bytes"), "{error}");
+        }
+        let inflated = zlib(&vec![0; 1024 * 1024]);
+        for compressed in [
+            inflated,
+            zlib(&d)[..zlib(&d).len() - 1].to_vec(),
+            [zlib(&d), vec![0]].concat(),
+            [zlib(&d), zlib(&d)].concat(),
+        ] {
+            let section = [
+                format!("delta {}\n", d.len()).into_bytes(),
+                encode85(&compressed),
+            ]
+            .concat();
+            let lines: Vec<_> = section.split_inclusive(|b| *b == b'\n').collect();
+            assert!(binary_section(&lines, &mut 0, limit).is_err());
+        }
     }
 }

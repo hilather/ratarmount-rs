@@ -310,6 +310,9 @@ The complete status against the Python original is in the
    After a machine failure, a leftover relaxed marker requires
    `overlay fsck --repair` before reuse. See
    [Relaxed overlay durability](sandbox.md#relaxed-overlay-durability).
+   [Patch import](sandbox.md#overlay-import) accepts Git binary literals and
+   deltas; deltas require full SHA-1/SHA-256 index ids, a regular-file preimage
+   and sizes within `--max-patch-bytes`.
    The supervisor accepts `sandbox new --overlay-durability relaxed` and
    refuses to finalize an attempt with a foreign/unknown-boot marker; discard
    that attempt. See [relaxed attempts](sandbox.md#relaxed-attempts).

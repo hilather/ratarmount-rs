@@ -227,6 +227,11 @@ ratarmount overlay unpack attempt.tar.zst restored
 ratarmount overlay verify restored
 ```
 
+The patch importer accepts `git diff --binary --full-index` output, including
+binary delta sections for modified fixtures. Delta sections require full SHA-1
+or SHA-256 index ids and verify both the merged preimage and the result. See
+[Overlay import](sandbox.md#overlay-import) for limits and `--reject` behavior.
+
 `overlay unseal restored --i-know` explicitly makes a sealed copy writable again.
 For a stopped kernel overlayfs upperdir, use
 `ratarmount overlay import-upperdir --lower prepared upperdir imported base.tar.zst`.

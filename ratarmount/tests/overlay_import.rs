@@ -703,3 +703,63 @@ fn regression_import_binary_delta_docx_cli() {
         ratarmount_compositing::overlay_seal::unseal(dir).unwrap();
     }
 }
+
+/// Regression (#343): a newline-heavy binary preimage allocated a text line
+/// table (>256 MiB for 16 MiB of bytes) before applying a tiny delta.
+#[cfg(target_os = "linux")]
+#[test]
+fn regression_import_binary_delta_memory_bound_cli() {
+    use std::os::unix::process::CommandExt;
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    fs::create_dir(&base).unwrap();
+    let mut pre = vec![b'\n'; 16 * 1024 * 1024];
+    pre[0] = 0;
+    let mut post = pre.clone();
+    post[8 * 1024 * 1024] = b'!';
+    fs::write(base.join("binary"), &pre).unwrap();
+    let mut patch = format!(
+        "diff --git a/binary b/binary\nindex {}..{} 100644\nGIT binary patch\n",
+        blob_sha1(&pre),
+        blob_sha1(&post)
+    )
+    .into_bytes();
+    patch.extend(delta_section(&pre, &post));
+    let patch_path = root.path().join("patch");
+    fs::write(&patch_path, patch).unwrap();
+    let dest = root.path().join("overlay");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    command
+        .args(["overlay", "import", "--no-seal"])
+        .arg(&patch_path)
+        .arg(&dest)
+        .arg(&base);
+    // Constrain only the exec'd CLI, never the shared test process.
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 256 * 1024 * 1024,
+                rlim_max: 256 * 1024 * 1024,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::setrlimit(libc::RLIMIT_CORE, &no_core) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{:?}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(dest.join("binary")).unwrap(), post);
+}

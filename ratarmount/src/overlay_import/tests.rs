@@ -1201,7 +1201,7 @@ const TEXT_A: &[u8] =
     b"diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
 
 /// Regression (#343): a `delta` binary section applies to the lower preimage,
-/// with abbreviated and full blob ids, alongside text hunks.
+/// with full SHA-1 and SHA-256 blob ids, alongside text hunks.
 #[test]
 fn regression_import_binary_delta_applies_to_preimage() {
     let f = Fixture::new();
@@ -1210,11 +1210,11 @@ fn regression_import_binary_delta_applies_to_preimage() {
     for (name, index) in [
         ("full", None),
         (
-            "abbrev",
+            "sha256",
             Some(format!(
                 "{}..{}",
-                &parse::blob_ids(pre)[0][..7],
-                &parse::blob_ids(post)[0][..7]
+                parse::blob_ids(pre)[1],
+                parse::blob_ids(post)[1]
             )),
         ),
     ] {
@@ -1260,17 +1260,35 @@ fn regression_import_binary_delta_wrong_preimage_and_reject() {
         )),
     );
     let on_link = delta_section("link", b"a", b"b", None);
+    let missing = delta_section("missing", lower, post, None);
+    let wrong_result = delta_section(
+        "binary",
+        lower,
+        post,
+        Some(format!(
+            "{}..{}",
+            parse::blob_ids(lower)[0],
+            parse::blob_ids(other)[0]
+        )),
+    );
     for (case, section, message) in [
         ("blob", wrong, "sha1 information is lacking or useless"),
         ("size", sized, "does not match the preimage size"),
         ("link", on_link, "not a regular file"),
+        ("missing", missing, "preimage does not exist"),
+        ("result", wrong_result, "index expects"),
     ] {
         let mut args = f.args(&format!("{case}-strict"));
         let patch = [section.clone(), TEXT_A.to_vec()].concat();
         let error = f.apply(&args, &patch).unwrap_err();
-        let path = if case == "link" { "link:" } else { "binary:" };
+        let name = match case {
+            "link" => "link",
+            "missing" => "missing",
+            _ => "binary",
+        };
+        let path = format!("{name}:");
         assert!(
-            error.contains(path) && error.contains(message),
+            error.contains(&path) && error.contains(message),
             "{case}: {error}"
         );
         assert!(!args.directory.exists(), "{case}");
@@ -1280,10 +1298,11 @@ fn regression_import_binary_delta_wrong_preimage_and_reject() {
         assert_eq!(code, 1, "{case}: {json}");
         assert!(json.contains("\"rejected\":1"), "{json}");
         let view = f.view(&args.directory);
-        let name = if case == "link" { "link" } else { "binary" };
-        let restored = view.lookup(&format!("/{name}"), 0).unwrap();
+        let restored = view.lookup(&format!("/{name}"), 0);
         if case == "link" {
-            assert_eq!(restored.linkname, "a");
+            assert_eq!(restored.unwrap().linkname, "a");
+        } else if case == "missing" {
+            assert!(restored.is_none());
         } else {
             assert_eq!(read_entry(&view, name, 1 << 20).unwrap().unwrap().1, lower);
         }
@@ -1325,6 +1344,199 @@ fn regression_import_binary_delta_over_max_patch_bytes() {
     assert_eq!(f.apply(&args, &patch).unwrap().1, 0);
 }
 
+/// Regression (#343): a directory preimage must take the delta rejection path
+/// instead of aborting --reject before unrelated files can be applied.
+#[test]
+fn regression_import_binary_delta_directory_preimage_reject() {
+    let f = Fixture::new();
+    let section = delta_section("nested", b"\0old", b"\0new", None);
+    let patch = [section, TEXT_A.to_vec()].concat();
+    let mut args = f.args("directory-delta");
+    let error = f.apply(&args, &patch).unwrap_err();
+    assert!(
+        error.contains("nested:") && error.contains("not a regular file"),
+        "{error}"
+    );
+    assert!(!args.directory.exists());
+    args.reject = true;
+    args.no_seal = false;
+    let (json, code) = f.apply(&args, &patch).unwrap();
+    assert_eq!(code, 1, "{json}");
+    let view = f.view(&args.directory);
+    assert!(is_dir(&view, "/nested"));
+    assert_eq!(
+        read_entry(&view, "nested/base", 1024).unwrap().unwrap().1,
+        b"keep\n"
+    );
+    assert_eq!(
+        read_entry(&view, "a", 1024).unwrap().unwrap().1,
+        b"one\nTWO\nthree\n"
+    );
+    assert!(args.directory.join("nested.rej").is_file());
+    drop(view);
+    fsck_clean(&args.directory);
+    assert!(
+        ratarmount_compositing::overlay_seal::verify(&args.directory, f.source.clone())
+            .unwrap()
+            .ok
+    );
+    ratarmount_compositing::overlay_seal::unseal(&args.directory).unwrap();
+}
+
+/// Regression (#343): a rejected rename/copy delta must retain both paths,
+/// its operation and mode headers, so the rejection can be inspected/replayed.
+#[test]
+fn regression_import_binary_delta_reject_preserves_section() {
+    let f = Fixture::new();
+    for operation in ["rename", "copy"] {
+        let section = delta_section("binary", b"\0other base", b"\0changed", None);
+        let section = String::from_utf8(section).unwrap().replacen(
+            "diff --git a/binary b/binary\n",
+            &format!("diff --git a/binary b/moved\nold mode 100644\nnew mode 100755\n{operation} from binary\n{operation} to moved\n"),
+            1,
+        );
+        let mut args = f.args(operation);
+        args.reject = true;
+        let (_, code) = f.apply(&args, section.as_bytes()).unwrap();
+        assert_eq!(code, 1);
+        let view = f.view(&args.directory);
+        assert!(view.lookup("/moved", 0).is_none());
+        assert_eq!(
+            read_entry(&view, "binary", 1024).unwrap().unwrap().1,
+            b"\0old binary"
+        );
+        let rejected = fs::read(args.directory.join("moved.rej")).unwrap();
+        assert!(
+            rejected.ends_with(section.as_bytes()),
+            "{}",
+            String::from_utf8_lossy(&rejected)
+        );
+        let parsed = parse::parse(&rejected, 4096).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].old.as_deref(), Some("binary"));
+        assert_eq!(parsed[0].new.as_deref(), Some("moved"));
+        assert_eq!(parsed[0].copy, operation == "copy");
+        assert_eq!(parsed[0].new_mode, Some(0o100755));
+    }
+}
+
+/// Regression (#343): delta sources come from the merged lower stack and
+/// earlier sections; a later rejection restores that stack, not the base.
+#[test]
+fn regression_import_binary_delta_lower_and_chained_sections() {
+    let f = Fixture::new();
+    let lower = b"\0prepared bytes";
+    let middle = b"\0first edit";
+    let last = b"\0second edit";
+    let mut prepared = f.args("prepared");
+    prepared.no_seal = false;
+    f.apply(
+        &prepared,
+        &delta_section("binary", b"\0old binary", lower, None),
+    )
+    .unwrap();
+    for reject in [false, true] {
+        let mut args = f.args(if reject { "chain-rejected" } else { "chain" });
+        args.lower.push(prepared.directory.clone());
+        args.reject = reject;
+        args.no_seal = false;
+        let pre: &[u8] = if reject { b"\0wrong edit" } else { middle };
+        let patch = [
+            delta_section("binary", lower, middle, None),
+            delta_section("binary", pre, last, None),
+            TEXT_A.to_vec(),
+        ]
+        .concat();
+        let patches = parse::parse(&patch, args.max_patch_bytes).unwrap();
+        let stack = ImportStack::open(&args, &Default::default()).unwrap();
+        let lower_view = stack.view.clone();
+        assert_eq!(
+            import(&args, &patches, stack, 123.0).unwrap().1,
+            i32::from(reject)
+        );
+        let view =
+            ReadOnlyOverlayLayer::new(lower_view.clone(), &args.directory, Immutability::Shared)
+                .unwrap();
+        assert_eq!(
+            read_entry(&view, "binary", 4096).unwrap().unwrap().1,
+            if reject {
+                lower.as_slice()
+            } else {
+                last.as_slice()
+            }
+        );
+        assert_eq!(
+            read_entry(&view, "a", 4096).unwrap().unwrap().1,
+            b"one\nTWO\nthree\n"
+        );
+        drop(view);
+        assert!(
+            ratarmount_compositing::overlay_seal::verify(&args.directory, lower_view)
+                .unwrap()
+                .ok
+        );
+        ratarmount_compositing::overlay_seal::unseal(&args.directory).unwrap();
+    }
+    ratarmount_compositing::overlay_seal::unseal(&prepared.directory).unwrap();
+}
+
+/// Regression (#343/#329): failed deltas restore both directions of a type
+/// change; later child deltas cannot read through the restored regular file.
+#[test]
+fn regression_import_binary_delta_type_change_reject() {
+    let f = Fixture::new();
+    let child = delta_section("type/y", b"wrong\n", b"new\n", None);
+    let later = delta_section("type/z", b"missing\n", b"new\n", None);
+    let parent = delta_section("nested", b"wrong\n", b"new\n", None);
+    for (name, patch) in [
+        (
+            "file-dir",
+            [DELETE_TYPE, ADD_TYPE_Y, &child, &later, TEXT_A].concat(),
+        ),
+        (
+            "dir-file",
+            [ADD_NESTED, DELETE_NESTED_BASE, &parent, TEXT_A].concat(),
+        ),
+    ] {
+        let mut args = f.args(name);
+        args.reject = true;
+        args.no_seal = false;
+        let (json, code) = f.apply(&args, &patch).unwrap();
+        assert_eq!(code, 1, "{json}");
+        let view = f.view(&args.directory);
+        assert_eq!(
+            read_entry(&view, "type", 4096).unwrap().unwrap().1,
+            b"regular\n"
+        );
+        assert!(is_dir(&view, "/nested"));
+        assert_eq!(
+            read_entry(&view, "nested/base", 4096).unwrap().unwrap().1,
+            b"keep\n"
+        );
+        assert_eq!(
+            read_entry(&view, "a", 4096).unwrap().unwrap().1,
+            b"one\nTWO\nthree\n"
+        );
+        if name == "file-dir" {
+            assert!(view.lookup("/type/y", 0).is_none());
+            assert!(view.lookup("/type/z", 0).is_none());
+            let rejected = fs::read(args.directory.join("type.rej")).unwrap();
+            let parsed = parse::parse(&rejected, 4096).unwrap();
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].path(), "type/y");
+            assert_eq!(parsed[1].path(), "type/z");
+        }
+        drop(view);
+        fsck_clean(&args.directory);
+        assert!(
+            ratarmount_compositing::overlay_seal::verify(&args.directory, f.source.clone())
+                .unwrap()
+                .ok
+        );
+        ratarmount_compositing::overlay_seal::unseal(&args.directory).unwrap();
+    }
+}
+
 fn git(dir: &Path, args: &[&str]) -> std::process::Output {
     let output = std::process::Command::new("git")
         .current_dir(dir)
@@ -1355,8 +1567,8 @@ fn noise(seed: u32, len: usize) -> Vec<u8> {
 }
 
 /// Regression (#343): real `git diff --binary` delta sections (random bytes, a
-/// docx-like zip, and a 96 KiB file needing multi-byte copy sizes), with full and
-/// abbreviated index lines, import to the same tree as the edited files; then
+/// docx-like zip, and a 96 KiB file needing multi-byte copy sizes), with full
+/// index lines, import to the same tree as the edited files; then
 /// `diff --git` of the result imports to the same canonical hash.
 #[test]
 fn regression_import_real_git_binary_delta() {
@@ -1444,22 +1656,25 @@ fn regression_import_real_git_binary_delta() {
         cow::cow_write(&ov, &format!("/{name}"), data);
     }
     drop(ov);
-    for (label, patch) in [("full", full), ("abbrev", abbrev.into_bytes())] {
-        let args = f.args(label);
-        let patches = parse::parse(&patch, args.max_patch_bytes).unwrap();
-        assert!(patches.iter().all(|p| p.delta.is_some()), "{label}");
-        let stack = ImportStack::open(&args, &Default::default()).unwrap();
-        assert_eq!(import(&args, &patches, stack, 123.0).unwrap().1, 0);
-        let view = f.view(&args.directory);
-        for (name, data) in &edited {
-            assert_eq!(
-                &read_entry(&view, name, 1 << 20).unwrap().unwrap().1,
-                data,
-                "{label} {name}"
-            );
-        }
-        assert_eq!(f.hash(&expected), f.hash(&args.directory), "{label}");
+    let error = parse::parse(abbrev.as_bytes(), 1 << 20)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("full index"), "{error}");
+    let args = f.args("full");
+    let patches = parse::parse(&full, args.max_patch_bytes).unwrap();
+    assert!(patches.iter().all(|p| p.delta.is_some()));
+    let stack = ImportStack::open(&args, &Default::default()).unwrap();
+    assert_eq!(import(&args, &patches, stack, 123.0).unwrap().1, 0);
+    let view = f.view(&args.directory);
+    for (name, data) in &edited {
+        assert_eq!(
+            &read_entry(&view, name, 1 << 20).unwrap().unwrap().1,
+            data,
+            "{name}"
+        );
     }
+    assert_eq!(f.hash(&expected), f.hash(&args.directory));
+    drop(view);
     // Reverse round trip: ratarmount's own `diff --git` (literal sections) of
     // the imported overlay must import to the same canonical hash.
     let args = f.args("again");
@@ -1476,4 +1691,123 @@ fn regression_import_real_git_binary_delta() {
     let stack = ImportStack::open(&args, &Default::default()).unwrap();
     assert_eq!(import(&args, &patches, stack, 123.0).unwrap().1, 0);
     assert_eq!(f.hash(&expected), f.hash(&args.directory));
+}
+
+/// Regression (#343): deterministic randomized binary edits, including
+/// renames, copies and chmod, must agree byte-for-byte with real git apply
+/// under both supported object formats. Pure opcode/hash tests run without Git.
+#[test]
+fn regression_import_real_git_binary_delta_randomized() {
+    use ratarmount_compositing::FolderMountSource;
+    use std::os::unix::fs::PermissionsExt;
+    let _processes = ratarmount_index::test_process::spawning();
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skip: git is unavailable; pure delta/hash tests remain active");
+        return;
+    }
+    for format in ["sha1", "sha256"] {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let base = temp.path().join("base");
+        fs::create_dir(&repo).unwrap();
+        fs::create_dir(&base).unwrap();
+        git(&repo, &["init", "-q", &format!("--object-format={format}")]);
+        let mut pairs = Vec::new();
+        for i in 0..64 {
+            let name = format!("file-{i}.bin");
+            let mut pre = noise(2 * i + 13, 4096 + i as usize * 1093);
+            pre[0] = 0;
+            fs::write(repo.join(&name), &pre).unwrap();
+            fs::write(base.join(&name), &pre).unwrap();
+            for root in [&repo, &base] {
+                fs::set_permissions(root.join(&name), fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            let mut post = pre.clone();
+            let at = post.len() / 3;
+            match i % 4 {
+                0 => {
+                    post[at] ^= 0x5a;
+                }
+                1 => {
+                    post.splice(at..at, noise(i + 17, 113));
+                }
+                2 => {
+                    post.drain(at..at + 79);
+                }
+                _ => {
+                    post.rotate_left(at);
+                }
+            }
+            let target = match i {
+                0 => "renamed binary.bin".to_string(),
+                1 => "copied binary.bin".to_string(),
+                _ => name.clone(),
+            };
+            pairs.push((name, target, pre, post));
+        }
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        for (i, (name, target, _, post)) in pairs.iter().enumerate() {
+            if i == 0 {
+                fs::remove_file(repo.join(name)).unwrap();
+            }
+            fs::write(repo.join(target), post).unwrap();
+            fs::set_permissions(
+                repo.join(target),
+                fs::Permissions::from_mode(if i == 2 { 0o755 } else { 0o644 }),
+            )
+            .unwrap();
+        }
+        git(&repo, &["add", "-A"]);
+        let patch = git(
+            &repo,
+            &[
+                "diff",
+                "--cached",
+                "--binary",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--find-renames",
+                "--find-copies-harder",
+                "HEAD",
+            ],
+        )
+        .stdout;
+        let parsed = parse::parse(&patch, 16 << 20).unwrap();
+        assert_eq!(parsed.len(), pairs.len(), "{format}");
+        assert!(
+            parsed.iter().all(|p| p.delta.is_some()),
+            "Git must exercise delta decoding"
+        );
+        assert!(parsed.iter().any(|p| p.copy));
+        assert!(parsed.iter().any(|p| !p.copy && p.old != p.new));
+        assert!(parsed.iter().any(|p| p.new_mode == Some(0o100755)));
+        let patch_path = temp.path().join("patch");
+        fs::write(&patch_path, &patch).unwrap();
+        git(&repo, &["reset", "--hard", "-q", "HEAD"]);
+        git(&repo, &["apply", "--index", patch_path.to_str().unwrap()]);
+        let source = Arc::new(FolderMountSource::new(&base).unwrap());
+        let f = Fixture { temp, base, source };
+        let args = f.args("imported");
+        assert_eq!(f.apply(&args, &patch).unwrap().1, 0);
+        let view = f.view(&args.directory);
+        for (i, (name, target, pre, post)) in pairs.iter().enumerate() {
+            let expected = fs::read(repo.join(target)).unwrap();
+            assert_eq!(&expected, post, "git output for {format} {target}");
+            let (fi, actual) = read_entry(&view, target, 1 << 20).unwrap().unwrap();
+            assert_eq!(actual, expected, "{format} {target}");
+            assert_eq!(fi.mode & 0o777, if i == 2 { 0o755 } else { 0o644 });
+            if i == 0 {
+                assert!(view.lookup(&format!("/{name}"), 0).is_none());
+            }
+            if i == 1 {
+                assert_eq!(&read_entry(&view, name, 1 << 20).unwrap().unwrap().1, pre);
+            }
+        }
+    }
 }

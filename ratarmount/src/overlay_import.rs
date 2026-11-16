@@ -36,7 +36,7 @@ pub struct ImportArgs {
     pub reject: bool,
     #[arg(long)]
     pub json: bool,
-    /// Bound patch input, each decoded literal and each pre/postimage in bytes.
+    /// Bound patch input, retained decoded binary data and each pre/postimage in bytes.
     #[arg(long, default_value_t = 256 * 1024 * 1024)]
     pub max_patch_bytes: u64,
     /// Patch file, or - for stdin.
@@ -244,19 +244,31 @@ fn import(
                 {
                     None
                 }
+                Some(path) if patch.delta.is_some() => {
+                    match overlay.lookup(&format!("/{path}"), 0) {
+                        // Preserve the kind for delta_postimage's rejection;
+                        // a directory must not abort --reject in read_entry.
+                        Some(fi) if fi.mode & S_IFMT != S_IFREG => Some((fi, Vec::new())),
+                        _ => read_entry(&overlay, path, args.max_patch_bytes)?,
+                    }
+                }
                 Some(path) => read_entry(&overlay, path, args.max_patch_bytes)?,
                 None => None,
             };
             let preimage = original
                 .as_ref()
                 .map_or(&[][..], |(_, bytes)| bytes.as_slice());
-            let (content, failed) = apply_hunks(preimage, &patch.hunks, args.max_patch_bytes)?;
-            // A failed delta (#343) is handled like a failed hunk.
-            let (content, delta_failure) =
+            // Binary data never needs a text line table. A newline-heavy
+            // preimage would otherwise allocate many times its byte budget.
+            let (content, failed, delta_failure) =
                 match delta_postimage(patch, original.as_ref(), args.max_patch_bytes) {
-                    None => (content, None),
-                    Some(Ok(bytes)) => (bytes, None),
-                    Some(Err(error)) => (content, Some(error)),
+                    None => {
+                        let (content, failed) =
+                            apply_hunks(preimage, &patch.hunks, args.max_patch_bytes)?;
+                        (content, failed, None)
+                    }
+                    Some(Ok(bytes)) => (bytes, Vec::new(), None),
+                    Some(Err(error)) => (Vec::new(), Vec::new(), Some(error)),
                 };
             if !failed.is_empty() || delta_failure.is_some() {
                 if !args.reject {
@@ -303,9 +315,6 @@ fn import(
                     reject.extend_from_slice(&patch.hunks[i].raw);
                 }
                 if delta_failure.is_some() {
-                    if let Some((old, new)) = &patch.index {
-                        reject.extend_from_slice(format!("index {old}..{new}\n").as_bytes());
-                    }
                     reject.extend_from_slice(&patch.binary_raw);
                 }
                 continue;
