@@ -15232,6 +15232,190 @@
       "rule_reason": "inventory-op:from_raw_fd"
     },
     {
+      "configured_path": "std::fs::OpenOptions::new",
+      "item": "ratarmount_core::owner_socket::bind_staged",
+      "leaf_digest": "215915a0707304838dcec8535ee489c6c578e19a329f1bb168081930d1b5fc35",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "baseline_reason": "O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content",
+        "category": "builder-setup",
+        "creation": {
+          "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions.",
+          "policy": "none"
+        },
+        "disposition": "support",
+        "id": "IR-B0289-M01",
+        "item": "ratarmount_core::owner_socket::bind_staged",
+        "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+        "supports_disposition": "out-of-family"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-B0289-M01\",\"item\":\"ratarmount_core::owner_socket::bind_staged\",\"disposition\":\"support\",\"category\":\"builder-setup\",\"reason\":\"Prepare the builder for this item's separately reviewed open/create leaf.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions.\"},\"supports_disposition\":\"out-of-family\",\"baseline_reason\":\"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content\"}",
+      "resolved": "<std::fs::OpenOptions>::new",
+      "rule_reason": "inventory-op:OpenOptions"
+    },
+    {
+      "configured_path": "std::fs::OpenOptions::open",
+      "item": "ratarmount_core::owner_socket::bind_staged",
+      "leaf_digest": "07c3106169a95615f99aa3f1bf0275d5c73e4df4c990f5cc0f220729ff82730c",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "directory-handle-or-durability",
+        "creation": {
+          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-B0289-M02",
+        "item": "ratarmount_core::owner_socket::bind_staged",
+        "reason": "O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-B0289-M02\",\"item\":\"ratarmount_core::owner_socket::bind_staged\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
+      "resolved": "<std::fs::OpenOptions>::open",
+      "rule_reason": "inventory-op:OpenOptions"
+    },
+    {
+      "configured_path": "std::fs::OpenOptions",
+      "item": "ratarmount_core::owner_socket::bind_staged",
+      "leaf_digest": "215915a0707304838dcec8535ee489c6c578e19a329f1bb168081930d1b5fc35",
+      "lint": "clippy::disallowed_types",
+      "metadata": {
+        "category": "builder-type-support",
+        "creation": {
+          "basis": "This is a type/import reference; it acquires no file or directory.",
+          "policy": "none"
+        },
+        "disposition": "support",
+        "id": "IR-B0289-T01",
+        "item": "ratarmount_core::owner_socket::bind_staged",
+        "reason": "Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-B0289-T01\",\"item\":\"ratarmount_core::owner_socket::bind_staged\",\"disposition\":\"support\",\"category\":\"builder-type-support\",\"reason\":\"Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content\",\"creation\":{\"policy\":\"none\",\"basis\":\"This is a type/import reference; it acquires no file or directory.\"}}",
+      "resolved": "std::fs::OpenOptions",
+      "rule_reason": "inventory-op:OpenOptions"
+    },
+    {
+      "configured_path": "libc::syscall",
+      "item": "ratarmount_core::owner_socket::rename_noreplace",
+      "leaf_digest": "5abbf301ec258473aceca9988304bb40859adb95331327a9042164f1fddbee4c",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "socket-publication",
+        "creation": {
+          "basis": "This syscall renames an existing staged socket with RENAME_NOREPLACE; it acquires no file descriptor or new inode.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-E0036-M01",
+        "item": "ratarmount_core::owner_socket::rename_noreplace",
+        "reason": "Publish an already-created daemon (CSI, volume plugin) socket with the renameat2 no-replace syscall."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0036-M01\",\"item\":\"ratarmount_core::owner_socket::rename_noreplace\",\"disposition\":\"out-of-family\",\"category\":\"socket-publication\",\"reason\":\"Publish an already-created daemon (CSI, volume plugin) socket with the renameat2 no-replace syscall.\",\"creation\":{\"policy\":\"none\",\"basis\":\"This syscall renames an existing staged socket with RENAME_NOREPLACE; it acquires no file descriptor or new inode.\"}}",
+      "resolved": "libc::unix::linux_like::linux::syscall",
+      "rule_reason": "inventory-op:libc::syscall"
+    },
+    {
+      "configured_path": "std::fs::DirBuilder::new",
+      "item": "ratarmount_core::owner_socket::stage_dir",
+      "leaf_digest": "b0cd66081cc652dc0978efaa64f943b35199e8f407e3950415951ed93c473264",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "creation-builder",
+        "creation": {
+          "basis": "Builder setup only; the distinct create event owns the 0700 directory creation.",
+          "policy": "none"
+        },
+        "disposition": "support",
+        "id": "IR-E0034-M01",
+        "item": "ratarmount_core::owner_socket::stage_dir",
+        "reason": "Construct the mode-aware builder for a fresh daemon (CSI, volume plugin) socket staging directory."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0034-M01\",\"item\":\"ratarmount_core::owner_socket::stage_dir\",\"disposition\":\"support\",\"category\":\"creation-builder\",\"reason\":\"Construct the mode-aware builder for a fresh daemon (CSI, volume plugin) socket staging directory.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Builder setup only; the distinct create event owns the 0700 directory creation.\"}}",
+      "resolved": "<std::fs::DirBuilder>::new",
+      "rule_reason": "inventory-op:DirBuilder"
+    },
+    {
+      "configured_path": "std::fs::DirBuilder",
+      "item": "ratarmount_core::owner_socket::stage_dir",
+      "leaf_digest": "b0cd66081cc652dc0978efaa64f943b35199e8f407e3950415951ed93c473264",
+      "lint": "clippy::disallowed_types",
+      "metadata": {
+        "category": "builder-type-support",
+        "creation": {
+          "basis": "This is a type/import reference; it acquires no file or directory.",
+          "policy": "none"
+        },
+        "disposition": "support",
+        "id": "IR-E0034-T01",
+        "item": "ratarmount_core::owner_socket::stage_dir",
+        "reason": "Builder type support: Construct the mode-aware builder for a fresh daemon (CSI, volume plugin) socket staging directory."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0034-T01\",\"item\":\"ratarmount_core::owner_socket::stage_dir\",\"disposition\":\"support\",\"category\":\"builder-type-support\",\"reason\":\"Builder type support: Construct the mode-aware builder for a fresh daemon (CSI, volume plugin) socket staging directory.\",\"creation\":{\"policy\":\"none\",\"basis\":\"This is a type/import reference; it acquires no file or directory.\"}}",
+      "resolved": "std::fs::DirBuilder",
+      "rule_reason": "inventory-op:DirBuilder"
+    },
+    {
+      "configured_path": "std::fs::DirBuilder::create",
+      "item": "ratarmount_core::owner_socket::stage_dir",
+      "leaf_digest": "eb67567689e321b93f5bee1015d383859f3d9194b6395ae2489d305db2e64296",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "socket-staging-directory",
+        "creation": {
+          "basis": "The builder requests 0700 and retries EEXIST without binding elsewhere; staging cleanup is retained.",
+          "policy": "exclusive-directory"
+        },
+        "disposition": "output-owner",
+        "id": "IR-E0035-M01",
+        "item": "ratarmount_core::owner_socket::stage_dir",
+        "reason": "Create the fresh daemon (CSI, volume plugin) socket staging directory using its generated collision-retried name."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0035-M01\",\"item\":\"ratarmount_core::owner_socket::stage_dir\",\"disposition\":\"output-owner\",\"category\":\"socket-staging-directory\",\"reason\":\"Create the fresh daemon (CSI, volume plugin) socket staging directory using its generated collision-retried name.\",\"creation\":{\"policy\":\"exclusive-directory\",\"basis\":\"The builder requests 0700 and retries EEXIST without binding elsewhere; staging cleanup is retained.\"}}",
+      "resolved": "<std::fs::DirBuilder>::create",
+      "rule_reason": "inventory-op:fs::create_dir"
+    },
+    {
       "configured_path": "std::fs::OpenOptions",
       "item": "ratarmount_csi",
       "leaf_digest": "f1c0a3b8b1bc297f349a7172118fcba6480e507d7623860aac5ab0d3db7b2714",
@@ -15270,114 +15454,8 @@
       "resolved": "core::macros::builtin::include"
     },
     {
-      "configured_path": "std::fs::OpenOptions::new",
-      "item": "ratarmount_csi::linux::bind_staged",
-      "leaf_digest": "215915a0707304838dcec8535ee489c6c578e19a329f1bb168081930d1b5fc35",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "baseline_reason": "O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content",
-        "category": "builder-setup",
-        "creation": {
-          "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions.",
-          "policy": "none"
-        },
-        "disposition": "support",
-        "id": "IR-B0289-M01",
-        "item": "ratarmount_csi::linux::bind_staged",
-        "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
-        "supports_disposition": "out-of-family"
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0289-M01\",\"item\":\"ratarmount_csi::linux::bind_staged\",\"disposition\":\"support\",\"category\":\"builder-setup\",\"reason\":\"Prepare the builder for this item's separately reviewed open/create leaf.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions.\"},\"supports_disposition\":\"out-of-family\",\"baseline_reason\":\"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content\"}",
-      "resolved": "<std::fs::OpenOptions>::new",
-      "rule_reason": "inventory-op:OpenOptions"
-    },
-    {
-      "configured_path": "std::fs::OpenOptions::open",
-      "item": "ratarmount_csi::linux::bind_staged",
-      "leaf_digest": "07c3106169a95615f99aa3f1bf0275d5c73e4df4c990f5cc0f220729ff82730c",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "directory-handle-or-durability",
-        "creation": {
-          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
-          "policy": "none"
-        },
-        "disposition": "out-of-family",
-        "id": "IR-B0289-M02",
-        "item": "ratarmount_csi::linux::bind_staged",
-        "reason": "O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content"
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0289-M02\",\"item\":\"ratarmount_csi::linux::bind_staged\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
-      "resolved": "<std::fs::OpenOptions>::open",
-      "rule_reason": "inventory-op:OpenOptions"
-    },
-    {
-      "configured_path": "std::fs::OpenOptions",
-      "item": "ratarmount_csi::linux::bind_staged",
-      "leaf_digest": "215915a0707304838dcec8535ee489c6c578e19a329f1bb168081930d1b5fc35",
-      "lint": "clippy::disallowed_types",
-      "metadata": {
-        "category": "builder-type-support",
-        "creation": {
-          "basis": "This is a type/import reference; it acquires no file or directory.",
-          "policy": "none"
-        },
-        "disposition": "support",
-        "id": "IR-B0289-T01",
-        "item": "ratarmount_csi::linux::bind_staged",
-        "reason": "Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content"
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0289-T01\",\"item\":\"ratarmount_csi::linux::bind_staged\",\"disposition\":\"support\",\"category\":\"builder-type-support\",\"reason\":\"Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content\",\"creation\":{\"policy\":\"none\",\"basis\":\"This is a type/import reference; it acquires no file or directory.\"}}",
-      "resolved": "std::fs::OpenOptions",
-      "rule_reason": "inventory-op:OpenOptions"
-    },
-    {
-      "configured_path": "libc::syscall",
-      "item": "ratarmount_csi::linux::rename_noreplace",
-      "leaf_digest": "5abbf301ec258473aceca9988304bb40859adb95331327a9042164f1fddbee4c",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "socket-publication",
-        "creation": {
-          "basis": "This syscall renames an existing staged socket with RENAME_NOREPLACE; it acquires no file descriptor or new inode.",
-          "policy": "none"
-        },
-        "disposition": "out-of-family",
-        "id": "IR-E0036-M01",
-        "item": "ratarmount_csi::linux::rename_noreplace",
-        "reason": "Publish an already-created CSI socket with the renameat2 no-replace syscall."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0036-M01\",\"item\":\"ratarmount_csi::linux::rename_noreplace\",\"disposition\":\"out-of-family\",\"category\":\"socket-publication\",\"reason\":\"Publish an already-created CSI socket with the renameat2 no-replace syscall.\",\"creation\":{\"policy\":\"none\",\"basis\":\"This syscall renames an existing staged socket with RENAME_NOREPLACE; it acquires no file descriptor or new inode.\"}}",
-      "resolved": "libc::unix::linux_like::linux::syscall",
-      "rule_reason": "inventory-op:libc::syscall"
-    },
-    {
       "configured_path": "std::fs::create_dir_all",
-      "item": "ratarmount_csi::linux::run",
+      "item": "ratarmount_csi::linux::bind_endpoint",
       "leaf_digest": "893aa70c588a4faabd58a3fcc5cf364950a549d6067b3eaa48973c41653462f1",
       "lint": "clippy::disallowed_methods",
       "metadata": {
@@ -15388,7 +15466,7 @@
         },
         "disposition": "output-owner",
         "id": "IR-E0037-M01",
-        "item": "ratarmount_csi::linux::run",
+        "item": "ratarmount_csi::linux::bind_endpoint",
         "reason": "Create the CSI listening socket parent before staged socket binding."
       },
       "multiplicity": 1,
@@ -15397,87 +15475,9 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0037-M01\",\"item\":\"ratarmount_csi::linux::run\",\"disposition\":\"output-owner\",\"category\":\"socket-parent-directory\",\"reason\":\"Create the CSI listening socket parent before staged socket binding.\",\"creation\":{\"policy\":\"recursive-directory\",\"basis\":\"The parent uses existing std directory defaults; fresh staging mode and no-replace publication are separately reviewed.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-E0037-M01\",\"item\":\"ratarmount_csi::linux::bind_endpoint\",\"disposition\":\"output-owner\",\"category\":\"socket-parent-directory\",\"reason\":\"Create the CSI listening socket parent before staged socket binding.\",\"creation\":{\"policy\":\"recursive-directory\",\"basis\":\"The parent uses existing std directory defaults; fresh staging mode and no-replace publication are separately reviewed.\"}}",
       "resolved": "std::fs::create_dir_all",
       "rule_reason": "inventory-op:fs::create_dir_all"
-    },
-    {
-      "configured_path": "std::fs::DirBuilder::new",
-      "item": "ratarmount_csi::linux::stage_dir",
-      "leaf_digest": "b0cd66081cc652dc0978efaa64f943b35199e8f407e3950415951ed93c473264",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "creation-builder",
-        "creation": {
-          "basis": "Builder setup only; the distinct create event owns the 0700 directory creation.",
-          "policy": "none"
-        },
-        "disposition": "support",
-        "id": "IR-E0034-M01",
-        "item": "ratarmount_csi::linux::stage_dir",
-        "reason": "Construct the mode-aware builder for a fresh CSI socket staging directory."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0034-M01\",\"item\":\"ratarmount_csi::linux::stage_dir\",\"disposition\":\"support\",\"category\":\"creation-builder\",\"reason\":\"Construct the mode-aware builder for a fresh CSI socket staging directory.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Builder setup only; the distinct create event owns the 0700 directory creation.\"}}",
-      "resolved": "<std::fs::DirBuilder>::new",
-      "rule_reason": "inventory-op:DirBuilder"
-    },
-    {
-      "configured_path": "std::fs::DirBuilder",
-      "item": "ratarmount_csi::linux::stage_dir",
-      "leaf_digest": "b0cd66081cc652dc0978efaa64f943b35199e8f407e3950415951ed93c473264",
-      "lint": "clippy::disallowed_types",
-      "metadata": {
-        "category": "builder-type-support",
-        "creation": {
-          "basis": "This is a type/import reference; it acquires no file or directory.",
-          "policy": "none"
-        },
-        "disposition": "support",
-        "id": "IR-E0034-T01",
-        "item": "ratarmount_csi::linux::stage_dir",
-        "reason": "Builder type support: Construct the mode-aware builder for a fresh CSI socket staging directory."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0034-T01\",\"item\":\"ratarmount_csi::linux::stage_dir\",\"disposition\":\"support\",\"category\":\"builder-type-support\",\"reason\":\"Builder type support: Construct the mode-aware builder for a fresh CSI socket staging directory.\",\"creation\":{\"policy\":\"none\",\"basis\":\"This is a type/import reference; it acquires no file or directory.\"}}",
-      "resolved": "std::fs::DirBuilder",
-      "rule_reason": "inventory-op:DirBuilder"
-    },
-    {
-      "configured_path": "std::fs::DirBuilder::create",
-      "item": "ratarmount_csi::linux::stage_dir",
-      "leaf_digest": "eb67567689e321b93f5bee1015d383859f3d9194b6395ae2489d305db2e64296",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "socket-staging-directory",
-        "creation": {
-          "basis": "The builder requests 0700 and retries EEXIST without binding elsewhere; staging cleanup is retained.",
-          "policy": "exclusive-directory"
-        },
-        "disposition": "output-owner",
-        "id": "IR-E0035-M01",
-        "item": "ratarmount_csi::linux::stage_dir",
-        "reason": "Create the fresh CSI socket staging directory using its generated collision-retried name."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0035-M01\",\"item\":\"ratarmount_csi::linux::stage_dir\",\"disposition\":\"output-owner\",\"category\":\"socket-staging-directory\",\"reason\":\"Create the fresh CSI socket staging directory using its generated collision-retried name.\",\"creation\":{\"policy\":\"exclusive-directory\",\"basis\":\"The builder requests 0700 and retries EEXIST without binding elsewhere; staging cleanup is retained.\"}}",
-      "resolved": "<std::fs::DirBuilder>::create",
-      "rule_reason": "inventory-op:fs::create_dir"
     },
     {
       "configured_path": "std::fs::File::open",
@@ -21658,86 +21658,6 @@
       "rule_reason": "inventory-op:OpenOptions"
     },
     {
-      "configured_path": "std::fs::OpenOptions::new",
-      "item": "ratarmount_volume_plugin::linux::bind_staged",
-      "leaf_digest": "215915a0707304838dcec8535ee489c6c578e19a329f1bb168081930d1b5fc35",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "baseline_reason": "O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content",
-        "category": "builder-setup",
-        "creation": {
-          "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions.",
-          "policy": "none"
-        },
-        "disposition": "support",
-        "id": "IR-B0550-M01",
-        "item": "ratarmount_volume_plugin::linux::bind_staged",
-        "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
-        "supports_disposition": "out-of-family"
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0550-M01\",\"item\":\"ratarmount_volume_plugin::linux::bind_staged\",\"disposition\":\"support\",\"category\":\"builder-setup\",\"reason\":\"Prepare the builder for this item's separately reviewed open/create leaf.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions.\"},\"supports_disposition\":\"out-of-family\",\"baseline_reason\":\"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content\"}",
-      "resolved": "<std::fs::OpenOptions>::new",
-      "rule_reason": "inventory-op:OpenOptions"
-    },
-    {
-      "configured_path": "std::fs::OpenOptions::open",
-      "item": "ratarmount_volume_plugin::linux::bind_staged",
-      "leaf_digest": "07c3106169a95615f99aa3f1bf0275d5c73e4df4c990f5cc0f220729ff82730c",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "directory-handle-or-durability",
-        "creation": {
-          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
-          "policy": "none"
-        },
-        "disposition": "out-of-family",
-        "id": "IR-B0550-M02",
-        "item": "ratarmount_volume_plugin::linux::bind_staged",
-        "reason": "O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content"
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0550-M02\",\"item\":\"ratarmount_volume_plugin::linux::bind_staged\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
-      "resolved": "<std::fs::OpenOptions>::open",
-      "rule_reason": "inventory-op:OpenOptions"
-    },
-    {
-      "configured_path": "std::fs::OpenOptions",
-      "item": "ratarmount_volume_plugin::linux::bind_staged",
-      "leaf_digest": "215915a0707304838dcec8535ee489c6c578e19a329f1bb168081930d1b5fc35",
-      "lint": "clippy::disallowed_types",
-      "metadata": {
-        "category": "builder-type-support",
-        "creation": {
-          "basis": "This is a type/import reference; it acquires no file or directory.",
-          "policy": "none"
-        },
-        "disposition": "support",
-        "id": "IR-B0550-T01",
-        "item": "ratarmount_volume_plugin::linux::bind_staged",
-        "reason": "Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content"
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0550-T01\",\"item\":\"ratarmount_volume_plugin::linux::bind_staged\",\"disposition\":\"support\",\"category\":\"builder-type-support\",\"reason\":\"Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content\",\"creation\":{\"policy\":\"none\",\"basis\":\"This is a type/import reference; it acquires no file or directory.\"}}",
-      "resolved": "std::fs::OpenOptions",
-      "rule_reason": "inventory-op:OpenOptions"
-    },
-    {
       "configured_path": "std::os::fd::FromRawFd::from_raw_fd",
       "item": "ratarmount_volume_plugin::linux::listener",
       "leaf_digest": "107f86db8a5b5da9fd6b36ef7588e6afd85e661be4ac735c6cfa27bf12aa0c7d",
@@ -21814,110 +21734,6 @@
       "reason": "internal-read:v1 {\"id\":\"IR-E0113-M01\",\"item\":\"ratarmount_volume_plugin::linux::listener\",\"disposition\":\"output-owner\",\"category\":\"socket-parent-directory\",\"reason\":\"Create the configured volume-plugin socket parent before staged binding.\",\"creation\":{\"policy\":\"recursive-directory\",\"basis\":\"The parent keeps current directory defaults; staging creation and final publication are separately reviewed.\"}}",
       "resolved": "std::fs::create_dir_all",
       "rule_reason": "inventory-op:fs::create_dir_all"
-    },
-    {
-      "configured_path": "libc::syscall",
-      "item": "ratarmount_volume_plugin::linux::rename_noreplace",
-      "leaf_digest": "5abbf301ec258473aceca9988304bb40859adb95331327a9042164f1fddbee4c",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "socket-publication",
-        "creation": {
-          "basis": "renameat2 moves the existing staged socket with RENAME_NOREPLACE; it opens no pathname or descriptor.",
-          "policy": "none"
-        },
-        "disposition": "out-of-family",
-        "id": "IR-E0111-M01",
-        "item": "ratarmount_volume_plugin::linux::rename_noreplace",
-        "reason": "Publish the already-bound volume-plugin socket with a no-replace rename syscall."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0111-M01\",\"item\":\"ratarmount_volume_plugin::linux::rename_noreplace\",\"disposition\":\"out-of-family\",\"category\":\"socket-publication\",\"reason\":\"Publish the already-bound volume-plugin socket with a no-replace rename syscall.\",\"creation\":{\"policy\":\"none\",\"basis\":\"renameat2 moves the existing staged socket with RENAME_NOREPLACE; it opens no pathname or descriptor.\"}}",
-      "resolved": "libc::unix::linux_like::linux::syscall",
-      "rule_reason": "inventory-op:libc::syscall"
-    },
-    {
-      "configured_path": "std::fs::DirBuilder::new",
-      "item": "ratarmount_volume_plugin::linux::stage_dir",
-      "leaf_digest": "b0cd66081cc652dc0978efaa64f943b35199e8f407e3950415951ed93c473264",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "creation-builder",
-        "creation": {
-          "basis": "Builder setup is separate from the following mode-0700 staging create operation.",
-          "policy": "none"
-        },
-        "disposition": "support",
-        "id": "IR-E0109-M01",
-        "item": "ratarmount_volume_plugin::linux::stage_dir",
-        "reason": "Construct the private socket staging-directory builder in the volume plugin binary."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0109-M01\",\"item\":\"ratarmount_volume_plugin::linux::stage_dir\",\"disposition\":\"support\",\"category\":\"creation-builder\",\"reason\":\"Construct the private socket staging-directory builder in the volume plugin binary.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Builder setup is separate from the following mode-0700 staging create operation.\"}}",
-      "resolved": "<std::fs::DirBuilder>::new",
-      "rule_reason": "inventory-op:DirBuilder"
-    },
-    {
-      "configured_path": "std::fs::DirBuilder",
-      "item": "ratarmount_volume_plugin::linux::stage_dir",
-      "leaf_digest": "b0cd66081cc652dc0978efaa64f943b35199e8f407e3950415951ed93c473264",
-      "lint": "clippy::disallowed_types",
-      "metadata": {
-        "category": "builder-type-support",
-        "creation": {
-          "basis": "This is a type/import reference; it acquires no file or directory.",
-          "policy": "none"
-        },
-        "disposition": "support",
-        "id": "IR-E0109-T01",
-        "item": "ratarmount_volume_plugin::linux::stage_dir",
-        "reason": "Builder type support: Construct the private socket staging-directory builder in the volume plugin binary."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0109-T01\",\"item\":\"ratarmount_volume_plugin::linux::stage_dir\",\"disposition\":\"support\",\"category\":\"builder-type-support\",\"reason\":\"Builder type support: Construct the private socket staging-directory builder in the volume plugin binary.\",\"creation\":{\"policy\":\"none\",\"basis\":\"This is a type/import reference; it acquires no file or directory.\"}}",
-      "resolved": "std::fs::DirBuilder",
-      "rule_reason": "inventory-op:DirBuilder"
-    },
-    {
-      "configured_path": "std::fs::DirBuilder::create",
-      "item": "ratarmount_volume_plugin::linux::stage_dir",
-      "leaf_digest": "eb67567689e321b93f5bee1015d383859f3d9194b6395ae2489d305db2e64296",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "socket-staging-directory",
-        "creation": {
-          "basis": "The generated name uses DirBuilder mode 0700; EEXIST retries and no replacing fallback is introduced.",
-          "policy": "exclusive-directory"
-        },
-        "disposition": "output-owner",
-        "id": "IR-E0110-M01",
-        "item": "ratarmount_volume_plugin::linux::stage_dir",
-        "reason": "Create a fresh private socket staging directory with bounded collision retry."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0110-M01\",\"item\":\"ratarmount_volume_plugin::linux::stage_dir\",\"disposition\":\"output-owner\",\"category\":\"socket-staging-directory\",\"reason\":\"Create a fresh private socket staging directory with bounded collision retry.\",\"creation\":{\"policy\":\"exclusive-directory\",\"basis\":\"The generated name uses DirBuilder mode 0700; EEXIST retries and no replacing fallback is introduced.\"}}",
-      "resolved": "<std::fs::DirBuilder>::create",
-      "rule_reason": "inventory-op:fs::create_dir"
     },
     {
       "configured_path": "std::fs::read",

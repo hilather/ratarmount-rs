@@ -7,6 +7,8 @@ mod atomic_update;
 mod attribute_mapping;
 pub mod budget;
 pub mod db_inodes;
+#[cfg(target_os = "linux")]
+pub mod owner_socket;
 mod quiet_print;
 mod redact;
 pub use atomic_update::{try_update_u64, try_update_usize};
