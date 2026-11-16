@@ -179,6 +179,17 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
     assert!(changelog.contains("now forks before it opens any database"));
 }
 
+/// Regression: #169 listed only the commit journal's archive opens, omitting
+/// the ZIP and TAR format probes from the unchecked-open inventory.
+#[test]
+fn regression_docs_169_names_unchecked_commit_probes() {
+    let docs = read("docs/sandbox.md");
+    assert!(
+        docs.contains("do not go through the check: the journal file `overlay pack --include-journal` reads (a JSON log, not a database) and the commit path's opens of the archive itself (the commit journal's, and the `is_zip_archive` and `is_uncompressed_tar` format probes that pick the commit method)."),
+        "docs/sandbox.md must name both commit format probes alongside the journal's unchecked archive opens"
+    );
+}
+
 /// Regression: unmount recipes ran offline verbs before the server released
 /// its lock, and a bare BEGIN IMMEDIATE probe could itself hold a reservation.
 #[test]
