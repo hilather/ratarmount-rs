@@ -7532,14 +7532,22 @@ fn recover_error_to_overlay(
 /// `root` (when it exists) from the locked descriptor before the journal is
 /// unlinked. `authorize` decides under the archive lock. The only offline
 /// recovery: a failed replacement cleans up after itself.
+/// `seen_present`: the entry gate saw the database (`Some(marked)`); see
+/// [`crate::journal_recovery::recover_journal_at_seen`] (#164).
 fn recover_offline(
     archive: &Path,
     root: &Path,
     owner: crate::journal_recovery::Owner<'_>,
+    seen_present: Option<bool>,
 ) -> Result<()> {
-    crate::journal_recovery::recover_journal_at(archive, Some(&root.join(HIDDEN_DB)), owner)
-        .map(|_| ())
-        .map_err(recover_error_to_overlay)
+    crate::journal_recovery::recover_journal_at_seen(
+        archive,
+        &root.join(HIDDEN_DB),
+        owner,
+        seen_present,
+    )
+    .map(|_| ())
+    .map_err(recover_error_to_overlay)
 }
 
 fn append_uncompressed_tar_plan(
@@ -7745,7 +7753,7 @@ fn commit_overlay_locked(
     opts: &CommitOverlayOptions,
 ) -> Result<bool> {
     crate::overlay_db::validate_overlay_state(&write_overlay.join(HIDDEN_DB))?;
-    match overlay_db_entry(write_overlay)? {
+    let marked = match overlay_db_entry(write_overlay)? {
         DbEntry::Absent => {
             return Err(OverlayError::Msg(format!(
                 "overlay {} has no database; use commit_overlay_raw_dir for a raw directory",
@@ -7755,8 +7763,9 @@ fn commit_overlay_locked(
         DbEntry::Lost { markers, .. } => return Err(lost_record_error(write_overlay, &markers)),
         DbEntry::Present { marked, .. } => {
             ensure_overlay_unsealed_required(write_overlay, marked, write_overlay)?;
+            marked
         }
-    }
+    };
     if let Err(refusal) =
         crate::overlay_gate::check_commit_base_offline(write_overlay, base, archive_file)
     {
@@ -7765,7 +7774,7 @@ fn commit_overlay_locked(
         }
         log::warn!("{refusal} (--force-base-mismatch: committing anyway)");
     }
-    commit_overlay_inner(write_overlay, archive_file, Some(base), opts)
+    commit_overlay_inner(write_overlay, archive_file, Some(base), opts, Some(marked))
 }
 
 /// Serializes seal and offline commit for one overlay, including when callers
@@ -7913,18 +7922,21 @@ fn commit_overlay_raw_dir_locked(
         crate::overlay_gate::ensure_journal_is_for_archive(archive_file)
             .map_err(OverlayError::Msg)?;
     }
-    let committed = commit_overlay_inner(write_overlay, archive_file, None, opts)?;
+    let committed = commit_overlay_inner(write_overlay, archive_file, None, opts, None)?;
     Ok(RawDirCommit {
         committed,
         identity_checked: false,
     })
 }
 
+/// `seen_present`: the entry gate saw the overlay database (`Some(marked)`);
+/// `None` for a raw directory (no database).
 fn commit_overlay_inner(
     write_overlay: &Path,
     archive_file: &Path,
     identity: Option<&crate::ClassifiedBase>,
     opts: &CommitOverlayOptions,
+    seen_present: Option<bool>,
 ) -> Result<bool> {
     if !write_overlay.is_dir() {
         return Err(OverlayError::Msg(
@@ -7959,7 +7971,7 @@ fn commit_overlay_inner(
             },
             _ => Owner::Inode,
         };
-        recover_offline(archive_file, write_overlay, owner)?;
+        recover_offline(archive_file, write_overlay, owner, seen_present)?;
     }
     // The one snapshot every write of this commit compares against: the file
     // the gate accepts after recovery (one stat when no identity applies).

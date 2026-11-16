@@ -281,6 +281,29 @@ impl<'a> Rows<'a> {
         rows
     }
 
+    /// [`Rows::path`] that also keeps what an earlier gate saw (#164): a
+    /// present database (`Some(marked)`) stays required even if it and its
+    /// marker vanished before this classification, so the guard refuses
+    /// `Absent` instead of reading it as "no record".
+    pub(crate) fn path_seen(db: &'a Path, seen_present: Option<bool>) -> Self {
+        let rows = Self::path(db);
+        if let (
+            Some(marked),
+            Rows::Path {
+                must_exist,
+                required_files,
+                ..
+            },
+        ) = (seen_present, &rows)
+        {
+            must_exist.set(true);
+            if marked {
+                required_files.set(true);
+            }
+        }
+        rows
+    }
+
     /// Raise [`Rows::Path`]'s flags from a classification.
     fn observe(&self, entry: &DbEntry) {
         if let Rows::Path {
@@ -748,6 +771,21 @@ pub fn recover_journal_at(
     // journal never touches the overlay database here.
     let rows = overlay_db.map_or(Rows::None, Rows::path);
     recover_journal(archive, rows, owner)
+}
+
+/// [`recover_journal_at`] of an offline commit whose entry gate saw the
+/// overlay database present (`Some(marked)`) before this call (#164): that
+/// observation is kept in the rows guard, so a database and marker that both
+/// vanished since refuse before any recovery write (a stale locator's clear
+/// included) instead of reading as "no record".
+pub(crate) fn recover_journal_at_seen(
+    archive: &Path,
+    overlay_db: &Path,
+    owner: Owner<'_>,
+    seen_present: Option<bool>,
+) -> std::result::Result<Option<Applied>, RecoverError> {
+    crate::overlay_db::validate_overlay_state(overlay_db).map_err(RecoverError::Refused)?;
+    recover_journal(archive, Rows::path_seen(overlay_db, seen_present), owner)
 }
 
 /// The journal rule an offline open owes a base. Journals are never applied

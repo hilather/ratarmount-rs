@@ -4098,6 +4098,45 @@ fn regression_offline_db_deleted_after_gate_keeps_recorded_owner() {
     );
 }
 
+/// Regression: #164: offline recovery built its rows guard from a fresh
+/// classification after the entry gate. When the database AND its marker
+/// vanished in that window, nothing said a record had been seen, the guard
+/// accepted `Absent` and a stale prepare locator was cleared before the later
+/// gate refused. The gate's observation (a present, marked record) is carried
+/// into the guard: the commit refuses with the locator, archive and overlay
+/// data untouched.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_164_offline_recovery_keeps_the_gates_record_requirement() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    let fx = Fixture::new();
+    let ov = fx.open(BaseDigestRequest::Compute, false);
+    fs::write(ov.root().join("new"), b"new").unwrap();
+    drop(ov);
+    stale_prepare(&fx.archive);
+    let before = locator(&fx.archive);
+    let archive_before = fs::read(&fx.archive).unwrap();
+    let overlay = fx.overlay.clone();
+    crate::write_overlay::BEFORE_OFFLINE_RECOVERY.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            fs::remove_file(overlay.join(HIDDEN_DB)).unwrap();
+            fs::remove_file(overlay.join(crate::OVERLAY_MARKER)).unwrap();
+        }));
+    });
+    let opts = CommitOverlayOptions {
+        yes: true,
+        ..Default::default()
+    };
+    let result =
+        crate::commit_overlay(&fx.overlay, &fx.archive, &archive_token(&fx.archive), &opts);
+    crate::write_overlay::BEFORE_OFFLINE_RECOVERY.with(|hook| *hook.borrow_mut() = None);
+    let error = result.expect_err("refused").to_string();
+    assert_eq!(locator(&fx.archive), before, "stale locator kept: {error}");
+    assert!(error.contains("disappeared"), "{error}");
+    assert_eq!(fs::read(&fx.archive).unwrap(), archive_before, "archive");
+    assert_eq!(fs::read(fx.overlay.join("new")).unwrap(), b"new");
+}
+
 /// What replaces the overlay database in [`regression_offline_gates_refuse_non_regular_db`].
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
