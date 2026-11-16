@@ -161,8 +161,29 @@ struct Worker {
     status: Option<ExitStatus>,
     /// File outside the mount the worker rewrites after each finished iteration.
     progress: Option<PathBuf>,
+    observed: WorkerProgress,
+}
+
+struct WorkerProgress {
     last_progress: String,
     last_change: Instant,
+}
+
+impl WorkerProgress {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_progress: String::new(),
+            last_change: now,
+        }
+    }
+
+    fn observe(&mut self, text: &str, now: Instant) {
+        // An empty read is a rewrite in flight, not progress.
+        if !text.is_empty() && text != self.last_progress {
+            self.last_progress = text.to_string();
+            self.last_change = now;
+        }
+    }
 }
 
 struct MountGuard {
@@ -268,8 +289,7 @@ fn regression_deadlock_cleanup_never_signals_a_reaped_workers_group() {
         log: dir.path().join("worker.log"),
         status,
         progress: None,
-        last_progress: String::new(),
-        last_change: Instant::now(),
+        observed: WorkerProgress::new(Instant::now()),
     };
     let daemon = Command::new("sleep").arg("60").spawn().unwrap();
     let mut guard = MountGuard {
@@ -300,96 +320,237 @@ fn regression_deadlock_cleanup_never_signals_a_reaped_workers_group() {
     );
 }
 
-/// Regression (#249): the wave failed as "deadlock" whenever it took over 30 s in total, which
-/// a disk busy with writeback causes while every worker still progresses (the request thread
-/// waits in `jbd2_log_wait_commit` for the overlay's fsyncs). A worker that keeps finishing
-/// iterations must pass however long the wave runs; one that stops must still be flagged after
-/// the stall window, long before the cap; progress past the cap is reported apart. Needs no FUSE.
+/// Regression (#249): progressing waves can outlast a stall window, but one stuck worker
+/// still fails and the overall cap remains distinct. Simulate time: the former shell fixture
+/// could itself flake when scheduling or I/O delayed its 100 ms iterations by 1.5 s.
 #[test]
 fn regression_wave_wait_tolerates_slow_progress_and_flags_a_stall() {
-    if !on_path("bash") {
-        eprintln!("skip: bash missing");
+    let start = Instant::now();
+    let deadline = start + WAVE_CAP;
+    let mut workers = [WorkerProgress::new(start), WorkerProgress::new(start)];
+    for iteration in 1..=6 {
+        let now = start + WAVE_STALL / 2 * iteration;
+        for worker in &mut workers {
+            worker.observe(&format!("{iteration}\n"), now);
+        }
+        assert!(wave_verdict(workers.iter().enumerate(), now, WAVE_STALL, deadline).is_none());
+    }
+    // Both can finish after three stall windows without a whole-wave timeout.
+    let now = start + WAVE_STALL * 3;
+    assert!(matches!(
+        wave_verdict(std::iter::empty(), now, WAVE_STALL, deadline),
+        Some(Wait::Done)
+    ));
+
+    // The other worker's progress must not extend worker 1's deadline.
+    let now = now + WAVE_STALL;
+    workers[0].observe("7\n", now);
+    assert!(matches!(
+        wave_verdict(workers.iter().enumerate(), now, WAVE_STALL, deadline),
+        Some(Wait::Stalled(ids)) if ids == vec![1]
+    ));
+
+    // Keep both workers advancing until exactly the cap, without any stalled worker.
+    let mut workers = [WorkerProgress::new(start), WorkerProgress::new(start)];
+    for iteration in 1..=20 {
+        let now = start + WAVE_STALL / 2 * iteration;
+        for worker in &mut workers {
+            worker.observe(&format!("{iteration}\n"), now);
+        }
+        let verdict = wave_verdict(workers.iter().enumerate(), now, WAVE_STALL, deadline);
+        if now < deadline {
+            assert!(verdict.is_none(), "{verdict:?}");
+        } else {
+            assert!(matches!(verdict, Some(Wait::OverCap)), "{verdict:?}");
+        }
+    }
+}
+
+/// Regression (#249 review): a full stop, including before the first marker, must fail.
+/// Missing, empty (truncate in flight), and unchanged markers cannot refresh the stall timer.
+#[test]
+fn regression_wave_wait_missing_empty_and_unchanged_markers_stall() {
+    let start = Instant::now();
+    let deadline = start + WAVE_CAP;
+    let mut workers = [WorkerProgress::new(start), WorkerProgress::new(start)];
+    workers[1].observe("1\n", start + Duration::from_secs(10));
+    let before_stall = start + WAVE_STALL - Duration::from_secs(1);
+    workers[0].observe("", before_stall);
+    workers[1].observe("1\n", before_stall);
+    assert!(wave_verdict(
+        workers.iter().enumerate(),
+        before_stall,
+        WAVE_STALL,
+        deadline
+    )
+    .is_none());
+    assert!(matches!(
+        wave_verdict(workers.iter().enumerate(), start + WAVE_STALL, WAVE_STALL, deadline),
+        Some(Wait::Stalled(ids)) if ids == vec![0]
+    ));
+
+    let now = start + WAVE_STALL + Duration::from_secs(10);
+    workers[1].observe("", now);
+    workers[1].observe("1\n", now);
+    assert!(matches!(
+        wave_verdict(workers.iter().enumerate(), now, WAVE_STALL, deadline),
+        Some(Wait::Stalled(ids)) if ids == vec![0, 1]
+    ));
+    // A stopped wave is still a stall if the next poll is delayed past the overall cap.
+    assert!(matches!(
+        wave_verdict(workers.iter().enumerate(), deadline, WAVE_STALL, deadline),
+        Some(Wait::Stalled(ids)) if ids == vec![0, 1]
+    ));
+}
+
+fn unmounted_guard(root: &Path) -> MountGuard {
+    let daemon = Command::new("sleep").arg("600").spawn().unwrap();
+    MountGuard {
+        mnt: root.join("mnt"),
+        daemon_pid: daemon.id(),
+        daemon,
+        daemon_log: root.join("daemon.log"),
+        workers: Vec::new(),
+        armed: true,
+        defused: false,
+    }
+}
+
+/// Regression (#249 review): the real worker scripts must publish completed iterations outside
+/// their working directory. A fast FUSE run also passed with the marker writes removed.
+#[test]
+fn regression_wave_worker_scripts_publish_progress() {
+    if !on_path("bash") || !on_path("sleep") {
+        eprintln!("skip: bash or sleep missing (pure wave timing tests still run)");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    // Finishes one iteration every 100 ms, `$1` in all.
-    let steady = dir.path().join("steady.sh");
+    let work = dir.path().join("work");
+    let source = dir.path().join("source");
+    fs::create_dir(&work).unwrap();
+    fs::create_dir(&source).unwrap();
+    for n in 1..=2 {
+        fs::write(source.join(format!("s1-{n}")), "original").unwrap();
+    }
+    let mut guard = unmounted_guard(dir.path());
+    for (label, script) in [("churn", CHURN_SH), ("mutator", MUTATOR_SH)] {
+        let path = dir.path().join(format!("{label}.sh"));
+        fs::write(&path, script).unwrap();
+        guard.spawn_worker(
+            &path,
+            &[
+                "1".into(),
+                source.display().to_string(),
+                "2".into(),
+                work.display().to_string(),
+            ],
+            &dir.path().join(format!("{label}.log")),
+            label,
+            Some(&work.join(format!("{label}.progress"))),
+        );
+    }
+    assert!(matches!(
+        guard.wait_workers(WAVE_STALL, WAVE_CAP),
+        Wait::Done
+    ));
+    guard.assert_workers_ok("marker scripts");
+    for label in ["churn", "mutator"] {
+        assert_eq!(
+            fs::read_to_string(work.join(format!("{label}.progress"))).unwrap(),
+            "2\n",
+            "{label} did not publish its final completed iteration"
+        );
+    }
+}
+
+/// Regression (#249 review): exercise real marker reads, process-group diagnostics and cleanup
+/// without relying on a short scheduling window or mounting FUSE.
+#[test]
+fn regression_wave_stall_report_and_cleanup() {
+    use std::os::unix::process::ExitStatusExt;
+
+    if !on_path("bash") || !on_path("sleep") {
+        eprintln!("skip: bash or sleep missing (pure wave timing tests still run)");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("stuck.sh");
+    // Publish the descendant's pid so diagnostics must find the whole group, not just bash.
     fs::write(
-        &steady,
-        "n=1; while [ \"$n\" -le \"$1\" ]; do sleep 0.1; printf '%s\\n' \"$n\" > \"$RRS_PROGRESS\"; n=$((n + 1)); done\n",
+        &script,
+        "sleep 600 &\nprintf '%s\\n' \"$!\" > \"$RRS_PROGRESS\"\nwait\n",
     )
     .unwrap();
-    // Finishes one iteration, then blocks as a deadlocked worker would.
-    let stuck = dir.path().join("stuck.sh");
-    fs::write(&stuck, "printf '1\\n' > \"$RRS_PROGRESS\"; exec sleep 60\n").unwrap();
-    let guard = |dir: &Path| {
-        let daemon = Command::new("sleep").arg("60").spawn().unwrap();
-        MountGuard {
-            mnt: dir.join("mnt"),
-            daemon_pid: daemon.id(),
-            daemon,
-            daemon_log: dir.join("daemon.log"),
-            workers: Vec::new(),
-            armed: true,
-            defused: false,
+    let progress = dir.path().join("progress");
+    let mut guard = unmounted_guard(dir.path());
+    guard.spawn_worker(
+        &script,
+        &[],
+        &dir.path().join("worker.log"),
+        "stuck",
+        Some(&progress),
+    );
+    let ready_deadline = Instant::now() + WAVE_STALL;
+    let descendant: u32 = loop {
+        if let Some(pid) = fs::read_to_string(&progress)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            break pid;
         }
+        assert!(
+            Instant::now() < ready_deadline,
+            "worker never published readiness"
+        );
+        sleep_up_to(ready_deadline, Duration::from_millis(20));
     };
-    let spawn = |g: &mut MountGuard, script: &Path, args: &[&str], label: &str| {
-        let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
-        let progress = dir.path().join(format!("progress-{label}"));
-        let log = dir.path().join(format!("{label}.log"));
-        g.spawn_worker(script, &args, &log, label, Some(&progress));
-    };
-    let stall = Duration::from_millis(1500);
-
-    // 30 iterations (about 3 s, twice the stall window) with no gap near the window.
-    let mut g = guard(dir.path());
-    spawn(&mut g, &steady, &["30"], "slow");
-    let t0 = Instant::now();
-    let verdict = g.wait_workers(stall, Duration::from_secs(60));
+    // Zero makes the first poll report a stall, independently of scheduler latency.
+    assert!(matches!(
+        guard.wait_workers(Duration::ZERO, WAVE_CAP),
+        Wait::Stalled(ids) if ids == vec![0]
+    ));
+    let report = guard.stall_report(&[0]);
     assert!(
-        matches!(verdict, Wait::Done),
-        "a progressing worker was not allowed to finish"
-    );
-    assert!(
-        t0.elapsed() > stall,
-        "the slow worker finished inside one stall window"
-    );
-    g.assert_workers_ok("slow");
-    drop(g);
-
-    let mut g = guard(dir.path());
-    spawn(&mut g, &steady, &["600"], "busy");
-    spawn(&mut g, &stuck, &[], "stuck");
-    let t0 = Instant::now();
-    let verdict = g.wait_workers(stall, Duration::from_secs(30));
-    let elapsed = t0.elapsed();
-    match verdict {
-        Wait::Stalled(ids) => assert_eq!(ids, vec![1], "only the stuck worker is stalled"),
-        _ => panic!("a worker that stopped was not reported stalled"),
-    }
-    assert!(
-        elapsed >= stall && elapsed < Duration::from_secs(10),
-        "{elapsed:?}"
-    );
-    let report = g.stall_report(&[1]);
-    assert!(
-        report.contains("stuck pid") && report.contains("last iteration 1"),
+        report.contains(&format!("last iteration {descendant}")),
         "{report}"
     );
-    assert!(
-        report.contains("sleep 60"),
-        "the blocked process is not in the report: {report}"
+    for pid in [guard.daemon_pid, guard.workers[0].child.id(), descendant] {
+        assert!(
+            report.contains(&format!("tid {pid} ")),
+            "missing pid {pid}: {report}"
+        );
+    }
+    assert!(report.contains("wchan"), "{report}");
+    guard.deadlock_cleanup();
+    assert_eq!(
+        guard.workers[0].status.and_then(|s| s.signal()),
+        Some(libc::SIGKILL)
     );
-    drop(g);
-
-    let mut g = guard(dir.path());
-    spawn(&mut g, &steady, &["600"], "long");
-    let verdict = g.wait_workers(stall, Duration::from_secs(2));
-    assert!(
-        matches!(verdict, Wait::OverCap),
-        "progress past the cap was not reported as such"
+    assert_eq!(
+        guard.daemon.try_wait().unwrap().unwrap().signal(),
+        Some(libc::SIGKILL)
     );
+    let deadline = Instant::now() + KILL_REAP;
+    loop {
+        let stat = fs::read_to_string(format!("/proc/{descendant}/stat"));
+        // A killed descendant may await reaping by init after its shell is killed.
+        if stat
+            .as_ref()
+            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+            || stat.as_ref().is_ok_and(|s| {
+                s.rsplit_once(')').is_some_and(|(_, fields)| {
+                    matches!(fields.split_whitespace().next(), Some("Z" | "X"))
+                })
+            })
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker descendant still running: {stat:?}"
+        );
+        sleep_up_to(deadline, Duration::from_millis(20));
+    }
 }
 
 /// Regression: Latin-1 file names must return EILSEQ without a U+FFFD overlay row.
@@ -724,8 +885,7 @@ impl MountGuard {
             log: log_path.to_path_buf(),
             status: early,
             progress: progress.map(Path::to_path_buf),
-            last_progress: String::new(),
-            last_change: Instant::now(),
+            observed: WorkerProgress::new(Instant::now()),
         });
     }
 
@@ -736,9 +896,7 @@ impl MountGuard {
         let deadline = Instant::now() + cap;
         loop {
             let now = Instant::now();
-            let mut pending = false;
-            let mut stuck = Vec::new();
-            for (i, w) in self.workers.iter_mut().enumerate() {
+            for w in &mut self.workers {
                 if w.status.is_some() {
                     continue;
                 }
@@ -747,30 +905,23 @@ impl MountGuard {
                         w.status = Some(st);
                         continue;
                     }
-                    Ok(None) => pending = true,
+                    Ok(None) => {}
                     Err(e) => return Wait::Error(e),
                 }
                 if let Some(p) = &w.progress {
-                    // An empty read is a rewrite in flight, not progress.
                     if let Ok(text) = fs::read_to_string(p) {
-                        if !text.is_empty() && text != w.last_progress {
-                            w.last_progress = text;
-                            w.last_change = now;
-                        }
+                        w.observed.observe(&text, now);
                     }
                 }
-                if now.duration_since(w.last_change) >= stall {
-                    stuck.push(i);
-                }
             }
-            if !pending {
-                return Wait::Done;
-            }
-            if !stuck.is_empty() {
-                return Wait::Stalled(stuck);
-            }
-            if now >= deadline {
-                return Wait::OverCap;
+            let pending = self
+                .workers
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| w.status.is_none())
+                .map(|(i, w)| (i, &w.observed));
+            if let Some(verdict) = wave_verdict(pending, now, stall, deadline) {
+                return verdict;
             }
             sleep_up_to(deadline, Duration::from_millis(20));
         }
@@ -783,13 +934,13 @@ impl MountGuard {
         let mut out = format!("daemon threads:\n{}", proc_snapshot(self.daemon_pid));
         for &i in workers {
             let w = &self.workers[i];
-            let last = w.last_progress.trim();
+            let last = w.observed.last_progress.trim();
             out.push_str(&format!(
                 "{} pid {} last iteration {} ({:?} ago):\n",
                 w.label,
                 w.child.id(),
                 if last.is_empty() { "none" } else { last },
-                w.last_change.elapsed()
+                w.observed.last_change.elapsed()
             ));
             for pid in group_members(w.pgid) {
                 let cmd = fs::read_to_string(format!("/proc/{pid}/cmdline"))
@@ -858,12 +1009,39 @@ impl MountGuard {
     }
 }
 
+#[derive(Debug)]
 enum Wait {
     Done,
     /// Indices into `MountGuard::workers`.
     Stalled(Vec<usize>),
     OverCap,
     Error(io::Error),
+}
+
+/// Pure decision shared by the real polling loop and tests with a simulated clock.
+fn wave_verdict<'a>(
+    pending: impl Iterator<Item = (usize, &'a WorkerProgress)>,
+    now: Instant,
+    stall: Duration,
+    deadline: Instant,
+) -> Option<Wait> {
+    let mut any_pending = false;
+    let mut stuck = Vec::new();
+    for (i, progress) in pending {
+        any_pending = true;
+        if now.duration_since(progress.last_change) >= stall {
+            stuck.push(i);
+        }
+    }
+    if !any_pending {
+        Some(Wait::Done)
+    } else if !stuck.is_empty() {
+        Some(Wait::Stalled(stuck))
+    } else if now >= deadline {
+        Some(Wait::OverCap)
+    } else {
+        None
+    }
 }
 
 /// Live processes whose process group is `pgid`.
