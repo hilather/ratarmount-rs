@@ -318,7 +318,11 @@ impl Directory {
                 // Legacy per-entry locks: never remove a held lock or a recent one.
                 if let Ok(file) = self.file(&name) {
                     if old_enough(&file.metadata()?, now) && file.try_lock().is_ok() {
-                        self.unlink(&name, false)?;
+                        let unlinked = self.unlink(&name, false);
+                        // Explicit (#187): a forked child may hold a copy of `file`.
+                        let unlocked = file.unlock();
+                        unlinked?;
+                        unlocked?;
                     }
                 }
             }

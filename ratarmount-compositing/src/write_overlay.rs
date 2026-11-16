@@ -248,6 +248,10 @@ thread_local! {
     /// database in [`overlay_db_regular`] on this thread fails with this errno.
     pub(crate) static FOLLOWED_STAT_ERRNO: std::cell::Cell<Option<i32>> =
         const { std::cell::Cell::new(None) };
+    /// Test seam (#176): change the entry after its metadata was read, before
+    /// the classifier consumes that observation. Runs once on this thread.
+    pub(crate) static AFTER_FOLLOWED_DB_STAT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -264,7 +268,12 @@ fn followed_db_stat(db_path: &Path) -> io::Result<fs::Metadata> {
     if let Some(errno) = FOLLOWED_STAT_ERRNO.with(|seam| seam.get()) {
         return Err(io::Error::from_raw_os_error(errno));
     }
-    fs::metadata(db_path)
+    let metadata = fs::metadata(db_path);
+    #[cfg(test)]
+    if let Some(hook) = AFTER_FOLLOWED_DB_STAT.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+    metadata
 }
 
 /// An I/O error with what failed on which path (#179): the text names both,
@@ -4722,9 +4731,20 @@ impl WriteOverlay {
         let archive_path = self.commit_archive_path(archive);
         let archive = archive_path.as_path();
         self.gate_pending_journal(archive)?;
-        if let Err(e) = self.recover_journal_after_gate(archive) {
-            self.refuse_base_after_commit_failure();
-            return Err(e);
+        if let Err(error) = self.recover_journal_raw(archive, None) {
+            // A refusal (the authorizer or the #150 guard) wrote nothing: it
+            // refuses this commit only and the mount keeps serving (R6-2,
+            // #166). A recovery that could not finish may have written, so
+            // the base is refused until a remount.
+            let wrote = !matches!(
+                error,
+                ratarmount_compress::commit_journal::RecoverError::Refused(_)
+            );
+            let error = self.recover_error(error);
+            if wrote {
+                self.refuse_base_after_commit_failure();
+            }
+            return Err(error);
         }
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
@@ -5168,18 +5188,27 @@ impl WriteOverlay {
         archive: &Path,
         admitted: Option<&crate::MountRecords>,
     ) -> Result<Option<ratarmount_compress::commit_journal::Applied>> {
-        use ratarmount_compress::commit_journal::RecoverError;
         self.recover_journal_raw(archive, admitted)
-            .map_err(|error| match error {
-                RecoverError::Committed(e) => {
-                    self.refuse_base_after_commit_failure();
-                    OverlayError::Msg(format!(
-                        "{e}; the archive holds the committed bytes but the recorded baseline \
+            .map_err(|error| self.recover_error(error))
+    }
+
+    /// A recovery error as this overlay answers it; committed bytes whose
+    /// baseline could not be updated refuse the base until a remount.
+    fn recover_error(
+        &self,
+        error: ratarmount_compress::commit_journal::RecoverError,
+    ) -> OverlayError {
+        use ratarmount_compress::commit_journal::RecoverError;
+        match error {
+            RecoverError::Committed(e) => {
+                self.refuse_base_after_commit_failure();
+                OverlayError::Msg(format!(
+                    "{e}; the archive holds the committed bytes but the recorded baseline \
                      could not be updated (remount required)"
-                    ))
-                }
-                other => OverlayError::Io(other.into_io()),
-            })
+                ))
+            }
+            other => OverlayError::Io(other.into_io()),
+        }
     }
 
     /// The recorded base digest kind and digest, read through the mount's own
@@ -7558,14 +7587,22 @@ fn recover_error_to_overlay(
 /// `root` (when it exists) from the locked descriptor before the journal is
 /// unlinked. `authorize` decides under the archive lock. The only offline
 /// recovery: a failed replacement cleans up after itself.
+/// `seen_present`: the entry gate saw the database (`Some(marked)`); see
+/// [`crate::journal_recovery::recover_journal_at_seen`] (#164).
 fn recover_offline(
     archive: &Path,
     root: &Path,
     owner: crate::journal_recovery::Owner<'_>,
+    seen_present: Option<bool>,
 ) -> Result<()> {
-    crate::journal_recovery::recover_journal_at(archive, Some(&root.join(HIDDEN_DB)), owner)
-        .map(|_| ())
-        .map_err(recover_error_to_overlay)
+    crate::journal_recovery::recover_journal_at_seen(
+        archive,
+        &root.join(HIDDEN_DB),
+        owner,
+        seen_present,
+    )
+    .map(|_| ())
+    .map_err(recover_error_to_overlay)
 }
 
 fn append_uncompressed_tar_plan(
@@ -7771,7 +7808,7 @@ fn commit_overlay_locked(
     opts: &CommitOverlayOptions,
 ) -> Result<bool> {
     crate::overlay_db::validate_overlay_state(&write_overlay.join(HIDDEN_DB))?;
-    match overlay_db_entry(write_overlay)? {
+    let required = std::cell::Cell::new(match overlay_db_entry(write_overlay)? {
         DbEntry::Absent => {
             return Err(OverlayError::Msg(format!(
                 "overlay {} has no database; use commit_overlay_raw_dir for a raw directory",
@@ -7779,25 +7816,36 @@ fn commit_overlay_locked(
             )))
         }
         DbEntry::Lost { markers, .. } => return Err(lost_record_error(write_overlay, &markers)),
-        DbEntry::Present { marked, .. } => {
-            ensure_overlay_unsealed_required(write_overlay, marked, write_overlay)?;
-        }
-    }
-    if let Err(refusal) =
-        crate::overlay_gate::check_commit_base_offline(write_overlay, base, archive_file)
-    {
+        DbEntry::Present { marked, .. } => marked,
+    });
+    ensure_overlay_unsealed_required(write_overlay, &required, write_overlay)?;
+    if let Err(refusal) = crate::overlay_gate::check_commit_base_offline_with(
+        write_overlay,
+        base,
+        archive_file,
+        None,
+        &required,
+    ) {
         if !opts.force_base_mismatch || refusal.is_policy() {
             return Err(refusal.into_overlay_error());
         }
         log::warn!("{refusal} (--force-base-mismatch: committing anyway)");
     }
-    commit_overlay_inner(write_overlay, archive_file, Some(base), opts)
+    commit_overlay_inner(
+        write_overlay,
+        archive_file,
+        Some(base),
+        opts,
+        Some(required.get()),
+    )
 }
 
 /// Serializes seal and offline commit for one overlay, including when callers
 /// name different copies of its base. Always acquire before an archive guard.
 /// An O_RDONLY | O_DIRECTORY handle locks the root itself without changing
-/// permissions or creating bookkeeping. Closing the handle releases the flock.
+/// permissions or creating bookkeeping. Dropping the guard unlocks it
+/// explicitly (#187): a child forked meanwhile (tar, git) holds a copy of the
+/// descriptor until it execs, so closing ours alone may not release it.
 pub(crate) struct SealCommitGuard {
     #[cfg(unix)]
     _fd: std::os::fd::OwnedFd,
@@ -7854,6 +7902,22 @@ impl SealCommitGuard {
     }
 }
 
+impl Drop for SealCommitGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the guard owns the descriptor until after this call.
+            if unsafe { libc::flock(self._fd.as_raw_fd(), libc::LOCK_UN) } != 0 {
+                log::warn!(
+                    "releasing the overlay seal/commit lock: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
 #[cfg(all(test, not(unix)))]
 #[test]
 fn regression_nonunix_commit_guard_accepts_unsealed_overlay() {
@@ -7877,15 +7941,15 @@ fn ensure_overlay_unsealed_display(write_overlay: &Path, display_path: &Path) ->
         DbEntry::Lost { markers, .. } => return Err(lost_record_error(write_overlay, &markers)),
         DbEntry::Present { marked, .. } => marked,
     };
-    ensure_overlay_unsealed_required(write_overlay, marked, display_path)
+    ensure_overlay_unsealed_required(write_overlay, &std::cell::Cell::new(marked), display_path)
 }
 
 fn ensure_overlay_unsealed_required(
     write_overlay: &Path,
-    marked: bool,
+    required: &std::cell::Cell<bool>,
     display_path: &Path,
 ) -> Result<()> {
-    let meta = crate::OverlayMeta::read_no_recovery_required(write_overlay, marked)?;
+    let meta = crate::OverlayMeta::read_no_recovery_required(write_overlay, required)?;
     if meta.as_ref().is_some_and(crate::OverlayMeta::layer_sealed) {
         return Err(OverlayError::Msg(format!(
             "overlay {} is sealed; mount it with --lower, or `overlay unseal`",
@@ -7924,33 +7988,41 @@ fn commit_overlay_raw_dir_locked(
 ) -> Result<RawDirCommit> {
     let db = write_overlay.join(HIDDEN_DB);
     crate::overlay_db::validate_overlay_state(&db)?;
-    if let DbEntry::Lost { markers, .. } = overlay_db_entry(write_overlay)? {
-        return Err(lost_record_error(write_overlay, &markers));
-    }
-    if !overlay_db_absent(write_overlay) {
-        return Err(OverlayError::Msg(format!(
-            "overlay database {} exists (or something else is at its path); its base \
-             identity must be checked, so commit it with a classified base \
-             (commit_overlay), not as a raw directory",
-            db.display()
-        )));
+    // One classification (#176): a second one could disagree under a race and
+    // misname an unresolvable entry as an existing database. Its own error
+    // (an unresolvable or non-regular entry) propagates with its own text.
+    match overlay_db_entry(write_overlay)? {
+        DbEntry::Absent => {}
+        DbEntry::Lost { markers, .. } => {
+            return Err(lost_record_error(write_overlay, &markers));
+        }
+        DbEntry::Present { .. } => {
+            return Err(OverlayError::Msg(format!(
+                "overlay database {} exists; its base identity must be checked, so \
+                 commit it with a classified base (commit_overlay), not as a raw directory",
+                db.display()
+            )));
+        }
     }
     if !opts.force_base_mismatch {
         crate::overlay_gate::ensure_journal_is_for_archive(archive_file)
             .map_err(OverlayError::Msg)?;
     }
-    let committed = commit_overlay_inner(write_overlay, archive_file, None, opts)?;
+    let committed = commit_overlay_inner(write_overlay, archive_file, None, opts, None)?;
     Ok(RawDirCommit {
         committed,
         identity_checked: false,
     })
 }
 
+/// `seen_present`: the entry gate saw the overlay database (`Some(marked)`);
+/// `None` for a raw directory (no database).
 fn commit_overlay_inner(
     write_overlay: &Path,
     archive_file: &Path,
     identity: Option<&crate::ClassifiedBase>,
     opts: &CommitOverlayOptions,
+    seen_present: Option<bool>,
 ) -> Result<bool> {
     if !write_overlay.is_dir() {
         return Err(OverlayError::Msg(
@@ -7985,7 +8057,7 @@ fn commit_overlay_inner(
             },
             _ => Owner::Inode,
         };
-        recover_offline(archive_file, write_overlay, owner)?;
+        recover_offline(archive_file, write_overlay, owner, seen_present)?;
     }
     // The one snapshot every write of this commit compares against: the file
     // the gate accepts after recovery (one stat when no identity applies).

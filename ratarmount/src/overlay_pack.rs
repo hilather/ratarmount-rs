@@ -501,17 +501,18 @@ pub fn pack(
         clippy::disallowed_methods,
         reason = r###"internal-read:v1 {"id":"IR-B0060-M01","item":"ratarmount::overlay_pack::pack","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
-    let mut encoded = tempfile::Builder::new()
+    let encoded = tempfile::Builder::new()
         .prefix(PACK_TEMP_PREFIX)
         .suffix(PACK_TEMP_SUFFIX)
         .tempfile_in(output_parent)?;
     // Held while the file is written, so a concurrent pack's sweep never
-    // removes a live temp file; released when the process exits or is killed.
+    // removes a live temp file. Also unlock on compression/publication failure.
     if !try_flock(encoded.as_file()) {
         return Err(io::Error::other(
             "pack temp file is locked by another process",
         ));
     }
+    let mut encoded = LockedTempFile(Some(encoded));
     ratarmount_compositing::overlay_meta::test_pack_hold();
     {
         let mut writer =
@@ -526,7 +527,7 @@ pub fn pack(
         writer.finish().map_err(io::Error::other)?;
     }
     encoded.as_file().sync_all()?;
-    encoded.persist_noclobber(bundle).map_err(|e| e.error)?;
+    encoded.persist_noclobber(bundle)?;
     Ok(digest)
 }
 
@@ -905,7 +906,83 @@ struct StageLock {
 
 fn try_flock(file: &File) -> bool {
     use std::os::fd::AsRawFd;
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 };
+    #[cfg(test)]
+    if locked {
+        AFTER_FILE_LOCK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(file);
+            }
+        });
+    }
+    locked
+}
+
+#[cfg(test)]
+type FileLockHook = std::cell::RefCell<Option<Box<dyn FnMut(&File)>>>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_FILE_LOCK: FileLockHook = const { std::cell::RefCell::new(None) };
+}
+
+/// Releases a staging, copy or entry lock explicitly at the end of its
+/// critical section (#187). A child forked meanwhile by any thread holds a
+/// copy of the descriptor until it execs, so closing ours alone may not
+/// release the lock. A filesystem without `flock` has nothing to release.
+fn unlock(fd: impl std::os::fd::AsFd, path: &Path) {
+    match rustix::fs::flock(fd, rustix::fs::FlockOperation::Unlock) {
+        Ok(()) => {}
+        Err(error) if flock_unsupported(error) => {}
+        Err(error) => log::warn!("releasing the lock of {}: {error}", path.display()),
+    }
+}
+
+/// A locked bundle output or private copy. Remove an unpublished file before
+/// unlocking it, on success and on every error path (#187).
+struct LockedTempFile(Option<tempfile::NamedTempFile>);
+
+impl LockedTempFile {
+    fn path(&self) -> &Path {
+        self.0.as_ref().expect("held until dropped").path()
+    }
+
+    fn as_file(&self) -> &File {
+        self.0.as_ref().expect("held until dropped").as_file()
+    }
+
+    fn as_file_mut(&mut self) -> &mut File {
+        self.0.as_mut().expect("held until dropped").as_file_mut()
+    }
+
+    fn persist_noclobber(mut self, path: &Path) -> io::Result<()> {
+        match self
+            .0
+            .take()
+            .expect("held until published")
+            .persist_noclobber(path)
+        {
+            Ok(file) => {
+                unlock(&file, path);
+                Ok(())
+            }
+            Err(error) => {
+                self.0 = Some(error.file);
+                Err(error.error)
+            }
+        }
+    }
+}
+
+impl Drop for LockedTempFile {
+    fn drop(&mut self) {
+        if let Some(copy) = self.0.take() {
+            let (file, path) = copy.into_parts();
+            let name = path.to_path_buf();
+            drop(path);
+            unlock(&file, &name);
+        }
+    }
 }
 
 impl StageLock {
@@ -955,6 +1032,7 @@ fn lock_names_current_inode(lock: &StageLock) -> io::Result<()> {
 impl Drop for StageLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+        unlock(&self._file, &self.path);
     }
 }
 
@@ -1110,6 +1188,10 @@ fn sweep_pack_temps_in(dir: &OwnedFd) {
                 unlink_if_same(dir, name, &file);
             }
         }
+        unlock(
+            &file,
+            Path::new(std::ffi::OsStr::from_bytes(name.to_bytes())),
+        );
     }
 }
 
@@ -1374,6 +1456,7 @@ fn sweep_stale_stages_in(dir: &OwnedFd, sweep_copies: bool) {
             };
             if try_flock(&file) {
                 unlink_if_same(dir, &name, &file);
+                unlock(&file, Path::new(&name));
             }
         } else if name.strip_suffix(".lock").is_some_and(is_stage_name) && kind == libc::S_IFREG {
             // Orphan lock whose stage is gone.
@@ -1382,6 +1465,7 @@ fn sweep_stale_stages_in(dir: &OwnedFd, sweep_copies: bool) {
                 if let Ok(file) = open_lock_at(dir, &name) {
                     if try_flock(&file) {
                         unlink_if_same(dir, &name, &file);
+                        unlock(&file, Path::new(&name));
                     }
                 }
             }
@@ -1392,7 +1476,10 @@ fn sweep_stale_stages_in(dir: &OwnedFd, sweep_copies: bool) {
                     if !try_flock(&file) {
                         continue;
                     }
-                    Some(file)
+                    Some(ratarmount_core::held_lock::HeldLock::new(
+                        file,
+                        "stale bundle stage",
+                    ))
                 }
                 // No lock: the stage predates locks or is foreign.
                 Err(_) if stat_age(&stat) > day => None,
@@ -1417,7 +1504,7 @@ fn sweep_stale_stages_in(dir: &OwnedFd, sweep_copies: bool) {
             // Non-recursive: only an empty directory goes.
             let _ = host::unlinkat(dir, name.as_str(), AtFlags::REMOVEDIR);
             if let Some(file) = held {
-                unlink_if_same(dir, &lock, &file);
+                unlink_if_same(dir, &lock, file.file());
             }
         }
     }
@@ -1614,6 +1701,11 @@ pub(crate) fn lock_layer_entry(path: &Path, deadline: std::time::Instant) -> io:
             }
         }
     }
+}
+
+/// Releases the entry lock [`lock_layer_entry`] took, explicitly (#187).
+pub(crate) fn unlock_layer_entry(root: &OwnedFd, path: &Path) {
+    unlock(root, path);
 }
 
 /// What `sync_tree` checks on each descriptor before its fsync (R1c-1 §5.6,
@@ -2186,8 +2278,14 @@ fn publish_layer(layer: &Path, directory: &Path) -> io::Result<()> {
     )]
     let root = host::open(layer, directory_flags(), Mode::empty())?;
     lock_entry(&root, directory, EntryLock::Exclusive)?;
-    let sealed = ratarmount_compositing::host_stat::fstat_named(&root, layer)?.st_mode;
-    host::fchmod(&root, Mode::from_raw_mode(sealed | 0o200))?;
+    let published = publish_locked(&root, layer, directory);
+    unlock(&root, directory);
+    published
+}
+
+fn publish_locked(root: &OwnedFd, layer: &Path, directory: &Path) -> io::Result<()> {
+    let sealed = ratarmount_compositing::host_stat::fstat_named(root, layer)?.st_mode;
+    host::fchmod(root, Mode::from_raw_mode(sealed | 0o200))?;
     fs::rename(layer, directory)
         .map_err(|e| io::Error::new(e.kind(), format!("publish layer: {e}")))?;
     #[cfg(test)]
@@ -2202,13 +2300,13 @@ fn publish_layer(layer: &Path, directory: &Path) -> io::Result<()> {
             return Err(io::Error::other("injected mode restore failure"));
         }
     }
-    host::fchmod(&root, Mode::from_raw_mode(sealed))?;
+    host::fchmod(root, Mode::from_raw_mode(sealed))?;
     #[cfg(test)]
     {
         events::record("restore", directory);
         events::record("unlock", directory);
     }
-    // Closing `root` releases the entry lock.
+    // The caller unlocks `root` explicitly (#187).
     Ok(())
 }
 
@@ -2274,7 +2372,7 @@ fn run_extract_hook(hook: &'static std::thread::LocalKey<ExtractHook>, stage: &P
 
 /// Copy the bundle into a private file inside the cache while hashing it, so
 /// everything after reads exactly the hashed bytes and never the original path.
-fn private_copy(bundle: &Path, cache: &Path) -> io::Result<(tempfile::NamedTempFile, String)> {
+fn private_copy(bundle: &Path, cache: &Path) -> io::Result<(LockedTempFile, String)> {
     use sha2::{Digest, Sha256};
     #[expect(
         clippy::disallowed_methods,
@@ -2285,14 +2383,16 @@ fn private_copy(bundle: &Path, cache: &Path) -> io::Result<(tempfile::NamedTempF
         clippy::disallowed_methods,
         reason = r###"internal-read:v1 {"id":"IR-B0082-M01","item":"ratarmount::overlay_pack::private_copy","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
-    let mut copy = tempfile::Builder::new()
+    let copy = tempfile::Builder::new()
         .prefix(COPY_PREFIX)
         .suffix(".tar.zst")
         .tempfile_in(cache)?;
-    // The flock lives as long as the copy's descriptor, i.e. until it is dropped.
+    // The flock lives until the copy is dropped, which unlocks it explicitly.
     if !try_flock(copy.as_file()) {
         return Err(io::Error::other("staging file is locked"));
     }
+    let mut copy = LockedTempFile(Some(copy));
+    let file = copy.as_file_mut();
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 20];
     loop {
@@ -2303,9 +2403,9 @@ fn private_copy(bundle: &Path, cache: &Path) -> io::Result<(tempfile::NamedTempF
             Err(e) => return Err(e),
         };
         hasher.update(&buffer[..n]);
-        copy.write_all(&buffer[..n])?;
+        file.write_all(&buffer[..n])?;
     }
-    copy.flush()?;
+    file.flush()?;
     Ok((copy, format!("{:x}", hasher.finalize())))
 }
 
@@ -2443,7 +2543,10 @@ pub(crate) fn cached_lower_in(
     let hit = |destination: &Path| -> io::Result<PathBuf> {
         let entry = open_root(destination)?;
         lock_entry(&entry, destination, EntryLock::Shared)?;
-        check_published(&entry, destination)?;
+        if let Err(e) = check_published(&entry, destination) {
+            unlock(&entry, destination);
+            return Err(e);
+        }
         #[cfg(test)]
         AFTER_HIT_CHECK.with(|hook| {
             if let Some(hook) = hook.borrow().as_ref() {
@@ -2468,7 +2571,8 @@ pub(crate) fn cached_lower_in(
         })();
         #[cfg(test)]
         events::record("hit", destination);
-        // The entry lock is released when `entry` drops, after this.
+        // Unlocked explicitly (#187), after the checks.
+        unlock(&entry, destination);
         checked.map(|()| destination.into())
     };
     if destination.try_exists()? {
@@ -2513,6 +2617,122 @@ pub(crate) mod tests {
     use super::*;
     use ratarmount_compositing::FolderMountSource;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn with_file_lock_hook<T>(hook: impl FnMut(&File) + 'static, run: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                AFTER_FILE_LOCK.with(|slot| slot.borrow_mut().take());
+            }
+        }
+        let _reset = Reset;
+        AFTER_FILE_LOCK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        run()
+    }
+
+    // Keep a duplicate (like a forked child's) and an independently opened
+    // contender alive, even after the production path unlinks the lock file.
+    fn inherited_and_probe(parent: &Path, file: &File) -> (File, File) {
+        let locked = file.metadata().unwrap();
+        let path = fs::read_dir(parent)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| {
+                let meta = entry.metadata().unwrap();
+                meta.dev() == locked.dev() && meta.ino() == locked.ino()
+            })
+            .unwrap()
+            .path();
+        let probe = File::open(path).unwrap();
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        (file.try_clone().unwrap(), probe)
+    }
+
+    /// Regression: pack unlocked its encoded temporary file only after a
+    /// successful persist, so failed publication leaked an inherited lock.
+    #[test]
+    fn regression_187_pack_unlocks_temps_on_publication_error() {
+        for fail in [false, true] {
+            let f = Fixture::new(true);
+            let bundle = f.tmp.path().join("output.tar.zst");
+            if fail {
+                fs::write(&bundle, b"keep existing bundle").unwrap();
+            }
+            let copies = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let captured = copies.clone();
+            let parent = f.tmp.path().to_path_buf();
+            let result = with_file_lock_hook(
+                move |file| {
+                    captured
+                        .borrow_mut()
+                        .push(inherited_and_probe(&parent, file));
+                },
+                || pack(&f.dir, &bundle, f.base.clone(), &PackOptions::default()),
+            );
+            if fail {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+                assert_eq!(fs::read(&bundle).unwrap(), b"keep existing bundle");
+            } else {
+                result.unwrap();
+            }
+            let copies = copies.borrow();
+            assert_eq!(copies.len(), 2, "captured stage and encoded-file locks");
+            for (_, probe) in copies.iter() {
+                probe
+                    .try_lock()
+                    .expect("released even with the inherited copy open");
+            }
+            assert!(
+                !fs::read_dir(f.tmp.path()).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".ratarmount-")
+                }),
+                "failed and successful packs remove their staging"
+            );
+        }
+    }
+
+    /// Regression: a stage replaced after its sweeper lock was taken caused
+    /// an early continue that closed the file without unlocking inherited copies.
+    #[test]
+    fn regression_187_stage_sweep_unlocks_on_open_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join(".ratarmount-layer-ABC123");
+        fs::create_dir(&stage).unwrap();
+        let lock = lock_path(&stage);
+        fs::write(&lock, b"").unwrap();
+        let copies = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let captured = copies.clone();
+        let parent = dir.path().to_path_buf();
+        let swapped = stage.clone();
+        with_file_lock_hook(
+            move |file| {
+                captured
+                    .borrow_mut()
+                    .push(inherited_and_probe(&parent, file));
+                fs::remove_dir(&swapped).unwrap();
+                std::os::unix::fs::symlink(".", &swapped).unwrap();
+            },
+            || sweep_stale_stages(dir.path(), false),
+        );
+        assert!(fs::symlink_metadata(&stage)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(lock.exists(), "a refused stage is left alone");
+        let copies = copies.borrow();
+        assert_eq!(copies.len(), 1, "sweeper acquired the stage lock");
+        copies[0]
+            .1
+            .try_lock()
+            .expect("failed open released the sweeper lock");
+    }
 
     struct Fixture {
         tmp: tempfile::TempDir,
