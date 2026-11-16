@@ -35,6 +35,14 @@
 //!   across `open`. Descriptors are not pooled: pooling would change what a
 //!   later open is allowed to do with the file.
 //!
+//! Both paths refuse `O_CREAT` without `O_NOFOLLOW` (or `O_EXCL`) through a
+//! dangling symlink instead of creating its target (#171): see
+//! [`openat_admitted`]. The generic path's fallback open after a failed
+//! exclusive create does not create (a file removed meanwhile is created
+//! again exclusively, so `created` is exact), and its writable `O_TRUNC`
+//! reopen follows the final component exactly as the caller's open did
+//! (#214).
+//!
 //! The registry lock is only ever held to look up, insert or remove an entry:
 //! never across `open(2)`, `fstat(2)` or a SQLite open, so a payload FIFO that
 //! blocks its opener cannot stall a database open elsewhere in the process
@@ -194,6 +202,32 @@ mod unix {
         Ok(st)
     }
 
+    /// Is the final component a symlink whose target does not exist? Only
+    /// asked after an `O_CREAT` open without `O_NOFOLLOW` found the name
+    /// both missing (followed) and present (`O_EXCL`).
+    fn dangling_symlink(dir: RawFd, name: &CString) -> bool {
+        matches!(
+            fstatat_name(dir, name, libc::O_NOFOLLOW),
+            Ok(st) if st.st_mode & libc::S_IFMT == libc::S_IFLNK
+        ) && matches!(
+            fstatat_name(dir, name, 0),
+            Err(e) if e.kind() == io::ErrorKind::NotFound
+        )
+    }
+
+    /// The refusal of `O_CREAT` without `O_NOFOLLOW` through a dangling
+    /// symlink (#171, #214 item 1).
+    fn dangling_refused(name: &Path) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a dangling symlink; the admitted open does not create a symlink's \
+                 target (open(2) would). Open the target's own name, or pass O_NOFOLLOW",
+                name.display()
+            ),
+        )
+    }
+
     /// The epoch is already spent and the name is still a registered database.
     /// No descriptor is opened. A missing name, a non-regular file, or an
     /// unregistered inode returns `None` so the open proceeds.
@@ -244,6 +278,15 @@ mod unix {
         /// Make every `fstat` fail with `EIO`.
         pub(super) static FAIL_FSTAT: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        /// Remove this path once, between the generic path's exclusive
+        /// create (`EEXIST`) and its fallback open (#214 item 2).
+        pub(super) static UNLINK_BEFORE_FALLBACK: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+        /// Rename the first path over the second just before the generic
+        /// read-only truncation's writable reopen (#214 item 3).
+        pub(super) static REPLACE_BEFORE_TRUNC_REOPEN:
+            std::cell::RefCell<Option<(std::path::PathBuf, std::path::PathBuf)>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     fn fstat(fd: RawFd) -> io::Result<libc::stat> {
@@ -322,6 +365,16 @@ mod unix {
     /// refusal is `PermissionDenied` (`EACCES`). With `O_CREAT` a missing file
     /// is created exclusively (a new inode cannot be a database); with
     /// `O_CREAT | O_EXCL` an existing file is `EEXIST`, untouched.
+    ///
+    /// Deliberate difference from `open(2)` (#171, #214 item 1): `O_CREAT`
+    /// without `O_NOFOLLOW` or `O_EXCL` on a dangling symlink does not create
+    /// the link's target; it is refused with `InvalidInput` naming the
+    /// symlink, on every platform. Creating a target through a symlink needs
+    /// a non-exclusive open that could land on an existing inode, which the
+    /// Linux path never opens before checking. With `O_NOFOLLOW` the result
+    /// is `ELOOP`, with `O_EXCL` `EEXIST`, as `open(2)` reports; a symlink to
+    /// an existing file opens that file. Every production `O_CREAT` caller
+    /// passes `O_NOFOLLOW`.
     pub fn openat_admitted(
         dir: Option<BorrowedFd<'_>>,
         name: &Path,
@@ -389,7 +442,7 @@ mod unix {
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound && create => {
-                    return create_fresh(dir, c, flags, mode);
+                    return create_fresh(dir, c, name, flags, mode);
                 }
                 Err(e) => return Err(e),
             }
@@ -402,11 +455,22 @@ mod unix {
     fn create_fresh(
         dir: RawFd,
         c: &CString,
+        name: &Path,
         flags: libc::c_int,
         mode: u32,
     ) -> io::Result<Option<OwnedFd>> {
         match openat_raw(dir, c, (flags | libc::O_EXCL) & !libc::O_TRUNC, mode) {
             Ok(fd) => Ok(Some(fd)),
+            // A followed probe saw nothing and `O_EXCL` saw a name: a
+            // dangling symlink is refused (see `openat_admitted`), not retried
+            // until the loop gives up.
+            Err(e)
+                if e.kind() == io::ErrorKind::AlreadyExists
+                    && flags & (libc::O_EXCL | libc::O_NOFOLLOW) == 0
+                    && dangling_symlink(dir, c) =>
+            {
+                Err(dangling_refused(name))
+            }
             // Another creator won: look at what it created.
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists && flags & libc::O_EXCL == 0 => {
                 Ok(None)
@@ -450,11 +514,25 @@ mod unix {
                     created = true;
                     fd
                 }
-                // The name exists: open it (`O_CREAT` is kept so a file
-                // removed meanwhile, or a dangling symlink's target, is
-                // created as `open(2)` would); it counts as existing.
+                // The name exists: open it without `O_CREAT`, so `created`
+                // stays exact (#214 item 2). A file removed meanwhile is
+                // `ENOENT` here and the exclusive create is retried; a dangling
+                // symlink is refused as on Linux (#171, #214 item 1).
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists && flags & libc::O_EXCL == 0 => {
-                    openat_raw(dir, c, flags & !libc::O_TRUNC, mode)?
+                    #[cfg(test)]
+                    if let Some(path) = UNLINK_BEFORE_FALLBACK.with(|p| p.borrow_mut().take()) {
+                        std::fs::remove_file(path).expect("test seam unlink");
+                    }
+                    match openat_raw(dir, c, flags & !(libc::O_TRUNC | libc::O_CREAT), 0) {
+                        Ok(fd) => fd,
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                            if flags & libc::O_NOFOLLOW == 0 && dangling_symlink(dir, c) {
+                                return Err(dangling_refused(name));
+                            }
+                            return Ok(None);
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -486,11 +564,22 @@ mod unix {
                 // `O_RDONLY | O_TRUNC` on an existing file (empty included):
                 // truncate through a writable handle on the same, admitted
                 // inode (write permission is required, as for the kernel's
-                // own `O_TRUNC`).
+                // own `O_TRUNC`). The writer follows the final component as
+                // the caller's open did (#214 item 3); the identity check
+                // below refuses a name swapped to another file meanwhile.
+                #[cfg(test)]
+                if let Some((from, to)) =
+                    REPLACE_BEFORE_TRUNC_REOPEN.with(|p| p.borrow_mut().take())
+                {
+                    std::fs::rename(from, to).expect("test seam rename");
+                }
                 let writer = openat_raw(
                     dir,
                     c,
-                    libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                    libc::O_WRONLY
+                        | (flags & libc::O_NOFOLLOW)
+                        | libc::O_CLOEXEC
+                        | libc::O_NONBLOCK,
                     0,
                 )?;
                 let wst = match fstat(writer.as_raw_fd()) {
@@ -905,5 +994,295 @@ mod tests {
             "ordinary reopen churn does not quarantine another descriptor"
         );
         assert_eq!(fs::metadata(&db).unwrap().len(), 14);
+    }
+
+    /// Regression (#167): on the generic path (macOS, Linux without `/proc`)
+    /// looping opens of hard links of an open overlay database leaked one
+    /// quarantined descriptor per attempt until `EMFILE`. The external-alias
+    /// epoch cap (#196) refuses every open after the first before `open`:
+    /// hundreds of opens (mixed flags, several hard links, a directory
+    /// descriptor, a followed symlink) and repeated re-registration of the
+    /// inode quarantine at most one descriptor in total.
+    #[test]
+    fn regression_167_generic_alias_open_loop_quarantines_at_most_one() {
+        use std::os::fd::AsFd;
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _generic = ForceGenericGuard::enter();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let db = dir.join("db.sqlite");
+        fs::write(&db, b"database bytes").unwrap();
+        let mut aliases = Vec::new();
+        for i in 0..4 {
+            let alias = dir.join(format!("alias{i}"));
+            fs::hard_link(&db, &alias).unwrap();
+            aliases.push(alias);
+        }
+        std::os::unix::fs::symlink(&aliases[0], dir.join("link")).unwrap();
+        let parent = fs::File::open(dir).unwrap();
+        let before = quarantined();
+        let all_flags = [
+            libc::O_RDONLY,
+            libc::O_RDONLY | libc::O_NOFOLLOW,
+            libc::O_WRONLY | libc::O_TRUNC,
+            libc::O_RDONLY | libc::O_TRUNC,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW,
+            libc::O_RDWR | libc::O_CREAT,
+        ];
+        for cycle in 0..5 {
+            let registration = register_db_inode(id_of(&db), &db);
+            for round in 0..20 {
+                for (i, &flags) in all_flags.iter().enumerate() {
+                    let alias = &aliases[(round + i) % aliases.len()];
+                    let error = open_admitted(alias, flags, 0o644).unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+                    let name = alias.file_name().unwrap();
+                    let error = openat_admitted(Some(parent.as_fd()), Path::new(name), flags, 0)
+                        .unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+                }
+                let error = open_admitted(&dir.join("link"), libc::O_RDONLY, 0).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+                assert!(
+                    quarantined() <= before + 1,
+                    "cycle {cycle} round {round}: {} descriptors quarantined",
+                    quarantined() - before
+                );
+            }
+            drop(registration);
+        }
+        assert_eq!(quarantined(), before + 1, "exactly the first refusal");
+        assert_eq!(fs::metadata(&db).unwrap().len(), 14, "nothing truncated");
+    }
+
+    /// One `O_CREAT` symlink table, run on the default path and on the
+    /// generic one with identical expectations (#171, #214 item 1).
+    fn dangling_symlink_table(generic: bool) {
+        let _generic = generic.then(ForceGenericGuard::enter);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let target = dir.join("target");
+        let dangling = dir.join("dangling");
+        std::os::unix::fs::symlink(&target, &dangling).unwrap();
+        let started = std::time::Instant::now();
+        let error = open_admitted(&dangling, libc::O_RDWR | libc::O_CREAT, 0o644).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidInput,
+            "{generic}: {error}"
+        );
+        assert!(error.to_string().contains("dangling symlink"), "{error}");
+        assert!(!error.to_string().contains("kept appearing"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let error = open_admitted(
+            &dangling,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidInput,
+            "{generic}: {error}"
+        );
+        assert!(!target.exists(), "{generic}: the target was not created");
+        let error = open_admitted(
+            &dangling,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW,
+            0o644,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ELOOP),
+            "{generic}: {error}"
+        );
+        let error = open_admitted(
+            &dangling,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            0o644,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::AlreadyExists,
+            "{generic}: {error}"
+        );
+        assert!(!target.exists());
+        assert!(fs::symlink_metadata(&dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        // A symlink to an existing file opens (and truncates) that file.
+        fs::write(&target, b"bytes").unwrap();
+        open_admitted(
+            &dangling,
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        )
+        .expect("a live symlink opens its target");
+        assert_eq!(fs::metadata(&target).unwrap().len(), 0, "{generic}");
+        // A plain missing name is still created.
+        let fresh = dir.join("fresh");
+        open_admitted(&fresh, libc::O_RDWR | libc::O_CREAT, 0o600).unwrap();
+        assert!(fresh.is_file());
+    }
+
+    /// Regression (#171, #214 item 1): `O_CREAT` without `O_NOFOLLOW` through
+    /// a dangling symlink retried 16 times on Linux and failed with "kept
+    /// appearing and disappearing", while the generic path created the
+    /// link's target. Both paths now refuse it with `InvalidInput` naming the
+    /// dangling symlink and create nothing; `O_NOFOLLOW` is `ELOOP`, `O_EXCL`
+    /// is `EEXIST` and a live symlink opens its target, as `open(2)` does.
+    #[test]
+    fn regression_171_creat_through_dangling_symlink_is_refused() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        dangling_symlink_table(false);
+        dangling_symlink_table(true);
+    }
+
+    /// Regression (#214 item 2): on the generic path a file removed between
+    /// the exclusive create (`EEXIST`) and the fallback open was recreated by
+    /// the fallback's `O_CREAT` but counted as existing, so an
+    /// `O_RDONLY | O_CREAT | O_TRUNC` with mode `000` took the writable
+    /// reopen, failed with `EACCES` and left the new file behind. The
+    /// fallback no longer creates; the exclusive create is retried, so the
+    /// new file is this call's and opens.
+    #[test]
+    fn regression_214_generic_fallback_recreates_a_removed_file_as_created() {
+        use super::unix::UNLINK_BEFORE_FALLBACK;
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // Safety: `geteuid` has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skip: root bypasses the mode-000 write-permission check");
+            return;
+        }
+        let _generic = ForceGenericGuard::enter();
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        fs::write(&file, b"old bytes").unwrap();
+        UNLINK_BEFORE_FALLBACK.with(|p| *p.borrow_mut() = Some(file.clone()));
+        let opened = open_admitted(&file, libc::O_RDONLY | libc::O_CREAT | libc::O_TRUNC, 0);
+        let fired = UNLINK_BEFORE_FALLBACK
+            .with(|p| p.borrow_mut().take())
+            .is_none();
+        assert!(fired, "the seam removed the file between the two opens");
+        opened.expect("the recreated file is this call's own");
+        let meta = fs::metadata(&file).unwrap();
+        assert_eq!(meta.len(), 0);
+        assert_eq!(meta.permissions().mode() & 0o7777, 0);
+    }
+
+    /// Regression (#214 item 3): the generic path's writable reopen for an
+    /// `O_RDONLY | O_TRUNC` open always added `O_NOFOLLOW`, so a symlink the
+    /// caller's flags followed was refused with `ELOOP` after the first open
+    /// had followed it. The reopen follows as the caller asked: the target is
+    /// truncated (as on the Linux path); with `O_NOFOLLOW` it stays `ELOOP`
+    /// and nothing is truncated.
+    #[test]
+    fn regression_214_generic_trunc_reopen_honours_follow_flags() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        for generic in [false, true] {
+            let _generic = generic.then(ForceGenericGuard::enter);
+            let tmp = tempfile::tempdir().unwrap();
+            let target = tmp.path().join("target");
+            let link = tmp.path().join("link");
+            fs::write(&target, b"bytes").unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let error = open_admitted(&link, libc::O_RDONLY | libc::O_TRUNC | libc::O_NOFOLLOW, 0)
+                .unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ELOOP),
+                "{generic}: {error}"
+            );
+            assert_eq!(fs::metadata(&target).unwrap().len(), 5, "{generic}");
+            open_admitted(&link, libc::O_RDONLY | libc::O_TRUNC, 0)
+                .unwrap_or_else(|e| panic!("{generic}: {e}"));
+            assert_eq!(fs::metadata(&target).unwrap().len(), 0, "{generic}");
+        }
+    }
+
+    /// Regression: following symlinks on the generic writable reopen (#214)
+    /// must still refuse a swapped inode before truncation, and quarantine
+    /// a descriptor of a database rather than close it and release its locks.
+    /// Cover both hard-link and symlink replacements, including O_NOFOLLOW.
+    #[test]
+    fn regression_214_generic_trunc_reopen_refuses_swapped_names() {
+        use super::unix::REPLACE_BEFORE_TRUNC_REOPEN;
+        use std::os::fd::AsFd;
+
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _generic = ForceGenericGuard::enter();
+        for nofollow in [false, true] {
+            for symlink in [false, true] {
+                for database in [false, true] {
+                    let case =
+                        format!("nofollow={nofollow}, symlink={symlink}, database={database}");
+                    let tmp = tempfile::tempdir().unwrap();
+                    let dir = fs::File::open(tmp.path()).unwrap();
+                    let original = tmp.path().join("original");
+                    let replacement = tmp.path().join("replacement");
+                    let name = tmp.path().join("name");
+                    let staged = tmp.path().join("staged");
+                    fs::write(&original, b"original bytes").unwrap();
+                    fs::write(&replacement, b"replacement bytes").unwrap();
+                    fs::hard_link(&original, &name).unwrap();
+                    if symlink {
+                        std::os::unix::fs::symlink(&replacement, &staged).unwrap();
+                    } else {
+                        fs::hard_link(&replacement, &staged).unwrap();
+                    }
+                    let registration =
+                        database.then(|| register_db_inode(id_of(&replacement), &replacement));
+                    let before = quarantined();
+                    REPLACE_BEFORE_TRUNC_REOPEN.with(|p| {
+                        *p.borrow_mut() = Some((staged, name));
+                    });
+                    let flags = libc::O_RDONLY
+                        | libc::O_TRUNC
+                        | if nofollow { libc::O_NOFOLLOW } else { 0 };
+                    let opened = openat_admitted(Some(dir.as_fd()), Path::new("name"), flags, 0);
+                    let fired = REPLACE_BEFORE_TRUNC_REOPEN
+                        .with(|p| p.borrow_mut().take())
+                        .is_none();
+                    assert!(fired, "{case}: writable reopen was not reached");
+                    let error = opened.unwrap_err();
+                    let quarantines = if nofollow && symlink {
+                        assert_eq!(error.raw_os_error(), Some(libc::ELOOP), "{case}: {error}");
+                        0
+                    } else if database {
+                        assert_eq!(
+                            error.kind(),
+                            io::ErrorKind::PermissionDenied,
+                            "{case}: {error}"
+                        );
+                        assert!(
+                            error
+                                .to_string()
+                                .contains(&replacement.display().to_string()),
+                            "{case}: {error}"
+                        );
+                        1
+                    } else {
+                        assert_eq!(error.kind(), io::ErrorKind::Other, "{case}: {error}");
+                        assert!(
+                            error.to_string().contains("changed while it was opened"),
+                            "{case}: {error}"
+                        );
+                        0
+                    };
+                    assert_eq!(quarantined(), before + quarantines, "{case}");
+                    drop(registration);
+                    assert_eq!(fs::read(&original).unwrap(), b"original bytes", "{case}");
+                    assert_eq!(
+                        fs::read(&replacement).unwrap(),
+                        b"replacement bytes",
+                        "{case}"
+                    );
+                }
+            }
+        }
     }
 }
