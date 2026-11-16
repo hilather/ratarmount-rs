@@ -4696,9 +4696,20 @@ impl WriteOverlay {
         let archive_path = self.commit_archive_path(archive);
         let archive = archive_path.as_path();
         self.gate_pending_journal(archive)?;
-        if let Err(e) = self.recover_journal_after_gate(archive) {
-            self.refuse_base_after_commit_failure();
-            return Err(e);
+        if let Err(error) = self.recover_journal_raw(archive, None) {
+            // A refusal (the authorizer or the #150 guard) wrote nothing: it
+            // refuses this commit only and the mount keeps serving (R6-2,
+            // #166). A recovery that could not finish may have written, so
+            // the base is refused until a remount.
+            let wrote = !matches!(
+                error,
+                ratarmount_compress::commit_journal::RecoverError::Refused(_)
+            );
+            let error = self.recover_error(error);
+            if wrote {
+                self.refuse_base_after_commit_failure();
+            }
+            return Err(error);
         }
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
@@ -5142,18 +5153,27 @@ impl WriteOverlay {
         archive: &Path,
         admitted: Option<&crate::MountRecords>,
     ) -> Result<Option<ratarmount_compress::commit_journal::Applied>> {
-        use ratarmount_compress::commit_journal::RecoverError;
         self.recover_journal_raw(archive, admitted)
-            .map_err(|error| match error {
-                RecoverError::Committed(e) => {
-                    self.refuse_base_after_commit_failure();
-                    OverlayError::Msg(format!(
-                        "{e}; the archive holds the committed bytes but the recorded baseline \
+            .map_err(|error| self.recover_error(error))
+    }
+
+    /// A recovery error as this overlay answers it; committed bytes whose
+    /// baseline could not be updated refuse the base until a remount.
+    fn recover_error(
+        &self,
+        error: ratarmount_compress::commit_journal::RecoverError,
+    ) -> OverlayError {
+        use ratarmount_compress::commit_journal::RecoverError;
+        match error {
+            RecoverError::Committed(e) => {
+                self.refuse_base_after_commit_failure();
+                OverlayError::Msg(format!(
+                    "{e}; the archive holds the committed bytes but the recorded baseline \
                      could not be updated (remount required)"
-                    ))
-                }
-                other => OverlayError::Io(other.into_io()),
-            })
+                ))
+            }
+            other => OverlayError::Io(other.into_io()),
+        }
     }
 
     /// The recorded base digest kind and digest, read through the mount's own
@@ -7788,7 +7808,9 @@ fn commit_overlay_locked(
 /// Serializes seal and offline commit for one overlay, including when callers
 /// name different copies of its base. Always acquire before an archive guard.
 /// An O_RDONLY | O_DIRECTORY handle locks the root itself without changing
-/// permissions or creating bookkeeping. Closing the handle releases the flock.
+/// permissions or creating bookkeeping. Dropping the guard unlocks it
+/// explicitly (#187): a child forked meanwhile (tar, git) holds a copy of the
+/// descriptor until it execs, so closing ours alone may not release it.
 pub(crate) struct SealCommitGuard {
     #[cfg(unix)]
     _fd: std::os::fd::OwnedFd,
@@ -7841,6 +7863,22 @@ impl SealCommitGuard {
             // Sealing is Unix-only. Preserve the existing non-Unix copy-commit
             // path, which has no seal operation to serialize against.
             Ok(Self {})
+        }
+    }
+}
+
+impl Drop for SealCommitGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the guard owns the descriptor until after this call.
+            if unsafe { libc::flock(self._fd.as_raw_fd(), libc::LOCK_UN) } != 0 {
+                log::warn!(
+                    "releasing the overlay seal/commit lock: {}",
+                    io::Error::last_os_error()
+                );
+            }
         }
     }
 }

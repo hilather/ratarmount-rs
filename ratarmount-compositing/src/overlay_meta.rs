@@ -120,7 +120,7 @@ pub(crate) fn plan_excludes(
 
 /// `SQLITE_READONLY_ROLLBACK`: a read-only open found a hot rollback journal
 /// (a writer died mid-transaction) that only a read-write open can play back.
-fn is_hot_journal(error: &rusqlite::Error) -> bool {
+pub(crate) fn is_hot_journal(error: &rusqlite::Error) -> bool {
     matches!(
         error,
         rusqlite::Error::SqliteFailure(code, _)

@@ -349,6 +349,12 @@ mount keeps serving, and `--force-base-mismatch` accepts the new base. A swap of
 the base with the same size and mtime cannot be caught without hashing; only
 `overlay verify` with a strong digest catches it (`overlay seal` of an
 already-strong base compares the stamp and does not rehash).
+A commit-journal recovery guard that refuses before recovery writes also keeps
+the mount serving and interval commits enabled. Restore the required overlay
+database state before retrying; `--force-base-mismatch` does not bypass that
+guard. During a live commit, a recovery failure that may have written disables
+later live commits and refuses base reads until a remount. Overlay payloads
+remain readable.
 `--commit-overlay` on a raw directory of files (no overlay database) has no
 identity to check and says so. Only an absent database path in an unused
 overlay counts as "no database".
@@ -438,7 +444,21 @@ refusal is a refused recovery, also next to a complete journal: a live mount
 is not marked as having a base changed by a failed commit, and the next gate
 still refuses. The restamp after a roll-forward re-checks the record too, and a
 used overlay's database must still have its `files` table, else the journal is
-kept. A stale prepare locator without a journal is otherwise cleared
+kept. A hot overlay rollback journal is a separate refusal: its record cannot be read
+without first modifying the database, so archive recovery must not defer it to
+a writable open that checks identity, sealing and relaxed durability afterward.
+This applies to the `-w` top and directory lowers, even with force or a pending
+complete commit journal. A stale prepare locator beside a hot overlay journal is kept, with the archive, database and hot journal unchanged.
+The error names the explicit recovery route: `ratarmount --no-mount ARCHIVE`
+without `-w` or `--lower`. That command recovers only the archive; it does not
+open the overlay. Inspect the overlay on a writable copy before retrying:
+SQLite can roll its hot journal back on that copy before sealed or unclean
+metadata becomes readable. Ordinary writable opens without archive recovery
+retain that SQLite behavior. The same refusal runs before `--no-mount` returns,
+before export servers or interval commits start, and in a daemonized mount's
+serving child after its early fork (#163).
+
+A stale prepare locator without a journal is otherwise cleared
 after a directory sync; a complete locator whose journal cannot be found is
 refused, never cleared (the commit's hook may not have run), and the error
 names the manual escape: verify the archive, then remove its
@@ -2229,18 +2249,38 @@ snapshot) by one that gets the same inode number from the filesystem counts
 as the same file; some filesystems (ext4, for example) reuse freed inode
 numbers. Nor are these opens, which
 do not go through the check: the journal file `overlay pack --include-journal`
-reads (a JSON log, not a database) and the commit journal's opens of the
-archive itself. Opens that used to bypass the check no longer open a data
+reads (a JSON log, not a database) and the commit path's opens of the
+archive itself (the commit journal's, and the `is_zip_archive` and
+`is_uncompressed_tar` format probes that pick the commit method). Opens that
+used to bypass the check no longer open a data
 descriptor at all: `overlay seal`'s and `unseal`'s permission walk and the
 unpack stage's mode pass change modes through an `O_PATH` pin on Linux (by
 name with `AT_SYMLINK_NOFOLLOW` elsewhere, where a swap of the name between the
 check and the change is not detected) (#149); a failed first open leaves an
 existing 0-byte database to SQLite's rollback instead of truncating it (#160);
 and `overlay pack` ships SQLite copies of the layer database and of the base
-index (#156). Of the checked sites, the ZIP commit reader, the
-read-only layer, live diff, the seal sentinels, the pack sentinel and lock
+index (#156). Not every `overlay pack` / `unpack` open is checked either:
+reads of a bundle file (`overlay unpack`, a bundle `--lower` and the sandbox
+supervisor's lower checks), the `--lower` bundle cache's private copy of it,
+and the `<staging directory>.lock` file that `overlay pack`, `unpack` and the
+cache fill create (or reuse) beside their staging directory use ordinary opens.
+The bundle output and its temporary files, extracted regular-file members,
+and cache verification markers are created new (`O_EXCL` or anonymous).
+Unpack finalization opens directories for metadata updates; its regular-file
+mode pass uses the lock-preserving `O_PATH` pins on Linux and no data descriptor
+elsewhere, as described above (#149). Of the checked sites, the ZIP commit
+reader, the read-only layer, live diff, the seal sentinels, the pack sentinel and lock
 reads and the macOS park share the tested helper but have no test of their
 own. Pack payload append has a direct registered-alias refusal/lock regression.
+The `--journal` operation log is not checked either: a FUSE mount opens it
+for appending (creating it if absent) after any overlay database is open and
+keeps that descriptor in its writer thread. Its path must lie outside the mount
+point and the overlay directory, but another hard link of the overlay database
+elsewhere is not refused: the journal's lines would be appended to the
+database file, and closing the descriptor (when the journal is finished at
+unmount, when its writer fails, or when the journal open fails after the file
+was opened) would release this process's locks on the database. Do not point `--journal` at a link of an overlay
+database.
 
 These protections keep the SQLite locks of a process that holds the database
 for its whole life: a mount or export server, foreground (`-f`; `sandbox run`
