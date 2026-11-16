@@ -2705,11 +2705,22 @@ impl WriteOverlay {
         self.refuse_existing_mkdir(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
+        if let Some(parent) = real.parent() {
+            self.ensure_under_root(parent)?;
+            // Keep automatic parent creation, but never use recursive mkdir
+            // for the leaf: it accepts a host directory that wins the race
+            // after lookup, letting the losing request change its mode.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-316-MKDIR-PARENTS","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir","disposition":"output-owner","category":"overlay-directory","reason":"Preserve automatic parent creation separately from the exclusive mkdir leaf.","creation":{"policy":"recursive-directory","basis":"The parent is confined under the overlay root; existing parent permissions are unchanged, and new parents retain directory defaults."}}"###
+            )]
+            fs::create_dir_all(parent)?;
+        }
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0014-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir","disposition":"output-owner","category":"overlay-directory","reason":"Create the directory requested by the overlay mkdir operation and mark it present.","creation":{"policy":"recursive-directory","basis":"Confinement/mutation checks precede creation; Unix permissions are explicitly set to caller mode masked to 07777."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-E0014-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir","disposition":"output-owner","category":"overlay-directory","reason":"Exclusively create the directory requested by mkdir before initializing its mode and row.","creation":{"policy":"exclusive-directory","basis":"Confinement/mutation checks precede creation; an existing host leaf returns EEXIST without chmod or row changes, and only our newly created directory receives caller mode masked to 07777."}}"###
         )]
-        fs::create_dir_all(&real)?;
+        fs::create_dir(&real)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2770,6 +2781,11 @@ impl WriteOverlay {
         } else {
             None
         };
+        // Keep removal and tombstone publication together with mkdir/rmdir,
+        // including without a policy. Otherwise a mkdir over an old tombstone
+        // can finish here and then be hidden by this unlink's late row update.
+        // Acquire after parking so unpoliced descriptor opens hold no gate.
+        let _parents = self.parent_lock();
         let _account = self.account_path(&path);
         // remove_file unlinks symlinks without following them.
         if fs::symlink_metadata(&real).is_ok() {

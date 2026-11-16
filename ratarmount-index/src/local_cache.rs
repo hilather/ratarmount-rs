@@ -648,9 +648,8 @@ mod tests {
     }
 
     /// Regression (#316): an `enforce_budget` error was thrown away with
-    /// `let _ =`. A cache hit and the post-publish trim still succeed (the
-    /// eviction is best effort), and the error is logged at debug level with
-    /// the cache directory.
+    /// `let _ =`. A cache hit and the best-effort helper still succeed, and
+    /// the error is logged with the cache directory.
     #[test]
     fn regression_316_enforce_budget_failure_is_logged_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
@@ -680,6 +679,62 @@ mod tests {
             2,
             "lookup and the best-effort trim each log once: {messages:?}"
         );
+    }
+
+    /// Regression (#316): the post-publish caller must log budget failures
+    /// itself; testing its private helper alone missed a reverted call site.
+    #[test]
+    fn regression_316_post_publish_budget_failure_is_debug_logged() {
+        const CHILD: &str = "RATARMOUNT_TEST_316_BUDGET_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let cache = LocalIndexCache::from_env();
+            let path = cache.dir.join("published.sqlite");
+            crate::test_log::capture_logs();
+            // A non-cache publication must neither trim nor log a failure.
+            enforce_local_index_budget_if_path(&cache.dir.with_file_name("other.sqlite"));
+            assert!(crate::test_log::messages().is_empty());
+            if cache.budget.is_none() {
+                enforce_local_index_budget_if_path(&path);
+                assert!(crate::test_log::messages().is_empty());
+                return;
+            }
+            // The cache root is a regular file: read_dir fails without a
+            // platform-specific errno, permission assumption or fault seam.
+            let error = cache.enforce_budget().unwrap_err();
+            enforce_local_index_budget_if_path(&path);
+            assert_eq!(
+                crate::test_log::messages(),
+                [format!(
+                    "local-index-v1 budget enforcement in {} failed: {error}",
+                    cache.dir.display()
+                )]
+            );
+            crate::test_log::capture_logs();
+            // This child runs just this test, so changing the process-global
+            // log filter cannot race any other test's capture.
+            log::set_max_level(log::LevelFilter::Info);
+            enforce_local_index_budget_if_path(&path);
+            assert!(crate::test_log::messages().is_empty(), "debug only");
+            return;
+        }
+        let _process = crate::test_process::spawning();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache-file");
+        fs::write(&root, b"not a directory").unwrap();
+        for budget in ["0", "1024"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "local_cache::tests::regression_316_post_publish_budget_failure_is_debug_logged",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(LOCAL_INDEX_DIR_ENV, &root)
+                .env(LOCAL_INDEX_CACHE_BYTES_ENV, budget)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "budget={budget}: {output:?}");
+        }
     }
 
     /// Regression: LRU cap deletes oldest `last_open_unix` `{hex}.sqlite`+`.json` pairs.

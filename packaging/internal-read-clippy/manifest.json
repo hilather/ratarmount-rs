@@ -1370,18 +1370,18 @@
     {
       "configured_path": "std::fs::create_dir_all",
       "item": "<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir",
-      "leaf_digest": "83077cd504caf7fed07fce7304842e0d2d81ce42793082b0eacf045bf8d86e16",
+      "leaf_digest": "3c637d8549402d31ae2c63c1b964761dd1a15a959e3243055cb0ac1a690a2ef1",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "overlay-directory",
         "creation": {
-          "basis": "Confinement/mutation checks precede creation; Unix permissions are explicitly set to caller mode masked to 07777.",
+          "basis": "The parent is confined under the overlay root; existing parent permissions are unchanged, and new parents retain directory defaults.",
           "policy": "recursive-directory"
         },
         "disposition": "output-owner",
-        "id": "IR-E0014-M01",
+        "id": "IR-316-MKDIR-PARENTS",
         "item": "<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir",
-        "reason": "Create the directory requested by the overlay mkdir operation and mark it present."
+        "reason": "Preserve automatic parent creation separately from the exclusive mkdir leaf."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -1389,9 +1389,35 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0014-M01\",\"item\":\"<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir\",\"disposition\":\"output-owner\",\"category\":\"overlay-directory\",\"reason\":\"Create the directory requested by the overlay mkdir operation and mark it present.\",\"creation\":{\"policy\":\"recursive-directory\",\"basis\":\"Confinement/mutation checks precede creation; Unix permissions are explicitly set to caller mode masked to 07777.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-316-MKDIR-PARENTS\",\"item\":\"<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir\",\"disposition\":\"output-owner\",\"category\":\"overlay-directory\",\"reason\":\"Preserve automatic parent creation separately from the exclusive mkdir leaf.\",\"creation\":{\"policy\":\"recursive-directory\",\"basis\":\"The parent is confined under the overlay root; existing parent permissions are unchanged, and new parents retain directory defaults.\"}}",
       "resolved": "std::fs::create_dir_all",
       "rule_reason": "inventory-op:fs::create_dir_all"
+    },
+    {
+      "configured_path": "std::fs::create_dir",
+      "item": "<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir",
+      "leaf_digest": "8b31d8003fe0d3a27246cd42a1cdcab72b7fc799ae84d723a22079d1120cdcc8",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "overlay-directory",
+        "creation": {
+          "basis": "Confinement/mutation checks precede creation; an existing host leaf returns EEXIST without chmod or row changes, and only our newly created directory receives caller mode masked to 07777.",
+          "policy": "exclusive-directory"
+        },
+        "disposition": "output-owner",
+        "id": "IR-E0014-M01",
+        "item": "<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir",
+        "reason": "Exclusively create the directory requested by mkdir before initializing its mode and row."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-E0014-M01\",\"item\":\"<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir\",\"disposition\":\"output-owner\",\"category\":\"overlay-directory\",\"reason\":\"Exclusively create the directory requested by mkdir before initializing its mode and row.\",\"creation\":{\"policy\":\"exclusive-directory\",\"basis\":\"Confinement/mutation checks precede creation; an existing host leaf returns EEXIST without chmod or row changes, and only our newly created directory receives caller mode masked to 07777.\"}}",
+      "resolved": "std::fs::create_dir",
+      "rule_reason": "inventory-op:fs::create_dir"
     },
     {
       "configured_path": "ratarmount_core::db_inodes::open_admitted",

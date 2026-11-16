@@ -1915,7 +1915,11 @@ NFS4ERR_EXIST, SMB `STATUS_OBJECT_NAME_COLLISION`, WebDAV MKCOL 405, SFTP v3
 change the existing directory's mode. As with `mkdir(2)` on a read-only Linux
 mount, `EEXIST` takes precedence over a read-only rule's `EROFS` and is not
 counted as a denial. A name deleted in the overlay is not visible, so mkdir
-over it succeeds. (#316)
+over it succeeds. Unlink serializes its removal and tombstone update with mkdir
+so a concurrent recreation stays visible. Host leaf creation is exclusive: a directory created by a
+concurrent host writer returns `EEXIST` without changing its permissions.
+SMB directory `FILE_OPEN_IF` opens the winning directory after a creation race
+and reports `FILE_OPENED`; `FILE_CREATE` still returns a collision. (#316)
 A chown on a writable path to the owner an entry is already shown with (after any
 `-o uid=...,gid=...` mapping) succeeds as a no-op, so ownership-preserving tools
 such as `cp -p` and `sed -i` work, also as root; each ID is
