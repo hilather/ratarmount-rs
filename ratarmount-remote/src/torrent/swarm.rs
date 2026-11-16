@@ -536,8 +536,6 @@ std::fs::write(&path, LAN_ALLOWLIST)?;
                 rt.block_on(session.stop());
                 drop(session);
                 rt.shutdown_timeout(Duration::from_secs(2));
-                // Explicit (#187): a forked child may hold a copy of the descriptor.
-                ratarmount_core::held_lock::unlock_or_log(&owner, "torrent scratch owner");
                 drop(owner);
                 drop(scratch);
             })?;

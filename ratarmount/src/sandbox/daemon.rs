@@ -82,11 +82,9 @@ pub(super) fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-// A concurrently spawned child can retain this lock after its guard is dropped
-// until the child execs or exits, normally briefly. O_CLOEXEC confines this to
-// fork-to-exec; the lock is never released early, and the worst case is a
-// spurious "busy" response.
-pub fn lock(path: &Path) -> Result<File> {
+// Explicitly unlock on every exit, including failed socket/supervisor setup.
+// Closing alone leaves a concurrently forked child's copy holding the lock.
+pub fn lock(path: &Path) -> Result<ratarmount_core::held_lock::HeldLock> {
     let file = {
         #[expect(
             clippy::disallowed_types,
@@ -130,14 +128,29 @@ pub fn lock(path: &Path) -> Result<File> {
             "socket or state directory already in use",
         ));
     }
-    Ok(file)
+    let held = ratarmount_core::held_lock::HeldLock::new(file, "sandbox state");
+    #[cfg(test)]
+    AFTER_STATE_LOCK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(held.file());
+        }
+    });
+    Ok(held)
+}
+
+#[cfg(test)]
+type StateLockHook = std::cell::RefCell<Option<Box<dyn FnOnce(&File)>>>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_STATE_LOCK: StateLockHook = const { std::cell::RefCell::new(None) };
 }
 
 pub struct SocketGuard {
     pub listener: UnixListener,
     path: PathBuf,
     inode: u64,
-    _lock: File,
+    _lock: ratarmount_core::held_lock::HeldLock,
 }
 
 impl SocketGuard {
@@ -278,8 +291,6 @@ impl Drop for SocketGuard {
         {
             let _ = fs::remove_file(&self.path);
         }
-        // Explicit (#187): a forked child may hold a copy of the descriptor.
-        ratarmount_core::held_lock::unlock_or_log(&self._lock, "sandbox daemon state");
     }
 }
 
@@ -360,7 +371,7 @@ pub struct Supervisor<M: Mounter> {
     pub test_ids: Option<TestIds>,
     #[cfg(test)]
     pub seams: super::finalize::Seams,
-    _lock: File,
+    _lock: ratarmount_core::held_lock::HeldLock,
 }
 
 /// What the supervisor keeps per live attempt ID (R1c-1 §5.7).
@@ -1720,4 +1731,59 @@ fn regression_create_base_preserves_git_url_alias() {
         .message
         .contains("network git URLs are not supported; clone locally"));
     assert!(Path::new(&absolute_source("relative/repo@HEAD").unwrap()).is_absolute());
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use crate::sandbox::tests::{private_tempdir, Fake};
+
+    /// Regression: the supervisor's daemon.lock was missed by the explicit
+    /// unlock audit, so an inherited descriptor kept a stopped daemon busy.
+    #[test]
+    fn regression_187_supervisor_lock_released_while_copy_is_held() {
+        let dir = private_tempdir();
+        let supervisor =
+            Supervisor::open(dir.path(), 1, Duration::from_secs(1), Fake::default()).unwrap();
+        let inherited = supervisor._lock.file().try_clone().unwrap();
+        let probe = File::open(dir.path().join("daemon.lock")).unwrap();
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(supervisor);
+        probe.try_lock().unwrap();
+        drop(inherited);
+    }
+
+    /// Regression: failures after acquiring either daemon state lock left a
+    /// forked child's copy holding it even though setup had already returned.
+    #[test]
+    fn regression_187_daemon_setup_errors_release_locks() {
+        for socket in [false, true] {
+            let dir = private_tempdir();
+            let inherited = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let captured = inherited.clone();
+            AFTER_STATE_LOCK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |file| {
+                    *captured.borrow_mut() = Some(file.try_clone().unwrap());
+                }));
+            });
+            let lock_path = if socket {
+                let path = dir.path().join("control.sock");
+                fs::write(&path, b"not a socket").unwrap();
+                assert!(matches!(SocketGuard::bind(&path), Err(e) if e.code == "unsafe_path"));
+                dir.path().join("control.sock.lock")
+            } else {
+                fs::write(dir.path().join("bases.json"), b"invalid JSON").unwrap();
+                assert!(matches!(
+                    Supervisor::open(dir.path(), 1, Duration::from_secs(1), Fake::default()),
+                    Err(e) if e.message.contains("invalid persisted bases")
+                ));
+                dir.path().join("daemon.lock")
+            };
+            assert!(inherited.borrow().is_some(), "lock hook ran");
+            File::open(lock_path).unwrap().try_lock().unwrap();
+        }
+    }
 }

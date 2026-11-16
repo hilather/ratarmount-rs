@@ -720,6 +720,50 @@ pub fn validate_path(path: &Path, mount: &Path, overlay: Option<&Path>) -> io::R
 mod tests {
     use super::*;
 
+    /// Regression: explicit journal unlock must follow the last buffered
+    /// write, on normal completion and on an error before publishing `end`.
+    #[test]
+    fn regression_187_journal_unlock_follows_flush_and_sync() {
+        for fail_sync in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("journal.jsonl");
+            let file = File::create(&path).unwrap();
+            file.try_lock().unwrap();
+            let inherited = file.try_clone().unwrap();
+            let probe = File::open(&path).unwrap();
+            let output = BufWriter::new(LockedJournal(file));
+            let (tx, rx) = mpsc::sync_channel(1);
+            tx.send(json!({"op": "mkdir", "path": "kept"})).unwrap();
+            drop(tx);
+            let result = writer_loop(output, rx, Instant::now(), &AtomicU64::new(0), |_| {
+                assert!(matches!(
+                    probe.try_lock(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ));
+                assert!(std::fs::read_to_string(&path).unwrap().contains("kept"));
+                if fail_sync {
+                    Err(io::Error::other("injected sync failure"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_err(), fail_sync);
+            probe
+                .try_lock()
+                .expect("journal released with an inherited copy alive");
+            let records: Vec<Value> = std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(records.len(), if fail_sync { 1 } else { 2 });
+            if !fail_sync {
+                assert_eq!(records[1]["op"], "end");
+            }
+            drop(inherited);
+        }
+    }
+
     fn options(path: PathBuf) -> JournalOptions {
         JournalOptions {
             path,

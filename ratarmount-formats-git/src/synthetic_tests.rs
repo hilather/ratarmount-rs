@@ -768,3 +768,28 @@ fn regression_187_synthetic_cache_lock_released_while_copy_is_held() {
     drop(copy);
     drop(src);
 }
+
+/// Regression: failing to build a synthetic tree must release the cache lock
+/// too, while preserving the original build error and any inherited descriptor.
+#[cfg(unix)]
+#[test]
+fn regression_187_synthetic_cache_error_unlocks_while_copy_is_held() {
+    let dir = test_dir();
+    let path = dir.path().join("repo");
+    let (repo, first, _, _) = fixture(&path);
+    let cache = dir.path().join("cache");
+    let copy = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let captured = copy.clone();
+    super::synthetic::AFTER_CACHE_LOCK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |file| {
+            *captured.borrow_mut() = Some(file.try_clone().unwrap());
+        }));
+    });
+    let result = super::synthetic::SyntheticGit::build(&repo, &path, first, Oid::zero(), 0, &cache);
+    assert!(
+        matches!(result, Err(GitError::Git(_))),
+        "missing tree must fail"
+    );
+    assert!(copy.borrow().is_some(), "lock hook ran");
+    fs::File::open(&cache).unwrap().try_lock().unwrap();
+}
