@@ -97,6 +97,7 @@ impl Owner<'_> {
                 base,
                 archive,
                 Some((header, locked)),
+                &Cell::new(false),
             )
             .map(drop)
             .map_err(refusal),
@@ -905,7 +906,7 @@ fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
         DbEntry::Present { marked, .. } => marked,
         _ => true,
     };
-    OverlayMeta::read_no_recovery_required(dir, marked).map_err(|error| match error {
+    OverlayMeta::read_no_recovery_required(dir, &Cell::new(marked)).map_err(|error| match error {
         OverlayError::Io(error) => error,
         other => io::Error::other(other),
     })

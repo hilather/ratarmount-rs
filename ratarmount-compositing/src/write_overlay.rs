@@ -7753,7 +7753,7 @@ fn commit_overlay_locked(
     opts: &CommitOverlayOptions,
 ) -> Result<bool> {
     crate::overlay_db::validate_overlay_state(&write_overlay.join(HIDDEN_DB))?;
-    let marked = match overlay_db_entry(write_overlay)? {
+    let required = std::cell::Cell::new(match overlay_db_entry(write_overlay)? {
         DbEntry::Absent => {
             return Err(OverlayError::Msg(format!(
                 "overlay {} has no database; use commit_overlay_raw_dir for a raw directory",
@@ -7761,20 +7761,28 @@ fn commit_overlay_locked(
             )))
         }
         DbEntry::Lost { markers, .. } => return Err(lost_record_error(write_overlay, &markers)),
-        DbEntry::Present { marked, .. } => {
-            ensure_overlay_unsealed_required(write_overlay, marked, write_overlay)?;
-            marked
-        }
-    };
-    if let Err(refusal) =
-        crate::overlay_gate::check_commit_base_offline(write_overlay, base, archive_file)
-    {
+        DbEntry::Present { marked, .. } => marked,
+    });
+    ensure_overlay_unsealed_required(write_overlay, &required, write_overlay)?;
+    if let Err(refusal) = crate::overlay_gate::check_commit_base_offline_with(
+        write_overlay,
+        base,
+        archive_file,
+        None,
+        &required,
+    ) {
         if !opts.force_base_mismatch || refusal.is_policy() {
             return Err(refusal.into_overlay_error());
         }
         log::warn!("{refusal} (--force-base-mismatch: committing anyway)");
     }
-    commit_overlay_inner(write_overlay, archive_file, Some(base), opts, Some(marked))
+    commit_overlay_inner(
+        write_overlay,
+        archive_file,
+        Some(base),
+        opts,
+        Some(required.get()),
+    )
 }
 
 /// Serializes seal and offline commit for one overlay, including when callers
@@ -7860,15 +7868,15 @@ fn ensure_overlay_unsealed_display(write_overlay: &Path, display_path: &Path) ->
         DbEntry::Lost { markers, .. } => return Err(lost_record_error(write_overlay, &markers)),
         DbEntry::Present { marked, .. } => marked,
     };
-    ensure_overlay_unsealed_required(write_overlay, marked, display_path)
+    ensure_overlay_unsealed_required(write_overlay, &std::cell::Cell::new(marked), display_path)
 }
 
 fn ensure_overlay_unsealed_required(
     write_overlay: &Path,
-    marked: bool,
+    required: &std::cell::Cell<bool>,
     display_path: &Path,
 ) -> Result<()> {
-    let meta = crate::OverlayMeta::read_no_recovery_required(write_overlay, marked)?;
+    let meta = crate::OverlayMeta::read_no_recovery_required(write_overlay, required)?;
     if meta.as_ref().is_some_and(crate::OverlayMeta::layer_sealed) {
         return Err(OverlayError::Msg(format!(
             "overlay {} is sealed; mount it with --lower, or `overlay unseal`",
