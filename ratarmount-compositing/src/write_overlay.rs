@@ -246,6 +246,10 @@ thread_local! {
     /// database in [`overlay_db_regular`] on this thread fails with this errno.
     pub(crate) static FOLLOWED_STAT_ERRNO: std::cell::Cell<Option<i32>> =
         const { std::cell::Cell::new(None) };
+    /// Test seam (#176): change the entry after its metadata was read, before
+    /// the classifier consumes that observation. Runs once on this thread.
+    pub(crate) static AFTER_FOLLOWED_DB_STAT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -262,7 +266,12 @@ fn followed_db_stat(db_path: &Path) -> io::Result<fs::Metadata> {
     if let Some(errno) = FOLLOWED_STAT_ERRNO.with(|seam| seam.get()) {
         return Err(io::Error::from_raw_os_error(errno));
     }
-    fs::metadata(db_path)
+    let metadata = fs::metadata(db_path);
+    #[cfg(test)]
+    if let Some(hook) = AFTER_FOLLOWED_DB_STAT.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+    metadata
 }
 
 /// `e` (its kind kept) with what failed on which path in its text.
@@ -7953,16 +7962,21 @@ fn commit_overlay_raw_dir_locked(
 ) -> Result<RawDirCommit> {
     let db = write_overlay.join(HIDDEN_DB);
     crate::overlay_db::validate_overlay_state(&db)?;
-    if let DbEntry::Lost { markers, .. } = overlay_db_entry(write_overlay)? {
-        return Err(lost_record_error(write_overlay, &markers));
-    }
-    if !overlay_db_absent(write_overlay) {
-        return Err(OverlayError::Msg(format!(
-            "overlay database {} exists (or something else is at its path); its base \
-             identity must be checked, so commit it with a classified base \
-             (commit_overlay), not as a raw directory",
-            db.display()
-        )));
+    // One classification (#176): a second one could disagree under a race and
+    // misname an unresolvable entry as an existing database. Its own error
+    // (an unresolvable or non-regular entry) propagates with its own text.
+    match overlay_db_entry(write_overlay)? {
+        DbEntry::Absent => {}
+        DbEntry::Lost { markers, .. } => {
+            return Err(lost_record_error(write_overlay, &markers));
+        }
+        DbEntry::Present { .. } => {
+            return Err(OverlayError::Msg(format!(
+                "overlay database {} exists; its base identity must be checked, so \
+                 commit it with a classified base (commit_overlay), not as a raw directory",
+                db.display()
+            )));
+        }
     }
     if !opts.force_base_mismatch {
         crate::overlay_gate::ensure_journal_is_for_archive(archive_file)

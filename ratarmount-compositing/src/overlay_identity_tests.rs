@@ -642,6 +642,135 @@ fn regression_raw_dir_commit_refuses_when_overlay_db_exists() {
     assert!(err.contains(HIDDEN_DB), "{err}");
 }
 
+/// Regression: #176: raw commit must name an existing database (marked or
+/// not), a lost record, and an unresolvable entry (its own error). Introduce
+/// faults after acquiring the guard so they reach the commit's classifier,
+/// rather than being refused by the guard's earlier unsealed checks.
+#[cfg(unix)]
+#[test]
+fn regression_176_raw_dir_commit_names_each_entry_after_lock() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for row in ["marked", "unmarked", "lost", "empty", "unresolvable"] {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::None, false));
+        fs::write(fx.overlay.join("added"), b"raw payload").unwrap();
+        let guard = crate::OverlayCommitGuard::acquire(&fx.overlay).unwrap();
+        let db = fx.overlay.join(HIDDEN_DB);
+        let marker = fx.overlay.join(crate::OVERLAY_MARKER);
+        match row {
+            "unmarked" => fs::remove_file(&marker).unwrap(),
+            "lost" => fs::remove_file(&db).unwrap(),
+            "empty" => fs::write(&db, b"").unwrap(),
+            _ => {}
+        }
+        let archive_before = fs::read(&fx.archive).unwrap();
+        let db_before = fs::read(&db).ok();
+        let marker_before = fs::read(&marker).ok();
+        let seam = (row == "unresolvable").then(|| FollowedStatErrno::set(libc::EIO));
+        let err = guard
+            .commit_raw_dir(
+                &fx.archive,
+                &CommitOverlayOptions {
+                    yes: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        drop(seam);
+        let text = err.to_string();
+        let expect = match row {
+            "lost" | "empty" => "missing or empty",
+            "unresolvable" => "cannot resolve the overlay database",
+            _ => "exists; its base identity must be checked",
+        };
+        assert!(text.contains(expect), "{row}: {text}");
+        assert!(text.contains(&db.display().to_string()), "{row}: {text}");
+        assert!(
+            !text.contains("something else is at its path"),
+            "{row}: {text}"
+        );
+        if row == "unresolvable" {
+            assert!(
+                matches!(&err, crate::OverlayError::Io(e)
+                    if e.kind() == std::io::Error::from_raw_os_error(libc::EIO).kind()),
+                "{row}: {err:?}"
+            );
+        }
+        assert_eq!(fs::read(&fx.archive).unwrap(), archive_before, "{row}");
+        assert_eq!(fs::read(&db).ok(), db_before, "{row}: database");
+        assert_eq!(fs::read(&marker).ok(), marker_before, "{row}: marker");
+        assert_eq!(fs::read(fx.overlay.join("added")).unwrap(), b"raw payload");
+    }
+}
+
+/// Regression: #176: a database observed as present must refuse raw commit,
+/// even if it and its marker disappear before a second classification could
+/// run. The old two-check path instead committed without checking identity.
+#[test]
+fn regression_176_raw_dir_commit_keeps_present_observation_after_removal() {
+    use crate::write_overlay::AFTER_FOLLOWED_DB_STAT;
+
+    struct ResetHook;
+    impl Drop for ResetHook {
+        fn drop(&mut self) {
+            AFTER_FOLLOWED_DB_STAT.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for marked in [false, true] {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::None, false));
+        let db = fx.overlay.join(HIDDEN_DB);
+        let marker = fx.overlay.join(crate::OVERLAY_MARKER);
+        if !marked {
+            fs::remove_file(&marker).unwrap();
+        }
+        fs::write(fx.overlay.join("added"), b"raw payload").unwrap();
+        // A ZIP permits the success control on every platform without GNU tar.
+        let destination = fx.archive.with_extension("zip");
+        zip::ZipWriter::new(fs::File::create(&destination).unwrap())
+            .finish()
+            .unwrap();
+        let archive_before = fs::read(&destination).unwrap();
+        let guard = crate::OverlayCommitGuard::acquire(&fx.overlay).unwrap();
+        let _reset = ResetHook;
+        let (remove_db, remove_marker) = (db.clone(), marker.clone());
+        AFTER_FOLLOWED_DB_STAT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::remove_file(remove_db).unwrap();
+                if marked {
+                    fs::remove_file(remove_marker).unwrap();
+                }
+            }));
+        });
+        let opts = CommitOverlayOptions {
+            yes: true,
+            ..Default::default()
+        };
+        let result = guard.commit_raw_dir(&destination, &opts);
+        assert!(!db.exists() && !marker.exists(), "removal hook must run");
+        let error = result.expect_err("an observed database cannot become a raw directory");
+        assert!(
+            error
+                .to_string()
+                .contains("its base identity must be checked"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), archive_before);
+        assert_eq!(fs::read(fx.overlay.join("added")).unwrap(), b"raw payload");
+
+        // Control: the now-raw directory really is committable. The refusal
+        // above must come from the first observation, not a later write error.
+        let done = crate::commit_overlay_raw_dir(&fx.overlay, &destination, &opts).unwrap();
+        assert!(done.committed && !done.identity_checked);
+        let mut archive = zip::ZipArchive::new(fs::File::open(&destination).unwrap()).unwrap();
+        let mut payload = Vec::new();
+        std::io::Read::read_to_end(&mut archive.by_name("added").unwrap(), &mut payload).unwrap();
+        assert_eq!(payload, b"raw payload");
+    }
+}
+
 #[test]
 fn regression_raw_dir_commit_succeeds_and_reports_no_identity_check() {
     let _process_guard = ratarmount_index::test_process::spawning();
