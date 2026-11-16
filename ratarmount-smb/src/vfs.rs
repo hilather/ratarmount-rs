@@ -411,6 +411,28 @@ mod tests {
         }
     }
 
+    /// Regression (#316): overlay mkdir of an existing name re-moded the
+    /// directory; through SMB it is STATUS_OBJECT_NAME_COLLISION (EEXIST).
+    #[test]
+    fn regression_316_mkdir_existing_is_name_collision() {
+        let td = tempfile::tempdir().unwrap();
+        let ov = Arc::new(crate::test_overlay::new_overlay(Arc::new(EmptyFs), td.path()).unwrap());
+        let fs = RatarmountSmb::with_overlay(ov.clone(), 0, 8, Some(ov));
+        fs.mkdir("/d", 0o750).expect("mkdir");
+        assert_eq!(
+            fs.mkdir("/d", 0o700).unwrap_err(),
+            smb2::STATUS_OBJECT_NAME_COLLISION
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(td.path().join("d"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o7777, 0o750);
+        }
+    }
+
     /// Regression: SMB policy failures are write-protected/quota NTSTATUS.
     #[test]
     fn regression_overlay_policy_denials() {

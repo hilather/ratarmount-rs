@@ -36,6 +36,8 @@ mod prepared_tests;
 mod publish_tests;
 mod range_cache;
 mod search;
+#[cfg(test)]
+mod test_log;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod test_process;
 

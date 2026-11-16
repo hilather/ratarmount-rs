@@ -13442,3 +13442,295 @@ fn regression_328_rowless_file_live_and_interval_commit() {
         assert_eq!(deleted_flag(&ov, "/tool.sh"), Some(0), "idle={idle}");
     }
 }
+
+/// Regression (#316): mkdir of an existing directory changed its mode
+/// instead of failing. POSIX mkdir fails with EEXIST for any existing entry
+/// (base or overlay directory, file, `/`) and leaves it as it was; a base
+/// directory is not materialized on the host. EEXIST is returned before a
+/// read-only rule's EROFS, as Linux mkdir(2) does on a read-only mount, and
+/// mkdir over a tombstoned base directory still succeeds.
+#[test]
+fn regression_316_mkdir_existing_entry_is_eexist_and_keeps_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut base = MemBase::with(&[("/bfile", b"base")]);
+    base.files.extend(MemBase::with_dir("/based").files);
+    let mut link = mem_file_info("/blink", 0);
+    link.mode = ratarmount_core::S_IFLNK | 0o777;
+    link.linkname = "missing".into();
+    base.files.insert("/blink".into(), link);
+    let root = dir.path().join("ov");
+    let mut ov = WriteOverlay::new_for_tests(Arc::new(base), &root).unwrap();
+    ov.mkdir("/mine", 0o750).unwrap();
+    put_overlay_bytes(&ov, "/ofile", b"overlay");
+    ov.create_symlink("/olink", "missing").unwrap();
+    let paths = [
+        "/", "/based", "/mine", "/bfile", "/ofile", "/blink", "/olink",
+    ];
+    let before: Vec<_> = paths.iter().map(|p| mode(&ov, p)).collect();
+    fn mode(ov: &WriteOverlay, p: &str) -> u32 {
+        ov.lookup(p, 0).unwrap().mode
+    }
+    let eexist = |r: Result<()>| {
+        assert!(
+            matches!(&r, Err(OverlayError::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists),
+            "{r:?}"
+        )
+    };
+    for p in paths.into_iter().chain(["/based/"]) {
+        eexist(ov.mkdir(p, 0o700));
+    }
+    let after: Vec<_> = paths.iter().map(|p| mode(&ov, p)).collect();
+    assert_eq!(after, before, "no entry changed");
+    assert_eq!(mode(&ov, "/based"), ratarmount_core::S_IFDIR | 0o755);
+    assert_eq!(
+        mode(&ov, "/bfile") & ratarmount_core::S_IFMT,
+        ratarmount_core::S_IFREG
+    );
+    assert!(
+        fs::symlink_metadata(root.join("based")).is_err(),
+        "a refused mkdir materializes nothing"
+    );
+    assert!(fs::symlink_metadata(root.join("bfile")).is_err());
+    assert!(fs::symlink_metadata(root.join("blink")).is_err());
+    assert_eq!(
+        fs::read_link(root.join("olink")).unwrap(),
+        Path::new("missing")
+    );
+    assert_eq!(
+        fs::metadata(root.join("mine"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o750
+    );
+
+    let rules = Arc::new(crate::ReadOnlyGlobs::new(["based", "newro"]).unwrap());
+    ov.set_policy(Some(rules.clone()));
+    eexist(ov.mkdir("/based", 0o700));
+    assert_eq!(rules.erofs_denied(), 0, "EEXIST precedes EROFS");
+    assert!(matches!(ov.mkdir("/newro", 0o700),
+        Err(OverlayError::Io(e)) if e.kind() == io::ErrorKind::ReadOnlyFilesystem));
+    assert_eq!(rules.erofs_denied(), 1);
+    ov.set_policy(None);
+
+    ov.rmdir("/based").unwrap();
+    assert!(ov.lookup("/based", 0).is_none());
+    ov.mkdir("/based", 0o700).unwrap();
+    assert_eq!(mode(&ov, "/based"), ratarmount_core::S_IFDIR | 0o700);
+
+    // Exclusive leaf creation retains the existing convenience of creating
+    // missing parents, without re-moding them on a repeated request.
+    ov.mkdir("/new/parents/leaf", 0o750).unwrap();
+    eexist(ov.mkdir("/new/parents/leaf", 0o700));
+    assert_eq!(mode(&ov, "/new/parents/leaf") & 0o7777, 0o750);
+}
+
+/// Regression (#316): create_dir_all accepted a host directory installed
+/// after the visibility probe, so the losing mkdir changed its mode.
+#[cfg(unix)]
+#[test]
+fn regression_316_mkdir_host_winner_keeps_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct HostWinner {
+        path: PathBuf,
+        probes: AtomicU64,
+    }
+    impl MountSource for HostWinner {
+        fn list(&self, _: &str) -> Option<ListResult> {
+            None
+        }
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            // The second overlay lookup has already checked the host. Model
+            // another host writer winning before mkdir creates the leaf.
+            if path == "/race" && self.probes.fetch_add(1, Ordering::SeqCst) == 1 {
+                fs::create_dir(&self.path).unwrap();
+                fs::set_permissions(&self.path, fs::Permissions::from_mode(0o751)).unwrap();
+            }
+            None
+        }
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Err(io::ErrorKind::NotFound.into())
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    for policy in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("overlay");
+        let base = Arc::new(HostWinner {
+            path: root.join("race"),
+            probes: AtomicU64::new(0),
+        });
+        let mut ov = WriteOverlay::new_for_tests(base.clone(), &root).unwrap();
+        if policy {
+            ov.set_policy(Some(Arc::new(CountingPolicy::new(u64::MAX))));
+        }
+        let result = ov.mkdir("/race", 0o700);
+        assert!(base.probes.load(Ordering::SeqCst) >= 2);
+        assert!(
+            matches!(result, Err(OverlayError::Io(ref e))
+            if e.kind() == io::ErrorKind::AlreadyExists),
+            "{result:?}"
+        );
+        assert_eq!(
+            metadata_mode(&fs::metadata(&base.path).unwrap()) & 0o7777,
+            0o751
+        );
+        assert_eq!(deleted_flag(&ov, "/race"), None, "no mkdir row on failure");
+    }
+}
+
+/// Regression (#316): competing mkdirs must have one winner, including
+/// recreation of a deleted lower name; the losing request cannot re-mode it.
+#[cfg(unix)]
+#[test]
+fn regression_316_concurrent_mkdir_has_one_winner() {
+    for policy in [false, true] {
+        for tombstoned in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = if tombstoned {
+                MemBase::with_dir("/race")
+            } else {
+                MemBase::with(&[])
+            };
+            let mut ov = WriteOverlay::new_for_tests(Arc::new(base), tmp.path()).unwrap();
+            if policy {
+                ov.set_policy(Some(Arc::new(CountingPolicy::new(u64::MAX))));
+            }
+            if tombstoned {
+                ov.rmdir("/race").unwrap();
+            }
+            let barrier = std::sync::Barrier::new(2);
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = [0o750, 0o700]
+                    .into_iter()
+                    .map(|mode| {
+                        let ov = &ov;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            (mode, ov.mkdir("/race", mode))
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                results.iter().filter(|(_, r)| r.is_ok()).count(),
+                1,
+                "{results:?}"
+            );
+            let winner_mode = results.iter().find(|(_, r)| r.is_ok()).unwrap().0;
+            let error = &results.iter().find(|(_, r)| r.is_err()).unwrap().1;
+            assert!(
+                matches!(error, Err(OverlayError::Io(e))
+                if e.kind() == io::ErrorKind::AlreadyExists),
+                "{error:?}"
+            );
+            assert_eq!(ov.lookup("/race", 0).unwrap().mode & 0o7777, winner_mode);
+            assert_eq!(
+                metadata_mode(&fs::metadata(tmp.path().join("race")).unwrap()) & 0o7777,
+                winner_mode
+            );
+            assert_eq!(deleted_flag(&ov, "/race"), Some(0));
+            assert!(!ov.is_deleted("/race"));
+            ov.rmdir("/race").unwrap();
+            assert!(!tmp.path().join("race").exists(), "no stray host directory");
+        }
+    }
+}
+
+/// Regression (#316): unlink could publish an old tombstone after mkdir
+/// recreated the name, hiding the new host directory despite mkdir succeeding.
+#[cfg(unix)]
+#[test]
+fn regression_316_mkdir_waits_for_unlink_tombstone() {
+    use std::sync::mpsc;
+
+    struct DelayedLookup {
+        base: MemBase,
+        hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+    impl MountSource for DelayedLookup {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.base.list(path)
+        }
+        fn lookup(&self, path: &str, version: i32) -> Option<FileInfo> {
+            let hook = self.hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            self.base.lookup(path, version)
+        }
+        fn open(
+            &self,
+            fi: &FileInfo,
+            flags: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.base.open(fi, flags)
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    for policy in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = Arc::new(DelayedLookup {
+            base: MemBase::with(&[("/race", b"old")]),
+            hook: Mutex::new(None),
+        });
+        let mut ov = WriteOverlay::new_for_tests(base.clone(), tmp.path()).unwrap();
+        if policy {
+            ov.set_policy(Some(Arc::new(CountingPolicy::new(u64::MAX))));
+        }
+        let ov = Arc::new(ov);
+        ov.unlink("/race").unwrap();
+        let (removed_tx, removed_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *base.hook.lock().unwrap() = Some(Box::new(move || {
+            // mark_deleted checks the base after removing the host entry.
+            removed_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        }));
+        let unlink = {
+            let ov = ov.clone();
+            std::thread::spawn(move || ov.unlink("/race"))
+        };
+        removed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let mkdir = {
+            let ov = ov.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = ov.mkdir("/race", 0o750);
+                done_tx.send(()).unwrap();
+                result
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = done_rx.recv_timeout(Duration::from_millis(100));
+        resume_tx.send(()).unwrap();
+        unlink.join().unwrap().unwrap();
+        mkdir.join().unwrap().unwrap();
+        assert!(
+            ov.lookup("/race", 0).is_some(),
+            "unlink hid the recreated directory"
+        );
+        assert_eq!(deleted_flag(&ov, "/race"), Some(0));
+        assert!(!ov.is_deleted("/race"));
+        assert!(
+            matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+            "mkdir must wait for unlink publication"
+        );
+    }
+}

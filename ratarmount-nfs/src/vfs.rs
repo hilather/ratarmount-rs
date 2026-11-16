@@ -1266,6 +1266,37 @@ mod tests {
         (td, nfs)
     }
 
+    /// Regression (#316): NFSv3 MKDIR of an existing name re-moded the
+    /// directory (to the fixed 0755) instead of failing; it is NFS3ERR_EXIST
+    /// for an overlay directory or an archive file, which stay as they were.
+    #[test]
+    fn regression_316_v3_mkdir_existing_is_exist() {
+        let mut base = Synth::new();
+        base.add_file("/keep", b"archive", vec![UserData::Other("t".into())]);
+        let (td, nfs) = overlay_export(base);
+        let (id, _) = nfs.mkdir_sync(1, &name("sub")).expect("mkdir");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                td.path().join("sub"),
+                std::fs::Permissions::from_mode(0o750),
+            )
+            .unwrap();
+        }
+        let before = nfs.getattr_sync(id).unwrap().mode;
+        assert_eq!(
+            stat_u32(nfs.mkdir_sync(1, &name("sub")).unwrap_err()),
+            stat_u32(nfsstat3::NFS3ERR_EXIST)
+        );
+        assert_eq!(nfs.getattr_sync(id).unwrap().mode, before);
+        assert_eq!(
+            stat_u32(nfs.mkdir_sync(1, &name("keep")).unwrap_err()),
+            stat_u32(nfsstat3::NFS3ERR_EXIST)
+        );
+        let keep = nfs.lookup_sync(1, &name("keep")).unwrap();
+        assert_eq!(nfs.getattr_sync(keep).unwrap().size, 7);
+    }
+
     /// Regression: NFS SETATTR mode/time requests must reach the overlay.
     #[test]
     fn regression_overlay_chmod_nfs_setattr() {

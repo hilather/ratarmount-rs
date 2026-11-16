@@ -339,6 +339,35 @@ class Contract(unittest.TestCase):
         self.assertEqual(entry["leaf_digest"],
                          policy.digest(b"let created = fs :: create_dir (& real) ;"))
 
+    def test_regression_316_mkdir_creation_reviews_match_source(self):
+        """Regression: exclusive leaf creation and recursive parents need separate approvals."""
+        source = (policy.ROOT / "ratarmount-compositing/src/write_overlay.rs").read_text()
+        approved = json.loads((Path(__file__).parent / "manifest.json").read_text())
+        for identity, function, argument, creation in (
+            ("IR-E0014-M01", "create_dir", "&real", "exclusive-directory"),
+            ("IR-316-MKDIR-PARENTS", "create_dir_all", "parent", "recursive-directory"),
+        ):
+            with self.subTest(identity=identity):
+                statement = f"fs::{function}({argument})?;"
+                found = re.findall(
+                    r'(internal-read:v1 \{"id":"' + identity + r'"[^\n]+?)"###\s*\)\]\s*'
+                    + re.escape(statement), source)
+                self.assertEqual(len(found), 1)
+                entries = [e for e in approved["entries"]
+                           if e.get("metadata", {}).get("id") == identity]
+                self.assertEqual(len(entries), 1)
+                entry = entries[0]
+                metadata = policy.metadata_reason(found[0])
+                self.assertEqual(entry["reason"], found[0])
+                self.assertEqual(entry["metadata"], metadata)
+                self.assertEqual(entry["item"], metadata["item"])
+                self.assertEqual(metadata["creation"]["policy"], creation)
+                self.assertEqual(entry["configured_path"], "std::fs::" + function)
+                self.assertEqual(entry["resolved"], "std::fs::" + function)
+                self.assertEqual(entry["rule_reason"], "inventory-op:fs::" + function)
+                tokens = f"fs :: {function} ({argument.replace('&', '& ')}) ?;"
+                self.assertEqual(entry["leaf_digest"], policy.digest(tokens.encode()))
+
 
 if __name__ == "__main__":
     unittest.main()

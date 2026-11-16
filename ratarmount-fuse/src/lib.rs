@@ -5830,6 +5830,31 @@ mod tests {
         assert!(fs.file_info_for_ino(zero_dst).is_none());
     }
 
+    /// Regression (#316): FUSE MKDIR of an existing name changed the
+    /// directory's mode instead of failing. It is EEXIST for a directory or a
+    /// file, and the entry keeps its mode. (A real mount usually answers
+    /// EEXIST from the kernel's own LOOKUP; this reaches the daemon path.)
+    #[test]
+    fn regression_316_mkdir_existing_is_eexist() {
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        overlay_write_new(&ov, "/a", b"a");
+        fs.mkdir_entry(FUSE_ROOT_ID, OsStr::new("d"), 0o750)
+            .expect("mkdir");
+        let before = ov.lookup("/d", 0).unwrap().mode;
+        assert_eq!(before & 0o7777, 0o750);
+        assert_eq!(
+            fs.mkdir_entry(FUSE_ROOT_ID, OsStr::new("d"), 0o700).err(),
+            Some(EEXIST)
+        );
+        assert_eq!(ov.lookup("/d", 0).unwrap().mode, before);
+        let file = ov.lookup("/a", 0).unwrap().mode;
+        assert_eq!(
+            fs.mkdir_entry(FUSE_ROOT_ID, OsStr::new("a"), 0o700).err(),
+            Some(EEXIST)
+        );
+        assert_eq!(ov.lookup("/a", 0).unwrap().mode, file);
+    }
+
     /// Regression (#86): rename errnos. renameat2 flags are refused (EINVAL),
     /// a directory source gives EISDIR like the other frontends, a missing
     /// source ENOENT, and a read-only mount EROFS.
