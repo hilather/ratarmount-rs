@@ -3473,7 +3473,7 @@ struct CopyRow {
 /// refused, the archive keeps its inode and the other writer's bytes, and the
 /// other writer's next commit is accepted. Rows marked control already passed.
 /// Without GNU tar only the rows that need it are skipped (#158): the native
-/// `.tar.zst`, ZIP and provenance-TAR rows still run.
+/// `.tar.zst`, ZIP and Auto provenance-TAR rows still run.
 #[cfg(unix)]
 #[test]
 fn regression_copy_paths_compare_the_gate_stamp() {
@@ -3705,6 +3705,75 @@ fn copy_row_needs_gnu_tar(r: &CopyRow) -> bool {
         CopyFmt::Zst | CopyFmt::Zip => false,
         CopyFmt::Gz | CopyFmt::Bz2 | CopyFmt::Xz => true,
         CopyFmt::Tar => r.mode == crate::CommitMode::Copy || r.way != Way::Provenance,
+    }
+}
+
+/// Regression: #158 skipped the entire copy-path matrix without GNU tar,
+/// including native rows. Run the real matrix with an isolated child PATH so
+/// GNU-tar-equipped CI also checks the missing-tool and BSD-tar-only cases.
+#[cfg(unix)]
+#[test]
+fn regression_copy_paths_run_native_rows_without_gnu_tar() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _process_guard = ratarmount_index::test_process::spawning();
+    let exe = std::env::current_exe().unwrap();
+    let (_, module) = module_path!().split_once("::").unwrap();
+    let test = format!("{module}::regression_copy_paths_compare_the_gate_stamp");
+    let path = tempfile::tempdir().unwrap();
+    for bsd_tar in [false, true] {
+        if bsd_tar {
+            let tar = path.path().join("tar");
+            fs::write(
+                &tar,
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then\n    printf '%s\\n' 'bsdtar (regression fixture)'\n    exit 0\nfi\nexit 99\n",
+            )
+            .unwrap();
+            fs::set_permissions(&tar, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let output = std::process::Command::new(&exe)
+            .env("PATH", path.path())
+            .args(["--exact", &test, "--nocapture"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "bsd_tar={bsd_tar}: {}\n{stdout}\n{stderr}",
+            output.status
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed;"),
+            "the child must select exactly the matrix test: {stdout}\n{stderr}"
+        );
+        let skipped: Vec<_> = stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("skip: "))
+            .collect();
+        assert_eq!(
+            skipped,
+            [
+                "A1 provenance tar copy: needs GNU tar",
+                "A3 live tar copy (control): needs GNU tar",
+                "A3 live tar after rollback: needs GNU tar",
+                "A4 offline tar copy (control): needs GNU tar",
+                "A4 offline tar after rollback: needs GNU tar",
+                "A6 offline tar.gz after gate: needs GNU tar",
+                "A6 offline tar.gz opened: needs GNU tar",
+                "A6 offline tar.bz2 after gate: needs GNU tar",
+                "A6 offline tar.bz2 opened: needs GNU tar",
+                "A6 offline tar.xz after gate: needs GNU tar",
+                "A6 offline tar.xz opened: needs GNU tar",
+            ],
+            "bsd_tar={bsd_tar}: only GNU-tar-dependent rows may skip\n{stderr}"
+        );
+        assert!(
+            stderr
+                .lines()
+                .any(|line| { line == "copy-path rows: 11 ran, 11 skipped for want of GNU tar" }),
+            "bsd_tar={bsd_tar}: native rows must execute, not silently return\n{stderr}"
+        );
     }
 }
 
