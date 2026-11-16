@@ -388,10 +388,12 @@ fn sidecar_tarstats_ok(idx_path: &Path, archive: &Path) -> bool {
 /// redirect is live, `f` runs under it (fd 1 is already away from stdout) and
 /// the last of them restores.
 pub(crate) fn silence_stdout<T>(f: impl FnOnce() -> T) -> T {
-    let _ = io::stdout().flush();
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.flush();
     let mut state = crate::diff::stdout_redirect();
     if let Some(guard) = crate::diff::ProgressToStderr::join(&mut state) {
         drop(state);
+        drop(stdout);
         let out = f();
         drop(guard);
         return out;
@@ -404,13 +406,15 @@ pub(crate) fn silence_stdout<T>(f: impl FnOnce() -> T) -> T {
     let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
     if saved < 0 {
         drop(state);
+        drop(stdout);
         return f();
     }
-    restore_stdout_after(state, saved, f)
+    restore_stdout_after(state, stdout, saved, f)
 }
 
 fn restore_stdout_after<T>(
     mut state: std::sync::MutexGuard<'static, crate::diff::StdoutRedirect>,
+    stdout: io::StdoutLock<'static>,
     saved: RawFd,
     f: impl FnOnce() -> T,
 ) -> T {
@@ -444,8 +448,10 @@ fn restore_stdout_after<T>(
             state.saved = Some(crate::diff::SavedStdout::Raw(saved));
             state.guards = 1;
             drop(state);
+            drop(stdout);
             // Restore even when `f` panics, then resume the panic.
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let mut stdout = io::stdout().lock();
             let mut state = crate::diff::stdout_redirect();
             state.guards -= 1;
             // A redirect that joined meanwhile restores when it ends.
@@ -455,6 +461,8 @@ fn restore_stdout_after<T>(
                 None
             };
             if let Some(saved) = saved {
+                // Drain partial progress lines to the redirected destination.
+                let _ = stdout.flush();
                 unsafe {
                     #[expect(
                         clippy::disallowed_methods,
@@ -465,11 +473,12 @@ fn restore_stdout_after<T>(
                 drop(saved);
             }
             drop(state);
-            let _ = io::stdout().flush();
+            drop(stdout);
             out.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         }
         Err(_) => {
             drop(state);
+            drop(stdout);
             // SAFETY: `saved` is an unused dup we still own.
             unsafe {
                 libc::close(saved);

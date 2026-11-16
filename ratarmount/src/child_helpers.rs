@@ -19,7 +19,7 @@ pub(crate) const SNAPSHOT_RESTIC_READER_CHILD: &str =
     "RATARMOUNT_TEST_SNAPSHOT_RESTIC_READER_CHILD";
 /// Set by `regression_mount_in_base_bind_alias_verdicts_in_user_namespace`.
 pub(crate) const MIB_BIND_ALIAS_CHILD: &str = "RATARMOUNT_TEST_MIB_BIND_ALIAS_CHILD";
-/// Set by `regression_298_overlapping_progress_guards_restore_stdout`.
+/// Set by the `regression_298_` redirect tests.
 pub(crate) const PROGRESS_TO_STDERR_CHILD: &str = "RATARMOUNT_TEST_PROGRESS_TO_STDERR_CHILD";
 
 /// The first words of a guard skip; a parent asserts it never sees them.

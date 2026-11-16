@@ -1105,7 +1105,7 @@ fn fd_identity(fd: i32) -> (u64, u64) {
 
 const PROGRESS_CHILD_DONE: &str = "#298 progress guards checked";
 
-/// Subprocess helper for `regression_298_overlapping_progress_guards_restore_stdout`:
+/// Subprocess helper for the `regression_298_` tests:
 /// fd 1 and fd 2 are distinct capture files there.
 #[test]
 #[ignore = "subprocess helper for the #298 stdout redirect test"]
@@ -1113,7 +1113,7 @@ fn progress_to_stderr_child() {
     if !crate::child_helpers::spawned_by_parent(
         crate::child_helpers::PROGRESS_TO_STDERR_CHILD,
         "progress_to_stderr_child",
-        "regression_298_overlapping_progress_guards_restore_stdout",
+        "regression_298_ tests",
     ) {
         return;
     }
@@ -1128,6 +1128,27 @@ fn progress_to_stderr_child() {
         out.write_all(text.as_bytes()).unwrap();
         out.flush().unwrap();
     };
+    match std::env::var("RATARMOUNT_TEST_PROGRESS_CASE").as_deref() {
+        Ok("lock-order") => {
+            progress_stdout_lock_order();
+            assert_eq!(fd_identity(libc::STDOUT_FILENO), stdout);
+            raw(&format!("{PROGRESS_CHILD_DONE}\n"));
+            return;
+        }
+        Ok("buffered") => {
+            progress_buffered_output();
+            assert_eq!(fd_identity(libc::STDOUT_FILENO), stdout);
+            raw(&format!("{PROGRESS_CHILD_DONE}\n"));
+            return;
+        }
+        Ok("panic") => {
+            progress_panic_restoration(stdout, stderr);
+            raw(&format!("{PROGRESS_CHILD_DONE}\n"));
+            return;
+        }
+        Ok("overlap") => {}
+        other => panic!("unexpected progress child case: {other:?}"),
+    }
     // Overlapping guards released in creation order (two parallel tests).
     let first = ProgressToStderr::new().unwrap();
     let second = ProgressToStderr::new().unwrap();
@@ -1141,6 +1162,13 @@ fn progress_to_stderr_child() {
         stdout,
         "fd 1 must be the original stdout once every guard is gone"
     );
+    // Nested guards released in reverse order.
+    let first = ProgressToStderr::new().unwrap();
+    let second = ProgressToStderr::new().unwrap();
+    drop(second);
+    assert_eq!(fd_identity(libc::STDOUT_FILENO), stderr);
+    drop(first);
+    assert_eq!(fd_identity(libc::STDOUT_FILENO), stdout);
     // `find`'s `/dev/null` redirect ending while a progress guard taken inside
     // it lives (a find test beside a diff test).
     let guard = crate::find::silence_stdout(|| {
@@ -1180,14 +1208,120 @@ fn progress_to_stderr_child() {
     raw(&format!("{PROGRESS_CHILD_DONE}\n"));
 }
 
-/// Regression (#298): `roundtrip_crlf`/`roundtrip_binary_deleted` failed on
-/// macOS with `diff: Bad file descriptor (os error 9)` while another test's
-/// diff ran. Each `ProgressToStderr` (and `find`'s `/dev/null` redirect) saved
-/// and restored fd 1 on its own, so overlapping redirects released in creation
-/// order left fd 1 on stderr or `/dev/null`; racing `dup2`/`fcntl` calls on
-/// fd 1 are consistent with the macOS EBADF. Overlapping redirects share one.
-#[test]
-fn regression_298_overlapping_progress_guards_restore_stdout() {
+fn progress_stdout_lock_order() {
+    // Holding stdout while entering/exiting a redirect must not invert locks
+    // against another thread's constructor or last-guard destructor.
+    for dropping in [false, true] {
+        let guard = dropping.then(|| ProgressToStderr::new().unwrap());
+        let stdout = io::stdout().lock();
+        let (started, ready) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            if let Some(guard) = guard {
+                drop(guard);
+            } else {
+                drop(ProgressToStderr::new().unwrap());
+            }
+        });
+        ready
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        // The worker is blocked on our stdout lock. It must leave the state
+        // mutex free, or reentering a redirect here would deadlock. Polling
+        // detects that inversion without leaving a deadlocked child behind.
+        let mut inverted = false;
+        while std::time::Instant::now() < deadline {
+            if STDOUT_REDIRECT.try_lock().is_err() {
+                inverted = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        if !inverted {
+            crate::find::silence_stdout(|| drop(ProgressToStderr::new().unwrap()));
+        }
+        drop(stdout);
+        worker.join().unwrap();
+        assert!(
+            !inverted,
+            "redirect held its state mutex while waiting for stdout (drop={dropping})"
+        );
+    }
+}
+
+fn progress_buffered_output() {
+    io::stdout().write_all(b"stdout before find").unwrap();
+    crate::find::silence_stdout(|| {
+        io::stdout()
+            .write_all(b"suppressed buffered progress")
+            .unwrap();
+    });
+    // `find` can be the last owner of a stderr redirect too.
+    let guard = ProgressToStderr::new().unwrap();
+    crate::find::silence_stdout(|| {
+        drop(guard);
+        io::stdout().write_all(b"buffered stderr progress").unwrap();
+    });
+    // Conversely, ProgressToStderr can be the last owner of /dev/null.
+    let guard = crate::find::silence_stdout(|| {
+        let guard = ProgressToStderr::new().unwrap();
+        io::stdout()
+            .write_all(b"suppressed joined progress")
+            .unwrap();
+        guard
+    });
+    drop(guard);
+}
+
+fn progress_panic_restoration(stdout: (u64, u64), stderr: (u64, u64)) {
+    for joined in [false, true] {
+        let outer = joined.then(|| ProgressToStderr::new().unwrap());
+        let panic = std::panic::catch_unwind(|| {
+            crate::find::silence_stdout(|| {
+                // Neither lock may be held while running the callback.
+                std::thread::spawn(|| drop(ProgressToStderr::new().unwrap()))
+                    .join()
+                    .unwrap();
+                std::panic::panic_any(298_u32);
+            });
+        })
+        .unwrap_err();
+        assert_eq!(*panic.downcast::<u32>().unwrap(), 298);
+        assert_eq!(
+            fd_identity(libc::STDOUT_FILENO),
+            if joined { stderr } else { stdout }
+        );
+        drop(outer);
+        assert_eq!(fd_identity(libc::STDOUT_FILENO), stdout);
+    }
+    let mut escaped = None;
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::find::silence_stdout(|| {
+            escaped = Some(ProgressToStderr::new().unwrap());
+            std::panic::panic_any(298_u32);
+        });
+    }))
+    .unwrap_err();
+    assert_eq!(*panic.downcast::<u32>().unwrap(), 298);
+    assert_ne!(fd_identity(libc::STDOUT_FILENO), stdout);
+    drop(escaped);
+    assert_eq!(fd_identity(libc::STDOUT_FILENO), stdout);
+    // Poison alone must not make a later cleanup panic or leak the redirect.
+    let guard = ProgressToStderr::new().unwrap();
+    assert!(std::panic::catch_unwind(|| {
+        let _state = stdout_redirect();
+        std::panic::panic_any(298_u32);
+    })
+    .is_err());
+    assert!(STDOUT_REDIRECT.is_poisoned());
+    drop(guard);
+    assert_eq!(fd_identity(libc::STDOUT_FILENO), stdout);
+    crate::find::silence_stdout(|| drop(ProgressToStderr::new().unwrap()));
+    assert_eq!(fd_identity(libc::STDOUT_FILENO), stdout);
+}
+
+fn progress_child_output(case: &str) -> std::process::Output {
     let _processes = ratarmount_index::test_process::spawning();
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
@@ -1197,7 +1331,8 @@ fn regression_298_overlapping_progress_guards_restore_stdout() {
             "--ignored",
             "--nocapture",
         ])
-        .env(crate::child_helpers::PROGRESS_TO_STDERR_CHILD, "1");
+        .env(crate::child_helpers::PROGRESS_TO_STDERR_CHILD, "1")
+        .env("RATARMOUNT_TEST_PROGRESS_CASE", case);
     let output = crate::test_child::TestChild::spawn(&mut command)
         .unwrap()
         .output(std::time::Duration::from_secs(60))
@@ -1210,10 +1345,48 @@ fn regression_298_overlapping_progress_guards_restore_stdout() {
         "{stderr}"
     );
     assert!(stdout.contains(PROGRESS_CHILD_DONE), "{stdout}\n{stderr}");
+    output
+}
+
+/// Regression (#298): overlapping redirects released in creation order left
+/// fd 1 on stderr or /dev/null. The macOS EBADF cause remains unverified.
+#[test]
+fn regression_298_overlapping_progress_guards_restore_stdout() {
+    let output = progress_child_output("overlap");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("progress while the second guard lives"),
         "{stderr}"
     );
     assert!(!stdout.contains("progress while"), "{stdout}");
     assert!(!stdout.contains("silenced") && !stderr.contains("silenced"));
+}
+
+/// Regression: #298 the state mutex and stdout lock could deadlock in opposite orders.
+#[test]
+fn regression_298_redirect_stdout_lock_order() {
+    progress_child_output("lock-order");
+}
+
+/// Regression: #298 the last find owner restored stdout before flushing progress.
+#[test]
+fn regression_298_redirect_flushes_before_restore() {
+    let output = progress_child_output("buffered");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("stdout before find"), "{stdout}");
+    assert!(!stderr.contains("stdout before find"), "{stderr}");
+    assert!(stderr.contains("buffered stderr progress"), "{stderr}");
+    assert!(!stdout.contains("buffered stderr progress"), "{stdout}");
+    assert!(
+        !stdout.contains("suppressed") && !stderr.contains("suppressed"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+/// Regression: #298 callback panics and mutex poison must preserve the last owner's restore.
+#[test]
+fn regression_298_redirect_restores_after_panic_and_poison() {
+    progress_child_output("panic");
 }

@@ -222,7 +222,9 @@ fn detect_renames(changes: &mut Vec<Change>) {
 // `find`'s `/dev/null`), and concurrent `dup2`/`fcntl` calls on fd 1 are
 // consistent with the EBADF seen on macOS. Overlapping redirects now share
 // one: the first redirects, the last restores, and every syscall on fd 1 runs
-// under `STDOUT_REDIRECT`, which is held only for those calls.
+// under `STDOUT_REDIRECT`. Take the stdout lock first, so a caller already
+// holding stdout cannot deadlock against a redirect waiting to flush it.
+// Both locks cover only a transition, never the work done under a redirect.
 pub(crate) struct ProgressToStderr(());
 
 /// fd 1 as it was before the first live redirect.
@@ -261,7 +263,8 @@ static STDOUT_REDIRECT: std::sync::Mutex<StdoutRedirect> = std::sync::Mutex::new
     saved: None,
 });
 
-/// Lock the shared fd 1 redirect state (a panic elsewhere does not poison it).
+/// Lock the shared fd 1 redirect state, recovering from poison.
+/// Callers that also need stdout must acquire its lock first.
 pub(crate) fn stdout_redirect() -> std::sync::MutexGuard<'static, StdoutRedirect> {
     STDOUT_REDIRECT
         .lock()
@@ -270,11 +273,12 @@ pub(crate) fn stdout_redirect() -> std::sync::MutexGuard<'static, StdoutRedirect
 
 impl ProgressToStderr {
     pub(crate) fn new() -> io::Result<Self> {
+        let mut stdout = io::stdout().lock();
         let mut state = stdout_redirect();
         if let Some(guard) = Self::join(&mut state) {
             return Ok(guard);
         }
-        io::stdout().flush()?;
+        stdout.flush()?;
         #[expect(
             clippy::disallowed_methods,
             reason = r###"internal-read:v1 {"id":"IR-B0002-M01","item":"<ratarmount::diff::ProgressToStderr>::new","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
@@ -319,6 +323,7 @@ impl ProgressToStderr {
 
 impl Drop for ProgressToStderr {
     fn drop(&mut self) {
+        let mut stdout = io::stdout().lock();
         let mut state = stdout_redirect();
         state.guards -= 1;
         if state.guards > 0 {
@@ -327,7 +332,7 @@ impl Drop for ProgressToStderr {
         let Some(saved) = state.saved.take() else {
             return;
         };
-        let _ = io::stdout().flush();
+        let _ = stdout.flush();
         unsafe {
             #[expect(
                 clippy::disallowed_methods,
