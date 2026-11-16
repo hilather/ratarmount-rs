@@ -1213,7 +1213,8 @@ fn regression_publish_two_archives_in_one_directory_share_no_state() {
 
 /// A source whose rows obey one invariant: `count(publication_rows)` equals
 /// `ledger.total`. A writer changes both, and many payload pages, in one
-/// transaction, so a snapshot mixing two states breaks the invariant.
+/// transaction. Seed several hundred payload pages before the snapshot so
+/// copying missing, stale or mixed payload bytes is observable as well.
 fn ledger_source(path: &Path, wal: bool) -> Connection {
     catalog(path, 1);
     let c = Connection::open(path).unwrap();
@@ -1226,20 +1227,22 @@ fn ledger_source(path: &Path, wal: bool) -> Connection {
     c.execute_batch(
         "CREATE TABLE ledger(total INTEGER NOT NULL);
          INSERT INTO ledger VALUES (1);
-         CREATE TABLE payload(b BLOB NOT NULL);",
+         CREATE TABLE payload(id INTEGER PRIMARY KEY, b BLOB NOT NULL);
+         WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 400)
+         INSERT INTO payload SELECT x, CAST(printf('%01000d', x) AS BLOB) FROM s;",
     )
     .unwrap();
     c
 }
-/// One transaction: 400 rows, 400 KiB of payload pages and the new total.
+/// One transaction: add 400 rows, rewrite every payload and update the total.
 const LEDGER_WRITE: &str = "BEGIN IMMEDIATE;
     WITH RECURSIVE s(x) AS (SELECT 2 UNION ALL SELECT x + 1 FROM s WHERE x < 401)
     INSERT INTO publication_rows SELECT x FROM s;
-    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 400)
-    INSERT INTO payload SELECT randomblob(1000) FROM s;
+    UPDATE payload SET b = CAST(printf('%01000d', id + 400) AS BLOB);
     UPDATE ledger SET total = 401;
     COMMIT;";
-/// `(rows, ledger total)` after an `integrity_check`; panics on a mixed state.
+/// Check integrity and every row/value, including all payload bytes. Equal
+/// counts and a hash of the output alone do not establish completeness.
 fn ledger_state(path: &Path) -> (i64, i64) {
     let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     let check: String = c
@@ -1254,6 +1257,37 @@ fn ledger_state(path: &Path) -> (i64, i64) {
         )
         .unwrap();
     assert_eq!(state.0, state.1, "mixed snapshot in {}", path.display());
+    let total: i64 = state.1;
+    assert!(matches!(total, 1 | 401));
+    let rows: Vec<i64> = c
+        .prepare("SELECT n FROM publication_rows ORDER BY n")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        rows == (1..=total).collect::<Vec<_>>(),
+        "wrong publication rows in {}",
+        path.display()
+    );
+    let payload: Vec<(i64, Vec<u8>)> = c
+        .prepare("SELECT id, b FROM payload ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(payload.len(), 400, "{}", path.display());
+    for (id, (actual_id, actual)) in (1..=400).zip(payload) {
+        assert_eq!(actual_id, id, "{}", path.display());
+        let expected = format!("{:01000}", id + total - 1).into_bytes();
+        assert!(
+            actual == expected,
+            "wrong payload {id} in {} (ledger={total})",
+            path.display()
+        );
+    }
     state
 }
 
@@ -1360,12 +1394,6 @@ fn regression_312_publish_with_concurrent_writer_pins_consistent_snapshot() {
         no_companions(&pin);
         no_tmp(d.path());
         assert_eq!(ledger_state(&source), (401, 401), "wal={wal}");
-        let c = Connection::open(&source).unwrap();
-        let payload: i64 = c
-            .query_row("SELECT count(*) FROM payload", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(payload, 400);
-        drop(c);
         // The writer's commit is published by the next publication.
         let next = publish(&base, &source);
         assert_ne!(next.index_id, pointer.index_id);
@@ -1443,9 +1471,17 @@ mod enospc {
         vfs
     }
 
-    /// Install the wrapper once; `arm` selects the snapshot file and the
-    /// number of bytes its filesystem still has room for.
-    pub fn install() {
+    /// Restore the captured slot even when a fixture assertion unwinds.
+    #[must_use]
+    pub struct RestorePwrite {
+        vfs: *mut rusqlite::ffi::sqlite3_vfs,
+        previous: unsafe extern "C" fn(),
+    }
+
+    /// Install only in an isolated child, before starting any SQLite threads.
+    /// Join those threads before dropping the guard: SQLite's slot is not atomic.
+    /// `arm` selects the snapshot file and its remaining capacity.
+    pub fn install() -> RestorePwrite {
         let vfs = vfs();
         // SAFETY: the unix VFS implements both system-call methods.
         unsafe {
@@ -1459,16 +1495,24 @@ mod enospc {
                 set(vfs, c"pwrite".as_ptr(), Some(hook)),
                 rusqlite::ffi::SQLITE_OK
             );
+            RestorePwrite {
+                vfs,
+                previous: original,
+            }
         }
     }
-    /// Restore SQLite's default `pwrite`.
-    pub fn uninstall() {
-        ARMED.store(0, SeqCst);
-        let vfs = vfs();
-        // SAFETY: a null pointer restores the default for the slot.
-        unsafe {
-            let set = (*vfs).xSetSystemCall.unwrap();
-            assert_eq!(set(vfs, c"pwrite".as_ptr(), None), rusqlite::ffi::SQLITE_OK);
+    impl Drop for RestorePwrite {
+        fn drop(&mut self) {
+            ARMED.store(0, SeqCst);
+            // SAFETY: the VFS and its captured slot live for this process.
+            // Restoring the default (None) would discard an earlier wrapper.
+            unsafe {
+                let set = (*self.vfs).xSetSystemCall.unwrap();
+                assert_eq!(
+                    set(self.vfs, c"pwrite".as_ptr(), Some(self.previous)),
+                    rusqlite::ffi::SQLITE_OK
+                );
+            }
         }
     }
     pub fn arm(target: &std::path::Path, limit: u64) {
@@ -1478,8 +1522,80 @@ mod enospc {
         LIMIT.store(limit, SeqCst);
         ARMED.store(1, SeqCst);
     }
-    pub fn disarm() {
-        ARMED.store(0, SeqCst);
+
+    /// Regression (#312): restore the prior syscall wrapper on success and
+    /// panic, while other databases and threads remain writable when armed.
+    #[test]
+    fn regression_312_enospc_restores_slot_and_contains_faults() {
+        super::relative_child(
+            "publish_tests::enospc::regression_312_enospc_restores_slot_and_contains_faults",
+            "WALPUB_312_ENOSPC_GUARD",
+            || {
+                unsafe extern "C" fn prior_pwrite(
+                    fd: c_int,
+                    buf: *const c_void,
+                    n: libc::size_t,
+                    off: libc::off_t,
+                ) -> libc::ssize_t {
+                    // SAFETY: forward the syscall's unchanged arguments.
+                    unsafe { libc::pwrite(fd, buf, n, off) }
+                }
+                let vfs = vfs();
+                // SAFETY: the unix VFS exposes these process-lifetime methods.
+                let (get, set) = unsafe {
+                    (
+                        (*vfs).xGetSystemCall.unwrap(),
+                        (*vfs).xSetSystemCall.unwrap(),
+                    )
+                };
+                // SAFETY: the registered slot has the Pwrite signature.
+                let original = unsafe { get(vfs, c"pwrite".as_ptr()).unwrap() };
+                let prior =
+                    unsafe { std::mem::transmute::<Pwrite, unsafe extern "C" fn()>(prior_pwrite) };
+                for panic in [false, true] {
+                    // A previous wrapper must survive too, not just the default.
+                    assert_eq!(
+                        unsafe { set(vfs, c"pwrite".as_ptr(), Some(prior)) },
+                        rusqlite::ffi::SQLITE_OK
+                    );
+                    let d = super::temp();
+                    let target = d.path().join("snapshot");
+                    std::fs::write(&target, []).unwrap();
+                    let result = std::panic::catch_unwind(|| {
+                        let _restore = install();
+                        arm(&target, 0);
+                        let dir = d.path().to_path_buf();
+                        std::thread::spawn(move || {
+                            for wal in [true, false] {
+                                let source = dir.join(format!("other-{wal}.sqlite"));
+                                let c = super::ledger_source(&source, wal);
+                                c.execute_batch(super::LEDGER_WRITE).unwrap();
+                                assert_eq!(super::ledger_state(&source), (401, 401));
+                            }
+                        })
+                        .join()
+                        .unwrap();
+                        if panic {
+                            panic!("slot assertion");
+                        }
+                    });
+                    let restored = unsafe { get(vfs, c"pwrite".as_ptr()).unwrap() };
+                    // Remove the fixture's prior wrapper before assertions.
+                    assert_eq!(
+                        unsafe { set(vfs, c"pwrite".as_ptr(), Some(original)) },
+                        rusqlite::ffi::SQLITE_OK
+                    );
+                    assert_eq!(result.is_err(), panic);
+                    if let Err(payload) = result {
+                        assert_eq!(payload.downcast_ref::<&str>(), Some(&"slot assertion"));
+                    }
+                    assert_eq!(restored as usize, prior as usize);
+                    assert_eq!(ARMED.load(SeqCst), 0);
+                    assert_eq!(REFUSED.load(SeqCst), 0);
+                    assert_eq!(SHORTENED.load(SeqCst), 0);
+                }
+            },
+        );
     }
 }
 
@@ -1519,7 +1635,7 @@ fn regression_312_publish_disk_full_during_vacuum_into() {
                     let wal_bytes = wal.then(|| bytes(&companion(&source, "-wal")));
                     enospc::REFUSED.store(0, SeqCst);
                     enospc::SHORTENED.store(0, SeqCst);
-                    enospc::install();
+                    let restore = enospc::install();
                     let snapshot = Rc::new(RefCell::new(None));
                     let seen = snapshot.clone();
                     let result = with_pin_hook(
@@ -1532,8 +1648,7 @@ fn regression_312_publish_disk_full_during_vacuum_into() {
                         },
                         || publish_index_pointer(&base, &source, None),
                     );
-                    enospc::disarm();
-                    enospc::uninstall();
+                    drop(restore);
                     let err = result.expect_err("publication succeeded on a full disk");
                     assert!(
                         matches!(&err, IndexError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
@@ -1583,4 +1698,90 @@ fn regression_312_publish_disk_full_during_vacuum_into() {
             }
         },
     );
+}
+
+/// Regression (#312): a seam error or panic must release the snapshot and its
+/// locks. Resume assertion panics in Rust, not SQLite's C progress callback.
+#[test]
+fn regression_312_publish_progress_failure_cleans_up() {
+    relative_child(
+        "publish_tests::regression_312_publish_progress_failure_cleans_up",
+        "WALPUB_312_PROGRESS_PANIC",
+        || {
+            for wal in [true, false] {
+                let d = temp();
+                let source = d.path().join("source.sqlite");
+                let base = d.path().join("a");
+                let holder = ledger_source(&source, wal);
+                let before = tree(d.path());
+                let err = with_pin_hook(
+                    |step| {
+                        if matches!(step, PinStep::Vacuuming(_)) {
+                            return Err(io::Error::other("progress failure"));
+                        }
+                        Ok(())
+                    },
+                    || publish_index_pointer(&base, &source, None),
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(&err, IndexError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+                        if e.extended_code == rusqlite::ffi::SQLITE_INTERRUPT),
+                    "{err:?}"
+                );
+                assert!(err.to_string().contains("VACUUM INTO"));
+                assert_eq!(tree(d.path()), before);
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_pin_hook(
+                        |step| {
+                            if matches!(step, PinStep::Vacuuming(_)) {
+                                panic!("progress assertion");
+                            }
+                            Ok(())
+                        },
+                        || publish_index_pointer(&base, &source, None),
+                    )
+                }))
+                .expect_err("the seam panic was swallowed");
+                assert_eq!(panic.downcast_ref::<&str>(), Some(&"progress assertion"));
+                assert_eq!(tree(d.path()), before);
+                no_tmp(d.path());
+                assert_eq!(ledger_state(&source), (1, 1));
+                holder.busy_timeout(std::time::Duration::ZERO).unwrap();
+                holder.execute_batch(LEDGER_WRITE).unwrap();
+                let pin = publish(&base, &source);
+                assert_eq!(
+                    ledger_state(&index_id_path(&base, &pin.index_id).unwrap()),
+                    (401, 401)
+                );
+            }
+        },
+    );
+}
+
+/// Regression (#312): SQLite integrity and equal counts alone accept wrong
+/// row values, missing payload rows and corrupt payload bytes.
+#[test]
+fn regression_312_ledger_rejects_incomplete_snapshots() {
+    for mutation in [
+        "UPDATE publication_rows SET n = 999 WHERE n = 1",
+        "DELETE FROM payload WHERE rowid = 1",
+        "UPDATE payload SET b = zeroblob(1000) WHERE rowid = 1",
+        "UPDATE payload SET b = CAST(printf('%01000d', id) AS BLOB) WHERE rowid = 1",
+    ] {
+        let d = temp();
+        let source = d.path().join("source.sqlite");
+        let holder = ledger_source(&source, false);
+        holder.execute_batch(LEDGER_WRITE).unwrap();
+        assert_eq!(ledger_state(&source), (401, 401));
+        assert_eq!(holder.execute(mutation, []).unwrap(), 1);
+        let check: String = holder
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+        assert!(
+            std::panic::catch_unwind(|| ledger_state(&source)).is_err(),
+            "incomplete snapshot accepted: {mutation}"
+        );
+    }
 }

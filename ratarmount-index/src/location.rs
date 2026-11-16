@@ -567,10 +567,13 @@ fn vacuum_snapshot(source: &Path, tmp: &Path) -> Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     conn.execute_batch("PRAGMA synchronous = FULL")?;
     #[cfg(test)]
-    let _progress = VacuumProgress::install(&conn, tmp);
+    let progress = VacuumProgress::install(&conn, tmp);
+    let result = crate::vacuum_into(&conn, tmp);
+    #[cfg(test)]
+    progress.resume_panic();
     // Name the step and both paths (#312): a bare "database or disk is full"
     // does not say which file could not be written. The SQLite code is kept.
-    crate::vacuum_into(&conn, tmp).map_err(|e| {
+    result.map_err(|e| {
         let context = format!(
             "cannot snapshot index {} into {} (VACUUM INTO)",
             source.display(),
@@ -592,10 +595,11 @@ fn vacuum_snapshot(source: &Path, tmp: &Path) -> Result<()> {
 /// Test seam (#312): fires [`PinStep::Vacuuming`] once from a progress
 /// handler, the first time the `VACUUM INTO` connection has a read
 /// transaction open on `main` (its snapshot of the source is then fixed).
-/// An error from the hook interrupts the VACUUM.
+/// An error or panic from the hook interrupts the VACUUM. A panic is resumed
+/// only after SQLite returns to Rust and the handler has been removed.
 #[cfg(test)]
-struct VacuumProgress {
-    db: *mut rusqlite::ffi::sqlite3,
+struct VacuumProgress<'conn> {
+    conn: &'conn rusqlite::Connection,
     state: *mut VacuumProgressState,
 }
 #[cfg(test)]
@@ -604,10 +608,11 @@ struct VacuumProgressState {
     tmp: PathBuf,
     fired: bool,
     interrupt: bool,
+    panic: Option<Box<dyn std::any::Any + Send>>,
 }
 #[cfg(test)]
-impl VacuumProgress {
-    fn install(conn: &rusqlite::Connection, tmp: &Path) -> Self {
+impl<'conn> VacuumProgress<'conn> {
+    fn install(conn: &'conn rusqlite::Connection, tmp: &Path) -> Self {
         unsafe extern "C" fn progress(arg: *mut std::ffi::c_void) -> std::ffi::c_int {
             // SAFETY: `arg` is the state boxed in `install`; it lives until
             // `Drop` removes the handler, and SQLite calls the handler on this
@@ -618,29 +623,52 @@ impl VacuumProgress {
                     == rusqlite::ffi::SQLITE_TXN_READ
             {
                 state.fired = true;
-                state.interrupt = pin_step(PinStep::Vacuuming(state.tmp.clone())).is_err();
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pin_step(PinStep::Vacuuming(state.tmp.clone()))
+                })) {
+                    Ok(result) => state.interrupt = result.is_err(),
+                    Err(panic) => {
+                        state.panic = Some(panic);
+                        state.interrupt = true;
+                    }
+                }
             }
             std::ffi::c_int::from(state.interrupt)
         }
-        // SAFETY: the connection outlives this guard (declared after it).
+        // SAFETY: the guard borrows the connection for its whole lifetime.
         let db = unsafe { conn.handle() };
         let state = Box::into_raw(Box::new(VacuumProgressState {
             db,
             tmp: tmp.to_path_buf(),
             fired: false,
             interrupt: false,
+            panic: None,
         }));
         // SAFETY: `db` is open; `state` stays valid until `Drop`.
         unsafe { rusqlite::ffi::sqlite3_progress_handler(db, 1, Some(progress), state.cast()) };
-        Self { db, state }
+        Self { conn, state }
+    }
+
+    fn resume_panic(self) {
+        // SAFETY: SQLite has returned, and this guard still owns the state.
+        let panic = unsafe { (*self.state).panic.take() };
+        drop(self);
+        if let Some(panic) = panic {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 #[cfg(test)]
-impl Drop for VacuumProgress {
+impl Drop for VacuumProgress<'_> {
     fn drop(&mut self) {
         // SAFETY: remove the handler before freeing the state it points to.
         unsafe {
-            rusqlite::ffi::sqlite3_progress_handler(self.db, 0, None, std::ptr::null_mut());
+            rusqlite::ffi::sqlite3_progress_handler(
+                self.conn.handle(),
+                0,
+                None,
+                std::ptr::null_mut(),
+            );
             drop(Box::from_raw(self.state));
         }
     }
