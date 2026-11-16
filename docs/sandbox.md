@@ -2231,8 +2231,15 @@ name with `AT_SYMLINK_NOFOLLOW` elsewhere, where a swap of the name between the
 check and the change is not detected) (#149); a failed first open leaves an
 existing 0-byte database to SQLite's rollback instead of truncating it (#160);
 and `overlay pack` ships SQLite copies of the layer database and of the base
-index (#156). Of the checked sites, the ZIP commit reader, the
-read-only layer, live diff, the seal sentinels, the pack sentinel and lock
+index (#156). Not every `overlay pack` / `unpack` open is checked either:
+reads of a bundle file (`overlay unpack`, a bundle `--lower` and the sandbox
+supervisor's lower checks), the `--lower` bundle cache's private copy of it,
+and the `<staging directory>.lock` file that `overlay pack`, `unpack` and the
+cache fill create (or reuse) beside their staging directory use ordinary opens.
+The other files they write (the bundle and its temporary files, the extracted
+members, the cache's verification markers) are created new (`O_EXCL` or
+anonymous), and the unpack finalization opens only directories. Of the checked sites, the ZIP commit
+reader, the read-only layer, live diff, the seal sentinels, the pack sentinel and lock
 reads and the macOS park share the tested helper but have no test of their
 own. Pack payload append has a direct registered-alias refusal/lock regression.
 
