@@ -2223,8 +2223,10 @@ snapshot) by one that gets the same inode number from the filesystem counts
 as the same file; some filesystems (ext4, for example) reuse freed inode
 numbers. Nor are these opens, which
 do not go through the check: the journal file `overlay pack --include-journal`
-reads (a JSON log, not a database) and the commit journal's opens of the
-archive itself. Opens that used to bypass the check no longer open a data
+reads (a JSON log, not a database) and the commit path's opens of the
+archive itself (the commit journal's, and the `is_zip_archive` and
+`is_uncompressed_tar` format probes that pick the commit method). Opens that
+used to bypass the check no longer open a data
 descriptor at all: `overlay seal`'s and `unseal`'s permission walk and the
 unpack stage's mode pass change modes through an `O_PATH` pin on Linux (by
 name with `AT_SYMLINK_NOFOLLOW` elsewhere, where a swap of the name between the
