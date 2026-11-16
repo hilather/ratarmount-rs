@@ -2237,6 +2237,15 @@ index (#156). Of the checked sites, the ZIP commit reader, the
 read-only layer, live diff, the seal sentinels, the pack sentinel and lock
 reads and the macOS park share the tested helper but have no test of their
 own. Pack payload append has a direct registered-alias refusal/lock regression.
+The `--journal` operation log is not checked either: a FUSE mount opens it
+for appending (creating it if absent) after any overlay database is open and
+keeps that descriptor in its writer thread. Its path must lie outside the mount
+point and the overlay directory, but another hard link of the overlay database
+elsewhere is not refused: the journal's lines would be appended to the
+database file, and closing the descriptor (when the journal is finished at
+unmount, when its writer fails, or when the journal open fails after the file
+was opened) would release this process's locks on the database. Do not point `--journal` at a link of an overlay
+database.
 
 These protections keep the SQLite locks of a process that holds the database
 for its whole life: a mount or export server, foreground (`-f`; `sandbox run`

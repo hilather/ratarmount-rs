@@ -88,6 +88,34 @@ fn regression_docs_state_failed_replacement_and_locator_rules() {
     }
 }
 
+/// Regression: #168 omitted the unchecked operation-log writer from the
+/// overlay-database hard-link residuals, hiding its append and lock-release risks.
+#[test]
+fn regression_docs_168_operation_log_unchecked_open() {
+    let docs = read("docs/sandbox.md");
+    let hard_links = docs
+        .split_once("### Hard links of the overlay database ")
+        .expect("missing overlay-database hard-link section")
+        .1
+        .split("### ")
+        .next()
+        .unwrap();
+    for sentence in [
+        "The `--journal` operation log is not checked either",
+        "for appending (creating it if absent) after any overlay database is open",
+        "Its path must lie outside the mount point and the overlay directory",
+        "another hard link of the overlay database elsewhere is not refused",
+        "the journal's lines would be appended to the database file",
+        "closing the descriptor (when the journal is finished at unmount, when its writer fails, or when the journal open fails after the file was opened) would release this process's locks on the database",
+        "Do not point `--journal` at a link of an overlay database.",
+    ] {
+        assert!(
+            hard_links.contains(sentence),
+            "docs/sandbox.md lost the #168 residual: {sentence}"
+        );
+    }
+}
+
 /// Regression: R11-S5 (#151, #183): the lock guarantees are scoped to processes that keep
 /// the database open (a daemonized mount holds no lock after its fork), the
 /// platform table is present, and the swap-back exclusion closed by the
