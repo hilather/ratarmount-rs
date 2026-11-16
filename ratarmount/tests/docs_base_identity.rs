@@ -134,6 +134,34 @@ fn regression_docs_state_failed_replacement_and_locator_rules() {
     }
 }
 
+/// Regression: #168 omitted the unchecked operation-log writer from the
+/// overlay-database hard-link residuals, hiding its append and lock-release risks.
+#[test]
+fn regression_docs_168_operation_log_unchecked_open() {
+    let docs = read("docs/sandbox.md");
+    let hard_links = docs
+        .split_once("### Hard links of the overlay database ")
+        .expect("missing overlay-database hard-link section")
+        .1
+        .split("### ")
+        .next()
+        .unwrap();
+    for sentence in [
+        "The `--journal` operation log is not checked either",
+        "for appending (creating it if absent) after any overlay database is open",
+        "Its path must lie outside the mount point and the overlay directory",
+        "another hard link of the overlay database elsewhere is not refused",
+        "the journal's lines would be appended to the database file",
+        "closing the descriptor (when the journal is finished at unmount, when its writer fails, or when the journal open fails after the file was opened) would release this process's locks on the database",
+        "Do not point `--journal` at a link of an overlay database.",
+    ] {
+        assert!(
+            hard_links.contains(sentence),
+            "docs/sandbox.md lost the #168 residual: {sentence}"
+        );
+    }
+}
+
 /// Regression: R11-S5 (#151, #183): the lock guarantees are scoped to processes that keep
 /// the database open (a daemonized mount holds no lock after its fork), the
 /// platform table is present, and the swap-back exclusion closed by the
@@ -195,6 +223,17 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
     assert!(changelog
         .contains("still holds no kernel lock on its overlay database after it forks (#183)"));
     assert!(changelog.contains("now forks before it opens any database"));
+}
+
+/// Regression: #169 listed only the commit journal's archive opens, omitting
+/// the ZIP and TAR format probes from the unchecked-open inventory.
+#[test]
+fn regression_docs_169_names_unchecked_commit_probes() {
+    let docs = read("docs/sandbox.md");
+    assert!(
+        docs.contains("do not go through the check: the journal file `overlay pack --include-journal` reads (a JSON log, not a database) and the commit path's opens of the archive itself (the commit journal's, and the `is_zip_archive` and `is_uncompressed_tar` format probes that pick the commit method)."),
+        "docs/sandbox.md must name both commit format probes alongside the journal's unchecked archive opens"
+    );
 }
 
 /// Regression: unmount recipes ran offline verbs before the server released
