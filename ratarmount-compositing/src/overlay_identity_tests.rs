@@ -6269,6 +6269,76 @@ fn regression_mount_symlinked_db_stale_prepare_names_next_step() {
     assert_eq!(fs::read(&target).unwrap(), target_before);
 }
 
+/// Regression: #163 (hot-journal route): a hot rollback `-journal` on the
+/// mount's `-w` top database beside a stale prepare locator refused the
+/// locator clear with a bare "attempt to write a readonly database", which
+/// `main` could not tell from any other refusal and exited 2 on every mount.
+/// The refusal is now typed ([`crate::waits_for_top_open`]) so the mount
+/// defers the member to after its `-w` open; nothing is written here. The same
+/// journal on a `--lower` record is not the top's and stays an ordinary
+/// refusal (no `-w` open would roll it back).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_163_top_hot_journal_waits_for_the_open() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for top in [true, false] {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        let db = fx.overlay.join(HIDDEN_DB);
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (x)")
+            .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "overlay_db::tests::hot_journal_writer_child",
+                "--nocapture",
+            ])
+            .env("RATARMOUNT_TEST_HOT_JOURNAL", &db)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let journal = PathBuf::from(format!("{}-journal", db.display()));
+        assert!(fs::metadata(&journal).is_ok_and(|m| m.len() > 0), "hot");
+        stale_prepare(&fx.archive);
+        let archive_before = fs::read(&fx.archive).unwrap();
+        let locator_before = locator(&fx.archive);
+        let journal_before = fs::read(&journal).unwrap();
+        let records = if top {
+            records_of(&fx)
+        } else {
+            MountRecords {
+                lowers: vec![fx.overlay.clone()],
+                ..Default::default()
+            }
+        };
+        assert!(matches!(
+            classify_mount_journal(&records, &fx.archive),
+            Ok(MountJournal::None)
+        ));
+        let error = crate::recover_journal_at(
+            &fx.archive,
+            top.then_some(db.as_path()),
+            crate::Owner::Mount {
+                records: &records,
+                member: &fx.archive,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(crate::waits_for_top_open(&error), top, "top={top}: {error}");
+        if top {
+            assert!(
+                error.to_string().contains("only its -w open rolls back"),
+                "{error}"
+            );
+        }
+        assert_eq!(fs::read(&fx.archive).unwrap(), archive_before, "top={top}");
+        assert_eq!(locator(&fx.archive), locator_before, "top={top}");
+        assert_eq!(fs::read(&journal).unwrap(), journal_before, "top={top}");
+    }
+}
+
 /// Regression: #239 offline recovery refuses a symlinked database before
 /// clearing even a stale prepare locator; archive, target and marker stay put.
 #[cfg(any(target_os = "linux", target_os = "macos"))]

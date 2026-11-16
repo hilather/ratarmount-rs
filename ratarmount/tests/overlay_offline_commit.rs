@@ -661,6 +661,150 @@ fn regression_mount_roll_forward_restamps_then_remount_accepts() {
     }
 }
 
+/// Parent-set switch for [`hot_overlay_journal_child`] (#310 pattern).
+#[cfg(unix)]
+const HOT_OVERLAY_JOURNAL_CHILD: &str = "RATARMOUNT_TEST_HOT_OVERLAY_JOURNAL_CHILD";
+
+/// Child of [`regression_163_mount_hot_journal_and_stale_prepare`]: leave a
+/// hot rollback `-journal` beside the overlay database named in
+/// `RATARMOUNT_TEST_HOT_OVERLAY_DB`, like a writer killed mid-transaction.
+#[cfg(unix)]
+#[test]
+#[ignore = "child process of regression_163_mount_hot_journal_and_stale_prepare"]
+fn hot_overlay_journal_child() {
+    if std::env::var_os(HOT_OVERLAY_JOURNAL_CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        eprintln!(
+            "skip: hot_overlay_journal_child runs only as a child of \
+             regression_163_mount_hot_journal_and_stale_prepare \
+             ({HOT_OVERLAY_JOURNAL_CHILD}=1 is not set)"
+        );
+        return;
+    }
+    let db = std::env::var_os("RATARMOUNT_TEST_HOT_OVERLAY_DB").expect("child overlay db");
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=DELETE; PRAGMA cache_size=1; BEGIN IMMEDIATE; \
+         CREATE TABLE hot_filler(x); INSERT INTO hot_filler SELECT zeroblob(1000000); \
+         DELETE FROM files",
+    )
+    .unwrap();
+    // A crashed writer: exit without rolling back or closing the connection.
+    std::process::exit(0);
+}
+
+/// Regression: #310 pattern for [`hot_overlay_journal_child`]: run directly
+/// (`cargo test -- --ignored`) with a database path but without its parent's
+/// variable, it skips and leaves the database and its journal untouched.
+#[cfg(unix)]
+#[test]
+fn regression_163_hot_overlay_journal_child_skips_without_its_parent() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    let env = Env::new();
+    let db = env.path("overlay.sqlite");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("CREATE TABLE files (path, name, deleted)")
+        .unwrap();
+    let before = fs::read(&db).unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "hot_overlay_journal_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env_remove(HOT_OVERLAY_JOURNAL_CHILD)
+        .env("RATARMOUNT_TEST_HOT_OVERLAY_DB", &db)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    let all = text(&output);
+    assert!(all.contains("1 passed"), "{all}");
+    assert!(
+        all.contains("skip: hot_overlay_journal_child runs only as a child"),
+        "{all}"
+    );
+    assert_eq!(fs::read(&db).unwrap(), before, "database untouched");
+    assert!(!PathBuf::from(format!("{}-journal", db.display())).exists());
+}
+
+/// Regression: #163 (hot-journal route): one SIGKILL during a live commit can
+/// leave a hot `-journal` on the `-w` top database AND a stale prepare
+/// locator on the archive. Mount recovery read the top's record without
+/// rolling the journal back, refused the stale-locator clear and exited 2 on
+/// every mount. Now the stale locator waits for the `-w` open (which rolls the
+/// journal back) and is cleared after the gates; the mount succeeds, the
+/// interrupted overlay write is gone and the remount is clean.
+#[cfg(unix)]
+#[test]
+fn regression_163_mount_hot_journal_and_stale_prepare() {
+    let _spawning = ratarmount_index::test_process::spawning();
+    let env = Env::new();
+    let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    let db = overlay.join(ratarmount_compositing::HIDDEN_DB);
+    // A tombstone the interrupted transaction deletes: it must survive.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO files (path, name, deleted) VALUES ('/', 'a.txt', 1)",
+            [],
+        )
+        .unwrap();
+    {
+        let len = fs::metadata(&archive).unwrap().len();
+        let mut suffix = tempfile::tempfile().unwrap();
+        suffix.write_all(&[0; 1536]).unwrap();
+        let out = ratarmount_compress::commit_journal::replace_suffix_with_hook(
+            &archive,
+            len - 1024,
+            &mut suffix,
+            &mut |step| {
+                if step == "locator prepare" {
+                    Err(std::io::Error::other("crash"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(out.is_err());
+        let _ = fs::remove_file(ratarmount_compress::commit_journal::journal_path(&archive));
+        assert_eq!(policy_locator(&archive).get(4), Some(&b'P'), "stale P");
+    }
+    let archive_before = fs::read(&archive).unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "hot_overlay_journal_child", "--ignored"])
+        .env(HOT_OVERLAY_JOURNAL_CHILD, "1")
+        .env("RATARMOUNT_TEST_HOT_OVERLAY_DB", &db)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    let journal = PathBuf::from(format!("{}-journal", db.display()));
+    assert!(
+        fs::metadata(&journal).is_ok_and(|m| m.len() > 0),
+        "no hot journal: {}",
+        text(&output)
+    );
+
+    let out = env.run(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(!journal.exists(), "the -w open rolled the journal back");
+    assert!(policy_locator(&archive).is_empty(), "stale locator cleared");
+    assert!(
+        fs::read(&archive).unwrap() == archive_before,
+        "archive unchanged"
+    );
+    let tombstones: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT count(*) FROM files WHERE deleted = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(tombstones, 1, "the interrupted delete was rolled back");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+}
+
 /// Regression (#328): startup must reject an unclean relaxed overlay before
 /// archive recovery, even with force. Preserve both torn and complete journals.
 #[cfg(unix)]

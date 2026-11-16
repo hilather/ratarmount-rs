@@ -661,6 +661,12 @@ pub(crate) fn recover_journal_with_records(
     mut owner: Owner<'_>,
     admitted: Option<&MountRecords>,
 ) -> std::result::Result<Option<Applied>, RecoverError> {
+    // A mount's `-w` top: its hot journal is the typed refusal (#163).
+    let top = match &owner {
+        Owner::Mount { records, .. } => records.top.clone(),
+        _ => None,
+    };
+    let top = top.as_ref();
     let mut records: Vec<PathBuf> = match &owner {
         Owner::Mount { records, .. } | Owner::AdmittedMount { records } => records
             .top
@@ -708,7 +714,7 @@ pub(crate) fn recover_journal_with_records(
     let mut before_write = || {
         validate()?;
         for dir in &records {
-            read_record(dir)?;
+            read_record_or_hot(dir, top == Some(dir))?;
         }
         rows.guard()
     };
@@ -861,6 +867,12 @@ pub enum MountJournal {
 /// Read a record only after its database and every companion passed the
 /// strict named-state policy, including an otherwise unmarked raw directory.
 fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
+    read_record_or_hot(dir, false)
+}
+
+/// [`read_record`]; with `top`, a hot rollback journal on the database (an
+/// interrupted overlay write) is the typed [`TopHotJournal`] refusal (#163).
+fn read_record_or_hot(dir: &Path, top: bool) -> io::Result<Option<OverlayMeta>> {
     crate::overlay_db::validate_overlay_state(&dir.join(crate::HIDDEN_DB))?;
     let marked = match usable_entry(dir)? {
         DbEntry::Absent => return Ok(None),
@@ -869,8 +881,52 @@ fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
     };
     OverlayMeta::read_no_recovery_required(dir, marked).map_err(|error| match error {
         OverlayError::Io(error) => error,
+        OverlayError::Sqlite(error) if top && crate::overlay_meta::is_hot_journal(&error) => {
+            io::Error::other(TopHotJournal {
+                dir: dir.to_path_buf(),
+                source: error,
+            })
+        }
         other => io::Error::other(other),
     })
+}
+
+/// A mount's `-w` top database has a hot rollback journal: an overlay write
+/// was interrupted (one SIGKILL during a live commit can leave it beside a
+/// stale prepare locator). Recovery never rolls it back before the gates
+/// voted; the `-w` open does, so a mount whose member has no pending commit
+/// journal waits for that open instead of refusing every mount (#163).
+#[derive(Debug)]
+struct TopHotJournal {
+    dir: PathBuf,
+    source: rusqlite::Error,
+}
+
+impl std::fmt::Display for TopHotJournal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the write overlay database in {} has an interrupted write (a hot rollback \
+             journal) that only its -w open rolls back; no recovery write was made: {}",
+            self.dir.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for TopHotJournal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// `error` refused a mount's recovery ([`Owner::Mount`]) only because its
+/// `-w` top database has a hot rollback journal, before anything was written.
+/// The caller may let the `-w` open roll that journal back and recover the
+/// member after the gates (#163).
+pub fn waits_for_top_open(error: &RecoverError) -> bool {
+    matches!(error, RecoverError::Refused(e)
+        if e.get_ref().is_some_and(|inner| inner.is::<TopHotJournal>()))
 }
 
 /// The decision table on the journal header and the file's current identity.
