@@ -949,14 +949,29 @@ folder, committed Git source and remote source forms as other offline overlay
 commands. Import pins Git references before opening the source and records the
 base identity and lower-layer stack identity.
 
-Accepted patches include `git diff --binary` literal sections (Git base85 plus
-zlib), additions, deletions, executable mode changes, symlinks, rename/copy
-headers and ordinary unified hunks. Rename means copy the preimage to the new
-name, apply its hunks, then delete the old name. Copy keeps the old name.
-Reverse binary literals are validated and ignored. Binary delta sections and
-`Binary files … differ` without content are errors naming the affected file;
-regenerate these as literal patches, for example with `ratarmount diff --git`.
-Index object IDs are accepted without verification.
+Accepted patches include `git diff --binary` literal and delta sections (Git
+base85 plus zlib), additions, deletions, executable mode changes, symlinks,
+rename/copy headers and ordinary unified hunks. Rename means copy the preimage
+to the new name, apply its hunks, then delete the old name. Copy keeps the old
+name. The reverse section (literal or delta) is validated and ignored.
+`Binary files … differ` without content is an error naming the affected file;
+regenerate such a patch with `git diff --binary` or `ratarmount diff --git`.
+
+A delta section modifies an existing regular file: its copy and insert opcodes
+are applied to the preimage in the merged view (base, lower layers and this
+import's earlier sections), as `git apply` does. A delta needs an `index
+<old>..<new>` line: the preimage's Git blob id must equal `<old>` and the
+result's must equal `<new>`. Both ids must use the same object format: full
+40-hex SHA-1 or full 64-hex SHA-256, as required by `git apply`. Abbreviated
+ids are refused. The delta's source size must equal the preimage, every copy must lie inside it, and the
+output must have exactly the declared size. A delta without an index line or
+with an all-zero id, for an added or deleted file, or with text hunks is
+refused. A mismatching blob id or size, or a missing, symlink or directory
+preimage fails like a hunk: without `--reject` import exits 2 naming the file; with
+`--reject` the path keeps its lower content and `PATH.rej` receives the complete
+binary section, including its original paths, rename/copy, mode and index
+headers. A rejected type change restores the lower subtree as a whole. Index
+ids of text hunks and literal sections are accepted without verification.
 
 Hunks require exact context bytes. Their location may move; context is never
 trimmed to force a match. CRLF, Latin-1 file content and missing final newlines
@@ -1009,9 +1024,14 @@ but still opens so the partial result can be inspected. Delete the directory and
 import again.
 
 `--max-patch-bytes N` defaults to 268435456 (256 MiB). It bounds input bytes,
-the total retained decoded literals, each reverse literal, and each file's
-preimage/postimage. Import buffers the bounded patch and one file's text at a
-time; increase the limit explicitly for larger patches.
+the total retained decoded literals and delta streams, each reverse section,
+each delta's declared postimage size (checked while parsing, before allocating
+the postimage or writing the overlay), and each file's preimage/postimage.
+Inflation is bounded by each section's declared size; delta preimages are
+processed as bytes without constructing text line tables. Import buffers the
+bounded patch and one file's preimage/postimage at a time; increase the limit
+explicitly for larger patches. This is not a total size limit on generated
+overlay files.
 
 Git/unified patches cannot represent empty directories, directory metadata or
 extended attributes. Empty directories therefore do not round-trip, and Git

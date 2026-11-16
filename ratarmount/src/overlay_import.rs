@@ -36,7 +36,7 @@ pub struct ImportArgs {
     pub reject: bool,
     #[arg(long)]
     pub json: bool,
-    /// Bound patch input, each decoded literal and each pre/postimage in bytes.
+    /// Bound patch input, retained decoded binary data and each pre/postimage in bytes.
     #[arg(long, default_value_t = 256 * 1024 * 1024)]
     pub max_patch_bytes: u64,
     /// Patch file, or - for stdin.
@@ -244,20 +244,42 @@ fn import(
                 {
                     None
                 }
+                Some(path) if patch.delta.is_some() => {
+                    match overlay.lookup(&format!("/{path}"), 0) {
+                        // Preserve the kind for delta_postimage's rejection;
+                        // a directory must not abort --reject in read_entry.
+                        Some(fi) if fi.mode & S_IFMT != S_IFREG => Some((fi, Vec::new())),
+                        _ => read_entry(&overlay, path, args.max_patch_bytes)?,
+                    }
+                }
                 Some(path) => read_entry(&overlay, path, args.max_patch_bytes)?,
                 None => None,
             };
             let preimage = original
                 .as_ref()
                 .map_or(&[][..], |(_, bytes)| bytes.as_slice());
-            let (content, failed) = apply_hunks(preimage, &patch.hunks, args.max_patch_bytes)?;
-            if !failed.is_empty() {
+            // Binary data never needs a text line table. A newline-heavy
+            // preimage would otherwise allocate many times its byte budget.
+            let (content, failed, delta_failure) =
+                match delta_postimage(patch, original.as_ref(), args.max_patch_bytes) {
+                    None => {
+                        let (content, failed) =
+                            apply_hunks(preimage, &patch.hunks, args.max_patch_bytes)?;
+                        (content, failed, None)
+                    }
+                    Some(Ok(bytes)) => (bytes, Vec::new(), None),
+                    Some(Err(error)) => (Vec::new(), Vec::new(), Some(error)),
+                };
+            if !failed.is_empty() || delta_failure.is_some() {
                 if !args.reject {
-                    return Err(format!(
-                        "{}: hunk #{} failed (exact context not found)",
-                        patch.path(),
-                        failed[0] + 1
-                    ));
+                    return Err(match &delta_failure {
+                        Some(error) => format!("{}: {error}", patch.path()),
+                        None => format!(
+                            "{}: hunk #{} failed (exact context not found)",
+                            patch.path(),
+                            failed[0] + 1
+                        ),
+                    });
                 }
                 // The lower view is the original even if an earlier section in
                 // this patch stream changed this path.
@@ -291,6 +313,9 @@ fn import(
                 });
                 for i in failed {
                     reject.extend_from_slice(&patch.hunks[i].raw);
+                }
+                if delta_failure.is_some() {
+                    reject.extend_from_slice(&patch.binary_raw);
                 }
                 continue;
             }
@@ -701,6 +726,26 @@ fn replace_directory(
     Ok(Replace::Removed(
         deletions.into_iter().map(|(path, j)| (j, path)).collect(),
     ))
+}
+
+/// The postimage of a `delta` section, or `None` without one. `Err` names
+/// why the delta does not apply (missing or non-regular preimage, blob id or
+/// size mismatch); the caller rejects or refuses it like a failed hunk.
+fn delta_postimage(
+    patch: &parse::FilePatch,
+    original: Option<&(FileInfo, Vec<u8>)>,
+    limit: u64,
+) -> Option<Result<Vec<u8>, String>> {
+    let delta = patch.delta.as_deref()?;
+    // The parser refuses a delta without an index line.
+    let index = patch.index.as_ref()?;
+    Some(match original {
+        None => Err("delta preimage does not exist".into()),
+        Some((fi, _)) if fi.mode & S_IFMT != S_IFREG => {
+            Err("delta preimage is not a regular file".into())
+        }
+        Some((_, bytes)) => parse::apply_delta(bytes, delta, index, limit),
+    })
 }
 
 fn read_entry(

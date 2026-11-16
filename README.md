@@ -256,7 +256,7 @@ Commands beyond mounting (see `ratarmount COMMAND --help`):
 |---|---|
 | `diff OVERLAY [BASE]` | Patch, manifest, canonical hash, names or statistics; compare attempts with `--between` |
 | `overlay info\|seal\|unseal\|verify\|fsck` | Inspect identity and manage layer integrity |
-| `overlay import\|import-upperdir\|pack\|unpack` | Replay patches or overlayfs upperdirs; transport sealed layers |
+| `overlay import\|import-upperdir\|pack\|unpack` | Replay Git/unified patches (including binary literals/deltas) or overlayfs upperdirs; transport sealed layers |
 | `journal summarize\|mark` | Summarize operation JSONL or mark an agent turn |
 | `tensors manifest PATH...` | Map local checkpoint tensors and expert slices to file byte ranges ([format and limits](docs/formats-tensors.md#expert-manifest)) |
 | `sandbox run` | Run one container command and finalize its attempt |
