@@ -325,6 +325,17 @@ fn regression_docs_state_offline_symlink_refusal() {
     }
 }
 
+/// Regression: #163 must not promise a safe automatic writable retry when
+/// SQLite has to modify an unreadable overlay before its gates can run.
+#[test]
+fn regression_163_docs_name_explicit_hot_journal_recovery() {
+    let text = read("docs/sandbox.md");
+    assert!(text.contains("A stale prepare locator beside a hot overlay journal is kept, with the archive, database and hot journal unchanged."));
+    assert!(text.contains("`ratarmount --no-mount ARCHIVE`"));
+    assert!(text.contains("without `-w` or `--lower`"));
+    assert!(text.contains("Inspect the overlay on a writable copy before retrying"));
+}
+
 /// Regression: publication docs preserve WAL limitations and the old-pin recovery instructions.
 #[test]
 fn regression_docs_state_index_wal_and_pin_limits() {

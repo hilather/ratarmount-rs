@@ -882,8 +882,45 @@ fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
     };
     OverlayMeta::read_no_recovery_required(dir, marked).map_err(|error| match error {
         OverlayError::Io(error) => error,
+        OverlayError::Sqlite(error) if crate::overlay_meta::is_hot_journal(&error) => {
+            io::Error::other(HotOverlayJournal {
+                dir: dir.to_path_buf(),
+                source: error,
+            })
+        }
         other => io::Error::other(other),
     })
+}
+
+/// Recovery cannot read this record without writing its database. Deferring
+/// to a writable open would roll it back before sealing, durability and
+/// identity could be checked, so name the explicit recovery route (#163).
+#[derive(Debug)]
+struct HotOverlayJournal {
+    dir: PathBuf,
+    source: rusqlite::Error,
+}
+
+impl std::fmt::Display for HotOverlayJournal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the overlay database in {} has an interrupted write (a hot rollback journal); \
+             its identity, sealing and durability state cannot be checked without modifying \
+             it. Recovery stopped; the archive's commit journal or stale prepare \
+             locator is kept. Recover the archive separately with `ratarmount --no-mount \
+             ARCHIVE` (without -w or --lower), then inspect the overlay on a writable copy \
+             before retrying: {}",
+            self.dir.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for HotOverlayJournal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// The decision table on the journal header and the file's current identity.
@@ -908,31 +945,49 @@ fn decide(
         why,
         force_flag: flag,
     };
+    // A bundle or an earlier mismatching record may defer an otherwise usable
+    // journal, but must not hide a record whose writable open would mutate it
+    // before the gates. Read each directory once before deciding to defer.
+    let voters = records
+        .top
+        .iter()
+        .map(|d| (d, true))
+        .chain(records.lowers.iter().map(|d| (d, false)))
+        .map(|(dir, is_top)| {
+            let read = match read_record(dir) {
+                // Path policy and hot journals outrank deferral: force cannot
+                // turn either refusal into recovery authority.
+                Err(e)
+                    if crate::overlay_db::is_overlay_state_error(&e)
+                        || e.get_ref()
+                            .is_some_and(|inner| inner.is::<HotOverlayJournal>()) =>
+                {
+                    return Err(e);
+                }
+                other => other,
+            };
+            if let Ok(meta) = &read {
+                crate::relaxed_durability::refuse_unclean(meta.as_ref())
+                    .map_err(io::Error::other)?;
+            }
+            Ok((dir, is_top, read))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     if records.bundles {
         return Ok(defer(
             "a --lower bundle's record is read after unpacking".into(),
             "--force-stack-mismatch",
         ));
     }
-    let voters = records
-        .top
-        .iter()
-        .map(|d| (d, true))
-        .chain(records.lowers.iter().map(|d| (d, false)));
-    for (dir, is_top) in voters {
+    for (dir, is_top, read) in voters {
         let flag = if is_top {
             "--force-base-mismatch"
         } else {
             "--force-stack-mismatch"
         };
-        let meta = match read_record(dir) {
+        let meta = match read {
             Ok(meta) => meta,
             Err(e) => {
-                // Path policy outranks journal deferral: force cannot turn a
-                // typed acquisition/metadata refusal into recovery authority.
-                if crate::overlay_db::is_overlay_state_error(&e) {
-                    return Err(e);
-                }
                 return Ok(defer(
                     format!(
                         "has an overlay record ({}) that cannot be read: {e}",
@@ -943,11 +998,6 @@ fn decide(
             }
         };
         let Some(meta) = meta else { continue };
-        // #328: even an inode-owned archive journal cannot be recovered using
-        // a record left unclean by relaxed durability. Refuse before recovery
-        // writes, not later when the writable overlay is opened. Force may
-        // override a base mismatch, but cannot validate this database.
-        crate::relaxed_durability::refuse_unclean(Some(&meta)).map_err(io::Error::other)?;
         if is_top && meta.layer_sealed() {
             return Ok(defer("is guarded by a sealed overlay".into(), flag));
         }

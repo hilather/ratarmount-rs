@@ -6359,6 +6359,105 @@ fn regression_mount_symlinked_db_stale_prepare_names_next_step() {
     assert_eq!(fs::read(&target).unwrap(), target_before);
 }
 
+/// Regression: #163 a hot overlay journal made stale-locator recovery fail
+/// without naming a remedy. A writable open cannot safely read the record
+/// before rollback, so both top and lower refuse with explicit recovery steps.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_163_hot_journal_refusal_names_recovery() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for top in [true, false] {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        let db = fx.overlay.join(HIDDEN_DB);
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (x)")
+            .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "overlay_db::tests::hot_journal_writer_child",
+                "--nocapture",
+            ])
+            .env("RATARMOUNT_TEST_HOT_JOURNAL", &db)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let journal = PathBuf::from(format!("{}-journal", db.display()));
+        assert!(fs::metadata(&journal).is_ok_and(|m| m.len() > 0), "hot");
+        stale_prepare(&fx.archive);
+        let archive_before = fs::read(&fx.archive).unwrap();
+        let locator_before = locator(&fx.archive);
+        let journal_before = fs::read(&journal).unwrap();
+        let db_before = fs::read(&db).unwrap();
+        let records = if top {
+            records_of(&fx)
+        } else {
+            MountRecords {
+                lowers: vec![fx.overlay.clone()],
+                ..Default::default()
+            }
+        };
+        assert!(matches!(
+            classify_mount_journal(&records, &fx.archive),
+            Ok(MountJournal::None)
+        ));
+        let error = crate::recover_journal_at(
+            &fx.archive,
+            top.then_some(db.as_path()),
+            crate::Owner::Mount {
+                records: &records,
+                member: &fx.archive,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ratarmount_compress::commit_journal::RecoverError::Refused(_)
+        ));
+        let message = error.to_string();
+        assert!(
+            message.contains("stale prepare locator is kept"),
+            "{message}"
+        );
+        assert!(
+            message.contains("ratarmount --no-mount ARCHIVE"),
+            "{message}"
+        );
+        assert!(message.contains("without -w or --lower"), "{message}");
+        assert_eq!(fs::read(&fx.archive).unwrap(), archive_before, "top={top}");
+        assert_eq!(locator(&fx.archive), locator_before, "top={top}");
+        assert_eq!(fs::read(&journal).unwrap(), journal_before, "top={top}");
+        assert_eq!(fs::read(&db).unwrap(), db_before, "top={top}");
+
+        // A real pending journal must not defer this unreadable record to a
+        // writable open either, even when its archive bytes are complete.
+        crate::recover_journal_at(&fx.archive, None, crate::Owner::Inode).unwrap();
+        interrupt_complete(&fx.archive);
+        let commit_journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+        let before = overlay_239_snapshot(&fx.archive, &fx.overlay, &commit_journal);
+        let error = classify_mount_journal(&records, &fx.archive).unwrap_err();
+        assert!(
+            error.to_string().contains("hot rollback journal"),
+            "{error}"
+        );
+        let with_bundle = MountRecords {
+            bundles: true,
+            ..records
+        };
+        let error = classify_mount_journal(&with_bundle, &fx.archive).unwrap_err();
+        assert!(
+            error.to_string().contains("hot rollback journal"),
+            "{error}"
+        );
+        assert_eq!(
+            overlay_239_snapshot(&fx.archive, &fx.overlay, &commit_journal),
+            before
+        );
+    }
+}
+
 /// Regression: #239 offline recovery refuses a symlinked database before
 /// clearing even a stale prepare locator; archive, target and marker stay put.
 #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -432,7 +432,21 @@ refusal is a refused recovery, also next to a complete journal: a live mount
 is not marked as having a base changed by a failed commit, and the next gate
 still refuses. The restamp after a roll-forward re-checks the record too, and a
 used overlay's database must still have its `files` table, else the journal is
-kept. A stale prepare locator without a journal is otherwise cleared
+kept. A hot overlay rollback journal is a separate refusal: its record cannot be read
+without first modifying the database, so archive recovery must not defer it to
+a writable open that checks identity, sealing and relaxed durability afterward.
+This applies to the `-w` top and directory lowers, even with force or a pending
+complete commit journal. A stale prepare locator beside a hot overlay journal is kept, with the archive, database and hot journal unchanged.
+The error names the explicit recovery route: `ratarmount --no-mount ARCHIVE`
+without `-w` or `--lower`. That command recovers only the archive; it does not
+open the overlay. Inspect the overlay on a writable copy before retrying:
+SQLite can roll its hot journal back on that copy before sealed or unclean
+metadata becomes readable. Ordinary writable opens without archive recovery
+retain that SQLite behavior. The same refusal runs before `--no-mount` returns,
+before export servers or interval commits start, and in a daemonized mount's
+serving child after its early fork (#163).
+
+A stale prepare locator without a journal is otherwise cleared
 after a directory sync; a complete locator whose journal cannot be found is
 refused, never cleared (the commit's hook may not have run), and the error
 names the manual escape: verify the archive, then remove its
