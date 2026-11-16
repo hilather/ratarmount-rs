@@ -642,6 +642,53 @@ fn regression_raw_dir_commit_refuses_when_overlay_db_exists() {
     assert!(err.contains(HIDDEN_DB), "{err}");
 }
 
+/// Regression: #176: `commit_overlay_raw_dir` classified the database entry
+/// twice and answered the second classification's "exists (or something else
+/// is at its path)" for anything but `Absent`, so the two could disagree and
+/// misname the entry. One classification now names each case: an existing
+/// database (marked or not), a lost record, and an unresolvable entry (its own
+/// error, here an injected `EIO`); nothing is written in any row.
+#[cfg(unix)]
+#[test]
+fn regression_176_raw_dir_commit_names_each_entry_once() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for row in ["marked", "unmarked", "lost", "unresolvable"] {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::None, false));
+        let db = fx.overlay.join(HIDDEN_DB);
+        let marker = fx.overlay.join(crate::OVERLAY_MARKER);
+        match row {
+            "unmarked" => fs::remove_file(&marker).unwrap(),
+            "lost" => fs::remove_file(&db).unwrap(),
+            _ => {}
+        }
+        let archive_before = fs::read(&fx.archive).unwrap();
+        let seam = (row == "unresolvable").then(|| FollowedStatErrno::set(libc::EIO));
+        let err = crate::commit_overlay_raw_dir(&fx.overlay, &fx.archive, &Default::default())
+            .unwrap_err();
+        drop(seam);
+        let text = err.to_string();
+        let expect = match row {
+            "lost" => "missing or empty",
+            "unresolvable" => "cannot resolve the overlay database",
+            _ => "exists; its base identity must be checked",
+        };
+        assert!(text.contains(expect), "{row}: {text}");
+        assert!(
+            !text.contains("something else is at its path"),
+            "{row}: {text}"
+        );
+        if row == "unresolvable" {
+            assert!(
+                matches!(&err, crate::OverlayError::Io(e)
+                    if e.kind() == std::io::Error::from_raw_os_error(libc::EIO).kind()),
+                "{row}: {err:?}"
+            );
+        }
+        assert_eq!(fs::read(&fx.archive).unwrap(), archive_before, "{row}");
+    }
+}
+
 #[test]
 fn regression_raw_dir_commit_succeeds_and_reports_no_identity_check() {
     let _process_guard = ratarmount_index::test_process::spawning();

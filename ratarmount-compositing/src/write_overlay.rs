@@ -7898,16 +7898,21 @@ fn commit_overlay_raw_dir_locked(
 ) -> Result<RawDirCommit> {
     let db = write_overlay.join(HIDDEN_DB);
     crate::overlay_db::validate_overlay_state(&db)?;
-    if let DbEntry::Lost { markers, .. } = overlay_db_entry(write_overlay)? {
-        return Err(lost_record_error(write_overlay, &markers));
-    }
-    if !overlay_db_absent(write_overlay) {
-        return Err(OverlayError::Msg(format!(
-            "overlay database {} exists (or something else is at its path); its base \
-             identity must be checked, so commit it with a classified base \
-             (commit_overlay), not as a raw directory",
-            db.display()
-        )));
+    // One classification (#176): a second one could disagree under a race and
+    // misname an unresolvable entry as an existing database. Its own error
+    // (an unresolvable or non-regular entry) propagates with its own text.
+    match overlay_db_entry(write_overlay)? {
+        DbEntry::Absent => {}
+        DbEntry::Lost { markers, .. } => {
+            return Err(lost_record_error(write_overlay, &markers));
+        }
+        DbEntry::Present { .. } => {
+            return Err(OverlayError::Msg(format!(
+                "overlay database {} exists; its base identity must be checked, so \
+                 commit it with a classified base (commit_overlay), not as a raw directory",
+                db.display()
+            )));
+        }
     }
     if !opts.force_base_mismatch {
         crate::overlay_gate::ensure_journal_is_for_archive(archive_file)
