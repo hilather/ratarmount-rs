@@ -38,6 +38,13 @@ sudo ratarmount-volume-plugin --socket /run/docker/plugins/ratarmount.sock \
   --ratarmount /usr/bin/ratarmount --mount-timeout 60
 ```
 
+Foreground socket creation uses a temporary sibling directory owned by the
+daemon's effective user with mode 0700. An inherited setgid bit from a shared
+socket parent is cleared on that temporary directory; other owners or unsafe
+modes are refused. Shared setgid socket parents and umask 0002 are supported.
+With systemd activation, the service uses the supplied listening descriptor
+directly; the socket unit controls its permissions.
+
 `--mount-timeout` is in seconds and must be positive. Increase it for a cold index
 or a slow remote source. `journalctl -u ratarmount-volume-plugin.service` records
 child exits. Child stdout/stderr are suppressed so remote credentials cannot leak

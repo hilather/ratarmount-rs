@@ -3472,6 +3472,8 @@ struct CopyRow {
 /// rebuild compared nothing and published without the copy guard. Now P1 is
 /// refused, the archive keeps its inode and the other writer's bytes, and the
 /// other writer's next commit is accepted. Rows marked control already passed.
+/// Without GNU tar only the rows that need it are skipped (#158): the native
+/// `.tar.zst`, ZIP and Auto provenance-TAR rows still run.
 #[cfg(unix)]
 #[test]
 fn regression_copy_paths_compare_the_gate_stamp() {
@@ -3479,10 +3481,6 @@ fn regression_copy_paths_compare_the_gate_stamp() {
     use crate::CommitMode::{Auto, Copy};
     use CopyFmt::*;
     use CopyWindow::*;
-    if !have_gnu_tar() {
-        eprintln!("skip: GNU tar unavailable");
-        return;
-    }
     let row = |site, fmt, way, mode, window, delete| CopyRow {
         site,
         fmt,
@@ -3669,8 +3667,16 @@ fn regression_copy_paths_compare_the_gate_stamp() {
             false,
         ),
     ];
+    let gnu_tar = have_gnu_tar();
+    let (mut ran, mut skipped) = (0, 0);
     let mut failed = Vec::new();
     for r in &rows {
+        if !gnu_tar && copy_row_needs_gnu_tar(r) {
+            eprintln!("skip: {}: needs GNU tar", r.site);
+            skipped += 1;
+            continue;
+        }
+        ran += 1;
         let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if matches!(r.fmt, Tar | Zst) {
                 copy_row_with_p2(r)
@@ -3684,7 +3690,91 @@ fn regression_copy_paths_compare_the_gate_stamp() {
             failed.push(r.site);
         }
     }
+    eprintln!("copy-path rows: {ran} ran, {skipped} skipped for want of GNU tar");
     assert!(failed.is_empty(), "failed rows: {failed:?}");
+}
+
+/// Does this copy-path row reach GNU tar before its refusal? The `.tar.zst`
+/// splice and the ZIP rebuild are native. Offline gzip/bzip2/xz recompress
+/// through GNU tar. An uncompressed TAR needs it in `Copy` mode (the live
+/// commit checks for it up front) and on the live and offline copy fallbacks;
+/// the provenance rewrite (`persist_provenance_plan`) is native.
+#[cfg(unix)]
+fn copy_row_needs_gnu_tar(r: &CopyRow) -> bool {
+    match r.fmt {
+        CopyFmt::Zst | CopyFmt::Zip => false,
+        CopyFmt::Gz | CopyFmt::Bz2 | CopyFmt::Xz => true,
+        CopyFmt::Tar => r.mode == crate::CommitMode::Copy || r.way != Way::Provenance,
+    }
+}
+
+/// Regression: #158 skipped the entire copy-path matrix without GNU tar,
+/// including native rows. Run the real matrix with an isolated child PATH so
+/// GNU-tar-equipped CI also checks the missing-tool and BSD-tar-only cases.
+#[cfg(unix)]
+#[test]
+fn regression_copy_paths_run_native_rows_without_gnu_tar() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _process_guard = ratarmount_index::test_process::spawning();
+    let exe = std::env::current_exe().unwrap();
+    let (_, module) = module_path!().split_once("::").unwrap();
+    let test = format!("{module}::regression_copy_paths_compare_the_gate_stamp");
+    let path = tempfile::tempdir().unwrap();
+    for bsd_tar in [false, true] {
+        if bsd_tar {
+            let tar = path.path().join("tar");
+            fs::write(
+                &tar,
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then\n    printf '%s\\n' 'bsdtar (regression fixture)'\n    exit 0\nfi\nexit 99\n",
+            )
+            .unwrap();
+            fs::set_permissions(&tar, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let output = std::process::Command::new(&exe)
+            .env("PATH", path.path())
+            .args(["--exact", &test, "--nocapture"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "bsd_tar={bsd_tar}: {}\n{stdout}\n{stderr}",
+            output.status
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed;"),
+            "the child must select exactly the matrix test: {stdout}\n{stderr}"
+        );
+        let skipped: Vec<_> = stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("skip: "))
+            .collect();
+        assert_eq!(
+            skipped,
+            [
+                "A1 provenance tar copy: needs GNU tar",
+                "A3 live tar copy (control): needs GNU tar",
+                "A3 live tar after rollback: needs GNU tar",
+                "A4 offline tar copy (control): needs GNU tar",
+                "A4 offline tar after rollback: needs GNU tar",
+                "A6 offline tar.gz after gate: needs GNU tar",
+                "A6 offline tar.gz opened: needs GNU tar",
+                "A6 offline tar.bz2 after gate: needs GNU tar",
+                "A6 offline tar.bz2 opened: needs GNU tar",
+                "A6 offline tar.xz after gate: needs GNU tar",
+                "A6 offline tar.xz opened: needs GNU tar",
+            ],
+            "bsd_tar={bsd_tar}: only GNU-tar-dependent rows may skip\n{stderr}"
+        );
+        assert!(
+            stderr
+                .lines()
+                .any(|line| { line == "copy-path rows: 11 ran, 11 skipped for want of GNU tar" }),
+            "bsd_tar={bsd_tar}: native rows must execute, not silently return\n{stderr}"
+        );
+    }
 }
 
 /// A `.tar`/`.tar.zst` row: P2 (another `-w` overlay) appends its member in
@@ -6403,6 +6493,105 @@ fn regression_mount_symlinked_db_stale_prepare_names_next_step() {
     assert_eq!(fs::read(&fx.archive).unwrap(), archive_before);
     assert_eq!(locator(&fx.archive), locator_before);
     assert_eq!(fs::read(&target).unwrap(), target_before);
+}
+
+/// Regression: #163 a hot overlay journal made stale-locator recovery fail
+/// without naming a remedy. A writable open cannot safely read the record
+/// before rollback, so both top and lower refuse with explicit recovery steps.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_163_hot_journal_refusal_names_recovery() {
+    let _process_guard = ratarmount_index::test_process::spawning();
+    for top in [true, false] {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        let db = fx.overlay.join(HIDDEN_DB);
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (x)")
+            .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "overlay_db::tests::hot_journal_writer_child",
+                "--nocapture",
+            ])
+            .env("RATARMOUNT_TEST_HOT_JOURNAL", &db)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let journal = PathBuf::from(format!("{}-journal", db.display()));
+        assert!(fs::metadata(&journal).is_ok_and(|m| m.len() > 0), "hot");
+        stale_prepare(&fx.archive);
+        let archive_before = fs::read(&fx.archive).unwrap();
+        let locator_before = locator(&fx.archive);
+        let journal_before = fs::read(&journal).unwrap();
+        let db_before = fs::read(&db).unwrap();
+        let records = if top {
+            records_of(&fx)
+        } else {
+            MountRecords {
+                lowers: vec![fx.overlay.clone()],
+                ..Default::default()
+            }
+        };
+        assert!(matches!(
+            classify_mount_journal(&records, &fx.archive),
+            Ok(MountJournal::None)
+        ));
+        let error = crate::recover_journal_at(
+            &fx.archive,
+            top.then_some(db.as_path()),
+            crate::Owner::Mount {
+                records: &records,
+                member: &fx.archive,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ratarmount_compress::commit_journal::RecoverError::Refused(_)
+        ));
+        let message = error.to_string();
+        assert!(
+            message.contains("stale prepare locator is kept"),
+            "{message}"
+        );
+        assert!(
+            message.contains("ratarmount --no-mount ARCHIVE"),
+            "{message}"
+        );
+        assert!(message.contains("without -w or --lower"), "{message}");
+        assert_eq!(fs::read(&fx.archive).unwrap(), archive_before, "top={top}");
+        assert_eq!(locator(&fx.archive), locator_before, "top={top}");
+        assert_eq!(fs::read(&journal).unwrap(), journal_before, "top={top}");
+        assert_eq!(fs::read(&db).unwrap(), db_before, "top={top}");
+
+        // A real pending journal must not defer this unreadable record to a
+        // writable open either, even when its archive bytes are complete.
+        crate::recover_journal_at(&fx.archive, None, crate::Owner::Inode).unwrap();
+        interrupt_complete(&fx.archive);
+        let commit_journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+        let before = overlay_239_snapshot(&fx.archive, &fx.overlay, &commit_journal);
+        let error = classify_mount_journal(&records, &fx.archive).unwrap_err();
+        assert!(
+            error.to_string().contains("hot rollback journal"),
+            "{error}"
+        );
+        let with_bundle = MountRecords {
+            bundles: true,
+            ..records
+        };
+        let error = classify_mount_journal(&with_bundle, &fx.archive).unwrap_err();
+        assert!(
+            error.to_string().contains("hot rollback journal"),
+            "{error}"
+        );
+        assert_eq!(
+            overlay_239_snapshot(&fx.archive, &fx.overlay, &commit_journal),
+            before
+        );
+    }
 }
 
 /// Regression: #239 offline recovery refuses a symlinked database before

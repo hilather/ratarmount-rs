@@ -736,3 +736,60 @@ fn regression_synthetic_file_entry_cannot_reference_commit_object() {
     assert!(error.contains("unexpected Git object type"), "{error}");
     assert_eq!(fs::read_dir(cache).unwrap().count(), 0);
 }
+
+/// Regression (#187): the cache root lock was released only by closing its
+/// descriptor, so a git child forked meanwhile (holding a copy of it until
+/// it execs) kept the lock after the open returned.
+#[cfg(unix)]
+#[test]
+fn regression_187_synthetic_cache_lock_released_while_copy_is_held() {
+    use std::os::fd::AsFd;
+    let dir = test_dir();
+    let path = dir.path().join("repo");
+    let (_, first, _, _) = fixture(&path);
+    let cache = dir.path().join("cache");
+    let copy: std::rc::Rc<std::cell::RefCell<Option<std::os::fd::OwnedFd>>> = Default::default();
+    let held = copy.clone();
+    super::synthetic::AFTER_CACHE_LOCK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |file: &fs::File| {
+            *held.borrow_mut() = Some(file.as_fd().try_clone_to_owned().unwrap());
+        }));
+    });
+    let src = GitMountSource::open(&path, Some(&first.to_string()))
+        .unwrap()
+        .with_synthetic_head(&cache)
+        .unwrap();
+    assert!(copy.borrow().is_some(), "the hook ran");
+    // The copy (a child's inherited descriptor) is still open.
+    assert!(
+        fs::File::open(&cache).unwrap().try_lock().is_ok(),
+        "the cache root lock outlived the open"
+    );
+    drop(copy);
+    drop(src);
+}
+
+/// Regression: failing to build a synthetic tree must release the cache lock
+/// too, while preserving the original build error and any inherited descriptor.
+#[cfg(unix)]
+#[test]
+fn regression_187_synthetic_cache_error_unlocks_while_copy_is_held() {
+    let dir = test_dir();
+    let path = dir.path().join("repo");
+    let (repo, first, _, _) = fixture(&path);
+    let cache = dir.path().join("cache");
+    let copy = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let captured = copy.clone();
+    super::synthetic::AFTER_CACHE_LOCK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |file| {
+            *captured.borrow_mut() = Some(file.try_clone().unwrap());
+        }));
+    });
+    let result = super::synthetic::SyntheticGit::build(&repo, &path, first, Oid::zero(), 0, &cache);
+    assert!(
+        matches!(result, Err(GitError::Git(_))),
+        "missing tree must fail"
+    );
+    assert!(copy.borrow().is_some(), "lock hook ran");
+    fs::File::open(&cache).unwrap().try_lock().unwrap();
+}

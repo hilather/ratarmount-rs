@@ -7791,7 +7791,9 @@ fn commit_overlay_locked(
 /// Serializes seal and offline commit for one overlay, including when callers
 /// name different copies of its base. Always acquire before an archive guard.
 /// An O_RDONLY | O_DIRECTORY handle locks the root itself without changing
-/// permissions or creating bookkeeping. Closing the handle releases the flock.
+/// permissions or creating bookkeeping. Dropping the guard unlocks it
+/// explicitly (#187): a child forked meanwhile (tar, git) holds a copy of the
+/// descriptor until it execs, so closing ours alone may not release it.
 pub(crate) struct SealCommitGuard {
     #[cfg(unix)]
     _fd: std::os::fd::OwnedFd,
@@ -7844,6 +7846,22 @@ impl SealCommitGuard {
             // Sealing is Unix-only. Preserve the existing non-Unix copy-commit
             // path, which has no seal operation to serialize against.
             Ok(Self {})
+        }
+    }
+}
+
+impl Drop for SealCommitGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the guard owns the descriptor until after this call.
+            if unsafe { libc::flock(self._fd.as_raw_fd(), libc::LOCK_UN) } != 0 {
+                log::warn!(
+                    "releasing the overlay seal/commit lock: {}",
+                    io::Error::last_os_error()
+                );
+            }
         }
     }
 }

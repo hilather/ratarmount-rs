@@ -229,9 +229,9 @@ impl OpLog {
             ),
             std::fs::TryLockError::Error(error) => error,
         })?;
-        let mut output = BufWriter::new(file);
+        let mut output = BufWriter::new(LockedJournal(file));
         // Separate sessions in an append-only file, even after a killed writer.
-        if output.get_ref().metadata()?.len() != 0 {
+        if output.get_ref().0.metadata()?.len() != 0 {
             output.write_all(b"\n")?;
         }
         let start = Instant::now();
@@ -256,9 +256,9 @@ impl OpLog {
         let join = std::thread::Builder::new()
             .name("ratarmount-oplog".into())
             .spawn(move || {
-                let result = writer_loop(output, rx, start, &ended, |file: &File| {
+                let result = writer_loop(output, rx, start, &ended, |file: &LockedJournal| {
                     if sync {
-                        file.sync_all()?;
+                        file.0.sync_all()?;
                     }
                     Ok(())
                 });
@@ -601,6 +601,27 @@ pub fn path_field(record: &mut Value, path: &[u8]) {
     }
 }
 
+/// The journal file while this writer holds its lock. Dropping it unlocks
+/// the file explicitly (#187): a child forked meanwhile holds a copy of the
+/// descriptor until it execs, so the close alone may not release the lock.
+struct LockedJournal(File);
+
+impl Write for LockedJournal {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Drop for LockedJournal {
+    fn drop(&mut self) {
+        ratarmount_core::held_lock::unlock_or_log(&self.0, "operation journal");
+    }
+}
+
 fn write_line(output: &mut impl Write, record: &Value) -> io::Result<()> {
     serde_json::to_writer(&mut *output, record)?;
     output.write_all(b"\n")
@@ -698,6 +719,50 @@ pub fn validate_path(path: &Path, mount: &Path, overlay: Option<&Path>) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: explicit journal unlock must follow the last buffered
+    /// write, on normal completion and on an error before publishing `end`.
+    #[test]
+    fn regression_187_journal_unlock_follows_flush_and_sync() {
+        for fail_sync in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("journal.jsonl");
+            let file = File::create(&path).unwrap();
+            file.try_lock().unwrap();
+            let inherited = file.try_clone().unwrap();
+            let probe = File::open(&path).unwrap();
+            let output = BufWriter::new(LockedJournal(file));
+            let (tx, rx) = mpsc::sync_channel(1);
+            tx.send(json!({"op": "mkdir", "path": "kept"})).unwrap();
+            drop(tx);
+            let result = writer_loop(output, rx, Instant::now(), &AtomicU64::new(0), |_| {
+                assert!(matches!(
+                    probe.try_lock(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ));
+                assert!(std::fs::read_to_string(&path).unwrap().contains("kept"));
+                if fail_sync {
+                    Err(io::Error::other("injected sync failure"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_err(), fail_sync);
+            probe
+                .try_lock()
+                .expect("journal released with an inherited copy alive");
+            let records: Vec<Value> = std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(records.len(), if fail_sync { 1 } else { 2 });
+            if !fail_sync {
+                assert_eq!(records[1]["op"], "end");
+            }
+            drop(inherited);
+        }
+    }
 
     fn options(path: PathBuf) -> JournalOptions {
         JournalOptions {
