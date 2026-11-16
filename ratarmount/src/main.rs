@@ -731,8 +731,11 @@ struct Args {
     print_features: bool,
 
     /// Input archives/folders/URLs and optional mountpoint. A mountpoint may not be, lie
-    /// inside, or contain a folder being mounted (refused, exit 2); a folder defaults to
-    /// `<folder>.mounted`.
+    /// inside, or contain a folder being mounted (refused, exit 2). Without one, the
+    /// mount point is the first input's file name, minus a compression suffix and one
+    /// more extension, in the current directory (`dir/base` and `dir/base.tar.gz` both
+    /// mount at `./base`); only when that would be the input folder itself is
+    /// `.mounted` appended (`base.mounted`).
     #[arg(required = false)]
     paths: Vec<PathBuf>,
 
@@ -7502,6 +7505,63 @@ mod create_missing_cli_tests {
         }
         let u = find("unmount");
         assert!(u.contains("fusermount3 -u"), "--unmount long help: {u}");
+    }
+
+    /// Regression: #224 the positional help said "a folder defaults to
+    /// `<folder>.mounted`", but the default is the input's name in the current
+    /// directory; `.mounted` is appended only when that would be the folder itself.
+    #[test]
+    fn regression_help_states_default_mount_point() {
+        use clap::CommandFactory;
+        let help = Args::command()
+            .get_positionals()
+            .find(|a| a.get_id() == "paths")
+            .and_then(|a| a.get_long_help().or(a.get_help()))
+            .map(|h| h.to_string())
+            .expect("paths help");
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !flat.contains("a folder defaults to `<folder>.mounted`"),
+            "{flat}"
+        );
+        for needle in [
+            "the first input's file name, minus a compression suffix and one more extension, in the current directory",
+            "(`dir/base` and `dir/base.tar.gz` both mount at `./base`)",
+            "only when that would be the input folder itself is `.mounted` appended",
+        ] {
+            assert!(flat.contains(needle), "paths help lacks {needle:?}: {flat}");
+        }
+        // The examples in the text are what the code derives.
+        assert_eq!(
+            default_mountpoint(Path::new("dir/base")),
+            PathBuf::from("base")
+        );
+        assert_eq!(
+            default_mountpoint(Path::new("dir/base.tar.gz")),
+            PathBuf::from("base")
+        );
+        assert_eq!(
+            default_mountpoint(Path::new("dir/v1.2.tar.gz")),
+            PathBuf::from("v1.2")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("base");
+        let other = dir.path().join("other");
+        fs::create_dir(&folder).unwrap();
+        fs::create_dir(&other).unwrap();
+        // Run from another directory: `<cwd>/base`, not `<folder>.mounted`.
+        assert_eq!(
+            mount_guard::default_for_input(&mount_guard::RealFs::with_cwd(other), &folder),
+            PathBuf::from("base")
+        );
+        // Run from the folder's parent: `base` is the folder itself.
+        assert_eq!(
+            mount_guard::default_for_input(
+                &mount_guard::RealFs::with_cwd(dir.path().to_path_buf()),
+                Path::new("base")
+            ),
+            PathBuf::from("base.mounted")
+        );
     }
 
     #[test]
