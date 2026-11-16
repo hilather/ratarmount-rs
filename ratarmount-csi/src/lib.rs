@@ -47,6 +47,16 @@ struct Journal {
     _lock: File,
 }
 
+impl Drop for Journal {
+    fn drop(&mut self) {
+        // Explicit (#187): a mount process forked meanwhile holds a copy of
+        // the descriptor until it execs, so the close alone may not release it.
+        if let Err(error) = self._lock.unlock() {
+            log::warn!("releasing the CSI state lock: {error}");
+        }
+    }
+}
+
 impl Journal {
     fn open(dir: &Path) -> Result<Self, Status> {
         #[expect(

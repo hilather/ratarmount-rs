@@ -1296,17 +1296,21 @@ fn regression_supervisor_status_reads_real_denials() {
 /// earlier connects still queued) the connect itself held it until the
 /// listener closed. The read gets `finalize_wait()`, the smaller of
 /// `--timeout` and 10 s, the connect included; an unanswered read leaves
-/// `erofs_denied` null and the finalize goes on. Each stalled finalize, the
-/// whole `handle` call, takes at most a finalize of the same attempt shape
-/// without a stall plus that wait (and a second of slack), so no other step
-/// waits on the socket. A watchdog closes the listener after a few seconds,
-/// so a regression fails instead of hanging.
+/// `erofs_denied` null and the finalize goes on. Outside that read, a stalled
+/// finalize (the whole `handle` call) spends at most what a finalize of the
+/// same attempt shape without a stall spends, plus two seconds of slack for a
+/// loaded runner, so no other step waits on the socket: a second wait would
+/// add at least 80 % of the 4 s `finalize_wait()`. (#357: the first version
+/// bounded the whole call by one baseline plus a 1.5 s wait and one second of
+/// slack, which a loaded CI runner exceeded with no second wait.) A watchdog
+/// closes the listener after a few seconds, so a regression fails instead of
+/// hanging.
 #[test]
 fn regression_supervisor_finalize_stalled_status_socket_holds_at_most_finalize_wait() {
     if !linux() {
         return;
     }
-    let wait = Duration::from_millis(1500);
+    let wait = Duration::from_secs(4);
     let mut env = Env::with_timeout(wait);
     env.fake.0.lock().unwrap().process_status = true;
     let last_read = |env: &Env| {
@@ -1353,9 +1357,10 @@ fn regression_supervisor_finalize_stalled_status_socket_holds_at_most_finalize_w
             held < wait + Duration::from_secs(1),
             "full backlog {full_backlog}: the read held handle() for {held:?}, past finalize_wait() {wait:?}"
         );
+        let outside = total.saturating_sub(held);
         assert!(
-            total < baseline + wait + Duration::from_secs(1),
-            "full backlog {full_backlog}: the finalize held the serve loop for {total:?} (baseline {baseline:?}, finalize_wait() {wait:?})"
+            outside < baseline + Duration::from_secs(2),
+            "full backlog {full_backlog}: the finalize held the serve loop for {total:?}, {outside:?} of it outside the status read (baseline {baseline:?}, finalize_wait() {wait:?})"
         );
     }
     // `--timeout` above 10 s: the read gets 10 s.

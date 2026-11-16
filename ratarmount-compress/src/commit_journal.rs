@@ -193,6 +193,7 @@ pub struct Applied {
 }
 
 /// Why a recovery or a journaled replacement did not finish.
+/// The underlying I/O error is available through [`std::error::Error::source`].
 #[derive(Debug)]
 pub enum RecoverError {
     /// The authorizer said no; nothing was written.
@@ -222,7 +223,13 @@ impl std::fmt::Display for RecoverError {
     }
 }
 
-impl std::error::Error for RecoverError {}
+impl std::error::Error for RecoverError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Refused(e) | Self::Journal(e) | Self::Committed(e) => Some(e),
+        }
+    }
+}
 
 impl From<RecoverError> for io::Error {
     fn from(error: RecoverError) -> Self {
@@ -699,8 +706,12 @@ mod unix {
     pub(crate) struct Lock(File);
     impl Drop for Lock {
         fn drop(&mut self) {
-            unsafe {
-                libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            // Explicit (#187): a forked child may hold a copy of the descriptor.
+            if unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } != 0 {
+                log::warn!(
+                    "releasing the archive commit lock: {}",
+                    io::Error::last_os_error()
+                );
             }
         }
     }

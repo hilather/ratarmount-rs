@@ -355,6 +355,99 @@ fn regression_offline_classify_refuses_pending_commit_journal() {
     }
 }
 
+/// `file://` spellings of `path` the factory resolves to it: the plain URL
+/// (percent-encoded) and a mixed-case scheme with a `localhost` host.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn file_urls(path: &Path) -> Vec<String> {
+    let url = url::Url::from_file_path(path).unwrap().to_string();
+    let mixed = url.replacen("file://", "FiLe://localhost", 1);
+    vec![url, mixed]
+}
+
+/// Regression (#212): the #174 refusal probed an offline verb's base as a
+/// filesystem path, so a `file://` URL of an archive mid-commit found "no
+/// journal" while the factory resolved the URL and read the torn archive.
+/// The probe now resolves a local `file://` URL the way the factory does: a
+/// pending journal and an active/complete locator without its journal refuse
+/// exactly as for the path, and archive, journal and locator stay untouched.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_212_offline_classify_file_url_refuses_pending_commit_journal() {
+    use ratarmount_compress::commit_journal::{journal_path, pending};
+    let context = OverlayRunContext::default();
+    for step in ["archive truncate", "locator complete"] {
+        let dir = tempfile::tempdir().unwrap();
+        // A space forces percent-encoding in the URL.
+        let base = dir.path().join("base archive.tar");
+        write_tar_file(&base);
+        crash_commit(&base, step);
+        let bytes = std::fs::read(&base).unwrap();
+        let journal = journal_path(&base);
+        let journal_bytes = std::fs::read(&journal).unwrap();
+        for url in file_urls(&base) {
+            let error = match classify_offline(Path::new(&url), GitIntent::Replay(None), &context) {
+                Err(error) => error,
+                Ok(_) => panic!("{step} {url}: a pending commit journal must refuse"),
+            };
+            assert!(
+                error.contains("pending commit journal"),
+                "{step} {url}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(&base).unwrap(),
+                bytes,
+                "{step} {url}: archive"
+            );
+            assert_eq!(
+                std::fs::read(&journal).unwrap(),
+                journal_bytes,
+                "{step} {url}: journal"
+            );
+            assert!(pending(&base).unwrap().is_some(), "{step} {url}: pending");
+        }
+        // The journal gone, its locator still `A`/`C`: refused by URL too.
+        std::fs::remove_file(&journal).unwrap();
+        let locator = commit_locator(&base);
+        for url in file_urls(&base) {
+            let error = match classify_offline(Path::new(&url), GitIntent::Replay(None), &context) {
+                Err(error) => error,
+                Ok(_) => panic!("{step} {url}: a missing journal must refuse"),
+            };
+            assert!(
+                error.contains("commit-journal locator"),
+                "{step} {url}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(&base).unwrap(),
+                bytes,
+                "{step} {url}: archive"
+            );
+            assert_eq!(commit_locator(&base), locator, "{step} {url}: locator");
+        }
+    }
+    // A clean archive by URL still classifies, and a finished commit's stale
+    // `D` locator does not refuse.
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("clean.tar");
+    write_tar_file(&base);
+    crash_commit(&base, "journal unlink");
+    for url in file_urls(&base) {
+        let token = classify_offline(Path::new(&url), GitIntent::Replay(None), &context)
+            .unwrap_or_else(|e| panic!("{url}: {e}"));
+        assert!(token.source().lookup("/f", 0).is_some(), "{url}");
+    }
+    // An unparsable `file://` URL is refused, not probed as a path.
+    let error = match classify_offline(
+        Path::new("file://remote-host/x.tar"),
+        GitIntent::Replay(None),
+        &context,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a non-local file URL must refuse"),
+    };
+    assert!(error.contains("file://remote-host/x.tar"), "{error}");
+}
+
 /// The `user.ratarmount.commit-journal` locator bytes on `path`, if set.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn commit_locator(path: &Path) -> Option<Vec<u8>> {
