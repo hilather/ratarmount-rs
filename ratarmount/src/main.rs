@@ -732,10 +732,11 @@ struct Args {
 
     /// Input archives/folders/URLs and optional mountpoint. A mountpoint may not be, lie
     /// inside, or contain a folder being mounted (refused, exit 2). Without one, the
-    /// mount point is the first input's file name, minus a compression suffix and one
-    /// more extension, in the current directory (`dir/base` and `dir/base.tar.gz` both
-    /// mount at `./base`); only when that would be the input folder itself is
-    /// `.mounted` appended (`base.mounted`).
+    /// mount point is the first input's file name (the active numbered archive with
+    /// --roll-every), minus a compression suffix and one more extension, in the current
+    /// directory (`dir/base` and `dir/base.tar.gz` both mount at `./base`); only when
+    /// that would be the input folder itself is `.mounted` appended (`base.mounted`).
+    /// TAR shorthands such as `.tgz` count as `.tar.gz`.
     #[arg(required = false)]
     paths: Vec<PathBuf>,
 
@@ -7510,6 +7511,7 @@ mod create_missing_cli_tests {
     /// Regression: #224 the positional help said "a folder defaults to
     /// `<folder>.mounted`", but the default is the input's name in the current
     /// directory; `.mounted` is appended only when that would be the folder itself.
+    /// TAR shorthands preserve preceding dots, and rolling uses the active archive.
     #[test]
     fn regression_help_states_default_mount_point() {
         use clap::CommandFactory;
@@ -7525,28 +7527,32 @@ mod create_missing_cli_tests {
             "{flat}"
         );
         for needle in [
-            "the first input's file name, minus a compression suffix and one more extension, in the current directory",
+            "the first input's file name (the active numbered archive with --roll-every), minus a compression suffix and one more extension, in the current directory",
             "(`dir/base` and `dir/base.tar.gz` both mount at `./base`)",
+            "TAR shorthands such as `.tgz` count as `.tar.gz`",
             "only when that would be the input folder itself is `.mounted` appended",
         ] {
             assert!(flat.contains(needle), "paths help lacks {needle:?}: {flat}");
         }
         // The examples in the text are what the code derives.
-        assert_eq!(
-            default_mountpoint(Path::new("dir/base")),
-            PathBuf::from("base")
-        );
-        assert_eq!(
-            default_mountpoint(Path::new("dir/base.tar.gz")),
-            PathBuf::from("base")
-        );
-        assert_eq!(
-            default_mountpoint(Path::new("dir/v1.2.tar.gz")),
-            PathBuf::from("v1.2")
-        );
+        for (input, expected) in [
+            ("dir/base", "base"),
+            ("dir/base.tar.gz", "base"),
+            ("dir/base.d", "base"),
+            ("dir/v1.2.tar.gz", "v1.2"),
+            ("dir/v1.2.tgz", "v1.2"),
+            ("dir/v1.2.txz", "v1.2"),
+        ] {
+            assert_eq!(
+                default_mountpoint(Path::new(input)),
+                PathBuf::from(expected),
+                "{input}"
+            );
+        }
         let dir = tempfile::tempdir().unwrap();
-        let folder = dir.path().join("base");
-        let other = dir.path().join("other");
+        let root = dir.path().canonicalize().unwrap();
+        let folder = root.join("base");
+        let other = root.join("other");
         fs::create_dir(&folder).unwrap();
         fs::create_dir(&other).unwrap();
         // Run from another directory: `<cwd>/base`, not `<folder>.mounted`.
@@ -7557,11 +7563,22 @@ mod create_missing_cli_tests {
         // Run from the folder's parent: `base` is the folder itself.
         assert_eq!(
             mount_guard::default_for_input(
-                &mount_guard::RealFs::with_cwd(dir.path().to_path_buf()),
+                &mount_guard::RealFs::with_cwd(root.clone()),
                 Path::new("base")
             ),
             PathBuf::from("base.mounted")
         );
+        let args =
+            Args::try_parse_from(["ratarmount", "--roll-every", "1d", "-w", "ov", "logs.tar"])
+                .unwrap();
+        let fs = mount_guard::RealFs::with_cwd(root.clone());
+        let inputs = [root.join("logs.tar")];
+        let plan = mount_guard::plan_mount_point(&fs, &args, None, &inputs).unwrap();
+        assert_eq!(plan.mp, PathBuf::from("logs.000001"));
+        // An existing series resumes its latest generation, not the series stem.
+        fs::write(root.join("logs.000003.tar"), b"").unwrap();
+        let plan = mount_guard::plan_mount_point(&fs, &args, None, &inputs).unwrap();
+        assert_eq!(plan.mp, PathBuf::from("logs.000003"));
     }
 
     #[test]
