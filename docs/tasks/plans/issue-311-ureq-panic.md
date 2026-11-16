@@ -2,38 +2,44 @@
 
 | Field | Value |
 |-------|--------|
-| **Issue** | #311 — Investigate: ureq 2.12.1 panics at `response.rs:403` when the server resets the connection after replying (follow-up of #297 / PR #302) |
-| **Status** | Investigation only. No production change. Any fix plan goes through Keystone. |
-| **Base** | `origin/main` 2019fd7 |
-| **Platforms affected** | macOS, verified upstream and in our CI (#297). Not Linux: no natively reproducible failure there. Other BSDs and Windows: unknown. |
+| **Issue** | [#311](https://github.com/hilather/ratarmount-rs/issues/311) — investigation following [#297](https://github.com/hilather/ratarmount-rs/issues/297) / [PR #302](https://github.com/hilather/ratarmount-rs/pull/302) |
+| **Status** | Investigation only. No production change or approved fix plan. All options and recommendations below are inputs to Keystone architecture review. |
+| **Base** | `2019fd7`; workspace line numbers below refer to this revision. |
+| **Platforms affected** | macOS: reported upstream and confirmed in #297's CI logs. The reset-triggered setter failure was not reproduced on Linux; this is not a guarantee that a setter can never fail there. Other BSDs and Windows: unknown. |
+| **Review** | Primary sources rechecked 2026-11-15: local dependency/workspace sources, GitHub API and crates.io API. Historical experiment counts are distinguished from this review's checks in §2. |
 
 ## TL;DR
 
-- Both panics are `expect()` calls in ureq 2.12.1's `Response::stream_to_reader`, which runs inside
-  `call()` / `send_*()`. Each fires when `Stream::reset()` → `TcpStream::set_read_timeout(None)` fails
-  while ureq returns the connection to the pool. That happens only for bodies that ureq has
-  already fully buffered, or that are empty.
-- On macOS, `setsockopt(SO_RCVTIMEO/SO_SNDTIMEO)` returns `EINVAL` once the peer has reset the
-  connection. A typical trigger is a server that closes without reading the whole request. On Linux
-  the call succeeds on a reset socket. Natively on Linux we got 0 panics in 24 000 rounds. With
-  `LD_PRELOAD` fault injection that models the macOS behaviour, the panic reproduces 20/20.
+- Both panics are `expect()` calls in ureq 2.12.1's `Response::stream_to_reader`, inside
+  `call()` / `send_*()`. `return_to_pool()` calls `Stream::reset()`, which can fail at either
+  `TcpStream::set_read_timeout(None)` or `set_write_timeout(None)`. The panicking branches are
+  zero-length bodies and positive `Content-Length` bodies already entirely in ureq's buffer.
+- On macOS, `setsockopt(SO_RCVTIMEO/SO_SNDTIMEO)` can return `EINVAL` on the resulting closed
+  socket. A reported trigger is a server that closes without reading the whole request. On Linux
+  the checked kernel timeout-option implementation has no equivalent closed-state rejection.
+  The original investigation reports 0 panics in 24 000 native Linux rounds and 20/20 under
+  timed `LD_PRELOAD` injection; those historical counts have no attached logs (§2).
 - The panic happens **before the caller sees the response**. Neither the caller's body handling
-  (`into_string` / `into_reader`) nor `Connection: close` nor a non-pooled agent avoids it. We
-  verified all three under injection.
+  (`into_string` / `into_reader`) nor `Connection: close` nor disabling cross-request reuse
+  removes the reset call. The source proves that a zero-capacity pool also cannot bypass it;
+  the supplied `nopool` experiment actually uses fresh agents with default pool capacity.
 - Upstream: algesten/ureq#1219 (closed). ureq 3 is fixed in **3.5.1** (PR #1220: on macOS only,
   `InvalidInput` from the timeout setter is tolerated). ureq 2 is **not fixed**: no release after
   2.12.1 on crates.io, and both `expect`s are still present at the head of the `2.12.x-msrv1.71`
   branch.
-- Recommendation: fix it by finishing the ureq 3 migration already planned under this issue
-  (S3 → S4a → S4b), with a floor of `ureq >= 3.5.1` (3.5.2 is current). Add a macOS-only
-  regression test with the S4b flip. An optional interim guard is a `catch_unwind` at the facade
-  boundary (option B).
+- Recommendation **for Keystone review**: prefer finishing the existing ureq 3 migration
+  (S3 → S4a → S4b), within 3.x and with a minimum of 3.5.1 (3.5.2 is current at review).
+  Require deterministic error-injection coverage and macOS integration coverage with the fix.
+  A facade `catch_unwind` guard is an alternative to evaluate, not authorized implementation.
 
 ## 1. The panic condition
 
-`~/.cargo/registry/src/index.crates.io-*/ureq-2.12.1/src/response.rs`, in `Response::stream_to_reader`,
+Checked against `~/.cargo/registry/src/index.crates.io-*/ureq-2.12.1/src/response.rs`,
+in `Response::stream_to_reader`,
 called from `Response::do_from_stream` (line 612). That function runs inside `Request::call()` /
 `send_bytes()` / `send_string()`, before a `Response` exists:
+
+Annotated excerpt (omissions and explanatory comments are not verbatim source):
 
 ```rust
 // response.rs:363-369
@@ -83,7 +89,7 @@ pub(crate) fn return_to_pool(mut self) -> io::Result<()> {
     Ok(())
 }
 pub(crate) fn reset(&mut self) -> io::Result<()> {
-    if let Some(socket) = self.socket() {                 // plain TCP and rustls (rtls.rs:33) both Some
+    if let Some(socket) = self.socket() {                 // default TCP/rustls exposes the socket (rtls.rs:33)
         socket.set_read_timeout(None)?;
         socket.set_write_timeout(None)?;
     }
@@ -91,51 +97,86 @@ pub(crate) fn reset(&mut self) -> io::Result<()> {
 }
 ```
 
-So the only failure source at 403 is the `setsockopt` inside `reset()`. Line 389 is the same call
-without the `LimitedRead`.
+For this buffered `read_exact` branch, the I/O error that reaches the `expect` comes from a
+timeout setter in `reset()`: reading the already buffered bytes does not issue a socket read.
+Line 389 calls the same reset without `LimitedRead`. The error text alone does not identify
+which of the read/write setters failed. Source: [response.rs](https://github.com/algesten/ureq/blob/2.12.1/src/response.rs#L353),
+[stream.rs](https://github.com/algesten/ureq/blob/2.12.1/src/stream.rs#L254).
 
 **Which responses take these branches:**
 
-- **Line 389:** every `HEAD` response, `204` and `304` (`body_type`, `response.rs:320-329`), and
-  `Content-Length: 0`.
-- **Line 403:** a `Content-Length` body that arrived in the same reads as the headers. The limit is
-  the `BufReader` capacity, which is the std default of 8 KiB (`stream.rs:195`). This includes small
-  `Status` error bodies, such as a 403 XML from S3, because `Error::Status` is built from the
-  `Response` after `do_from_stream`.
-- **No panic, but the same setter failure:** for chunked bodies (`PoolReturnRead`, `pool.rs:283`)
-  and streamed `LimitedRead` bodies over the buffer size, `return_to_pool()?` turns the failure into
-  an `Err` on the final read of a **complete** body. The caller sees an I/O error and drops a
-  response that is complete.
+- **Line 389:** `HEAD`, `204` and `304` select zero length regardless of their headers
+  (`response.rs:321-329`). Other `Content-Length: 0` replies do too, unless the preceding
+  transfer-encoding branch selects chunked framing (`response.rs:332-348`).
+- **Line 403:** a positive `Content-Length` no greater than the bytes **remaining in the buffer
+  after header parsing** (`len <= buffer_len`). Small size alone is insufficient: a fragmented
+  small body can be streamed instead. `stream.rs:195` uses `BufReader::new`, whose documented
+  current default is 8 KiB; there is no universal “8 KiB minus total headers” cutoff because
+  header parsing may refill the buffer. Framing is selected before decompression. A small
+  4xx/5xx body can qualify: `Request::do_call` creates `Error::Status` only after response
+  construction (`request.rs:160-170`).
+- **No panic from these two expects:** a non-buffered length-delimited body propagates a reset
+  error on the read that reaches its declared length (`response.rs:876-881`), even if small.
+  A chunked body propagates it when the decoder reports EOF (`pool.rs:278-305`); it may already
+  have delivered all payload bytes. A caller stopping before that EOF may not observe it.
+  Close-delimited bodies do not return to the pool on this path (`response.rs:412-414`).
+  Earlier timeout/read errors remain possible for every shape. These are classifications of
+  the actual response, not guarantees for a large Range request that receives a small error
+  response or a redirect.
 
 **Why it is a race on macOS:** the setter at line 364 runs first. If the RST has already been
 processed by then, that call fails instead and becomes the non-panicking `ErrorReader` (A). The
-panic needs the RST to land between line 364 and the reset at 389/403, a window of microseconds.
-That fits the rare, flaky failure in #297 (macOS CI, `regression_served_kind_webdav_through_the_real_opener`,
-which passed on rerun). It also fits upstream's measured rate of about 0.5% panics with RST on
+panic needs the close-state change to land between line 364 and the reset at 389/403. This is a
+narrow timing window; its duration was not measured here. `ErrorReader` leaves status/headers
+available and defers the error until a body read, so it does not always lose the whole response.
+The #297 macOS CI logs confirm `regression_served_kind_webdav_through_the_real_opener`
+failed at `response.rs:403:34` with `Invalid argument` in
+[job 129915183618](https://github.com/hilather/ratarmount-rs/actions/runs/42840807379/job/129915183618)
+and passed in [rerun job 129955367006](https://github.com/hilather/ratarmount-rs/actions/runs/42840807379/job/129955367006).
+Both job logs were retrieved through `gh api` during review. The mechanism also fits upstream's reported rate of about 0.5% panics with RST on
 macOS (10/2000 runs). A request with a deadline (`Request::timeout`, our `Profile::Probe`) also
-calls the setter before every socket read (`stream.rs:83-90`). Those requests fail more often, and
-earlier, with `Error encountered in a header/the status line: Invalid argument`, but they still panic
-sometimes (see §2).
+calls the setters on `DeadlineStream::fill_buf` (`stream.rs:83-90`), even when that call will
+find buffered data. The `Read` fast path at 116-120 avoids it when bytes are buffered. This
+adds earlier failure opportunities during header parsing; §2 reports both errors and panics
+with a deadline. `Profile::Probe` defines such a timeout, but has no production user yet;
+`overlay_cmd.rs:835` currently configures its own direct agent timeout.
 
 **OS behaviour:**
 
-- **XNU:** our understanding, from memory and not checked offline, is that `sosetopt` rejects
-  options with `EINVAL` once the socket is `SS_CANTRCVMORE|SS_CANTSENDMORE`, which an RST produces.
-  Upstream #1219 measured the result: after a peer close with unread request data,
-  `set_read_timeout` returned `EINVAL` in 300/300 runs while `read()` still returned the full
-  response.
-- **Linux:** `SO_RCVTIMEO` has no socket-state check. Our native runs confirm that it succeeds on
-  a reset socket.
+- **XNU:** checked `sosetoptlock` in Apple's published source at
+  [f6217f89, `bsd/kern/uipc_socket.c:4749`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/uipc_socket.c#L4749).
+  It returns `EINVAL` when both `SS_CANTRCVMORE` and `SS_CANTSENDMORE` are set **and**
+  `SOF_NPX_SETOPTSHUT` is absent. This supports the mechanism, but the exact kernel builds in
+  #297/#1219 were not matched to this source revision. [Upstream #1219](https://github.com/algesten/ureq/issues/1219)
+  reports 300/300 setter failures followed by complete reads in its bare-socket experiment;
+  these are the reporter's measurements, not a macOS rerun here.
+- **Linux:** [v7.0 `net/core/sock.c`](https://github.com/torvalds/linux/blob/v7.0/net/core/sock.c#L1300)
+  routes both timeout options to `sock_set_timeout`, which checks the timeval rather than TCP
+  closed state. During this review, each setter with a zero timeval succeeded in 20/20 raw-socket
+  RST trials on Linux 7.0.0-1025-nvidia, aarch64; `TCP_INFO` reported `TCP_CLOSE` in every trial.
+  This does not prove that every Linux environment or other setter error is harmless.
 
 ## 2. Reproduction
 
+**Evidence provenance:** the tables in §2a/§2b are the original investigation's reported
+measurements. No logs, scratch lockfile or exact compiler/build identity were attached to
+that commit, so their exact counts and original x86_64 environment are **not independently
+verified** by this review. They remain useful context, not measured failure probabilities or
+proof of deterministic scheduling/unwind safety. The source snippets below are inspectable.
+
 Standalone crate, outside the tree (scratch, not committed). It pins `ureq = "=2.12.1"` with
 `default-features = false`; the plain-HTTP path is the same as with our `tls` feature. The server
-reads the request head, writes the whole response in **one** write, optionally sleeps, then sets
+reads the request head, supplies headers and body together to `write_all` (which may perform
+multiple writes), optionally sleeps, then sets
 `SO_LINGER 0` and closes (RST). In `unread` mode the client instead POSTs 4 KiB that the server
-never reads, and a normal `close()` then sends an RST by itself, as in #297.
+never reads; a close with unread request data can produce a reset, as reported in #297/#302.
+The plain-HTTP harness does not experimentally verify TLS behavior.
 
-### 2a. Native Linux (kernel 7.0, x86_64): does not reproduce
+**Harness caveat:** `nopool` builds a new default-capacity agent inside each iteration, discarding
+the outer agent configured with `max_idle_connections(0)`. It tests absence of cross-request
+reuse, not a zero-capacity pool. The source analysis in §1 establishes the latter's exposure.
+
+### 2a. Reported native Linux run (kernel 7.0, x86_64): no panic observed
 
 Fresh agent per request (`nopool`), 3000 rounds each:
 
@@ -147,18 +188,22 @@ Fresh agent per request (`nopool`), 3000 rounds each:
 | 64 KiB streamed | 2999 ok, 1 `ECONNRESET`, 0 panic | 2999 ok, 1 `ECONNRESET`, 0 panic |
 
 A side observation, not part of #311: with a **pooled** agent, about a third to a half of requests
-fail with `Connection reset by peer`. ureq reuses the pooled connection that the server already
-reset (`GET` + RST: 983/3000 errors for zero-length bodies, 1320/3000 for small bodies). The facade's
-pooled-stale contract tests (`contract_pooled_stale_*`) cover ureq's retry rules. This test server
-resets every connection, so it is an extreme case.
+fail with `Connection reset by peer` (`GET` + RST: 983/3000 errors for zero-length bodies,
+1320/3000 for small bodies). These counts do not show whether a failed connection was reused:
+`unit.rs:361-362` also propagates errors from the pre-reuse `server_closed()` probe, and
+`stream.rs:223-238` propagates a reset from `peek`. The facade's
+`http_client/tests_behaviour.rs:486/500/526` tests (`contract_pooled_stale_*`) exercise stale
+connection retry rules, not this reset race. This server resets every connection.
 
-### 2b. Linux with fault injection that models macOS: reproduces deterministically
+### 2b. Reported Linux fault injection: 20/20 in widened runs
 
 `shim.c` is an `LD_PRELOAD` wrapper for `setsockopt`. For `SOL_SOCKET` with `SO_RCVTIMEO` or
 `SO_SNDTIMEO`, it returns `EINVAL` when `TCP_INFO` reports `tcpi_state == TCP_CLOSE`, which is the
-state after an RST. That models the XNU rule. With `SHIM_SLEEP_MS` set, it also sleeps after every
+state observed after an RST. That approximates the closed-socket failure, not the full XNU
+state/flag semantics. With `SHIM_SLEEP_MS` set, it also sleeps after every
 *successful* timeout set, which widens the window between line 364 and the reset. In the widened
-runs below, the server sleeps 20 ms before the RST and the shim sleeps 100 ms.
+runs below, the server sleeps 20 ms before the RST and the shim sleeps 100 ms. Sleeps widen a
+race; they do not force ordering and are not by themselves a deterministic regression test.
 
 | Scenario | Result |
 |----------|--------|
@@ -182,7 +227,10 @@ Commands, from the scratch crate:
 
 ```sh
 cc -shared -fPIC -O2 -o shim.so shim.c -ldl
-cargo build --release --offline        # own CARGO_TARGET_DIR
+. ~/.cargo/env
+CARGO_TARGET_DIR=/home/brewerm/git/rr-bl-311/target CARGO_BUILD_JOBS=2 \
+  flock /tmp/muse-cargo.lock cargo build --release --offline
+# repro311 below denotes /home/brewerm/git/rr-bl-311/target/release/repro311
 repro311 small 3000 nopool             # native: 0 panics
 LD_PRELOAD=$PWD/shim.so SHIM_SLEEP_MS=100 repro311 small 20 nopool delay=20             # 20/20 panic @403
 LD_PRELOAD=$PWD/shim.so SHIM_SLEEP_MS=100 repro311 zero  20 nopool delay=20 connclose   # 20/20 panic @389
@@ -191,7 +239,7 @@ LD_PRELOAD=$PWD/shim.so SHIM_SLEEP_MS=100 repro311 zero  20 nopool delay=20 conn
 <details><summary><code>shim.c</code></summary>
 
 ```c
-// LD_PRELOAD fault injection modelling XNU: setsockopt(SOL_SOCKET,
+// LD_PRELOAD fault injection approximating the observed macOS failure: setsockopt(SOL_SOCKET,
 // SO_RCVTIMEO/SO_SNDTIMEO) returns EINVAL once the TCP connection is closed
 // in both directions (Linux tcpi_state == TCP_CLOSE after an RST).
 // SHIM_SLEEP_MS: sleep after every *successful* timeout set, to widen the
@@ -293,7 +341,7 @@ fn main() {
                     let mut v = format!("HTTP/1.1 200 OK\r\n{cc}Content-Length: 65536\r\n\r\n").into_bytes();
                     v.extend(std::iter::repeat(b'a').take(65536)); v }
             };
-            s.write_all(&resp).unwrap(); // single write: headers + body together
+            s.write_all(&resp).unwrap(); // headers + body together; may use multiple writes
             if delay > 0 { std::thread::sleep(Duration::from_millis(delay)); }
             if !unread { set_linger0(&s); }
             drop(s);
@@ -338,169 +386,262 @@ fn main() {
 ```
 </details>
 
-**No `#[ignore]`d test is committed:**
+### 2c. Review rerun (2026-11-15, Linux aarch64)
 
-- On Linux it cannot fail natively. The only deterministic form needs a C compiler and an
-  `LD_PRELOAD` shim injected into a re-executed test binary, which is test infrastructure for one
-  ureq-2 bug that the migration removes.
-- On macOS it is a microsecond race, about 0.5% upstream, so it would be flaky.
-- The useful regression lands with the fix (see §4).
+The supplied Rust/C harness was rebuilt outside the repository with Rust **1.100.0
+(0ef1bc386)**, Cargo 1.100.0, the **dev** profile and `CARGO_TARGET_DIR` set to this worktree's
+`target`. The initial offline build without a lockfile failed dependency resolution; copying
+the workspace's `2019fd7` lockfile into the scratch crate before the offline build succeeded.
+The resulting scratch lockfile SHA-256 was
+`bc07609955c793b5b8932b0f2be4b81af8c6c8d295c70acd778309f02cb05edb`.
+These are new observations, not verification of the original x86_64 counts:
+
+| Review trial | Observed result |
+|--------------|-----------------|
+| Native `zero`, `small`, `chunked`, `big`, each with `nopool`, with/without `unread` | 100/100 successful requests in each of eight cases; no errors or panics |
+| Native `small 100 nopool deadline` | 100/100 successful; no errors or panics |
+| Injected `zero` and `small`, each with `SHIM_SLEEP_MS=100`, `delay=20`, 20 rounds per configuration | 20/20 panics per configuration, with the respective 389/403 expect messages. Configurations: `nopool`; `nopool connclose`; shared agent; `nopool reader`; `nopool unread`. |
+| Injected `zero` / `small` with `nopool deadline`, same delays | 20/20 status-line `Invalid argument` errors each; no panics |
+| Injected `chunked` / `big` with `nopool`, same delays | 20/20 `Invalid argument` body-read errors each; no panics |
+
+The `nopool` caveat above still applies. These trials confirm the mechanism and the tested
+caller-side non-solutions on this build; they do not establish a deterministic timing test,
+real-world failure rate, TLS behavior or native macOS results.
+
+**No production code or test is committed in this investigation.** A native socket race is
+unsuitable as the sole regression gate: upstream reports 10/2000 ureq-2 RST panics in each of
+two runs, not a universal rate. A future approved fix needs automated coverage in the same
+PR, with a controlled timeout-setter failure (a test seam or synchronized injection) and
+appropriate platform integration checks (§5). `LD_PRELOAD` is one possible technique, not
+the only way to test the policy; #1220 itself contains deterministic injected-error tests.
 
 ## 3. Reachability in our code
 
-Every **ureq** user goes through ureq 2.12.1, either via the facade or directly, so every path below
-reaches `do_from_stream`. The only other HTTP client in `Cargo.lock` is `reqwest`, pulled in by
-`librqbit` under the `bittorrent` feature (trackers, UPnP). That path is not affected by this bug.
-`hyper` comes in through `axum` and `tonic`, which are servers. On macOS, a path panics if it can get a HEAD, 204 or 304 response, a
-`Content-Length: 0` response, or a small body, and the server resets the connection after
-replying. That is likely when a server answers or rejects **before reading the whole request
-body**: S3, GCS and Azure answering an upload with 4xx, 413 or a redirect, or a proxy or load
-balancer that resets after a response with `Connection: close`.
+`Cargo.lock` contains one ureq version, **2.12.1**, used by `ratarmount`, `ratarmount-index` and
+`ratarmount-remote`. Workspace searches for `ureq`, `http_client`, `http_pool` and `HttpRangeSource`
+confirmed the production entry points below, including calls through stored request/agent
+values. Requests that reach HTTP response parsing enter the same `do_from_stream` path.
+
+`reqwest` 0.13.5 is also in the lockfile, used by `librqbit`, `librqbit-tracker-comms` and
+`librqbit-upnp` under the optional BitTorrent stack. It does not run the ureq code in question.
+`hyper` is a dependency of `reqwest` as well as `axum`/`tonic` and other transport crates;
+calling it exclusively a server dependency would be incorrect. This is an inventory of ureq
+exposure, not an audit of every HTTP implementation. Torrent **metadata URL fetching** still
+uses our ureq facade (§3 table), distinct from librqbit's reqwest traffic.
+
+A macOS caller **can** panic if its actual reply takes one of §1's two branches and a timeout
+reset fails in the relevant window. Early upload rejections (including cloud-storage 4xx or
+redirects) and resets by proxies are plausible triggers, not production incidents measured
+here. `Connection: close` alone does not establish either an RST or a failing setter.
 
 ### Via the facade (`ratarmount_index::http_client`, S1a/S1b/S2)
 
-The facade is `ureq::AgentBuilder` plus `agent.request(..).call()` / `send_*`
-(`http_client.rs:425-460`), so it is the same code path as the repro. Its users:
+The facade builds agents/requests at `ratarmount-index/src/http_client.rs:425-460` and executes
+`call` / `send_bytes` / `send_string` / `send_reader` at **111-137**. Its production caller is
+`ratarmount-remote/src/http_pool.rs:81/116`, using `Profile::Pooled`; facade Direct/Probe
+profiles are defined but not yet used by production callers. `http_pool` owns the redirect
+loop and X-Linked-Etag capture. The following production request-construction sites feed it
+(paths relative to `ratarmount-remote/src/`; range reads also use `HttpRangeSource` methods):
 
-- `ratarmount-remote/src/http_pool.rs`: remote HTTP range reads, HEAD/size probes, redirect hops,
-  X-Linked-Etag. Callers: `lib`, `webdav` (PROPFIND, the #297 path), `folder`, `oci`, `ipfs`,
-  `dropbox`, `hf`, `hf_commit`, torrent metadata.
+| Caller | Verified sites and role |
+|--------|-------------------------|
+| `lib.rs` | HEAD 774; range-size GET 861; range GET/hash 920/952; capped/full GET 1001/1063/1195; range download 1099; `HttpRangeFile::read` 1437-1495 |
+| `webdav.rs` | PROPFIND 139/212/459 (including the #297 route); GET 497 |
+| `folder.rs` | HEAD 759 and GET 774 |
+| `oci.rs` | GET 415/787/848/1181 (auth, manifests, blobs/ranges) |
+| `ipfs.rs` | POST 591 / fallback GET 599; HEAD 770 / fallback GET 777 |
+| `dropbox.rs` | POST 448/593/665/802 (listing/metadata/content) |
+| `hf.rs` | write-request helper 563; GET 660; range probe 804; range source constructed at 748 |
+| `hf_commit.rs` | `write_request` at 197/257/286/382 delegates to `hf.rs`; action request helper 417 covers upload/completion/verification |
+| `torrent/metadata.rs` | `HttpRangeSource::request_with_timeout("GET", ...)` at 135; not reqwest |
 
 ### Direct `ureq::` (S3 carry and others)
 
 All of these are production code unless marked otherwise.
 
-- `ratarmount-remote/src/s3.rs`: GET at 306, 612 and 668; GET at 2028 and 2075 (in
-  `s3_list_objects_v2_page`); PUT at 326; HEAD at 709 and 762; `request(verb)` at 961 (multipart
-  and index-sibling uploads).
-- `ratarmount-remote/src/gcs.rs`: GET at 374 and 828; GET at 1508 (`gcs_list_page`) and 1535
-  (`gcs_list_page_xml`); POST at 425 (token); HEAD at 857; PUT at 964.
-- `ratarmount-remote/src/azure.rs`: GET at 435 and 760; GET at 1708 (`azure_list_page`); PUT at
-  1064; HEAD at 1113.
+- `ratarmount-remote/src/s3.rs`: GET at 306 and PUT at 326 are credential/metadata helpers
+  (including IMDS token acquisition), not object GET/PUT. Object GETs are 612/668; list GETs
+  are 2028/2075 (`s3_list_objects_v2_page`); HEADs are 709/762; `request(verb)` at 961 is
+  `S3CallCtx::execute`, used for object/multipart/index-sibling operations.
+- `ratarmount-remote/src/gcs.rs`: metadata-token GET 374; token-exchange POST 425; object GET
+  828; HEAD 857; PUT 964; listing GETs 1508 (`gcs_list_page`) and 1535 (`gcs_list_page_xml`).
+- `ratarmount-remote/src/azure.rs`: metadata-token GET 435; object GET 760; PUT 1064;
+  HEAD 1113; listing GET 1708 (`azure_list_page`).
 - `ratarmount-index/src/location.rs:1584`: GET in `fetch_index_http_uncached`, the remote sidecar
   fetch. `location.rs:2834` is a HEAD inside the test `link_describedby_archive_head`, so it is not
   production.
-- `ratarmount/src/overlay_cmd.rs:834`: an `AgentBuilder` in `remote_base_token`, the remote base
-  identity probe for overlay verbs.
-- The PR bodies of #318 and #322 name only `s3`, `gcs` and `azure` as the S3 carry. The facade
-  header says callers move "in S2/S3". `location.rs:1584` and `overlay_cmd.rs:834` are not named in the PR
-  bodies we read, so the plan should state their slice explicitly.
+- `ratarmount/src/overlay_cmd.rs:834`: an `AgentBuilder` in `remote_base_token`, with **HEAD
+  at 838 and `call()` at 845**, a 3-second timeout and redirects disabled. Its production
+  caller is `overlay_create.rs:41`; its `s3://` branch uses `head_s3_object` instead.
+  `.ok()?` converts errors, not panics.
+- **Additional test-only direct caller omitted from the original list:**
+  `ratarmount-index/src/http_client.rs:543`, GET in
+  `ureq_2_engine_only_error_display_cross_check` (`#[cfg(test)]`). Other direct ureq references
+  there construct errors or check types; they do not issue requests.
+- No additional production ureq entry point was found in the workspace search.
+  [PR #322](https://github.com/hilather/ratarmount-rs/pull/322) explicitly lists `s3`, `gcs` and
+  `azure` as S3 carry. [PR #318](https://github.com/hilather/ratarmount-rs/pull/318) discusses
+  Direct/Probe profiles, including “like the overlay probe”, but does not provide a complete
+  S3 file list. Neither names `location.rs:1584` or `overlay_cmd.rs:834` explicitly. Keystone
+  should account for both production callers and separately classify the two test-only sites.
 
 ### Response shapes that reach each line
 
 | Line | Responses |
 |------|-----------|
-| 389 | Every HEAD (size and identity probes in http_pool, s3, gcs, azure, location); 204s (deletes); `Content-Length: 0` replies (redirects, some PUT/POST acknowledgements) |
-| 403 | Small range reads (TAR headers, `.index.ptr` pointers, small sidecar or metadata JSON), WebDAV PROPFIND 207s, and any small 4xx/5xx error body |
-| Error only, no panic | Large range bodies (> about 8 KiB minus headers) and chunked bodies. A complete body ends in an `Err` on its last read (§1). |
+| 389, if the initial setter succeeds | HEAD probes through `http_pool`, `s3`, `gcs`, `azure`, **`overlay_cmd`**; 204/304; other zero-length replies when framing selects `LengthDelimited(0)`. `location.rs:2834` is a test-only HEAD; production 1584 is GET. |
+| 403, if the initial setter succeeds | Positive length-delimited bodies entirely buffered after headers: possibly small range/pointer/sidecar/JSON bodies, PROPFIND 207s or 4xx/5xx bodies. None qualifies solely by status or small size. |
+| No panic at these two expects | Streamed length-delimited or chunked replies propagate a pool-reset error on their completion read (§1), if reached. Close-delimited replies do not use that pool-return path. Any request may first receive a redirect/error response with a different shape. |
 
 ### Blast radius
 
-The panic is ordinary unwinding:
+The checked repository configuration uses ordinary unwinding on its desktop targets: no
+`panic = "abort"` profile, no repository `.cargo/config` or `.cargo/config.toml`, and no
+`-C panic=abort` or panic-profile environment override in `packaging/` or `.github/workflows/`.
+CI sets `RUSTFLAGS=-Dwarnings`; other jobs clear it, and the inventory-driver builder sets a
+link search path. Thus “the only RUSTFLAGS is -Dwarnings” was too broad. Cargo defaults dev
+and release to unwind ([Cargo profiles](https://doc.rust-lang.org/cargo/reference/profiles.html#panic)).
+User environment/config overrides and separately distributed binaries were not audited.
+The following consequences assume unwinding, not abort, and no further panic in cleanup.
 
-- The workspace `Cargo.toml` has no `[profile]` section with `panic = "abort"`, and there is no
-  `.cargo/config`.
-- No `-C panic=abort` appears in `packaging/` or `.github/workflows/`. The only `RUSTFLAGS` is CI's
-  `-Dwarnings`, so release and package builds unwind too.
+| Execution context | Verified behavior and limits |
+|-------------------|------------------------------|
+| `http-range` prefetch worker | `http_pool.rs:1065-1075` spawns the synchronous `source.fetch`. On consumption, `worker.join()` maps its panic to `io::Error::other("HTTP range worker panicked")` at 1117-1119. `HttpRangeFile::read` clears the failed prefetch state and returns the error (`lib.rs:1471-1479`); FUSE can reply with EIO rather than lose its event loop. A canceled/detached worker may never be joined, so not every worker panic is delivered to a reader. The default panic hook still runs. |
+| FUSE event loop (`fuser-0`) | Ratarmount fixes `config.n_threads = Some(1)` (`ratarmount-fuse/src/lib.rs:3929`). fuser 0.18.0 spawns that thread, dispatches callbacks without `catch_unwind`, and converts a failed join to `io::Error::other("event loop thread panicked")` (`session.rs:293-315`, `:523-540`, `request.rs:238`). A synchronous request panic therefore ends this sole loop and fails the session. |
+| Main thread | A panic escaping a CLI operation on main normally ends the process with Rust's panic status 101. Mount preparation/index building, publishing and offline/overlay commands can call the above request sites. This is conditional on the panic reaching main; it must not be applied to all live commits or background reads. Commit recovery after a panic was not audited. |
+| Live interval commits | These run on **`ratarmount-overlay-commit`**, not main (`ratarmount/src/overlay_commit.rs:303-346`). The loop invokes remote commit/reopen synchronously through `enqueue_commit` (`ratarmount-compositing/src/write_overlay.rs:4104-4147`) without a panic catch. An unwind stops that worker; whether partial state or poisoned locks subsequently affect serving/recovery remains unverified. |
+| Export servers / other background work | The NFS, 9P, SMB, SFTP and HTTP request-task boundaries, other commit entry points, and codec/background-reader behavior have not been exhaustively audited. Their blast radius cannot be inferred solely from “uses tokio” or “uses a thread”; it depends on actual catch/join/supervision and cleanup paths. |
+| Python bindings | Lockfile: pyo3 **0.29.2**. Its generated-call trampoline catches Rust unwinds and raises `PanicException` (`src/impl_/trampoline.rs:289-320`). That exception derives from `BaseException`, so ordinary `except Exception` does not catch it. No ratarmount Python integration repro was run; aborts or panics on other threads are not covered by that trampoline. [PyO3 source](https://github.com/PyO3/pyo3/blob/v0.29.2/src/impl_/trampoline.rs#L289), [exception definition](https://github.com/PyO3/pyo3/blob/v0.29.2/src/panic.rs). |
 
-The effect therefore depends on the thread:
+The synchronous FUSE read path was traced in repository code, not inferred from fuser alone:
+`Filesystem::read` → `read_handle` → `readahead_fill` → `fill_read_for_fuse` → the source reader
+(`ratarmount-fuse/src/lib.rs:3409`, `:1567-1594`, `:278-361`, `:113-120`). `open_source_backend`
+also calls `self.source.open` directly at 1457. A concrete source is the remote folder mount:
+its `open` delegates to the backend's `open_range` (`ratarmount-remote/src/folder.rs:244-269`),
+and the WebDAV backend returns `HttpRangeFile` at 477/479. For that reader, network
+I/O can run on this same thread via the direct fallback (`ratarmount-remote/src/lib.rs:1488`),
+the synchronous forward window (`http_pool.rs:915`), or a prefetch cache-gap fill (`:1105-1111`).
+`read_into_with_pattern` calls `fetch`/`range_reader` at 654/659, ultimately reaching the facade.
+Prefetch does not isolate all remote reads. This traces the synchronous reader case; it does
+not assert that every format/codec performs network I/O on the event loop.
+The direct cloud range readers likewise issue synchronous requests from `Read::read`:
+`S3RangeFile` calls `s3_get_object` at `s3.rs:1748`, `GcsRangeFile` calls `gcs_get_object` at
+`gcs.rs:1370`, and `AzureRangeFile` calls `azure_get_blob` at `azure.rs:1506`. They do not
+automatically gain the `http-range` worker's panic-to-error conversion.
 
-- **`http-range` prefetch workers** (`http_pool.rs:1065`): contained. `worker.join()` maps the
-  panic to `io::Error::other("HTTP range worker panicked")` (`http_pool.rs:1117-1119`). The
-  default panic hook still prints to stderr.
-- **FUSE request thread:** fuser 0.18 runs even `n_threads = 1` on a spawned `fuser-0` thread
-  (`fuser-0.18.0/src/session.rs:290-316`) and has no `catch_unwind`. Remote reads fetch on the calling thread:
-  `HttpRangeFile`'s `Read` (`ratarmount-remote/src/lib.rs:1455-1495`) falls back from the
-  prefetcher to `read_into_with_pattern` (`http_pool.rs:640-660`), which calls `fetch` or
-  `range_reader` and then the facade. When the caller is a FUSE `read` callback, that is the
-  `fuser-0` thread. We traced the chain through `ratarmount-remote` only. That `MountSource` reads
-  run on the event-loop thread follows from fuser's design, and we did not trace every FUSE
-  callback. A panic there ends the event loop. `run()`
-  returns `Err("event loop thread panicked")`, `fuse_session_result` passes it through
-  (`ratarmount-fuse/src/lib.rs:3995`), and `mount_blocking` returns the error. The **whole mount
-  ends** and the process exits with an error. Two consequences are inferred and were not observed
-  here: that the session's mount guard unmounts on drop, and that macOS readers then get
-  `ENXIO`/`EIO`.
-- **Main thread** (mount setup and index build over a remote archive, `--publish-index`, live and
-  offline remote commits, `overlay` verbs that probe or fetch): the process exits with status 101
-  and a panic message. Offline commits and the journal recovery that follows are not covered by
-  this investigation.
-- **Export servers** (NFS, 9P, SMB, SFTP, HTTP) serving a remote source: not audited. The
-  behaviour depends on each server's thread or task model (a tokio task's panic is contained in
-  its `JoinHandle`, but a plain thread loop dies).
-- **Python bindings** (pyo3 0.29): a panic that crosses a `#[pyfunction]` boundary becomes
-  `pyo3_runtime.PanicException`. Inferred from pyo3's documented behaviour, not tested here.
-- **Lock poisoning:** `http_pool` recovers poisoned locks (`unwrap_or_else(|e| e.into_inner())`
-  throughout). Inside ureq, `reset()` fails before `pool.add`, so the agent's pool mutex is not held
-  while it unwinds. We did not audit other callers for a `Mutex` held across a request.
+On that FUSE failure, `fuse_session_result` passes the join error through (`lib.rs:3995-4004`),
+and `mount_blocking_with_activity` returns it after notifier/journal cleanup (`:4148-4154`).
+The FUSE-only CLI handles it with exit **1**, not 101 (`ratarmount/src/main.rs:4224-4226`,
+`:4259-4268`). fuser's `UmountOnDrop` **attempts** unmount and logs a failure
+(`session.rs:107-120`); successful macOS unmount and exact client errnos (`ENXIO`/`EIO` were
+suggested previously) are **not verified**. A worker-contained panic and a synchronous
+event-loop panic therefore have different effects on a mount.
 
-Practical exposure: macOS builds (portable tarball, Homebrew) using any remote source or remote
-publish. The panic is rare per request but fatal for a FUSE mount. On Linux nothing changes, apart
-from the pooled-stale behaviour in §2a.
+**Locks:** the failing reset precedes `PoolReturner::return_to_pool` and `state.pool.add`
+(`stream.rs:254-267`, `pool.rs:252-255`), so this error is not raised while the ureq pool
+mutex is held. This is not a general unwind-safety proof. `http_pool` recovers poison on its
+mutexes, and it holds `target` across initial resolution (`http_pool.rs:537-540`);
+the FUSE source-read mutex is also held across I/O (`ratarmount-fuse/src/lib.rs:1568`).
+Other caller/codec state and cleanup need review before approving a panic guard.
+
+Practical exposure is macOS operations that reach the ureq callers above, including remote
+reads and publishing. This does not include every remote protocol (for example SSH/FTP do
+not become ureq callers just by being remote). Incidence in production is unknown; Linux
+experiments establish only the narrower observation in §2.
 
 ## 4. Upstream status
 
-Checked with `gh api` against GitHub and with the crates.io API, 2026-11-15:
+Rechecked with `gh api` against GitHub and the [crates.io API](https://crates.io/api/v1/crates/ureq)
+on 2026-11-15. These are public repository/release observations as of that date, not promises
+about future releases or independent reproduction of the reporter's measurements:
 
-- **algesten/ureq#1219** (opened 2026-10-21, closed 2026-10-22): "macOS: `set_read_timeout`
+- **[algesten/ureq#1219](https://github.com/algesten/ureq/issues/1219)** (opened 2026-10-21, closed 2026-10-22): "macOS: `set_read_timeout`
   fails with EINVAL after the server has closed, so a fully received response is lost (3.x: error;
-  2.x: panic on pool return)". It names exactly these two `expect`s and measures 10/2000 panics
-  with RST on 2.12.1, macOS. The reporter mentions carrying a local patch for 2.x.
-- **ureq 3:** fixed by PR **#1220** (merged 2026-10-22), released in **3.5.1** (crates.io
+  2.x: panic on pool return)". It identifies zero-length and buffered branches, explicitly
+  quotes the zero-length `expect`, and reports 10/2000 pool-return panics in each of two RST
+  runs on macOS with 2.12.1. It does not independently demonstrate both line-specific panics.
+  The reporter mentions carrying a local patch for 2.x; that is not evidence of a patch in
+  this ratarmount revision.
+- **ureq 3:** this timeout-error policy is fixed by [PR **#1220**](https://github.com/algesten/ureq/pull/1220)
+  (merged 2026-10-22), released in [**3.5.1**](https://crates.io/crates/ureq/3.5.1) (crates.io
   2026-11-02). Changelog: "Preserve readable responses after macOS rejects timeout changes on closed
-  sockets #1220". At 3.5.1 `src/unversioned/transport/tcp.rs`:
+  sockets #1220". At [3.5.1 `src/unversioned/transport/tcp.rs:284-288`](https://github.com/algesten/ureq/blob/3.5.1/src/unversioned/transport/tcp.rs#L284):
   ```rust
   // macOS can reject timeout changes after the peer closes with unread
   // request data. The response may still be readable: let I/O report the
   // outcome instead. Leave the cache unchanged since the setter failed.
   Err(e) if cfg!(target_os = "macos") && e.kind() == io::ErrorKind::InvalidInput => {}
   ```
-  - The tolerance is **macOS only**: FreeBSD and other BSDs still get the error, though not a
-    panic.
-  - **3.5.0 and 3.4.3 error** on this condition: no panic, but the response is lost.
-    `maybe_update_timeout` uses `?` at both tags, as checked through `gh api`. The maintainer's
-    "use 3.4.3 until we fix 3.5.0" refers to other 3.5.0 issues; 3.4.3 is not free of this one.
-  - The TLS connectors chain over `TcpTransport`, so TLS should share the fix (inferred from the
-    source).
-  - Current release: 3.5.2 (2026-11-12, `rust-version = 1.85`, below our 1.90 MSRV).
-- **ureq 2:** **not fixed**.
+  - The tolerance is **macOS only**. If another OS produces the same setter error, this code
+    still propagates it; this does not establish that FreeBSD actually produces that error.
+    It tolerates any setter `InvalidInput` on macOS without proving a peer reset, preserves the
+    cached timeout on failure, and lets subsequent I/O determine success or failure. It cannot
+    guarantee every response survives an RST.
+  - [**3.5.0**](https://github.com/algesten/ureq/blob/3.5.0/src/unversioned/transport/tcp.rs#L261)
+    and [**3.4.3**](https://github.com/algesten/ureq/blob/3.4.3/src/unversioned/transport/tcp.rs#L228)
+    propagate timeout-update errors with `?`. If a setter update is attempted and fails before
+    the response is read, they return an error rather than this ureq-2 panic. The maintainer's
+    recommendation in #1219 to use 3.4.3 does not explain its rationale; interpreting it as
+    referring to other bugs is **unverified**. The checked 3.4.3 source lacks #1220's tolerance.
+  - The [default connector chain](https://github.com/algesten/ureq/blob/3.5.1/src/unversioned/transport/mod.rs#L407)
+    places rustls/native-tls over the TCP transport. Ordinary direct TLS connections should
+    share this policy (source inference); no TLS reproduction or custom/proxy-transport audit
+    was performed.
+  - #1220 includes injected-error tests for successful/failed cache updates, macOS-only
+    `InvalidInput` tolerance and an interrupted-read retry with a rejected timeout update.
+    These avoid relying solely on an RST timing race.
+  - Latest published version at review: [3.5.2](https://crates.io/crates/ureq/3.5.2),
+    2026-11-12, not yanked; `rust-version = "1.85"` is below workspace MSRV 1.90.
+    Its `tcp.rs` still has the policy. This verifies metadata/source, not a successful
+    ratarmount migration build or the MSRV of all newly resolved dependencies.
+- **ureq 2:** the published version and inspected maintenance branch **still contain the bug**.
   - crates.io: newest 2.x is 2.12.1 (2024-12-04), not yanked.
-  - The `2.12.x-msrv1.71` branch head is 59989e10 (2026-07-22, #1186). It still has both
+  - The `2.12.x-msrv1.71` branch head is [59989e10](https://github.com/algesten/ureq/commit/59989e10ba060ff4235bda2f068ac636d2b9630a)
+    (2026-07-22, #1186). Its [response.rs](https://github.com/algesten/ureq/blob/59989e10ba060ff4235bda2f068ac636d2b9630a/src/response.rs#L389) still has both
     `expect`s with their TODO comments (`src/response.rs:389`, `:403`).
-  - The branch is still maintained (it got a fix in 2026-07), so a 2.12.2 is possible but not
-    announced.
+  - This confirms a July backport, not an ongoing maintenance commitment. No commitment to
+    a 2.12.2 release was found in #1219/#1220 or the inspected branch/release metadata;
+    future 2.x support and release timing remain **unverified**.
 
 ## 5. Options for callers (for Keystone)
 
+**Decision boundary:** [#311](https://github.com/hilather/ratarmount-rs/issues/311) explicitly asks
+for investigation only and requires architecture review before any fix plan. Nothing in this
+section is approved or implemented by this document. Existing migration PRs establish context,
+not authorization for the new panic guard, patch, version policy or tests proposed here.
+
 | Option | What it does | Covers | Trade-offs |
 |--------|--------------|--------|------------|
-| **A. Avoid the path** (`Connection: close`, a non-pooled agent, reading bodies differently, a deadline) | — | **Nothing** | Shown dead under injection (§2b): `reset()` runs before the pool returner is consulted and before the caller gets the response. A deadline only moves most failures earlier (to a header `Err`) and still panics sometimes. ureq 2 offers no plain-TCP custom transport to intercept the setter. |
-| **B. `catch_unwind` at the facade boundary** | Wrap `call` / `send_*` in `catch_unwind(AssertUnwindSafe(..))` and map a panic to a `TransportError` of kind `Io` (for example "connection reset after response (ureq 2)") | Facade users now. Direct callers only after S3 moves them, or with duplicate wrappers. | Small, contained, and removed at S4b. Risks and costs: unwind safety holds in practice. No ureq lock is held at the panic, and §2b's natural-race run shows a shared pooled agent keeps serving after 285 caught panics with no `PoisonError`. The default hook still prints a panic message unless a filtering hook is installed, which is process-global and unattractive. The complete response is lost; idempotent GET and HEAD could retry. It cannot help builds with `panic = "abort"` (none today). It needs a test: the §2b shim, or a test-only seam. |
-| **C. Finish the ureq 3 migration** (S3 direct callers → S4a facade-owned redirects → S4b engine flip) | Engine without the panic. On macOS also keeps the response instead of an error. | Everything, once all callers are on the facade | Already planned under #311 (PRs #318 and #322 say "planned for #311"). Must pin `ureq >= 3.5.1`. 3.5.0 and 3.4.3 both propagate the setter error with `?` in `maybe_update_timeout` (checked at both tags), so they give an error, not a panic, and the response is lost. Tolerance is macOS-only upstream. The S1b contract expectations flip at S4b anyway. Largest change, but it is the work already in flight. |
-| **D. Pin or patch ureq 2** (`[patch.crates-io]` fork, or vendoring with the two `expect`s replaced by `ErrorReader` / dropping the stream) | Turns the panic into an `Err`, or drops the connection | Everything at once | Small diff, but a fork to maintain for a dependency we are leaving. Precedent: `vendor/librqbit`. It does not fix the non-panic data loss (A path, chunked and streamed). Alternatively, send the two-line fix upstream to `2.12.x-msrv1.71` and adopt a 2.12.2 if one ships. That costs nothing to us but its timing is unknown. |
+| **A. Caller-side avoidance** (`Connection: close`, fresh/zero-capacity agents, different body-reading API, deadline) | Changes pooling or timing, without removing `reset()` | No reliable protection against the two expects | The reset precedes pool eligibility and response delivery (§1). A deadline adds earlier error opportunities; it does not ensure safe completion. Changing caller body handling is too late. No supported plain-TCP transport replacement was found in ureq 2's `AgentBuilder`; a library patch is a separate option. |
+| **B. Facade panic guard** | Proposed `catch_unwind(AssertUnwindSafe(..))` around `call` / all `send_*`, mapping to owned `TransportError` kind `Io` | These construction-time panics for callers that actually use the facade, under unwind builds | Direct callers in §3 remain exposed until migrated or separately wrapped. Deferred body I/O errors remain. The guard catches unrelated dependency or upload-reader panics too, so it must not diagnose every payload as a connection reset. The response is lost; retries require a separate replay/idempotency policy. Pool-lock analysis supports this specific failure, but the reported shared-agent run is not a general unwind-safety proof. Audit caller-owned readers/state, test repeated use, and account for panic-hook output; it cannot help abort builds. |
+| **C. Complete the ureq 3 migration** (S3 callers → S4a redirects → S4b engine) | Removes these ureq-2 expects; 3.5.1+ tolerates the specified macOS timeout error | All inventoried callers once migrated; the two direct test sites also need disposition | Consistent with #318/#322 and facade S4a/S4b comments. Keep a minimum of 3.5.1 **within major version 3**; 3.4.3/3.5.0 lack the tolerance. Review engine-specific expectations in `http_client/tests_behaviour.rs` at the flip. The policy allows readable data to be consumed; it cannot suppress genuine read/reset errors. Full migration/feature/MSRV validation is future work. |
+| **D. Patch/backport ureq 2** | Either replace the two expects with error handling, or discard a connection whose timeout reset fails while preserving the received response | All users resolving to the patched dependency | These are different patches: replacing just the expects does not fix the initial setter's `ErrorReader` or streamed/chunked completion errors. Handling failed reset centrally could also preserve those completion reads; the earlier setter path would still need separate consideration. Scope, error policy and tests require design review. A fork adds maintenance (`vendor/librqbit` is a repository precedent); upstream acceptance and a 2.12.2 release are not guaranteed. |
 
-**Recommendation**
+**Recommendation to Keystone, not an implementation plan**
 
-1. Keep the fix in option C, since this issue already anchors the migration.
-   - Add an explicit floor `ureq = ">=3.5.1"` (prefer 3.5.2) in the S4b plan.
-   - Make the S3 slice list name `location.rs:1584/2834` and `overlay_cmd.rs:834` along with
-     `s3`, `gcs` and `azure`.
-   - Add a `#[cfg(target_os = "macos")]` contract test at S4b, using upstream #1219's shape: the
-     server reads part of a POST, answers `302` with `Content-Length: 0`, and closes. Assert the
-     status arrives. Also run a small-body variant to cover line 403's shape.
-   - The test passes reliably on a fixed engine, but on a regressed one it fails only
-     occasionally. Through ureq, upstream measured 5/5000 to 58/2000 failures on 3.5.0. The 300/300
-     figure applies only to the bare setter after a 20 ms sleep.
-   - So the test needs many rounds, or a server design that forces the peer close to land before
-     ureq's timeout update. One example is a request with a deadline, where the update happens
-     before every read. Neither design is tested here.
-2. If S4b is more than a few weeks out, land option B as a small interim guard on the facade.
-   - It immediately protects the FUSE thread for the http_pool users, the hot path for remote
-     mounts, and S3 then moves the direct callers under it.
-   - Because of the hook noise, B is a stopgap and should be deleted at S4b.
-3. Option D is not recommended unless the migration stalls. Optionally offer the 2.12.x patch
-   upstream, since that is cheap.
-4. Option A should not be pursued: it does not work.
+1. Prefer evaluating C in the existing migration review. Propose a bounded 3.x requirement
+   such as `version = "3.5.2"` (Cargo caret, `>=3.5.2, <4.0.0`), or
+   `">=3.5.1, <4.0.0"`; an unbounded `">=3.5.1"` would also admit future major versions.
+   Explicitly include production `location.rs:1584` and `overlay_cmd.rs:834/838`, plus cloud
+   credential/token helpers, in caller coverage. Track `location.rs:2834` and
+   `http_client.rs:543` separately as test-only direct callers.
+2. An approved fix should include regression tests in the same PR. For C, cover a rejected
+   timeout update while a zero-length response or positive buffered body remains readable,
+   successful/failed timeout-cache updates, and legitimate I/O errors. #1220's injected tests
+   provide a policy model. A new ratarmount test must exercise the intended engine behavior;
+   a mock that bypasses the setter does not by itself prove the dependency regression fixed.
+   Keep the WebDAV real-opener case and add bounded macOS integration coverage as appropriate.
+   An unsynchronized close-after-POST loop is supplementary evidence, not a deterministic gate:
+   #1219 reports 5/5000 through 58/2000 setter errors on 3.5.0; its 300/300 number is a different,
+   bare-socket experiment after a 20 ms sleep. A deadline or more iterations does not force
+   the desired ordering, and RST can cause a real read error even with #1220's policy.
+3. If migration timing makes an interim change useful, ask Keystone to compare B and D with
+   explicit caller coverage, unwind/error semantics and deterministic tests. No delivery
+   deadline or urgency is established by the observed race counts. B could preserve the FUSE
+   loop for guarded requests but would leave direct callers and ordinary body errors to
+   their existing handling. Do not claim all remote mounts are protected by a facade guard.
+4. A is not a dependable fix based on the checked control flow. An upstream 2.x proposal is
+   another review decision, not a zero-cost or guaranteed-release alternative.
 
 Open items Keystone may want checked first:
 
@@ -508,3 +649,6 @@ Open items Keystone may want checked first:
 - Whether any export server runs remote fetches on a plain thread whose death takes down the
   server.
 - Windows and FreeBSD setter semantics on a reset socket (unknown).
+- Actual macOS mount teardown/client errnos, TLS/proxy reproduction, and live-commit recovery
+  after unwinding; none was tested here.
+- Historical §2a/§2b counts without retained logs, and future 2.x maintenance/release intent.
