@@ -3472,6 +3472,8 @@ struct CopyRow {
 /// rebuild compared nothing and published without the copy guard. Now P1 is
 /// refused, the archive keeps its inode and the other writer's bytes, and the
 /// other writer's next commit is accepted. Rows marked control already passed.
+/// Without GNU tar only the rows that need it are skipped (#158): the native
+/// `.tar.zst`, ZIP and provenance-TAR rows still run.
 #[cfg(unix)]
 #[test]
 fn regression_copy_paths_compare_the_gate_stamp() {
@@ -3479,10 +3481,6 @@ fn regression_copy_paths_compare_the_gate_stamp() {
     use crate::CommitMode::{Auto, Copy};
     use CopyFmt::*;
     use CopyWindow::*;
-    if !have_gnu_tar() {
-        eprintln!("skip: GNU tar unavailable");
-        return;
-    }
     let row = |site, fmt, way, mode, window, delete| CopyRow {
         site,
         fmt,
@@ -3669,8 +3667,16 @@ fn regression_copy_paths_compare_the_gate_stamp() {
             false,
         ),
     ];
+    let gnu_tar = have_gnu_tar();
+    let (mut ran, mut skipped) = (0, 0);
     let mut failed = Vec::new();
     for r in &rows {
+        if !gnu_tar && copy_row_needs_gnu_tar(r) {
+            eprintln!("skip: {}: needs GNU tar", r.site);
+            skipped += 1;
+            continue;
+        }
+        ran += 1;
         let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if matches!(r.fmt, Tar | Zst) {
                 copy_row_with_p2(r)
@@ -3684,7 +3690,22 @@ fn regression_copy_paths_compare_the_gate_stamp() {
             failed.push(r.site);
         }
     }
+    eprintln!("copy-path rows: {ran} ran, {skipped} skipped for want of GNU tar");
     assert!(failed.is_empty(), "failed rows: {failed:?}");
+}
+
+/// Does this copy-path row reach GNU tar before its refusal? The `.tar.zst`
+/// splice and the ZIP rebuild are native. Offline gzip/bzip2/xz recompress
+/// through GNU tar. An uncompressed TAR needs it in `Copy` mode (the live
+/// commit checks for it up front) and on the live and offline copy fallbacks;
+/// the provenance rewrite (`persist_provenance_plan`) is native.
+#[cfg(unix)]
+fn copy_row_needs_gnu_tar(r: &CopyRow) -> bool {
+    match r.fmt {
+        CopyFmt::Zst | CopyFmt::Zip => false,
+        CopyFmt::Gz | CopyFmt::Bz2 | CopyFmt::Xz => true,
+        CopyFmt::Tar => r.mode == crate::CommitMode::Copy || r.way != Way::Provenance,
+    }
 }
 
 /// A `.tar`/`.tar.zst` row: P2 (another `-w` overlay) appends its member in
