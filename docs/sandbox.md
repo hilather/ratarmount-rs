@@ -2237,18 +2237,38 @@ snapshot) by one that gets the same inode number from the filesystem counts
 as the same file; some filesystems (ext4, for example) reuse freed inode
 numbers. Nor are these opens, which
 do not go through the check: the journal file `overlay pack --include-journal`
-reads (a JSON log, not a database) and the commit journal's opens of the
-archive itself. Opens that used to bypass the check no longer open a data
+reads (a JSON log, not a database) and the commit path's opens of the
+archive itself (the commit journal's, and the `is_zip_archive` and
+`is_uncompressed_tar` format probes that pick the commit method). Opens that
+used to bypass the check no longer open a data
 descriptor at all: `overlay seal`'s and `unseal`'s permission walk and the
 unpack stage's mode pass change modes through an `O_PATH` pin on Linux (by
 name with `AT_SYMLINK_NOFOLLOW` elsewhere, where a swap of the name between the
 check and the change is not detected) (#149); a failed first open leaves an
 existing 0-byte database to SQLite's rollback instead of truncating it (#160);
 and `overlay pack` ships SQLite copies of the layer database and of the base
-index (#156). Of the checked sites, the ZIP commit reader, the
-read-only layer, live diff, the seal sentinels, the pack sentinel and lock
+index (#156). Not every `overlay pack` / `unpack` open is checked either:
+reads of a bundle file (`overlay unpack`, a bundle `--lower` and the sandbox
+supervisor's lower checks), the `--lower` bundle cache's private copy of it,
+and the `<staging directory>.lock` file that `overlay pack`, `unpack` and the
+cache fill create (or reuse) beside their staging directory use ordinary opens.
+The bundle output and its temporary files, extracted regular-file members,
+and cache verification markers are created new (`O_EXCL` or anonymous).
+Unpack finalization opens directories for metadata updates; its regular-file
+mode pass uses the lock-preserving `O_PATH` pins on Linux and no data descriptor
+elsewhere, as described above (#149). Of the checked sites, the ZIP commit
+reader, the read-only layer, live diff, the seal sentinels, the pack sentinel and lock
 reads and the macOS park share the tested helper but have no test of their
 own. Pack payload append has a direct registered-alias refusal/lock regression.
+The `--journal` operation log is not checked either: a FUSE mount opens it
+for appending (creating it if absent) after any overlay database is open and
+keeps that descriptor in its writer thread. Its path must lie outside the mount
+point and the overlay directory, but another hard link of the overlay database
+elsewhere is not refused: the journal's lines would be appended to the
+database file, and closing the descriptor (when the journal is finished at
+unmount, when its writer fails, or when the journal open fails after the file
+was opened) would release this process's locks on the database. Do not point `--journal` at a link of an overlay
+database.
 
 These protections keep the SQLite locks of a process that holds the database
 for its whole life: a mount or export server, foreground (`-f`; `sandbox run`

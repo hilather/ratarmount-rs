@@ -772,16 +772,29 @@ pub fn check_offline_journal(member: &Path) -> io::Result<()> {
         }
     }
     if let Some((phase, path)) = missing {
-        return Err(io::Error::other(format!(
-            "{} carries a {phase} commit-journal locator but its journal {} is missing or \
-                 moved; recover it through the archive's current directory name, or verify the \
-                 archive and remove its user.ratarmount.commit-journal xattr (setfattr -x on \
-                 Linux, xattr -d on macOS)",
-            member.display(),
-            path.display()
+        return Err(io::Error::other(missing_journal_message(
+            member, phase, &path,
         )));
     }
     Ok(())
+}
+
+/// The refusal for an active or complete locator whose journal is missing or
+/// moved. `phase` is "active" or "complete"; the article follows it (#223).
+fn missing_journal_message(member: &Path, phase: &str, path: &Path) -> String {
+    let article = if phase.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "an"
+    } else {
+        "a"
+    };
+    format!(
+        "{} carries {article} {phase} commit-journal locator but its journal {} is missing or \
+             moved; recover it through the archive's current directory name, or verify the \
+             archive and remove its user.ratarmount.commit-journal xattr (setfattr -x on \
+             Linux, xattr -d on macOS)",
+        member.display(),
+        path.display()
+    )
 }
 
 /// `verify`'s journal rule: the archive at `path` carries its OWN pending
@@ -1461,6 +1474,30 @@ where
 mod tests {
     use super::*;
     use std::rc::Rc;
+
+    /// Regression: #223 "carries a active commit-journal locator": the
+    /// missing-journal refusal must take "an" before "active" and "a" before
+    /// "complete".
+    #[test]
+    fn regression_223_missing_journal_message_article() {
+        let member = Path::new("/x/base.tar");
+        let journal = Path::new("/x/.base.tar.ratarmount-commit-journal");
+        let active = missing_journal_message(member, "active", journal);
+        assert!(
+            active.starts_with(
+                "/x/base.tar carries an active commit-journal locator but its journal /x/"
+            ),
+            "{active}"
+        );
+        let complete = missing_journal_message(member, "complete", journal);
+        assert!(
+            complete.starts_with(
+                "/x/base.tar carries a complete commit-journal locator but its journal /x/"
+            ),
+            "{complete}"
+        );
+        assert!(!active.contains("a active") && !complete.contains("an complete"));
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn assert_archive_locked(archive: &Path) {

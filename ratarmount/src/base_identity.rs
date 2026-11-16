@@ -199,12 +199,9 @@ fn classify_offline_in_memory(
         }
     };
     // Recovery is a mount's or a commit's write; this read-only check refuses
-    // the journal states recovery would refuse. It probes the path as typed:
-    // a `file://` or remote input names no local file, and
-    // `recover_journals: false` below still keeps the factory from applying
-    // one.
-    ratarmount_compositing::journal_recovery::check_offline_journal(base)
-        .map_err(|e| e.to_string())?;
+    // the journal states recovery would refuse. `recover_journals: false`
+    // below still keeps the factory from applying one.
+    check_offline_journal_input(base)?;
     let mut options = OpenOptions {
         write_index: false,
         index_in_memory: true,
@@ -226,6 +223,32 @@ fn classify_offline_in_memory(
         git == GitIntent::Auto,
     );
     ClassifiedBase::open(&mut opener)
+}
+
+/// An offline verb's read-only commit-journal check of the base `input` as
+/// typed: refuses the journal states recovery would refuse (a pending journal
+/// started for the file, or an active/complete locator whose journal is
+/// missing). A `file://` URL is probed at the local path the factory resolves
+/// it to and opens (#212); before that, the URL was probed as a path, found no
+/// journal, and the verb read a torn archive mid-commit. Any other remote
+/// scheme is fetched to a private copy by the factory and carries no local
+/// journal; a plain path (or `git://` URL) is probed as typed, as before.
+pub(crate) fn check_offline_journal_input(input: &Path) -> Result<(), String> {
+    let typed = input.to_string_lossy();
+    let probed = match ratarmount_remote::remote_url_scheme(&typed).as_deref() {
+        Some("file") => match &ratarmount_remote::resolve_to_local(&typed)
+            .map_err(|e| format!("{typed}: {e}"))?
+        {
+            ratarmount_remote::RemoteLocal::Local(path) => path.clone(),
+            // `file://` always resolves to a local path; anything else would
+            // be a fetched copy with no journal of its own.
+            _ => return Ok(()),
+        },
+        _ if ratarmount_remote::is_remote_url(&typed) => return Ok(()),
+        _ => input.to_path_buf(),
+    };
+    ratarmount_compositing::journal_recovery::check_offline_journal(&probed)
+        .map_err(|e| e.to_string())
 }
 
 /// The source a mount serves, plus what keeps it alive (downloaded bodies).
