@@ -5055,6 +5055,65 @@ fn regression_overlay_db_followed_stat_errors_are_not_present() {
     }
 }
 
+/// The first `raw_os_error()` along `error`'s source chain (itself included).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn errno_in_chain(error: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    let mut next = Some(error);
+    while let Some(e) = next {
+        if let Some(code) = e
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+        {
+            return Some(code);
+        }
+        next = e.source();
+    }
+    None
+}
+
+/// Regression: #179: a followed `stat` error of the overlay database (here an
+/// injected `EIO`) was flattened into a string by the classifier and again by
+/// the recovery guard, so `raw_os_error()` was lost along the error chain.
+/// The kind, the path text and the original errno all survive now.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_179_db_entry_error_keeps_its_source() {
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    let db = fx.overlay.join(HIDDEN_DB);
+    let eio = std::io::Error::from_raw_os_error(libc::EIO).kind();
+
+    let seam = FollowedStatErrno::set(libc::EIO);
+    let error = crate::write_overlay::overlay_db_entry(&fx.overlay).unwrap_err();
+    drop(seam);
+    let crate::OverlayError::Io(io) = &error else {
+        panic!("not an I/O error: {error:?}");
+    };
+    assert_eq!(io.kind(), eio, "{error}");
+    assert!(error
+        .to_string()
+        .contains("cannot resolve the overlay database"));
+    assert!(error.to_string().contains(&db.display().to_string()));
+    assert_eq!(errno_in_chain(&error), Some(libc::EIO), "{error:?}");
+
+    // Through the recovery guard (stale prepare locator: a write is due).
+    stale_prepare(&fx.archive);
+    let before = locator(&fx.archive);
+    let seam = FollowedStatErrno::set(libc::EIO);
+    let error = crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Inode).unwrap_err();
+    drop(seam);
+    let ratarmount_compress::commit_journal::RecoverError::Refused(io) = &error else {
+        panic!("not refused: {error:?}");
+    };
+    assert_eq!(io.kind(), eio, "{error}");
+    assert!(
+        error.to_string().contains("cannot be classified"),
+        "{error}"
+    );
+    assert_eq!(errno_in_chain(io), Some(libc::EIO), "{error:?}");
+    assert_eq!(locator(&fx.archive), before, "no recovery write");
+}
+
 /// Leave `archive` with a stale prepare (`P`) locator and no journal: the
 /// crash came before the journal was written (or after it was removed).
 #[cfg(any(target_os = "linux", target_os = "macos"))]

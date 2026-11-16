@@ -265,12 +265,36 @@ fn followed_db_stat(db_path: &Path) -> io::Result<fs::Metadata> {
     fs::metadata(db_path)
 }
 
-/// `e` (its kind kept) with what failed on which path in its text.
+/// An I/O error with what failed on which path (#179): the text names both,
+/// and the original error stays reachable as the [`std::error::Error::source`]
+/// (its `raw_os_error()` included), never flattened into a string.
+#[derive(Debug)]
+struct PathIoError {
+    context: String,
+    source: io::Error,
+}
+
+impl std::fmt::Display for PathIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.context, self.source)
+    }
+}
+
+impl std::error::Error for PathIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// `e` with `context` in its text; its kind is kept and `e` is the source.
+pub(crate) fn io_with_context(e: io::Error, context: String) -> io::Error {
+    io::Error::new(e.kind(), PathIoError { context, source: e })
+}
+
+/// `e` (its kind kept, itself the source) with what failed on which path in
+/// its text.
 fn io_with_path(e: io::Error, what: &str, path: &Path) -> OverlayError {
-    OverlayError::Io(io::Error::new(
-        e.kind(),
-        format!("{what} {}: {e}", path.display()),
-    ))
+    OverlayError::Io(io_with_context(e, format!("{what} {}", path.display())))
 }
 
 /// The overlay database at `db_path` as `Connection::open` would see it:
@@ -298,11 +322,11 @@ fn overlay_db_regular(db_path: &Path, marked: bool) -> Result<Option<fs::Metadat
              created through the symlink: restore its target or remove the symlink",
             db_path.display()
         ))),
-        Err(e) => Err(OverlayError::Io(io::Error::new(
-            e.kind(),
+        Err(e) => Err(OverlayError::Io(io_with_context(
+            e,
             format!(
                 "cannot resolve the overlay database {} (it is neither proved present nor \
-                 missing): {e}",
+                 missing)",
                 db_path.display()
             ),
         ))),
