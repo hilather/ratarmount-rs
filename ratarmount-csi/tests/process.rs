@@ -1,5 +1,7 @@
 #![cfg(target_os = "linux")]
 mod common;
+#[path = "../../test-harness/child_process.rs"]
+mod test_child;
 use ratarmount_csi::{
     options,
     process::{mountinfo_contains, ProcessMounter},
@@ -178,13 +180,15 @@ fn regression_310_parent_exit_helper_skips_without_its_parent() {
             dir.path().display()
         ),
     );
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--ignored", "--exact", "parent_exit_helper", "--nocapture"])
-        .env_remove(PARENT_EXIT_HELPER_CHILD)
-        .env("CSI_HELPER_DIR", dir.path())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
+    let output = test_child::TestChild::spawn(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "parent_exit_helper", "--nocapture"])
+            .env_remove(PARENT_EXIT_HELPER_CHILD)
+            .env("CSI_HELPER_DIR", dir.path()),
+    )
+    .unwrap()
+    .output(Duration::from_secs(5))
+    .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");

@@ -40,16 +40,18 @@ pub(crate) fn run_without_guard(
     guard: &str,
     envs: &[(&str, &OsStr)],
 ) -> std::process::Output {
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args(["--exact", test, "--ignored", "--nocapture"])
-        .env_remove(guard)
-        .stdin(Stdio::null());
+        .env_remove(guard);
     for (key, value) in envs {
         command.env(key, value);
     }
-    let output = command.output().unwrap();
+    let output = crate::test_child::TestChild::spawn(&mut command)
+        .unwrap()
+        .output(std::time::Duration::from_secs(5))
+        .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{test}: {stdout}\n{stderr}");
@@ -66,7 +68,6 @@ pub(crate) fn run_without_guard(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     /// Regression: #310 an `#[ignore]`d subprocess helper run directly
     /// (`cargo test -- --ignored`/`--include-ignored`) did its work outside
@@ -74,22 +75,31 @@ mod tests {
     /// without its guard: it skips and leaves no trace of its work.
     #[test]
     fn regression_310_ignored_helpers_skip_without_their_parent() {
-        // Most helpers are Linux only (no target cfg here: #201 N4).
-        if !cfg!(target_os = "linux") {
-            eprintln!("skip: the guarded subprocess helpers are Linux only");
-            return;
-        }
         let _processes = ratarmount_index::test_process::spawning();
         let temp = tempfile::tempdir().unwrap();
 
         // Would sleep 30 s.
-        let start = Instant::now();
         run_without_guard(
             "sandbox::process::tests::sandbox_waiting_child",
             SANDBOX_WAITING_CHILD,
             &[],
         );
-        assert!(start.elapsed() < Duration::from_secs(20));
+
+        // This helper is also present on macOS. Would open the repository
+        // and fail (panic) on a missing one.
+        let repo = temp.path().join("missing-repo");
+        let out = run_without_guard(
+            "snapshot::tests::snapshot_restic_reader_child",
+            SNAPSHOT_RESTIC_READER_CHILD,
+            &[("AI_SNAP_TEST_REPO", repo.as_os_str())],
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("restic reader verified"));
+
+        // The remaining helpers are Linux only (no target cfg here: #201 N4).
+        if !cfg!(target_os = "linux") {
+            eprintln!("skip: the remaining guarded subprocess helpers are Linux only");
+            return;
+        }
 
         // Would run ProcessMounter::stop and print its marker.
         let out = run_without_guard(
@@ -107,15 +117,6 @@ mod tests {
             &[("RATARMOUNT_RUN_DEATH_PROBE", marker.as_os_str())],
         );
         assert!(!marker.exists());
-
-        // Would open the repository and fail (panic) on a missing one.
-        let repo = temp.path().join("missing-repo");
-        let out = run_without_guard(
-            "snapshot::tests::snapshot_restic_reader_child",
-            SNAPSHOT_RESTIC_READER_CHILD,
-            &[("AI_SNAP_TEST_REPO", repo.as_os_str())],
-        );
-        assert!(!String::from_utf8_lossy(&out.stdout).contains("restic reader verified"));
 
         // Would create its fixture tree and bind mounts under the directory.
         let ns = temp.path().join("ns");

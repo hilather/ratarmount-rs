@@ -59,6 +59,9 @@ mod sandbox;
 mod shard;
 mod snapshot;
 mod tensors_cmd;
+#[cfg(test)]
+#[path = "../../test-harness/child_process.rs"]
+mod test_child;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 

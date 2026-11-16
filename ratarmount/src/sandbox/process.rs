@@ -775,23 +775,81 @@ mod tests {
         assert_eq!(parsed.write_overlay, Some(attempt.overlay_dir));
     }
 
-    /// Regression: a hung helper must be killed and reaped when its deadline expires.
-    #[test]
-    fn regression_subprocess_deadline_reaps_child() {
-        let _processes = ratarmount_index::test_process::spawning();
-        let mut child = Command::new(std::env::current_exe().unwrap())
+    const WAITING_CHILD_READY: &str = "#310 waiting helper ready";
+
+    fn waiting_child(mut command: Command, guarded: bool) -> crate::test_child::TestChild {
+        command
             .args([
                 "--exact",
                 "sandbox::process::tests::sandbox_waiting_child",
                 "--ignored",
+                "--nocapture",
             ])
-            .env(crate::child_helpers::SANDBOX_WAITING_CHILD, "1")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        assert!(!wait_bounded(&mut child, Duration::from_millis(40)).unwrap());
-        assert!(child.try_wait().unwrap().is_some());
+            .env_remove(crate::child_helpers::SANDBOX_WAITING_CHILD);
+        if guarded {
+            command.env(crate::child_helpers::SANDBOX_WAITING_CHILD, "1");
+        }
+        crate::test_child::TestChild::spawn(&mut command).unwrap()
+    }
+
+    fn waiting_child_ready(child: &mut crate::test_child::TestChild) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if child.child.try_wait().unwrap().is_some() {
+                return false;
+            }
+            if String::from_utf8_lossy(&child.stdout().unwrap()).contains(WAITING_CHILD_READY) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    fn deadline_reaps_waiting_child(child: &mut crate::test_child::TestChild) -> bool {
+        // The deadline must measure the helper's sleep, not libtest startup:
+        // a guard skip could otherwise pass on a host taking >40 ms to start.
+        waiting_child_ready(child)
+            && !wait_bounded(&mut child.child, Duration::from_millis(40)).unwrap()
+            && child.child.try_wait().unwrap().is_some()
+    }
+
+    /// Regression: a hung helper must be killed and reaped when its deadline expires.
+    #[test]
+    fn regression_subprocess_deadline_reaps_child() {
+        let _processes = ratarmount_index::test_process::spawning();
+        let mut child = waiting_child(Command::new(std::env::current_exe().unwrap()), true);
+        assert!(deadline_reaps_waiting_child(&mut child));
+    }
+
+    /// Regression: #310 a skipped helper must never satisfy the deadline
+    /// parent's check, even when startup exceeds its 40 ms deadline and
+    /// libtest exits successfully. Exercise the same check as the parent.
+    #[test]
+    fn regression_310_deadline_parent_rejects_skipped_helper() {
+        let _processes = ratarmount_index::test_process::spawning();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 0.2; exec \"$@\"", "sh"])
+            .arg(std::env::current_exe().unwrap());
+        let mut child = waiting_child(command, false);
+        assert!(!deadline_reaps_waiting_child(&mut child));
+        let output = child.output(Duration::from_secs(5)).unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(crate::child_helpers::GUARD_SKIP));
+    }
+
+    /// Regression: #310 a lost guard used to hang negative tests in output().
+    /// A helper that really entered its body must time out and be reaped.
+    #[test]
+    fn regression_310_helper_timeout_kills_and_reaps() {
+        let _processes = ratarmount_index::test_process::spawning();
+        let mut child = waiting_child(Command::new(std::env::current_exe().unwrap()), true);
+        assert!(waiting_child_ready(&mut child));
+        let error = child.output(Duration::ZERO).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains(WAITING_CHILD_READY));
+        assert!(child.child.try_wait().unwrap().is_some());
     }
 
     #[test]
@@ -802,6 +860,7 @@ mod tests {
             "sandbox_waiting_child",
             "regression_subprocess_deadline_reaps_child",
         ) {
+            println!("{WAITING_CHILD_READY}");
             thread::sleep(Duration::from_secs(30));
         }
     }

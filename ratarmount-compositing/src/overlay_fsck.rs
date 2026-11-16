@@ -433,6 +433,10 @@ pub(crate) fn check_connection(
 }
 
 #[cfg(test)]
+#[path = "../../test-harness/child_process.rs"]
+mod test_child;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{FolderMountSource, OverlayMetadata, WriteOverlay};
@@ -816,19 +820,21 @@ mod tests {
         };
         let before = listing(&dir);
         let ready = tmp.path().join("ready");
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "overlay_fsck::tests::hot_journal_child",
-                "--nocapture",
-            ])
-            .env_remove(HOT_JOURNAL_CHILD)
-            .env("RATARMOUNT_TEST_CHILD_OVERLAY", &dir)
-            .env("RATARMOUNT_TEST_JOURNAL_HOLD", &ready)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap();
+        let output = super::test_child::TestChild::spawn(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "overlay_fsck::tests::hot_journal_child",
+                    "--nocapture",
+                ])
+                .env_remove(HOT_JOURNAL_CHILD)
+                .env("RATARMOUNT_TEST_CHILD_OVERLAY", &dir)
+                .env("RATARMOUNT_TEST_JOURNAL_HOLD", &ready),
+        )
+        .unwrap()
+        .output(std::time::Duration::from_secs(5))
+        .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{stdout}\n{stderr}");
