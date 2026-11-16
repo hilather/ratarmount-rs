@@ -343,6 +343,24 @@ fn search_fts_match(
             "files_fts is not present; call ensure_fts5".into(),
         ));
     }
+    // An old prepared table can still contain hashes excluded by today's
+    // builder. Read-only workers must refuse it instead of matching stale
+    // content; ordinary `find --fts` rebuilds the table before querying.
+    let stale_hashes: bool = conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM files_fts WHERE COALESCE(hashes, '') != ''
+            AND offsetheader IN ({}))",
+            crate::shared_xattr_slots_sql(conn)?
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    if stale_hashes {
+        return Err(IndexError::Invalid(
+            "rebuild FTS with find --fts before searching this index: ambiguous shared-slot hashes"
+                .into(),
+        ));
+    }
     let (after_sql, limit_idx) = keyset_sql(SQL_FULLPATH_F, r#"f."offsetheader""#, after.is_some());
     let sql = format!(
         r#"
@@ -806,6 +824,49 @@ mod tests {
             hit_paths(&idx.search_fts("ownmemberslot").unwrap()),
             vec!["/own.txt"]
         );
+    }
+
+    /// Regression: #320 a prepared FTS table from an older build must not
+    /// match a stale shared hash, even when it cannot be rebuilt read-only.
+    #[test]
+    fn regression_320_legacy_fts_shared_hash_requires_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+        idx.begin_write().unwrap();
+        idx.insert_files_batch(&[
+            file_row("", "b.txt", 32, false),
+            file_row("", "text.txt", 32, false),
+            file_row("", "own.txt", 64, false),
+        ])
+        .unwrap();
+        idx.insert_xattr(32, "user.hash.sha256", b"stalesolidslot")
+            .unwrap();
+        idx.insert_xattr(64, "user.hash.sha256", b"ownmemberslot")
+            .unwrap();
+        idx.ensure_fts5().unwrap();
+        idx.with_conn(|conn| {
+            conn.execute(
+                "UPDATE files_fts SET hashes='stalesolidslot' WHERE offsetheader=32",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        idx.commit_write().unwrap();
+        drop(idx.into_read_only().unwrap());
+        let idx = SqliteIndex::open_read_only(&path).unwrap();
+        let error = idx.search_fts("stalesolidslot").unwrap_err().to_string();
+        assert!(error.contains("rebuild FTS"), "{error}");
+        drop(idx);
+        let idx = SqliteIndex::open_writable(&path).unwrap();
+        idx.ensure_fts5().unwrap();
+        assert!(idx.search_fts("stalesolidslot").unwrap().is_empty());
+        assert_eq!(
+            hit_paths(&idx.search_fts("ownmemberslot").unwrap()),
+            ["/own.txt"]
+        );
+        assert_eq!(hit_paths(&idx.search_fts("text").unwrap()), ["/text.txt"]);
     }
 
     /// Regression: FTS5 MATCH on path + `user.hash.*` payload under default features.

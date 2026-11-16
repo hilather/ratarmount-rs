@@ -4,6 +4,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "../../test-harness/sevenzip_fixture.rs"]
+mod sevenzip_fixture;
+
 use ratarmount_index::hash_hex;
 use rusqlite::Connection;
 
@@ -329,14 +332,10 @@ fn regression_320_cli_solid_7z_hashes_are_not_shared() {
     let dir = tempfile::tempdir().unwrap();
     let solid = dir.path().join("s3.7z");
     let non_solid = dir.path().join("ns.7z");
-    fs::write(
-        &solid,
-        ratarmount_formats_sevenzip::copy_7z_fixture(&members, true),
-    )
-    .unwrap();
+    fs::write(&solid, sevenzip_fixture::copy_7z_fixture(&members, true)).unwrap();
     fs::write(
         &non_solid,
-        ratarmount_formats_sevenzip::copy_7z_fixture(&members, false),
+        sevenzip_fixture::copy_7z_fixture(&members, false),
     )
     .unwrap();
     for path in [&solid, &non_solid] {

@@ -300,11 +300,18 @@ The complete status against the Python original is in the
    folders still decompress whole. The first read of a late member in a
    multi-GB solid archive is slow. `--hashes` digests of members of a solid
    folder are reported by the mount (`getfattr`, the payload cache) but not by
-   `find --hashes`, FTS search or `export-index`, whose index rows share one
+   `find --hashes`, hash predicates in `find --xattr`, FTS search or `export-index`, whose index rows share one
    `offsetheader` per solid folder. An index built with `--hashes` before the
    #320 fix holds the last member's digest for the whole folder; it is not
    reported, and `ratarmount --recreate-index --hashes sha256 ARCHIVE` stores
-   each member's own digest.
+   each member's own digest. Warm hash fills require each member's recorded
+   slot and requested key; a partial hashing pass does not count missing hashes
+   as kept. Old prepared FTS tables containing shared hashes must be rebuilt
+   with `ratarmount find --fts PATTERN ARCHIVE` before read-only searches.
+   Pack offsets at or above 2^61 bytes are refused to keep real offsets separate
+   from synthetic xattr slots. The Python-compatible `files`/`xattrs` layout
+   is unchanged; Python does not resolve the Rust per-member slots, and the
+   additive `sevenzip_member_xattrs` binding table is ignored by Python.
 4. **Writes.** ZIP commits rebuild the archive and cannot handle encrypted or
    multi-part ZIPs. Live commits cover uncompressed TAR and `.tar.zst` only
    and refuse to touch members in earlier zstd frames; the offline commit is

@@ -162,6 +162,7 @@ impl SevenZipMountSource {
             (a, false)
         };
 
+        validate_xattr_slot_ranges(&archive)?;
         reader.seek(SeekFrom::Start(0))?;
         let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(reader)));
 
@@ -360,6 +361,7 @@ impl SevenZipMountSource {
             decode::decompress_folder(folder, packed, None)
                 .map_err(|e| parse::SevenZipError::Msg(e.to_string()))
         })?;
+        validate_xattr_slot_ranges(&archive)?;
         file.seek(SeekFrom::Start(0))?;
         let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(file)));
         let (password, content_locked) =
@@ -407,6 +409,7 @@ impl SevenZipMountSource {
             decode::decompress_folder(folder, packed, None)
                 .map_err(|e| parse::SevenZipError::Msg(e.to_string()))
         })?;
+        validate_xattr_slot_ranges(&archive)?;
 
         reader.seek(SeekFrom::Start(0))?;
         let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(reader)));
@@ -1316,10 +1319,24 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
 /// Files rows key a 7z member by its folder's pack offset (Python parity), so
 /// every member of a solid folder has the same `offsetheader`, and an xattr
 /// stored there would belong to all of them (#320). Such members are keyed
-/// `SEVENZIP_MEMBER_XATTR_BASE + entry_index` instead. Real pack offsets stay
-/// below 2^61 and folderless members use `2^62 + entry_index`, so the ranges
-/// are disjoint.
+/// `SEVENZIP_MEMBER_XATTR_BASE + entry_index` instead. The opener validates
+/// that pack offsets and member indices stay below 2^61; folderless members
+/// use `2^62 + entry_index`, so the ranges are disjoint without overflow.
 const SOLID_XATTR_BASE: u64 = ratarmount_index::SEVENZIP_MEMBER_XATTR_BASE as u64;
+
+fn validate_xattr_slot_ranges(archive: &SevenZipArchiveInfo) -> Result<()> {
+    if archive.files.len() as u64 > SOLID_XATTR_BASE
+        || archive
+            .files
+            .iter()
+            .any(|entry| entry.folder_index.is_some() && entry.pack_offset >= SOLID_XATTR_BASE)
+    {
+        return Err(SzError::Msg(
+            "7z member indices or pack offsets overlap reserved xattr slots".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Pack offsets that more than one member's files row uses as `offsetheader`.
 fn solid_xattr_slots(archive: &SevenZipArchiveInfo) -> HashSet<u64> {
@@ -1379,6 +1396,22 @@ fn fill_member_content_hashes(
 
     let mut pending: Vec<(i64, String, Vec<u8>)> = Vec::new();
     let solid = solid_xattr_slots(archive);
+    let slots: Vec<_> = archive
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.folder_index.is_some() && entry.size > 0 && solid.contains(&entry.pack_offset)
+        })
+        .map(|(i, entry)| {
+            (
+                entry.pack_offset as i64,
+                entry.unpack_offset as i64,
+                member_xattr_slot(&solid, i, entry),
+            )
+        })
+        .collect();
+    index.store_sevenzip_member_xattr_slots(&slots)?;
 
     for (entry_index, entry) in archive.files.iter().enumerate() {
         if entry.is_dir || entry.is_empty_stream || entry.size == 0 {
@@ -1742,60 +1775,13 @@ impl MountSource for SevenZipMountSource {
     }
 }
 
-/// Copy-coder 7z written without an external `7z`: one solid folder holding
-/// every member (`solid`), or one folder per member (`7z a -ms=off`).
-/// Test fixture for small members (sizes below 128 bytes); not an archive writer.
-#[doc(hidden)]
-pub fn copy_7z_fixture(members: &[(&str, &[u8])], solid: bool) -> Vec<u8> {
-    let n = members.len() as u8;
-    let size = |b: &[u8]| {
-        assert!(b.len() < 0x80, "single-byte 7z numbers only");
-        b.len() as u8
-    };
-    let payload: Vec<u8> = members.iter().flat_map(|(_, b)| b.to_vec()).collect();
-    let mut header = vec![1, 4, 6, 0];
-    if solid {
-        let total = size(&payload);
-        header.extend_from_slice(&[1, 9, total, 0]);
-        header.extend_from_slice(&[7, 11, 1, 0, 1, 1, 0, 12, total, 0]);
-        header.extend_from_slice(&[8, 13, n, 9]);
-        header.extend(members[..members.len() - 1].iter().map(|(_, b)| size(b)));
-        header.push(0);
-    } else {
-        header.extend_from_slice(&[n, 9]);
-        header.extend(members.iter().map(|(_, b)| size(b)));
-        header.extend_from_slice(&[0, 7, 11, n, 0]);
-        for _ in members {
-            header.extend_from_slice(&[1, 1, 0]);
-        }
-        header.push(12);
-        header.extend(members.iter().map(|(_, b)| size(b)));
-        header.push(0);
-    }
-    header.push(0);
-    let mut names = vec![0u8];
-    for (name, _) in members {
-        for unit in name.encode_utf16().chain([0]) {
-            names.extend_from_slice(&unit.to_le_bytes());
-        }
-    }
-    header.extend_from_slice(&[5, n, 17, size(&names)]);
-    header.extend(names);
-    header.extend_from_slice(&[0, 0]);
-    let mut start = (payload.len() as u64).to_le_bytes().to_vec();
-    start.extend_from_slice(&(header.len() as u64).to_le_bytes());
-    start.extend_from_slice(&parse::crc32(&header).to_le_bytes());
-    let mut bytes = parse::MAGIC_7Z.to_vec();
-    bytes.extend_from_slice(&[0, 4]);
-    bytes.extend_from_slice(&parse::crc32(&start).to_le_bytes());
-    bytes.extend(start);
-    bytes.extend(payload);
-    bytes.extend(header);
-    bytes
-}
+#[cfg(test)]
+#[path = "../../test-harness/sevenzip_fixture.rs"]
+mod sevenzip_fixture;
 
 #[cfg(test)]
 mod tests {
+    use super::sevenzip_fixture::copy_7z_fixture;
     use super::*;
     fn prepared_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
         std::fs::read_dir(dir)
@@ -4080,6 +4066,181 @@ sys.stdout.buffer.write(packed)
 
     /// Archive name, `(member, content, sha256)` and whether the folder is solid.
     type Case<'a> = (&'a str, Vec<(&'a str, &'a [u8], &'a str)>, bool);
+
+    /// Regression: #320 real LZMA2 streams keep archive member indices across
+    /// directories, empty files, anti-items and symlinks, also on warm fills.
+    #[test]
+    fn regression_320_lzma2_solid_mixed_entries() {
+        let bytes = include_bytes!("../testdata/solid-hashes.7z");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.7z");
+        let index_path = dir.path().join("mixed.sqlite");
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            bytes[32] >= 0x80,
+            "fixture must contain a compressed LZMA2 chunk"
+        );
+        let bodies = [
+            ("/dir/b.txt", B_TXT.repeat(32)),
+            ("/dir/c.txt", C_TXT.repeat(32)),
+            ("/dir/text.txt", TEXT_TXT.repeat(32)),
+        ];
+        let hashes: Vec<_> = bodies
+            .iter()
+            .map(|(name, body)| (*name, hash_hex("sha256", body).unwrap()))
+            .collect();
+        let expected: Vec<_> = hashes
+            .iter()
+            .map(|(name, hash)| (*name, hash.as_str()))
+            .collect();
+        let source =
+            SevenZipMountSource::open(&path, Some(&index_path), &sha_opts(), "test", true).unwrap();
+        assert!(source.archive.solid);
+        assert_eq!(
+            source.archive.folders[0].coders[0].method,
+            parse::METHOD_LZMA2
+        );
+        assert_member_hashes(&source, &expected, "LZMA2 cold");
+        for (name, body) in &bodies {
+            let fi = source.lookup(name, 0).unwrap();
+            let mut actual = Vec::new();
+            source
+                .open(&fi, 0)
+                .unwrap()
+                .read_to_end(&mut actual)
+                .unwrap();
+            assert_eq!(&actual, body);
+        }
+        for name in ["/dir", "/empty", "/gone", "/link", "/emptydir"] {
+            let fi = source.lookup(name, 0).unwrap();
+            assert!(
+                source.get_xattr(&fi, "user.hash.sha256").is_none(),
+                "{name}"
+            );
+            assert!(source.list_xattr(&fi).is_empty(), "{name}");
+        }
+        assert_eq!(source.lookup("/link", 0).unwrap().linkname, "dir/b.txt");
+        drop(source);
+        let warm = SevenZipMountSource::open(
+            &path,
+            Some(&index_path),
+            &OpenOptions::default(),
+            "test",
+            false,
+        )
+        .unwrap();
+        assert_member_hashes(&warm, &expected, "LZMA2 warm");
+        drop(warm);
+        let index = SqliteIndex::open_writable(&index_path).unwrap();
+        let report =
+            ratarmount_index::fill_content_hashes(&index, &path, &["sha256".into()]).unwrap();
+        assert_eq!((report.kept_existing, report.unverifiable), (3, 0));
+        drop(index);
+        let nested = SevenZipMountSource::open_from_reader(
+            Cursor::new(bytes),
+            "nested.7z",
+            None,
+            &OpenOptions {
+                index_in_memory: true,
+                ..sha_opts()
+            },
+            "test",
+            true,
+        )
+        .unwrap();
+        assert_member_hashes(&nested, &expected, "LZMA2 nested");
+    }
+
+    /// Regression: #320 forged pack offsets must not alias either synthetic
+    /// xattr namespace, on cold, warm, or durable-structure opens.
+    #[test]
+    fn regression_320_reserved_pack_offsets_are_refused() {
+        let original = copy_7z_fixture(&[("b.txt", B_TXT), ("text.txt", TEXT_TXT)], true);
+        for offset in [SOLID_XATTR_BASE, SOLID_XATTR_BASE + 1, 1 << 62] {
+            let mut bytes = original.clone();
+            let header_start = 32 + B_TXT.len() + TEXT_TXT.len();
+            // Replace the single-byte PackPos with a 9-byte 7z uint.
+            bytes.splice(
+                header_start + 3..header_start + 4,
+                [vec![255], (offset - 32).to_le_bytes().to_vec()].concat(),
+            );
+            let header_len = (bytes.len() - header_start) as u64;
+            let header_crc = parse::crc32(&bytes[header_start..]);
+            bytes[20..28].copy_from_slice(&header_len.to_le_bytes());
+            bytes[28..32].copy_from_slice(&header_crc.to_le_bytes());
+            let start_crc = parse::crc32(&bytes[12..32]);
+            bytes[8..12].copy_from_slice(&start_crc.to_le_bytes());
+            let opts = OpenOptions {
+                index_in_memory: true,
+                ..Default::default()
+            };
+            let result = SevenZipMountSource::open_from_reader(
+                Cursor::new(bytes.clone()),
+                "forged.7z",
+                None,
+                &opts,
+                "test",
+                true,
+            );
+            assert!(
+                matches!(result, Err(ref e) if e.to_string().contains("reserved xattr slots")),
+                "cold offset {offset}"
+            );
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("forged.7z");
+            let index_path = dir.path().join("forged.sqlite");
+            std::fs::write(&path, &bytes).unwrap();
+            let index = SqliteIndex::create_writable(Some(&index_path)).unwrap();
+            index.begin_write().unwrap();
+            index
+                .store_metadata_key_value("backendName", BACKEND_NAME)
+                .unwrap();
+            index.commit_write().unwrap();
+            drop(index.into_read_only().unwrap());
+            let result = SevenZipMountSource::open_existing_path(
+                &path,
+                &index_path,
+                &OpenOptions::default(),
+            );
+            assert!(
+                matches!(result, Err(ref e) if e.to_string().contains("reserved xattr slots")),
+                "warm offset {offset}"
+            );
+
+            let source = SevenZipMountSource::open_from_reader(
+                Cursor::new(original.clone()),
+                "valid.7z",
+                None,
+                &opts,
+                "test",
+                true,
+            )
+            .unwrap();
+            let fp = ratarmount_index::NestedBodyFingerprint::from_seekable_body(
+                &mut Cursor::new(&original),
+                original.len() as u64,
+            )
+            .unwrap();
+            let mut blob = ratarmount_index::DurableNestedBlob::from_bytes(
+                &source.export_nested_durable(fp).unwrap(),
+            )
+            .unwrap();
+            for entry in &mut blob.sevenzip.as_mut().unwrap().files {
+                entry.pack_offset = offset;
+            }
+            let result = SevenZipMountSource::open_from_reader_with_durable(
+                Cursor::new(original.clone()),
+                "durable.7z",
+                &blob,
+                &opts,
+            );
+            assert!(
+                matches!(result, Err(ref e) if e.to_string().contains("reserved xattr slots")),
+                "durable offset {offset}"
+            );
+        }
+    }
 
     /// Regression: #320 solid 7z stored the last member's hash on every member
     /// of its folder (2- and 3-member blocks); `ms=off` control keeps the files-row slot.

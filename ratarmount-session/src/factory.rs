@@ -5614,6 +5614,10 @@ fn strip_source_name(name: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "../../test-harness/sevenzip_fixture.rs"]
+mod sevenzip_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
@@ -5637,7 +5641,7 @@ mod tests {
         for path in [&hashed, &stale] {
             std::fs::write(
                 path,
-                ratarmount_formats_sevenzip::copy_7z_fixture(&members, true),
+                super::sevenzip_fixture::copy_7z_fixture(&members, true),
             )
             .unwrap();
         }
