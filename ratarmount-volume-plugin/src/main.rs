@@ -217,7 +217,7 @@ mod linux {
     mod owner_only_socket_tests {
         use super::*;
         use ratarmount_core::owner_socket::{staging_names, PROC_SELF_FD};
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         /// Regression: the plugin socket is owner-only at the final path, a stale
         /// socket from an earlier run is replaced, and a live one or a non-socket is refused.
@@ -263,6 +263,7 @@ mod linux {
         #[test]
         fn regression_182_missing_parents_long_dir_exact_107_binds_via_proc_alias() {
             let base = tempfile::tempdir_in("/tmp").unwrap();
+            fs::set_permissions(base.path(), fs::Permissions::from_mode(0o2775)).unwrap();
             let base_len = base.path().as_os_str().as_encoded_bytes().len();
             let name = "plugin.sock";
             let absent = base.path().join("absent");

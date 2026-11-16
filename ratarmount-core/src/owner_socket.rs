@@ -8,7 +8,7 @@
 
 use std::fs;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -92,17 +92,58 @@ fn stage_dir(parent: &Path) -> io::Result<PathBuf> {
 /// Removes the staging directory, and the staged socket if rename did not run.
 struct StagingDir {
     path: PathBuf,
+    handle: Option<fs::File>,
+    bound: bool,
+}
+
+impl StagingDir {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            handle: None,
+            bound: false,
+        }
+    }
+
+    fn publish(&self, path: &Path) -> io::Result<()> {
+        let fd = self
+            .handle
+            .as_ref()
+            .expect("opened staging directory")
+            .as_raw_fd();
+        // SAFETY: fd is held open and `s` is inside the checked owner-only
+        // directory. Renaming that directory cannot redirect this chmod.
+        if unsafe { libc::fchmodat(fd, c"s".as_ptr(), 0o600, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        rename_noreplace(fd, path)
+    }
 }
 
 impl Drop for StagingDir {
     fn drop(&mut self) {
+        if self.bound {
+            if let Some(handle) = &self.handle {
+                // SAFETY: unlink only the socket we created in the held directory.
+                unsafe { libc::unlinkat(handle.as_raw_fd(), c"s".as_ptr(), 0) };
+            }
+        }
         let Ok(meta) = fs::symlink_metadata(&self.path) else {
             return;
         };
         if !meta.file_type().is_dir() || meta.uid() != euid() {
             return;
         }
-        let _ = fs::remove_file(self.path.join("s"));
+        if let Some(handle) = &self.handle {
+            let Ok(opened) = handle.metadata() else {
+                return;
+            };
+            if meta.dev() != opened.dev() || meta.ino() != opened.ino() {
+                return;
+            }
+        }
+        // Never recursively remove a replacement or a pre-existing `s`. If the
+        // open/check/bind failed, this removes only an empty staging directory.
         let _ = fs::remove_dir(&self.path);
     }
 }
@@ -160,21 +201,25 @@ fn check_staging_dir(dir: &Path, meta: &fs::Metadata, euid: u32) -> io::Result<(
 /// Binds `s` inside the staging directory. When `dir/s` is too long for `sun_path`,
 /// bind through `<proc_self_fd>/<fd>/s`, the alias of an fd open on the staging
 /// directory (Linux has no bindat(2)). The alias must resolve to that directory.
-fn bind_staged(dir: &Path, path: &Path, proc_self_fd: &Path) -> io::Result<UnixListener> {
-    let staged = dir.join("s");
+fn bind_staged(
+    staging: &mut StagingDir,
+    path: &Path,
+    proc_self_fd: &Path,
+) -> io::Result<UnixListener> {
+    let dir = &staging.path;
     let handle = {
         #[expect(
             clippy::disallowed_types,
-            reason = r###"internal-read:v1 {"id":"IR-B0289-T01","item":"ratarmount_core::owner_socket::bind_staged","disposition":"support","category":"builder-type-support","reason":"Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-B0289-T01","item":"ratarmount_core::owner_socket::bind_staged","disposition":"support","category":"builder-type-support","reason":"Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used to check and normalize private staging permissions, bind through /proc/self/fd, and anchor socket publication and cleanup; reads no file content","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
         )]
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0289-M01","item":"ratarmount_core::owner_socket::bind_staged","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content"}"###
+            reason = r###"internal-read:v1 {"id":"IR-B0289-M01","item":"ratarmount_core::owner_socket::bind_staged","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used to check and normalize private staging permissions, bind through /proc/self/fd, and anchor socket publication and cleanup; reads no file content"}"###
         )]
         let mut __inventory_value_0 = fs::OpenOptions::new();
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0289-M02","item":"ratarmount_core::owner_socket::bind_staged","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-B0289-M02","item":"ratarmount_core::owner_socket::bind_staged","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used to check and normalize private staging permissions, bind through /proc/self/fd, and anchor socket publication and cleanup; reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let __inventory_value_1 = __inventory_value_0
             .read(true)
@@ -182,15 +227,63 @@ fn bind_staged(dir: &Path, path: &Path, proc_self_fd: &Path) -> io::Result<UnixL
             .open(dir);
         __inventory_value_1
     }?;
-    let opened = handle.metadata()?;
-    check_staging_dir(dir, &opened, euid())?;
-    if staged.as_os_str().as_encoded_bytes().len() <= SUN_PATH_MAX {
-        return UnixListener::bind(&staged);
+    let mut opened = handle.metadata()?;
+    // Linux inherits S_ISGID from shared parents even when mkdir requests 0700.
+    // Normalize only this private, owned case, through the held descriptor;
+    // never chmod an unsafe replacement into passing the check.
+    if opened.is_dir() && opened.uid() == euid() && opened.mode() & 0o7777 == 0o2700 {
+        handle.set_permissions(fs::Permissions::from_mode(0o700))?;
+        opened = handle.metadata()?;
     }
+    check_staging_dir(dir, &opened, euid())?;
+    staging.handle = Some(handle);
+    bind_checked(staging, path, proc_self_fd)
+}
+
+fn staged_socket_exists(fd: RawFd) -> io::Result<bool> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fd is a live directory descriptor; stat points to writable storage.
+    let result = unsafe {
+        libc::fstatat(
+            fd,
+            c"s".as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+fn bind_checked(
+    staging: &mut StagingDir,
+    path: &Path,
+    proc_self_fd: &Path,
+) -> io::Result<UnixListener> {
+    let dir = &staging.path;
+    let handle = staging.handle.as_ref().expect("checked staging directory");
+    let opened = handle.metadata()?;
+    let fd = handle.as_raw_fd();
+    if staged_socket_exists(fd)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "staging socket already exists",
+        ));
+    }
+    let staged = dir.join("s");
     let alias = proc_self_fd.join(handle.as_raw_fd().to_string());
-    match fs::metadata(&alias) {
-        Ok(meta) if meta.dev() == opened.dev() && meta.ino() == opened.ino() => {}
-        _ => {
+    let alias_matches = fs::metadata(&alias)
+        .is_ok_and(|meta| meta.dev() == opened.dev() && meta.ino() == opened.ino());
+    let listener = if staged.as_os_str().as_encoded_bytes().len() <= SUN_PATH_MAX {
+        UnixListener::bind(&staged)?
+    } else {
+        if !alias_matches {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -204,32 +297,43 @@ fn bind_staged(dir: &Path, path: &Path, proc_self_fd: &Path) -> io::Result<UnixL
                 ),
             ));
         }
+        UnixListener::bind(alias.join("s"))?
+    };
+    // A short pathname can be replaced after the owner/mode check. Only return
+    // the listener if binding created `s` in the held directory, where other
+    // users cannot create entries. This also works without /proc. A listener
+    // bound in a replacement is closed without ever accepting requests.
+    if !staged_socket_exists(fd)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket staging directory changed during bind",
+        ));
     }
-    UnixListener::bind(alias.join("s"))
+    staging.bound = true;
+    Ok(listener)
 }
 
-/// Publish `staged` at `path` without replacing anything already there. rename(2)
+/// Publish `s` from the held staging directory at `path` without replacing
+/// anything already there. rename(2)
 /// would silently replace a live socket (#117); RENAME_NOREPLACE restores the
 /// EADDRINUSE a plain bind(path) gave. Other errors (EINVAL on a filesystem without
 /// RENAME_NOREPLACE, ENOSYS under a seccomp profile) pass through: no replacing fallback.
-fn rename_noreplace(staged: &Path, path: &Path) -> io::Result<()> {
+fn rename_noreplace(from_dir_fd: RawFd, path: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    let from = CString::new(staged.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
     let to = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
     // musl's libc crate bindings may lack renameat2 (musl 1.2.3); call the syscall directly.
-    // SAFETY: both pointers are valid NUL-terminated strings for the call.
+    // SAFETY: from_dir_fd is held open and both strings are NUL-terminated.
     #[expect(
         clippy::disallowed_methods,
-        reason = r###"internal-read:v1 {"id":"IR-E0036-M01","item":"ratarmount_core::owner_socket::rename_noreplace","disposition":"out-of-family","category":"socket-publication","reason":"Publish an already-created daemon (CSI, volume plugin) socket with the renameat2 no-replace syscall.","creation":{"policy":"none","basis":"This syscall renames an existing staged socket with RENAME_NOREPLACE; it acquires no file descriptor or new inode."}}"###
+        reason = r###"internal-read:v1 {"id":"IR-E0036-M01","item":"ratarmount_core::owner_socket::rename_noreplace","disposition":"out-of-family","category":"socket-publication","reason":"Publish an already-created daemon (CSI, volume plugin) socket with the renameat2 no-replace syscall.","creation":{"policy":"none","basis":"This syscall renames s relative to the held, checked staging directory with RENAME_NOREPLACE; it acquires no file descriptor or new inode."}}"###
     )]
     let rc = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            from.as_ptr(),
+            from_dir_fd,
+            c"s".as_ptr(),
             libc::AT_FDCWD,
             to.as_ptr(),
             libc::RENAME_NOREPLACE,
@@ -261,13 +365,9 @@ pub fn bind_private_with(path: &Path, proc_self_fd: &Path) -> io::Result<UnixLis
         _ => Path::new("."),
     };
     socket_path_fits(path)?;
-    let staging = StagingDir {
-        path: stage_dir(parent)?,
-    };
-    let listener = bind_staged(&staging.path, path, proc_self_fd)?;
-    let staged = staging.path.join("s");
-    fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
-    rename_noreplace(&staged, path)?;
+    let mut staging = StagingDir::new(stage_dir(parent)?);
+    let listener = bind_staged(&mut staging, path, proc_self_fd)?;
+    staging.publish(path)?;
     Ok(listener)
 }
 
@@ -301,6 +401,131 @@ mod owner_only_socket_tests {
     use super::*;
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     use std::os::unix::net::UnixStream;
+
+    /// Regression: setgid socket parents produce private 2700 staging directories,
+    /// which must be normalized to 0700 instead of refusing a legitimate bind.
+    #[test]
+    fn regression_182_setgid_parent_binds() {
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        for parent_len in [40, MAX_DIRECT_DIR_LEN + 1] {
+            let parent = base.path().join(
+                "p".repeat(parent_len - base.path().as_os_str().as_encoded_bytes().len() - 1),
+            );
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o2775)).unwrap();
+            let created = stage_dir(&parent).unwrap();
+            assert_eq!(fs::metadata(&created).unwrap().mode() & 0o7777, 0o2700);
+            fs::remove_dir(&created).unwrap();
+            let sock = parent.join("s");
+            let _listener = bind_private(&sock).unwrap();
+            assert_eq!(fs::metadata(&sock).unwrap().mode() & 0o7777, 0o600);
+            UnixStream::connect(&sock).unwrap();
+            assert!(staging_names(&parent).is_empty());
+            assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o7777, 0o2775);
+        }
+    }
+
+    /// Regression: refusing an unsafe staging directory must not delete an
+    /// existing `s` inside the replacement directory during error cleanup.
+    #[test]
+    fn regression_182_rejected_staging_preserves_existing_file() {
+        for (mode, error_kind) in [
+            (0o755, io::ErrorKind::PermissionDenied),
+            (0o700, io::ErrorKind::AddrInUse),
+        ] {
+            let base = tempfile::tempdir().unwrap();
+            let mut staging = StagingDir::new(stage_dir(base.path()).unwrap());
+            let path = staging.path.clone();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            fs::write(path.join("s"), b"keep me").unwrap();
+            let error = bind_staged(
+                &mut staging,
+                &base.path().join("socket"),
+                Path::new(PROC_SELF_FD),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), error_kind);
+            drop(staging);
+            assert_eq!(fs::read(path.join("s")).unwrap(), b"keep me");
+        }
+    }
+
+    /// Regression: a directory swapped after the owner/mode check must never
+    /// return a listener from the replacement, even on the short no-/proc path.
+    #[test]
+    fn regression_182_swap_after_check_refuses_short_bind() {
+        let base = tempfile::tempdir().unwrap();
+        let path = stage_dir(base.path()).unwrap();
+        let handle = fs::File::open(&path).unwrap();
+        check_staging_dir(&path, &handle.metadata().unwrap(), euid()).unwrap();
+        let mut staging = StagingDir::new(path.clone());
+        staging.handle = Some(handle);
+        let moved = base.path().join("moved");
+        fs::rename(&path, &moved).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = bind_checked(
+            &mut staging,
+            &base.path().join("socket"),
+            &base.path().join("no-proc"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            UnixStream::connect(path.join("s")).unwrap_err().kind(),
+            io::ErrorKind::ConnectionRefused
+        );
+        drop(staging);
+        assert!(fs::symlink_metadata(path.join("s"))
+            .unwrap()
+            .file_type()
+            .is_socket());
+        assert!(!moved.join("s").exists());
+    }
+
+    /// Regression: a post-bind directory swap redirected chmod, rename and
+    /// cleanup to an unrelated `s`. Both publication and error cleanup use the fd.
+    #[test]
+    fn regression_182_swap_after_bind_preserves_replacement() {
+        for publish in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            let mut staging = StagingDir::new(stage_dir(base.path()).unwrap());
+            let path = staging.path.clone();
+            let socket = base.path().join("socket");
+            let listener = bind_staged(&mut staging, &socket, Path::new(PROC_SELF_FD)).unwrap();
+            let moved = base.path().join("moved");
+            fs::rename(&path, &moved).unwrap();
+            fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            let victim = base.path().join("victim");
+            fs::write(&victim, b"keep me").unwrap();
+            fs::set_permissions(&victim, fs::Permissions::from_mode(0o640)).unwrap();
+            std::os::unix::fs::symlink(&victim, path.join("s")).unwrap();
+            if publish {
+                staging.publish(&socket).unwrap();
+                assert!(fs::symlink_metadata(&socket)
+                    .unwrap()
+                    .file_type()
+                    .is_socket());
+                assert_eq!(fs::metadata(&socket).unwrap().mode() & 0o7777, 0o600);
+                UnixStream::connect(&socket).unwrap();
+                listener.accept().unwrap();
+            } else {
+                fs::write(&socket, b"occupied").unwrap();
+                assert_eq!(
+                    staging.publish(&socket).unwrap_err().kind(),
+                    io::ErrorKind::AddrInUse
+                );
+                assert_eq!(fs::read(&socket).unwrap(), b"occupied");
+            }
+            drop(staging);
+            assert_eq!(fs::read(&victim).unwrap(), b"keep me");
+            assert_eq!(fs::metadata(&victim).unwrap().mode() & 0o7777, 0o640);
+            assert_eq!(fs::read_link(path.join("s")).unwrap(), victim);
+            assert!(!moved.join("s").exists());
+        }
+    }
 
     /// Regression: owner-only socket is mode 0600, staging dir is gone, client uses the final path.
     #[test]
@@ -583,29 +808,40 @@ mod owner_only_socket_tests {
     #[test]
     fn regression_182_staging_dir_owner_and_mode_checked() {
         let dir = tempfile::tempdir().unwrap();
-        let staging = dir.path().join(".rmaaaaaaaa");
-        fs::create_dir(&staging).unwrap();
-        fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join(".rmaaaaaaaa");
+        let mut staging = StagingDir::new(path.clone());
+        fs::create_dir(&path).unwrap();
         let sock = dir.path().join("daemon.sock");
-        let error = bind_staged(&staging, &sock, Path::new(PROC_SELF_FD)).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("mode 0755"), "{error}");
-        assert!(fs::symlink_metadata(staging.join("s")).is_err());
+        for mode in [0o755, 0o770, 0o2701, 0o2770, 0o1700, 0o4700] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let error = bind_staged(&mut staging, &sock, Path::new(PROC_SELF_FD)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                error.to_string().contains(&format!("mode {mode:04o}")),
+                "{error}"
+            );
+            assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, mode);
+            assert!(fs::symlink_metadata(path.join("s")).is_err());
+        }
 
-        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
-        let listener = bind_staged(&staging, &sock, Path::new(PROC_SELF_FD)).unwrap();
-        assert!(fs::symlink_metadata(staging.join("s"))
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o2700)).unwrap();
+        let listener = bind_staged(&mut staging, &sock, Path::new(PROC_SELF_FD)).unwrap();
+        assert_eq!(
+            staging.handle.as_ref().unwrap().metadata().unwrap().mode() & 0o7777,
+            0o700
+        );
+        assert!(fs::symlink_metadata(path.join("s"))
             .unwrap()
             .file_type()
             .is_socket());
         drop(listener);
 
         // Another owner is refused even with mode 0700.
-        let meta = fs::symlink_metadata(&staging).unwrap();
-        let error = check_staging_dir(&staging, &meta, meta.uid().wrapping_add(1)).unwrap_err();
+        let meta = fs::symlink_metadata(&path).unwrap();
+        let error = check_staging_dir(&path, &meta, meta.uid().wrapping_add(1)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("owned by uid"), "{error}");
-        check_staging_dir(&staging, &meta, meta.uid()).unwrap();
+        check_staging_dir(&path, &meta, meta.uid()).unwrap();
         // A non-directory is refused.
         let file = dir.path().join("file");
         fs::write(&file, b"").unwrap();
@@ -614,7 +850,7 @@ mod owner_only_socket_tests {
         assert!(check_staging_dir(&file, &meta, meta.uid()).is_err());
         // A symlinked staging directory is refused by O_NOFOLLOW before any check.
         let link = dir.path().join(".rmbbbbbbbb");
-        std::os::unix::fs::symlink(&staging, &link).unwrap();
-        assert!(bind_staged(&link, &sock, Path::new(PROC_SELF_FD)).is_err());
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(bind_staged(&mut StagingDir::new(link), &sock, Path::new(PROC_SELF_FD)).is_err());
     }
 }

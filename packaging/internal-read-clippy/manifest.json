@@ -15237,7 +15237,7 @@
       "leaf_digest": "215915a0707304838dcec8535ee489c6c578e19a329f1bb168081930d1b5fc35",
       "lint": "clippy::disallowed_methods",
       "metadata": {
-        "baseline_reason": "O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content",
+        "baseline_reason": "O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used to check and normalize private staging permissions, bind through /proc/self/fd, and anchor socket publication and cleanup; reads no file content",
         "category": "builder-setup",
         "creation": {
           "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions.",
@@ -15255,7 +15255,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0289-M01\",\"item\":\"ratarmount_core::owner_socket::bind_staged\",\"disposition\":\"support\",\"category\":\"builder-setup\",\"reason\":\"Prepare the builder for this item's separately reviewed open/create leaf.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions.\"},\"supports_disposition\":\"out-of-family\",\"baseline_reason\":\"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content\"}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0289-M01\",\"item\":\"ratarmount_core::owner_socket::bind_staged\",\"disposition\":\"support\",\"category\":\"builder-setup\",\"reason\":\"Prepare the builder for this item's separately reviewed open/create leaf.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions.\"},\"supports_disposition\":\"out-of-family\",\"baseline_reason\":\"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used to check and normalize private staging permissions, bind through /proc/self/fd, and anchor socket publication and cleanup; reads no file content\"}",
       "resolved": "<std::fs::OpenOptions>::new",
       "rule_reason": "inventory-op:OpenOptions"
     },
@@ -15273,7 +15273,7 @@
         "disposition": "out-of-family",
         "id": "IR-B0289-M02",
         "item": "ratarmount_core::owner_socket::bind_staged",
-        "reason": "O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content"
+        "reason": "O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used to check and normalize private staging permissions, bind through /proc/self/fd, and anchor socket publication and cleanup; reads no file content"
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -15281,7 +15281,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0289-M02\",\"item\":\"ratarmount_core::owner_socket::bind_staged\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0289-M02\",\"item\":\"ratarmount_core::owner_socket::bind_staged\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used to check and normalize private staging permissions, bind through /proc/self/fd, and anchor socket publication and cleanup; reads no file content\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
       "resolved": "<std::fs::OpenOptions>::open",
       "rule_reason": "inventory-op:OpenOptions"
     },
@@ -15299,7 +15299,7 @@
         "disposition": "support",
         "id": "IR-B0289-T01",
         "item": "ratarmount_core::owner_socket::bind_staged",
-        "reason": "Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content"
+        "reason": "Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used to check and normalize private staging permissions, bind through /proc/self/fd, and anchor socket publication and cleanup; reads no file content"
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -15307,19 +15307,19 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0289-T01\",\"item\":\"ratarmount_core::owner_socket::bind_staged\",\"disposition\":\"support\",\"category\":\"builder-type-support\",\"reason\":\"Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to check its owner and mode and to bind through /proc/self/fd; reads no file content\",\"creation\":{\"policy\":\"none\",\"basis\":\"This is a type/import reference; it acquires no file or directory.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0289-T01\",\"item\":\"ratarmount_core::owner_socket::bind_staged\",\"disposition\":\"support\",\"category\":\"builder-type-support\",\"reason\":\"Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used to check and normalize private staging permissions, bind through /proc/self/fd, and anchor socket publication and cleanup; reads no file content\",\"creation\":{\"policy\":\"none\",\"basis\":\"This is a type/import reference; it acquires no file or directory.\"}}",
       "resolved": "std::fs::OpenOptions",
       "rule_reason": "inventory-op:OpenOptions"
     },
     {
       "configured_path": "libc::syscall",
       "item": "ratarmount_core::owner_socket::rename_noreplace",
-      "leaf_digest": "5abbf301ec258473aceca9988304bb40859adb95331327a9042164f1fddbee4c",
+      "leaf_digest": "00a5c197f0459f94fccfc67de282f5891d3917c23dabac04832dfbce21430000",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "socket-publication",
         "creation": {
-          "basis": "This syscall renames an existing staged socket with RENAME_NOREPLACE; it acquires no file descriptor or new inode.",
+          "basis": "This syscall renames s relative to the held, checked staging directory with RENAME_NOREPLACE; it acquires no file descriptor or new inode.",
           "policy": "none"
         },
         "disposition": "out-of-family",
@@ -15333,7 +15333,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-E0036-M01\",\"item\":\"ratarmount_core::owner_socket::rename_noreplace\",\"disposition\":\"out-of-family\",\"category\":\"socket-publication\",\"reason\":\"Publish an already-created daemon (CSI, volume plugin) socket with the renameat2 no-replace syscall.\",\"creation\":{\"policy\":\"none\",\"basis\":\"This syscall renames an existing staged socket with RENAME_NOREPLACE; it acquires no file descriptor or new inode.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-E0036-M01\",\"item\":\"ratarmount_core::owner_socket::rename_noreplace\",\"disposition\":\"out-of-family\",\"category\":\"socket-publication\",\"reason\":\"Publish an already-created daemon (CSI, volume plugin) socket with the renameat2 no-replace syscall.\",\"creation\":{\"policy\":\"none\",\"basis\":\"This syscall renames s relative to the held, checked staging directory with RENAME_NOREPLACE; it acquires no file descriptor or new inode.\"}}",
       "resolved": "libc::unix::linux_like::linux::syscall",
       "rule_reason": "inventory-op:libc::syscall"
     },
