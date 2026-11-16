@@ -830,7 +830,7 @@ impl<M: Mounter> Supervisor<M> {
                     io::Error::other(error)
                 })
             };
-            let mut compose = |source| ratarmount_compositing::compose_stack(source, &layers);
+            let mut compose = |source| crate::MountLowerStack::compose_layers(source, &layers);
             let deadline = Instant::now() + self.finalize_wait();
             let mut progress = self.attempt_state[&id].finalize.progress.clone();
             let result = finalize_top(

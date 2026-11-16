@@ -11,7 +11,7 @@ use clap::{ArgGroup, Parser};
 use ratarmount_compositing::overlay_changes::{
     self as core, Algorithm, ChangeOptions, Entry, Normalize,
 };
-use ratarmount_compositing::{compose_stack, Immutability, OverlayMeta};
+use ratarmount_compositing::{Immutability, OverlayMeta};
 use ratarmount_core::{MountSource, S_IFDIR, S_IFMT};
 
 mod live;
@@ -394,8 +394,7 @@ fn prepare(
             )
         })
     });
-    let source = classified.source();
-    let stack = compose_stack(source, &layers)?;
+    let stack = crate::MountLowerStack::compose_layers(classified.source(), &layers)?;
     let changes = if let Some(other) = &args.between {
         core::between(&args.directory, other, stack, &options)?
     } else {

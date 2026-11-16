@@ -33,6 +33,262 @@ pub struct VerifyReport {
     pub computed: String,
     pub sentinel_ok: bool,
     pub mismatched: Vec<String>,
+    /// Whether the recorded preimage pins (#341) belong to this seal: `None`
+    /// for a layer that records none (sealed before #341, or over a base
+    /// whose identity covers content), `Some(false)` when the pin rows were
+    /// changed or their meta row is missing or stale.
+    pub preimages_bound: Option<bool>,
+    /// `path: reason` for every pinned base entry that differs from the base
+    /// as it is now (a same-size edit with a restored mtime included).
+    pub preimage_mismatched: Vec<String>,
+}
+
+/// Preimage pins (#341): for a layer sealed over a local directory base, the
+/// base side of every row that has one (modified, deleted, type changed; a
+/// rename source is a deleted row), so a reuse can tell that the base under
+/// a still-`modified` row changed. Not part of the canonical hash.
+const PREIMAGE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS seal_preimages (path TEXT PRIMARY KEY, kind TEXT NOT NULL, mode TEXT NOT NULL, size INTEGER NOT NULL, hash TEXT NOT NULL);";
+
+/// Meta row binding the `seal_preimages` rows to the seal's layer digest.
+pub const PREIMAGE_DIGEST_KEY: &str = "base_preimage_digest";
+
+/// One pinned base entry: a regular file or a symlink.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pin {
+    /// `file` or `symlink`.
+    pub kind: String,
+    /// `%06o` of a file's mode; empty for a symlink (its mode is not portable).
+    pub mode: String,
+    pub size: u64,
+    /// Content hash of the exact bytes (a symlink's target).
+    pub hash: String,
+}
+
+/// Pins by mount-relative path.
+pub type Pins = BTreeMap<String, Pin>;
+
+fn pin_of(entry: &changes::Entry) -> Option<Pin> {
+    let kind = entry.kind();
+    if kind == "dir" {
+        return None;
+    }
+    let (size, hash) = if kind == "symlink" {
+        use sha2::{Digest, Sha256};
+        let target = entry.symlink_target_bytes();
+        (
+            target.len() as u64,
+            format!("sha256:{:x}", Sha256::digest(target)),
+        )
+    } else {
+        (entry.size, entry.hash.clone()?)
+    };
+    Some(Pin {
+        kind: kind.into(),
+        mode: if kind == "symlink" {
+            String::new()
+        } else {
+            format!("{:06o}", entry.mode)
+        },
+        size,
+        hash,
+    })
+}
+
+fn pins_of(changes: &[changes::Change]) -> io::Result<Pins> {
+    let mut pins = Pins::new();
+    for change in changes {
+        if let Some(pin) = change.old.as_ref().and_then(pin_of) {
+            let path = String::from_utf8(change.path.clone()).map_err(io::Error::other)?;
+            pins.insert(path, pin);
+        }
+    }
+    Ok(pins)
+}
+
+/// `sha256:` over the layer digest and the sorted pins.
+pub fn preimage_digest(layer_digest: &str, pins: &Pins) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"ratarmount-preimage-pins-v1\0");
+    hash.update(layer_digest.as_bytes());
+    hash.update(b"\0");
+    for (path, pin) in pins {
+        for field in [
+            path.as_bytes(),
+            pin.kind.as_bytes(),
+            pin.mode.as_bytes(),
+            pin.size.to_string().as_bytes(),
+            pin.hash.as_bytes(),
+        ] {
+            hash.update(field);
+            hash.update(b"\0");
+        }
+    }
+    format!("sha256:{:x}", hash.finalize())
+}
+
+/// Whether a seal over the recorded base records pins: a local directory
+/// (its weak manifest is recorded) with a `weak` or `strong` identity. A
+/// directory's supplied strong digest is a claim the mount never rehashes;
+/// `none` asked for no identity; an archive, Git tree or remote base is not
+/// pinned (docs/tasks/plans/issue-341-preimage-pins.md).
+pub fn pins_preimages(meta: &OverlayMeta) -> bool {
+    meta.get("base_weak_digest").is_some()
+        && meta.get("base_git_tree").is_none()
+        && matches!(meta.base_digest_kind(), Some("weak" | "strong"))
+}
+
+fn table_exists(conn: &rusqlite::Connection, name: &str) -> io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [name],
+        |r| r.get(0),
+    )
+    .map_err(sql_error)
+}
+
+fn read_pins(conn: &rusqlite::Connection) -> io::Result<Option<Pins>> {
+    if !table_exists(conn, "seal_preimages")? {
+        return Ok(None);
+    }
+    let mut stmt = conn
+        .prepare("SELECT path,kind,mode,size,hash FROM seal_preimages")
+        .map_err(sql_error)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                Pin {
+                    kind: r.get(1)?,
+                    mode: r.get(2)?,
+                    size: r.get(3)?,
+                    hash: r.get(4)?,
+                },
+            ))
+        })
+        .map_err(sql_error)?;
+    let mut pins = Pins::new();
+    for row in rows {
+        let (path, pin) = row.map_err(sql_error)?;
+        if pins.insert(path.clone(), pin).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate preimage pin for {path}"),
+            ));
+        }
+    }
+    Ok(Some(pins))
+}
+
+/// The pins a sealed layer records and whether they belong to its seal, or
+/// `None` when it records none.
+fn recorded_pins(
+    conn: &rusqlite::Connection,
+    meta: &OverlayMeta,
+) -> io::Result<Option<(Pins, bool)>> {
+    let table = read_pins(conn)?;
+    match (meta.get(PREIMAGE_DIGEST_KEY), table) {
+        (None, None) => Ok(None),
+        (None, Some(pins)) if pins.is_empty() => Ok(None),
+        // Rows whose binding was removed.
+        (None, Some(pins)) => Ok(Some((pins, false))),
+        // Even an empty pin set must retain its table while its binding exists.
+        (Some(_), None) => Ok(Some((Pins::new(), false))),
+        (Some(recorded), Some(pins)) => {
+            let bound = meta
+                .get("layer_digest")
+                .is_some_and(|layer| preimage_digest(layer, &pins) == recorded);
+            Ok(Some((pins, bound)))
+        }
+    }
+}
+
+/// Why `now` (the base entry as it is) differs from `pinned`.
+fn pin_difference(pinned: Option<&Pin>, now: Option<&Pin>) -> Option<&'static str> {
+    match (pinned, now) {
+        (None, None) => None,
+        (None, Some(_)) => Some("not pinned by the seal"),
+        (Some(_), None) => Some("missing from the base, or no longer changed by the layer"),
+        (Some(a), Some(b)) if a == b => None,
+        (Some(a), Some(b)) if a.kind != b.kind => Some("type changed"),
+        (Some(a), Some(b)) if a.size != b.size => Some("size changed"),
+        (Some(a), Some(b)) if a.hash != b.hash => Some("content changed"),
+        _ => Some("mode changed"),
+    }
+}
+
+/// Text naming a binding failure, in the lists of mismatched pins.
+pub const PREIMAGES_UNBOUND: &str =
+    "seal_preimages: the pin rows do not match base_preimage_digest (changed after sealing)";
+
+fn pin_differences(pins: &Pins, now: &Pins) -> Vec<String> {
+    let paths: BTreeSet<_> = pins.keys().chain(now.keys()).collect();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            pin_difference(pins.get(path), now.get(path)).map(|reason| format!("{path}: {reason}"))
+        })
+        .collect()
+}
+
+fn read_sealed_pins(dir: &Path) -> io::Result<Option<(Pins, bool)>> {
+    let required = !crate::write_overlay::overlay_markers(dir)
+        .map_err(overlay_error)?
+        .is_empty();
+    let conn = connection_required(dir, true, required)?;
+    let Some(meta) = OverlayMeta::from_opened(&conn)
+        .map_err(overlay_error)?
+        .filter(OverlayMeta::layer_sealed)
+    else {
+        return Ok(None);
+    };
+    recorded_pins(&conn, &meta)
+}
+
+/// Check a seal's pins against an already computed complete, exact SHA-256
+/// change set (including `.git`, without exclusions or ignored modes). Pack
+/// uses this to validate every base without reading the preimages twice.
+pub fn check_preimages_for_changes(
+    dir: &Path,
+    changes: &[changes::Change],
+) -> io::Result<Vec<String>> {
+    let Some((pins, bound)) = read_sealed_pins(dir)? else {
+        return Ok(Vec::new());
+    };
+    let mut differing = pin_differences(&pins, &pins_of(changes)?);
+    if !bound {
+        differing.insert(0, PREIMAGES_UNBOUND.to_owned());
+    }
+    Ok(differing)
+}
+
+/// The cheap reuse check (#341): rehash only the base entries a sealed layer
+/// pinned, in `lower_view` (the base and the lowers beneath the layer), and
+/// check that the pins belong to the seal. Returns `path: reason` per
+/// difference (empty when the layer records no pins or nothing changed).
+/// An unsealed directory has no pins.
+pub fn check_preimages(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Vec<String>> {
+    let Some((pins, bound)) = read_sealed_pins(dir)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    if !bound {
+        out.push(PREIMAGES_UNBOUND.to_owned());
+    }
+    let opts = options();
+    for (path, pin) in &pins {
+        let now = match changes::base_entry(lower_view.clone(), path, &opts) {
+            Ok(entry) => entry.as_ref().and_then(pin_of),
+            Err(e) => {
+                out.push(format!("{path}: cannot read the base entry: {e}"));
+                continue;
+            }
+        };
+        if let Some(reason) = pin_difference(Some(pin), now.as_ref()) {
+            out.push(format!("{path}: {reason}"));
+        }
+    }
+    Ok(out)
 }
 
 fn overlay_error(error: OverlayError) -> io::Error {
@@ -239,7 +495,7 @@ fn digest_rows(
     dir: &Path,
     lower: Arc<dyn MountSource>,
     immutable: bool,
-) -> io::Result<(String, BTreeMap<String, String>)> {
+) -> io::Result<(String, BTreeMap<String, String>, Pins)> {
     let paths = changes::mentioned_paths_with_immutability(
         dir,
         if immutable {
@@ -267,7 +523,7 @@ fn digest_rows(
             Ok((path, c.row_hash(&opts)?))
         })
         .collect::<io::Result<_>>()?;
-    Ok((digest, rows))
+    Ok((digest, rows, pins_of(&changes)?))
 }
 
 /// Seal against the supplied composed lower view. Legacy overlays get minimal
@@ -511,7 +767,7 @@ fn seal_impl_locked(
     }
     let mut modes = BTreeMap::new();
     walk_modes(&root, "", &mut modes)?;
-    let (layer_digest, rows) = digest_rows(dir, lower_view, false)?;
+    let (layer_digest, rows, pins) = digest_rows(dir, lower_view, false)?;
     if let Some(base) = identity {
         // The caller's gate already accepted (or forced) this base. A released
         // overlay recorded no kind: the seal writes it now (no digest). An
@@ -544,6 +800,40 @@ fn seal_impl_locked(
             params![path, hash],
         )
         .map_err(sql_error)?;
+    }
+    // Pins (#341) are decided by the rows written above: the base this seal
+    // was gated (or forced) against, never by the caller's token.
+    if OverlayMeta::from_opened(&conn)
+        .map_err(overlay_error)?
+        .as_ref()
+        .is_some_and(pins_preimages)
+    {
+        conn.execute_batch(PREIMAGE_SCHEMA).map_err(sql_error)?;
+        conn.execute("DELETE FROM seal_preimages", [])
+            .map_err(sql_error)?;
+        for (path, pin) in &pins {
+            conn.execute(
+                "INSERT INTO seal_preimages(path,kind,mode,size,hash) VALUES (?1,?2,?3,?4,?5)",
+                params![
+                    path,
+                    pin.kind,
+                    pin.mode,
+                    i64::try_from(pin.size).map_err(io::Error::other)?,
+                    pin.hash
+                ],
+            )
+            .map_err(sql_error)?;
+        }
+        OverlayMeta::set(
+            &conn,
+            PREIMAGE_DIGEST_KEY,
+            &preimage_digest(&layer_digest, &pins),
+        )
+        .map_err(overlay_error)?;
+    } else {
+        conn.execute_batch("DROP TABLE IF EXISTS seal_preimages")
+            .map_err(sql_error)?;
+        OverlayMeta::remove(&conn, PREIMAGE_DIGEST_KEY).map_err(overlay_error)?;
     }
     if OverlayMeta::from_opened(&conn)
         .map_err(overlay_error)?
@@ -716,7 +1006,7 @@ pub fn unseal(dir: &Path) -> io::Result<()> {
             .map_err(sql_error)?;
         conn.execute_batch(SEAL_SCHEMA).map_err(sql_error)?;
         conn.execute_batch(
-            "DELETE FROM meta WHERE key IN ('sealed_at','layer_digest'); DELETE FROM seal_rows;",
+            "DELETE FROM meta WHERE key IN ('sealed_at','layer_digest','base_preimage_digest'); DELETE FROM seal_rows; DROP TABLE IF EXISTS seal_preimages;",
         )
         .map_err(sql_error)?;
         OverlayMeta::set(&conn, "unsealed_at", &chrono::Utc::now().to_rfc3339())
@@ -777,7 +1067,8 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
         .map_err(sql_error)?
         .collect::<rusqlite::Result<BTreeMap<_, _>>>()
         .map_err(sql_error)?;
-    let (computed, current) = digest_rows(dir, lower_view, true)?;
+    let pinned = recorded_pins(&conn, &meta)?;
+    let (computed, current, now_pins) = digest_rows(dir, lower_view, true)?;
     let paths: BTreeSet<_> = rows.keys().chain(current.keys()).collect();
     let mismatched: Vec<_> = paths
         .into_iter()
@@ -802,12 +1093,22 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
         }
         Err(e) => return Err(e),
     };
+    let (preimages_bound, preimage_mismatched) = match &pinned {
+        None => (None, Vec::new()),
+        Some((pins, bound)) => (Some(*bound), pin_differences(pins, &now_pins)),
+    };
     Ok(VerifyReport {
-        ok: recorded == computed && sentinel_ok && mismatched.is_empty(),
+        ok: recorded == computed
+            && sentinel_ok
+            && mismatched.is_empty()
+            && preimages_bound != Some(false)
+            && preimage_mismatched.is_empty(),
         recorded,
         computed,
         sentinel_ok,
         mismatched,
+        preimages_bound,
+        preimage_mismatched,
     })
 }
 

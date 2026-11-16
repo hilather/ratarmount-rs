@@ -623,6 +623,7 @@ pub fn verify(args: &VerifyArgs, context: &OverlayRunContext) -> Result<(String,
     let output = if args.seal.json {
         serde_json::json!({"ok":report.ok,"recorded":report.recorded,"computed":report.computed,
             "sentinel_ok":report.sentinel_ok,"mismatched":report.mismatched,
+            "preimages_bound":report.preimages_bound,"preimage_mismatched":report.preimage_mismatched,
             "base_ok":base_ok,"base_check":base_kind,"base_current":base_current})
         .to_string()
     } else if report.ok && !base_mismatch {
@@ -639,6 +640,15 @@ pub fn verify(args: &VerifyArgs, context: &OverlayRunContext) -> Result<(String,
             }
             for path in report.mismatched {
                 text.push_str(&format!("\n{path}"));
+            }
+            if report.preimages_bound == Some(false) {
+                text.push_str(&format!(
+                    "\n{}",
+                    ratarmount_compositing::overlay_seal::PREIMAGES_UNBOUND
+                ));
+            }
+            for pin in report.preimage_mismatched {
+                text.push_str(&format!("\nbase preimage changed: {pin}"));
             }
             lines.push(text);
         }

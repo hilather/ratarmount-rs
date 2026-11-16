@@ -1440,6 +1440,82 @@ fn regression_sandbox_v2_lower_other_base_fuse() {
     );
 }
 
+/// Regression (#341): a lower sealed over a directory base with a supplied
+/// strong digest passes the supervisor's admission (`check_stack`) and the
+/// child's cheap identity check (the directory's size/mtime manifest), but its
+/// preimage pins refuse a same-size base edit with a restored mtime under a
+/// path it modifies: `new` is `mount_failed`, naming the path, and nothing is
+/// left behind. The unchanged base is admitted.
+#[test]
+fn regression_sandbox_v2_lower_preimage_pin_fuse() {
+    use ratarmount_compositing::{
+        BaseDigestRequest, CreateOptions, FolderMountSource, WriteOverlay,
+    };
+    use std::sync::Arc;
+    if !prepared_fuse() {
+        return;
+    }
+    let daemon = Daemon::start();
+    let root = daemon.root.as_ref().unwrap().path().to_owned();
+    let base = root.join("dirbase");
+    fs::create_dir(&base).unwrap();
+    let file = base.join("f.txt");
+    fs::write(&file, b"old\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    daemon.call(json!({"op":"create_base", "name":"task", "source":base}));
+    let lower = root.join("pinned");
+    {
+        let source: Arc<dyn ratarmount_core::MountSource> =
+            Arc::new(FolderMountSource::new(&base).unwrap());
+        let classified = token::ClassifiedBaseOver::folder(source.clone(), &base);
+        let overlay = WriteOverlay::open(
+            &classified,
+            source.clone(),
+            &lower,
+            &CreateOptions {
+                base_digest: BaseDigestRequest::Supplied(format!("sha256:{}", "5".repeat(64))),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        overlay.unlink("/f.txt").unwrap();
+        let fd = overlay.create_file("/f.txt", 0o644).unwrap();
+        overlay.close_overlay_fd(fd);
+        drop(overlay);
+        fs::write(lower.join("f.txt"), b"new\n").unwrap();
+        ratarmount_compositing::overlay_seal::seal(&lower, &classified, source).unwrap();
+    }
+    let meta = ratarmount_compositing::OverlayMeta::read(&lower)
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.base_digest_kind(), Some("strong"));
+    assert!(meta.get("base_preimage_digest").is_some(), "{meta:?}");
+    let attempts =
+        daemon.call(json!({"version": 2, "op": "new", "base": "task", "lowers": [lower]}));
+    let path = Path::new(attempts[0]["path"].as_str().unwrap());
+    assert_eq!(fs::read(path.join("f.txt")).unwrap(), b"new\n");
+    daemon.call(json!({"op": "destroy", "base": "task"}));
+    let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+    fs::write(&file, b"alt\n").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(mtime))
+        .unwrap();
+    let reply =
+        daemon.envelope(json!({"version": 2, "op": "new", "base": "task", "lowers": [lower]}));
+    assert_eq!(reply["error"]["code"], "mount_failed", "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(message.contains("f.txt: content changed"), "{message}");
+    assert!(message.contains(lower.to_str().unwrap()), "{message}");
+    assert_eq!(daemon.call(json!({"op": "list"})), json!([]));
+    assert_eq!(
+        fs::read_dir(root.join("state/attempts")).unwrap().count(),
+        0
+    );
+}
+
 /// R1b timings (Keystone note (a), Risk 1): F1's `new` with `count` 2 and 8
 /// over its small bundle; the supervisor's validation of a bundle with 256 MiB
 /// of payload (refused by the stack check after its full read, so validation

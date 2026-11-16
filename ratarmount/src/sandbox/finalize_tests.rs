@@ -8547,3 +8547,91 @@ fn regression_supervisor_relaxed_lower_changed_before_compose() {
     }
     env.sup.destroy_all().unwrap();
 }
+
+/// Regression: supervisor diff/finalize composed directory lowers without
+/// rechecking their pins after a same-size base edit during the attempt.
+#[test]
+fn regression_supervisor_preimage_pins_before_diff_and_finalize() {
+    if !linux() {
+        return;
+    }
+    let mut env = Env::new();
+    let lower = env.layer("lower", &[], &[("f", "replaced\n")]);
+    let attempt = env.layered(&[&lower], true);
+    let diff = |env: &mut Env| {
+        env.sup.handle(Operation::Diff {
+            id: attempt.id.clone(),
+            git: true,
+        })
+    };
+    diff(&mut env).unwrap();
+    let path = env.base.join("f");
+    let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+    let rewrite = |bytes: &[u8]| {
+        fs::write(&path, bytes).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    };
+    rewrite(b"altered!\n");
+    let error = diff(&mut env).unwrap_err();
+    assert_eq!(error.code, "diff_failed");
+    assert!(
+        error.message.contains("f: content changed"),
+        "{}",
+        error.message
+    );
+    let error = env.finalize(&attempt.id, true, None).unwrap_err();
+    assert!(
+        error.message.contains("f: content changed"),
+        "{}",
+        error.message
+    );
+    assert!(!sealed(&attempt.overlay_dir));
+    for output in ["bundle.tar.zst", "manifest.jsonl"] {
+        assert!(!attempt.path.parent().unwrap().join(output).exists());
+    }
+    assert!(!env.sup.retained.contains_key(&attempt.id));
+    rewrite(b"original\n");
+    diff(&mut env).unwrap();
+    env.finalize(&attempt.id, true, None).unwrap();
+}
+
+/// Regression: a restored retained attempt's diff must also check the
+/// composed lower preimages, rather than trust its saved seal identifiers.
+#[test]
+fn regression_supervisor_preimage_pins_after_retained_restore() {
+    if !linux() {
+        return;
+    }
+    let mut env = Env::new();
+    let lower = env.layer("lower", &[], &[("f", "replaced\n")]);
+    let attempt = env.layered(&[&lower], true);
+    env.finalize(&attempt.id, false, None).unwrap();
+    let mut env = env.reopen();
+    let path = env.base.join("f");
+    let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+    fs::write(&path, b"altered!\n").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    let error = env
+        .sup
+        .handle(Operation::Diff {
+            id: attempt.id,
+            git: true,
+        })
+        .unwrap_err();
+    assert_eq!(error.code, "diff_failed");
+    assert!(
+        error.message.contains("f: content changed"),
+        "{}",
+        error.message
+    );
+}
