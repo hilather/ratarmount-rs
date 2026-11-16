@@ -1939,11 +1939,20 @@ fn regression_mount_in_base_bind_alias_verdicts_in_user_namespace() {
             "--nocapture",
         ])
         .env("RATARMOUNT_MIB_NS_DIR", td.path())
+        .env(crate::child_helpers::MIB_BIND_ALIAS_CHILD, "1")
         .output()
         .unwrap();
     let text =
         String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "helper failed: {text}");
+    assert!(!text.contains(crate::child_helpers::GUARD_SKIP), "{text}");
+    // The helper may legitimately skip without STATX_MNT_ID or MS_BIND.
+    assert!(
+        text.contains("bind alias verdicts checked")
+            || text.contains("skip: no STATX_MNT_ID")
+            || text.contains("skip: MS_BIND not permitted"),
+        "{text}"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1967,6 +1976,13 @@ fn mount_bind(src: &Path, dst: &Path) -> bool {
 #[test]
 #[ignore = "runs inside `unshare -Urm`; driven by regression_mount_in_base_bind_alias_verdicts_in_user_namespace"]
 fn helper_bind_alias_verdicts() {
+    if !crate::child_helpers::spawned_by_parent(
+        crate::child_helpers::MIB_BIND_ALIAS_CHILD,
+        "helper_bind_alias_verdicts",
+        "regression_mount_in_base_bind_alias_verdicts_in_user_namespace",
+    ) {
+        return;
+    }
     let Some(dir) = std::env::var_os("RATARMOUNT_MIB_NS_DIR") else {
         return;
     };
@@ -2013,4 +2029,5 @@ fn helper_bind_alias_verdicts() {
     assert!(mount_bind(&c, &sub));
     let msg = check(&c.join("mnt")).unwrap_err();
     assert!(msg.contains(&format!("{}/mnt", sub.display())), "{msg}");
+    println!("bind alias verdicts checked");
 }
