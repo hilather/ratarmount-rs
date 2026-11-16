@@ -246,6 +246,10 @@ thread_local! {
     /// database in [`overlay_db_regular`] on this thread fails with this errno.
     pub(crate) static FOLLOWED_STAT_ERRNO: std::cell::Cell<Option<i32>> =
         const { std::cell::Cell::new(None) };
+    /// Test seam (#176): change the entry after its metadata was read, before
+    /// the classifier consumes that observation. Runs once on this thread.
+    pub(crate) static AFTER_FOLLOWED_DB_STAT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -262,7 +266,12 @@ fn followed_db_stat(db_path: &Path) -> io::Result<fs::Metadata> {
     if let Some(errno) = FOLLOWED_STAT_ERRNO.with(|seam| seam.get()) {
         return Err(io::Error::from_raw_os_error(errno));
     }
-    fs::metadata(db_path)
+    let metadata = fs::metadata(db_path);
+    #[cfg(test)]
+    if let Some(hook) = AFTER_FOLLOWED_DB_STAT.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+    metadata
 }
 
 /// `e` (its kind kept) with what failed on which path in its text.
