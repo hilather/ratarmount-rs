@@ -2219,6 +2219,12 @@ registered the name opens normally, and the next registration of the same
 inode is refused again without another descriptor. The
 check never holds its lock across an open, so a FIFO under a payload name
 blocks only the request that opens it, never another overlay-database open.
+Unlike `open(2)`, a checked open with `O_CREAT` but neither `O_NOFOLLOW` nor
+`O_EXCL` does not create the target of a dangling symlink; it is refused
+(`EINVAL`, naming the symlink), on Linux and macOS alike. Creating through a symlink
+needs a non-exclusive open that could reach an existing inode before the check.
+The mount's own creates pass `O_NOFOLLOW` and get `ELOOP` there, as `open(2)`
+does.
 
 Not covered: a payload descriptor opened before its inode is first opened as
 a database in this process (no mount path does this: the database is opened
