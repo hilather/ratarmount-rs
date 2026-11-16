@@ -189,6 +189,25 @@ fn regression_240_overlay_lock_held(root: &Path) -> bool {
     }
 }
 
+/// Regression (#187): the seal/commit guard was released only by closing its
+/// descriptor, so a child forked meanwhile (holding a copy) kept the overlay
+/// locked after the commit ended.
+#[cfg(unix)]
+#[test]
+fn regression_187_seal_commit_guard_unlocks_while_copy_is_held() {
+    use std::os::fd::AsFd;
+    let dir = tempfile::tempdir().unwrap();
+    let guard = SealCommitGuard::acquire(dir.path()).unwrap();
+    let copy = guard._fd.as_fd().try_clone_to_owned().unwrap();
+    assert!(regression_240_overlay_lock_held(dir.path()));
+    drop(guard);
+    assert!(
+        !regression_240_overlay_lock_held(dir.path()),
+        "released while a copy is open"
+    );
+    drop(copy);
+}
+
 /// Regression: live and on-exit commits must take the overlay flock before
 /// their archive guard and retain it through publication, reopen and cleanup.
 #[cfg(unix)]

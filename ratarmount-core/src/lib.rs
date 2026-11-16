@@ -7,6 +7,7 @@ mod atomic_update;
 mod attribute_mapping;
 pub mod budget;
 pub mod db_inodes;
+pub mod held_lock;
 #[cfg(target_os = "linux")]
 pub mod owner_socket;
 mod quiet_print;
