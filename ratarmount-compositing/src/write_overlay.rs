@@ -184,6 +184,8 @@ pub enum DbEntry {
 /// symlink; and EVERY other `lstat` or followed-`stat` error (`ENOTDIR`,
 /// `EACCES`, `ELOOP`, `EIO`, ...), which is never read as "present" or
 /// "absent": an unresolved target proves nothing about the record.
+/// I/O errors retain their kind and path context; the original error and its
+/// raw OS code remain reachable through [`std::error::Error::source`].
 pub fn overlay_db_entry(dir: &Path) -> Result<DbEntry> {
     let markers = overlay_markers(dir)?;
     let marked = !markers.is_empty();

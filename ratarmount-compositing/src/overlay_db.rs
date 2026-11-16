@@ -103,7 +103,7 @@ pub(crate) struct OverlayStateError(pub(crate) String);
 
 /// Whether an error reports a strict overlay-state policy refusal.
 ///
-/// Several journal error types intentionally do not expose a source, and
+/// Some journal error types do not expose a source, and
 /// transparent I/O wrappers can skip their inner error's own identity.
 pub fn is_overlay_state_error(error: &(dyn std::error::Error + 'static)) -> bool {
     if error.is::<OverlayStateError>() {
