@@ -1567,6 +1567,56 @@ fn regression_offline_verbs_leave_pending_commit_journal_untouched() {
     }
 }
 
+/// Regression (#212): the #174 refusal probed the base argument as a path, so
+/// an offline verb given a `file://` URL of an archive mid-commit found no
+/// journal and the factory read the torn archive through the URL. Each verb
+/// now refuses naming the pending journal, and archive and journal stay
+/// byte-identical.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_212_offline_verbs_file_url_refuse_pending_commit_journal() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for complete in [false, true] {
+        for v in [Verb::Seal, Verb::Pack, Verb::Diff, Verb::Verify] {
+            let env = Env::new();
+            let (base, overlay) = fixture(&env, Kind::Archive, !matches!(v, Verb::Seal));
+            crash_commit(&base, complete);
+            let bytes = fs::read(&base).unwrap();
+            let journal = ratarmount_compress::commit_journal::journal_path(&base);
+            let journal_bytes = fs::read(&journal).unwrap();
+            let url = url::Url::from_file_path(&base).unwrap().to_string();
+            let out = verb(&env, v, &overlay, Path::new(&url), &[]);
+            assert!(
+                !out.status.success(),
+                "{v:?} complete={complete}: must refuse: {}",
+                text(&out)
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("pending commit journal"),
+                "{v:?} complete={complete}: refused by the journal probe: {}",
+                text(&out)
+            );
+            assert_eq!(
+                fs::read(&base).unwrap(),
+                bytes,
+                "{v:?} complete={complete}: archive"
+            );
+            assert_eq!(
+                fs::read(&journal).unwrap(),
+                journal_bytes,
+                "{v:?} complete={complete}: journal"
+            );
+            if matches!(v, Verb::Seal) {
+                assert!(!meta_of(&overlay).layer_sealed(), "sealed anyway");
+            }
+            assert!(!env.path("bundle.tar.zst").exists(), "{v:?} wrote a bundle");
+        }
+    }
+}
+
 /// Regression (#174): a commit journal deleted while its `A`/`C` locator is
 /// still on the archive (torn or committed bytes, nothing to recover from) is
 /// refused by verbs exactly as the factory's recovery refused it before.

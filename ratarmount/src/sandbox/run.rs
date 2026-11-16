@@ -414,8 +414,12 @@ impl RunLock {
 }
 impl Drop for RunLock {
     fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        // Explicit (#187): a forked child may hold a copy of the descriptor.
+        if unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            log::warn!(
+                "releasing the sandbox run lock: {}",
+                io::Error::last_os_error()
+            );
         }
     }
 }

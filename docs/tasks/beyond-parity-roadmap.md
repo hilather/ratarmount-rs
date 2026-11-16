@@ -137,7 +137,7 @@ WebDAV recursive directory mount is no longer out of scope in [`phase10-remote.m
 
 ### F-2 — Incremental reindex — `done`
 
-Last-frame `.tar.zst` splice and uncompressed GNU `tar --append` **patch the on-disk 0.7.x sidecar as a persist post-step** (interval, on-exit, offline splice). Prefix frames are not rescanned. Interval reopen uses `open_with_existing_index_body`; on-exit does not reopen in-process — the next remount is warm because tarstats were bumped during persist.
+Last-frame `.tar.zst` splice and uncompressed GNU `tar --append` **patch the on-disk 0.7.x sidecar as a persist post-step** (interval, on-exit, offline splice). Prefix frames normally are not rescanned. If generated offset-zero rows could conceal a real first directory member, persist reparses from zero so pruning cannot hide a directory retained in the prefix (#255; [details](../zstd-random-access.md#what-ratarmount-rs-does-at-runtime)). Interval reopen uses `open_with_existing_index_body`; on-exit does not reopen in-process — the next remount is warm because tarstats were bumped during persist.
 
 Acceptance: remount after last-frame splice does **not** rescan prefix frames; patched `files` equals a full `create_index_body`; `check_tarstats` still detects a replaced archive.
 
@@ -313,7 +313,7 @@ Protocol batch is in. Parallel-safe splits use the ownership column. Orchestrato
 
 1. ~~**F-1** remote directory mounts~~ — done (S3/SSH/WebDAV/HTTP + GCS/Azure/rclone/IPFS/FTP folders).
 2. ~~**P-4** FTP~~ — done (file REST + LIST/MLSD folders; implicit :990 residual).
-3. ~~**F-2** incremental reindex~~ — done (sidecar patch; prefix not rescanned; residuals above).
+3. ~~**F-2** incremental reindex~~ — done (sidecar patch; prefix normally not rescanned; ambiguity fallback and residuals above).
 4. ~~**P-5** HTTP Range export~~ / ~~**P-6** WebDAV~~ — HTTP `done`; WebDAV `done` (mux residual). SMB **P-2** `done` (Finder not CI; Kerberos/guest encrypt/WAN residual).
 5. ~~**P-1 + F-4** OCI~~, ~~**P-3** GCS/Azure~~, ~~**P-9** rclone~~, ~~**P-10** SFTP~~ — done (`sftp-russh` is a feature note).
 6. ~~**F-3** FTS5/locate~~ — done (`ratarmount find`, read-only `search/<pattern>`, socket `search`; FTS5 table only via `ensure_fts5`).
