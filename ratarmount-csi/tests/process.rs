@@ -1,5 +1,7 @@
 #![cfg(target_os = "linux")]
 mod common;
+#[path = "../../test-harness/child_process.rs"]
+mod test_child;
 use ratarmount_csi::{
     options,
     process::{mountinfo_contains, ProcessMounter},
@@ -128,10 +130,22 @@ async fn regression_mount_timeout_stops_the_child() {
     assert!(!mounter.healthy(&spec.target).await.unwrap());
 }
 
-/// Helper run in its own process by the parent-death regression below.
+/// Set by [`regression_driver_death_kills_owned_child`] for
+/// [`parent_exit_helper`] (#310).
+const PARENT_EXIT_HELPER_CHILD: &str = "RATARMOUNT_TEST_CSI_PARENT_EXIT_HELPER_CHILD";
+
+/// Helper run in its own process by the parent-death regression below; it
+/// skips unless that parent set [`PARENT_EXIT_HELPER_CHILD`].
 #[test]
 #[ignore = "subprocess helper; invoked by regression_driver_death_kills_owned_child"]
 fn parent_exit_helper() {
+    if std::env::var_os(PARENT_EXIT_HELPER_CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        eprintln!(
+            "skip: parent_exit_helper runs only as a child of \
+             regression_driver_death_kills_owned_child ({PARENT_EXIT_HELPER_CHILD}=1 is not set)"
+        );
+        return;
+    }
     let dir = std::path::PathBuf::from(std::env::var_os("CSI_HELPER_DIR").unwrap());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -152,6 +166,38 @@ fn parent_exit_helper() {
     });
 }
 
+/// Regression: #310 [`parent_exit_helper`] run directly (`cargo test --
+/// --ignored`) started a mount outside its parent. Without
+/// [`PARENT_EXIT_HELPER_CHILD`] it skips and never runs the fake mounter,
+/// although `CSI_HELPER_DIR` names one.
+#[test]
+fn regression_310_parent_exit_helper_skips_without_its_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    common::write_fake_mounter(
+        dir.path(),
+        &format!(
+            "#!/bin/sh\necho $$ > '{}/child.pid'\nexit 0\n",
+            dir.path().display()
+        ),
+    );
+    let output = test_child::TestChild::spawn(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "parent_exit_helper", "--nocapture"])
+            .env_remove(PARENT_EXIT_HELPER_CHILD)
+            .env("CSI_HELPER_DIR", dir.path()),
+    )
+    .unwrap()
+    .output(Duration::from_secs(5))
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("1 passed"), "{stdout}");
+    assert!(stderr.contains("skip: parent_exit_helper"), "{stderr}");
+    assert!(!dir.path().join("child.pid").exists());
+    assert!(!dir.path().join("overlays").exists());
+}
+
 /// Regression: a killed driver must not leave a credential-bearing daemon alive.
 #[test]
 fn regression_driver_death_kills_owned_child() {
@@ -166,6 +212,7 @@ fn regression_driver_death_kills_owned_child() {
     let mut driver = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "parent_exit_helper"])
         .env("CSI_HELPER_DIR", dir.path())
+        .env(PARENT_EXIT_HELPER_CHILD, "1")
         .stdout(std::process::Stdio::null())
         .spawn()
         .unwrap();
