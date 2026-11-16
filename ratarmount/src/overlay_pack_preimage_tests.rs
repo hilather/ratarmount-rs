@@ -839,14 +839,10 @@ fn regression_preimage_pin_type_changes_and_special_files() {
         .contains("dir/child: content changed"));
     edit_keeping_mtime(&base.dir.join("dir/child"), b"old");
     fs::remove_file(base.dir.join("f")).unwrap();
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
-        base.dir.join("f"),
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        0,
-    )
-    .unwrap();
+    // `libc::mkfifo` is portable; rustix's `mknodat` does not exist on macOS.
+    let fifo =
+        std::ffi::CString::new(base.dir.join("f").into_os_string().into_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     let error = base.open(std::slice::from_ref(&layer)).unwrap_err();
     assert!(error.contains("f: cannot read the base entry"), "{error}");
 }
