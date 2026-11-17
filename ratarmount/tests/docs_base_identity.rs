@@ -207,6 +207,8 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
         "so it holds the overlay database's exclusive lock and the index's shared lock for its whole life (#183)",
         "is refused with \"in use\" and changes nothing; a reader can no longer roll back the mount's in-flight journal. Wait for the serving process to exit (or retry on \"in use\") before running them right after an unmount",
         "| Platform / host | Installation | Checked open |",
+        "labeled `LegacyUnverified`",
+        "external-alias epoch cap",
         "opening one database file through both at once in one process is unsupported (#154",
     ] {
         assert!(flat.contains(sentence), "docs/sandbox.md lost: {sentence}");
@@ -323,6 +325,17 @@ fn regression_docs_state_offline_symlink_refusal() {
             );
         }
     }
+}
+
+/// Regression: #163 must not promise a safe automatic writable retry when
+/// SQLite has to modify an unreadable overlay before its gates can run.
+#[test]
+fn regression_163_docs_name_explicit_hot_journal_recovery() {
+    let text = read("docs/sandbox.md");
+    assert!(text.contains("A stale prepare locator beside a hot overlay journal is kept, with the archive, database and hot journal unchanged."));
+    assert!(text.contains("`ratarmount --no-mount ARCHIVE`"));
+    assert!(text.contains("without `-w` or `--lower`"));
+    assert!(text.contains("Inspect the overlay on a writable copy before retrying"));
 }
 
 /// Regression: publication docs preserve WAL limitations and the old-pin recovery instructions.

@@ -62,6 +62,12 @@ this driver instance, outside its target root, and writable only by the
 operator. The socket is mode 0600. Requests must name absolute, normalized
 targets below `--target-root`; symlink components are rejected.
 
+Socket creation uses a temporary sibling directory owned by the daemon's
+effective user with mode 0700. An inherited setgid bit from a shared socket
+parent is cleared on that temporary directory; other owners or unsafe modes
+are refused. The socket is changed to 0600 before publication. Shared setgid
+socket parents and umask 0002 are supported.
+
 ## Volume attributes
 
 | Key | Meaning |

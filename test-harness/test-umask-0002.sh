@@ -41,6 +41,9 @@ run() {
 }
 
 run -p ratarmount-index --lib range_cache "${@}"
+run -p ratarmount-core --lib owner_socket "${@}"
+run -p ratarmount-csi --bin ratarmount-csi owner_only_socket "${@}"
+run -p ratarmount-volume-plugin --bin ratarmount-volume-plugin owner_only_socket "${@}"
 run -p ratarmount-formats-git --lib secure_cache "${@}"
 run -p ratarmount-compositing --lib regression_cow_changes_match_rowed_edits "${@}"
 run -p ratarmount-compositing --lib regression_hash_excluded_edits_do_not_contribute "${@}"

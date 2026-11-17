@@ -54,7 +54,9 @@ pub fn spawn_if_pending(overlay: &Option<Arc<WriteOverlay>>) {
             }
             // Computed once per archive and cached in its index: without a
             // writable cache every mount would hash it again, so stay pending
-            // (seal and the verbs that need the digest resolve it).
+            // (seal and the verbs that need the digest resolve it). A SQLAR
+            // has no `files` table, so this returns before `PendingBase::hash`
+            // (#196). `PendingBase::hash` itself does not check the cache.
             if !pending.cache_available() {
                 log::info!(
                     "base digest stays pending: no writable index cache for {}",

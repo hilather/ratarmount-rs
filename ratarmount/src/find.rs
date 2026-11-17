@@ -383,8 +383,21 @@ fn sidecar_tarstats_ok(idx_path: &Path, archive: &Path) -> bool {
 }
 
 /// Redirect stdout to `/dev/null` for `f`, then restore. Best-effort.
-fn silence_stdout<T>(f: impl FnOnce() -> T) -> T {
-    let _ = io::stdout().flush();
+///
+/// fd 1 is shared with `diff::ProgressToStderr` (#298): while another thread's
+/// redirect is live, `f` runs under it (fd 1 is already away from stdout) and
+/// the last of them restores.
+pub(crate) fn silence_stdout<T>(f: impl FnOnce() -> T) -> T {
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.flush();
+    let mut state = crate::diff::stdout_redirect();
+    if let Some(guard) = crate::diff::ProgressToStderr::join(&mut state) {
+        drop(state);
+        drop(stdout);
+        let out = f();
+        drop(guard);
+        return out;
+    }
     // SAFETY: duplicating STDOUT_FILENO to restore after `/dev/null` redirect.
     #[expect(
         clippy::disallowed_methods,
@@ -392,12 +405,19 @@ fn silence_stdout<T>(f: impl FnOnce() -> T) -> T {
     )]
     let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
     if saved < 0 {
+        drop(state);
+        drop(stdout);
         return f();
     }
-    restore_stdout_after(saved, f)
+    restore_stdout_after(state, stdout, saved, f)
 }
 
-fn restore_stdout_after<T>(saved: RawFd, f: impl FnOnce() -> T) -> T {
+fn restore_stdout_after<T>(
+    mut state: std::sync::MutexGuard<'static, crate::diff::StdoutRedirect>,
+    stdout: io::StdoutLock<'static>,
+    saved: RawFd,
+    f: impl FnOnce() -> T,
+) -> T {
     let devnull = {
         #[expect(
             clippy::disallowed_types,
@@ -425,19 +445,40 @@ fn restore_stdout_after<T>(saved: RawFd, f: impl FnOnce() -> T) -> T {
                 )]
                 libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO);
             }
-            let out = f();
-            unsafe {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0019-M01","item":"ratarmount::find::restore_stdout_after","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )]
-                libc::dup2(saved, libc::STDOUT_FILENO);
-                libc::close(saved);
+            state.saved = Some(crate::diff::SavedStdout::Raw(saved));
+            state.guards = 1;
+            drop(state);
+            drop(stdout);
+            // Restore even when `f` panics, then resume the panic.
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let mut stdout = io::stdout().lock();
+            let mut state = crate::diff::stdout_redirect();
+            state.guards -= 1;
+            // A redirect that joined meanwhile restores when it ends.
+            let saved = if state.guards == 0 {
+                state.saved.take()
+            } else {
+                None
+            };
+            if let Some(saved) = saved {
+                // Drain partial progress lines to the redirected destination.
+                let _ = stdout.flush();
+                unsafe {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0019-M01","item":"ratarmount::find::restore_stdout_after","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )]
+                    libc::dup2(saved.raw(), libc::STDOUT_FILENO);
+                }
+                drop(saved);
             }
-            let _ = io::stdout().flush();
-            out
+            drop(state);
+            drop(stdout);
+            out.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         }
         Err(_) => {
+            drop(state);
+            drop(stdout);
             // SAFETY: `saved` is an unused dup we still own.
             unsafe {
                 libc::close(saved);
