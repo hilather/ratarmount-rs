@@ -75,6 +75,23 @@ ratar_wait_mounted() {
     return 1
 }
 
+# SIGTERM each given pid, skipping recorded PIDs that are not currently running
+# jobs of this shell (`jobs -pr` excludes stopped jobs). Pass `$!` of a simple
+# command or subshell: a pipeline's last PID may differ from `jobs -p`'s leader.
+# This is a numeric snapshot, not an identity guarantee: the snapshot-to-kill
+# race remains if a job exits and is reaped before `kill`. Same-shell PID reuse
+# by another running job also passes the guard, even if the recorded job was
+# reaped before cleanup.
+kill_running_jobs() {
+    local running pid
+    running=" $(jobs -pr | tr '\n' ' ') "
+    for pid in "$@"; do
+        if [[ -n "$pid" && "$running" == *" $pid "* ]]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
 # Python fixture root (required unless RATARMOUNT_ALLOW_NO_PY=1, e.g. macOS smoke).
 if [[ -z "${RATARMOUNT_PY_ROOT:-}" ]]; then
     if [[ -d "$ROOT/../ratarmount/tests" ]]; then

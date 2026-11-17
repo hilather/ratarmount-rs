@@ -15,7 +15,7 @@ MOUNT_PIDS=()
 cleanup() {
     set +e
     for pid in "${MOUNT_PIDS[@]:-}"; do
-        kill "$pid" 2>/dev/null || true
+        kill_running_jobs "$pid"
     done
     for pid in "${MOUNT_PIDS[@]:-}"; do
         wait "$pid" 2>/dev/null || true
@@ -95,7 +95,7 @@ while IFS=$'\t' read -r archive_rel path_in expected_md5 || [[ -n "${archive_rel
         if ! wait_mounted "$mp"; then
             echo "  [FAIL] mount did not come up"
             cat "$WORKDIR/mount-$name.log" || true
-            kill "$mpid" 2>/dev/null || true
+            kill_running_jobs "$mpid"
             failed=1
             continue
         fi
@@ -105,7 +105,7 @@ while IFS=$'\t' read -r archive_rel path_in expected_md5 || [[ -n "${archive_rel
             echo "  [FAIL] missing mounted path: $path_in"
             ls -laR "$mp" || true
             ratar_unmount "$mp"
-            kill "$mpid" 2>/dev/null || true
+            kill_running_jobs "$mpid"
             failed=1
             continue
         fi
