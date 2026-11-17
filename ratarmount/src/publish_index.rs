@@ -472,14 +472,16 @@ fn publish_remote(
 // VACUUM INTO takes a consistent SQLite snapshot including committed WAL pages.
 // A filesystem copy can silently omit metadata while the mounted index is open.
 fn snapshot_sidecar(source: &Path, dest: &Path) -> Result<(), String> {
-    let source =
-        rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| e.to_string())?;
-    let dest = dest
-        .to_str()
+    let source = ratarmount_index::checked_open::open_reclassifying(
+        source,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ratarmount_index::checked_open::NameMode::Path,
+    )
+    .map_err(|e| e.to_string())?;
+    dest.to_str()
         .ok_or("publication snapshot path is not UTF-8")?;
-    source
-        .execute("VACUUM INTO ?1", [dest])
+    let dest = std::path::absolute(dest).map_err(|e| e.to_string())?;
+    ratarmount_index::vacuum_into(&source.conn, &dest)
         .map_err(|e| format!("snapshot index: {e}"))?;
     Ok(())
 }
@@ -2272,5 +2274,45 @@ pub(crate) mod tests {
         got.unwrap();
         assert!(probes.len() >= 2, "pointer hash and Hub body: {probes:?}");
         assert!(probes.iter().all(|(_, kept)| *kept), "{probes:?}");
+    }
+    /// Regression: CLI publication's raw snapshot source missed #193's
+    /// reclassification and connection hold, despite the library being fixed.
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_endian = "little",
+        any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+    ))]
+    #[test]
+    fn regression_193_cli_publication_reclassifies() {
+        use ratarmount_index::checked_open::test_seams::{Seam, Seams};
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.sqlite");
+        let next = dir.path().join("next.sqlite");
+        let dest = dir.path().join("copy.sqlite");
+        for (path, n) in [(&source, 1), (&next, 2)] {
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .execute_batch(&format!(
+                    "CREATE TABLE marker(v); INSERT INTO marker VALUES ({n});"
+                ))
+                .unwrap();
+        }
+        let onto = source.clone();
+        let mut fired = false;
+        let seam = Seams::set(move |seam| {
+            if seam == Seam::AfterLowFdFill && !fired {
+                fired = true;
+                fs::rename(&next, &onto).unwrap();
+            }
+        });
+        snapshot_sidecar(&source, &dest).unwrap();
+        drop(seam);
+        let copy = rusqlite::Connection::open(dest).unwrap();
+        assert_eq!(
+            copy.query_row("SELECT v FROM marker", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 }

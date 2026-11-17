@@ -53,7 +53,9 @@
 //! descriptor they refused to [`coordinate_retained_fd`]. An inode this
 //! process holds — an overlay registration, or [`hold_db_locks`] for a
 //! non-overlay connection — keeps that descriptor until the last holder
-//! drops. A descriptor of any other inode is closed, so a republish does not
+//! drops. Temporary SQLite outputs defer all such closes with [`DbLockScope`]
+//! until their internal connections close. A descriptor of any other inode
+//! is then closed, so a republish does not
 //! leak one for the life of the process (#167). A descriptor whose inode
 //! cannot be read stays open for the process life (one per refusal): closing
 //! it could release a lock. Index holds are not overlay registrations, so a
@@ -175,13 +177,39 @@ pub fn hold_db_locks(id: (u64, u64)) -> DbLockHold {
     DbLockHold { id }
 }
 
+/// Defer mismatch closes while SQLite owns temporary databases whose inode
+/// is not exposed to the caller (for example the output of VACUUM INTO).
+/// All such connections must close before this scope drops. Known inode
+/// holds continue protecting their descriptors after the last scope drops.
+#[derive(Debug)]
+#[must_use]
+pub struct DbLockScope {
+    _private: (),
+}
+
+impl Drop for DbLockScope {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unix::scope_release();
+    }
+}
+
+pub fn defer_untracked_db_closes() -> DbLockScope {
+    #[cfg(unix)]
+    unix::scope_acquire();
+    DbLockScope { _private: () }
+}
+
 /// Take ownership of a descriptor a checked open retained.
 ///
 /// # Safety
 ///
 /// `fd` is open, owned by this process, and not closed by the caller. The
 /// coordinator closes it or keeps it; either way the caller must not touch it
-/// again.
+/// again. Every connection that may hold POSIX locks on this inode must keep
+/// a [`DbLockHold`], [`DbInodeRegistration`] or [`DbLockScope`] before its first query
+/// until after it closes. This registry cannot discover arbitrary raw SQLite
+/// connections or locks acquired outside the coordinated APIs.
 #[cfg(unix)]
 pub unsafe fn coordinate_retained_fd(fd: i32) {
     if fd < 0 {
@@ -226,6 +254,10 @@ pub fn hold_db_locks(_: (u64, u64)) -> DbLockHold {
 }
 
 #[cfg(not(unix))]
+/// No descriptor is retained on non-Unix platforms.
+///
+/// # Safety
+/// The argument must be a sentinel, not an owned descriptor.
 pub unsafe fn coordinate_retained_fd(_: i32) {}
 
 #[cfg(not(unix))]
@@ -734,6 +766,7 @@ mod unix {
     /// from [`QUARANTINE`] (those counts stay the admitted-open ones) and from
     /// `OPEN_DBS` (never held together with this mutex).
     struct State {
+        scopes: usize,
         holds: BTreeMap<(u64, u64), usize>,
         overlay: BTreeMap<(u64, u64), usize>,
         parked: BTreeMap<(u64, u64), Vec<OwnedFd>>,
@@ -742,6 +775,7 @@ mod unix {
     }
 
     static STATE: Mutex<State> = Mutex::new(State {
+        scopes: 0,
         holds: BTreeMap::new(),
         overlay: BTreeMap::new(),
         parked: BTreeMap::new(),
@@ -754,7 +788,8 @@ mod unix {
     }
 
     fn held(state: &State, id: (u64, u64)) -> bool {
-        state.holds.get(&id).copied().unwrap_or(0) > 0
+        state.scopes > 0
+            || state.holds.get(&id).copied().unwrap_or(0) > 0
             || state.overlay.get(&id).copied().unwrap_or(0) > 0
     }
 
@@ -798,6 +833,21 @@ mod unix {
 
     pub(super) fn hold_acquire(id: (u64, u64)) {
         inc(&mut state().holds, id);
+    }
+
+    pub(super) fn scope_acquire() {
+        state().scopes += 1;
+    }
+
+    pub(super) fn scope_release() {
+        let mut state = state();
+        state.scopes -= 1;
+        if state.scopes == 0 {
+            let ids: Vec<_> = state.parked.keys().copied().collect();
+            for id in ids {
+                release_unlocked(&mut state, id);
+            }
+        }
     }
 
     pub(super) fn hold_release(id: (u64, u64)) {
@@ -1548,5 +1598,33 @@ mod tests {
         assert_eq!(coordinated_parked(id), 0);
         assert_eq!(coordinated_closed(), closed + 3);
         assert!(!is_db_inode(id));
+    }
+
+    /// Regression: temporary SQLite outputs need nested global close deferral;
+    /// ending that deferral must still respect ordinary per-inode holders.
+    #[test]
+    fn regression_coordinated_retained_scopes_preserve_known_holds() {
+        use std::os::fd::IntoRawFd;
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("temporary");
+        let b = dir.path().join("known");
+        fs::write(&a, []).unwrap();
+        fs::write(&b, []).unwrap();
+        let (a_id, b_id) = (id_of(&a), id_of(&b));
+        let first = defer_untracked_db_closes();
+        let second = defer_untracked_db_closes();
+        let hold = hold_db_locks(b_id);
+        for path in [&a, &b] {
+            unsafe { coordinate_retained_fd(fs::File::open(path).unwrap().into_raw_fd()) };
+        }
+        drop(first);
+        assert_eq!(coordinated_parked(a_id), 1);
+        assert_eq!(coordinated_parked(b_id), 1);
+        drop(second);
+        assert_eq!(coordinated_parked(a_id), 0);
+        assert_eq!(coordinated_parked(b_id), 1);
+        drop(hold);
+        assert_eq!(coordinated_parked(b_id), 0);
     }
 }

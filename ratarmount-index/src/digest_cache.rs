@@ -1333,4 +1333,41 @@ mod tests {
         let index = index_with_files(dir.path());
         assert!(archive_digest_cache_available(Some(&index)));
     }
+    /// Regression: digest-cache opens must adopt a republished index through
+    /// the same checked retry path as ordinary index connections.
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_endian = "little",
+        any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+    ))]
+    #[test]
+    fn regression_193_digest_cache_reclassifies() {
+        use crate::checked_open::test_seams::{Seam, Seams};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        let next = dir.path().join("next.sqlite");
+        for (file, value) in [(&path, 1), (&next, 2)] {
+            Connection::open(file).unwrap().execute_batch(&format!(
+                "CREATE TABLE files(name); CREATE TABLE marker(v); INSERT INTO marker VALUES ({value});"
+            )).unwrap();
+        }
+        let onto = path.clone();
+        let mut fired = false;
+        let seam = Seams::set(move |seam| {
+            if seam == Seam::AfterLowFdFill && !fired {
+                fired = true;
+                std::fs::rename(&next, &onto).unwrap();
+            }
+        });
+        let cache = open_cache_at(path, true).unwrap();
+        drop(seam);
+        assert_eq!(
+            cache
+                .conn
+                .query_row("SELECT v FROM marker", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
 }

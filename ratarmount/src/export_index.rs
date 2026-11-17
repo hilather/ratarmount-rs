@@ -8,7 +8,7 @@ use clap::{Parser, ValueEnum};
 use ratarmount_compress::{scan_zstd_frames, ZstdFrameInfo};
 use ratarmount_index::{IndexLocation, SqliteIndex};
 use ratarmount_session::{resolve_index, IndexPolicy, Session};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::OpenFlags;
 use serde::Serialize;
 
 use crate::shard::{index_request, Manifest, Result};
@@ -129,7 +129,12 @@ fn inputs(args: &ExportArgs) -> Result<Vec<Input>> {
             let magic = ratarmount_index::managed_read::read_prefix(path, 16)?;
             let sqlite = magic.as_slice() == b"SQLite format 3\0";
             let sidecar = if sqlite {
-                let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                let opened = ratarmount_index::checked_open::open_reclassifying(
+                    path,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    ratarmount_index::checked_open::NameMode::Path,
+                )?;
+                let conn = &opened.conn;
                 conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='files')", [], |r| r.get::<_, bool>(0))?
             } else {
                 false
@@ -232,7 +237,12 @@ fn read_rows(input: &Input, mut emit: impl FnMut(ExportRow) -> Result<()>) -> Re
     let path = index_path(input)?;
     let index = SqliteIndex::open_catalog_read_only(&path)?;
     let frames = frame_map(&index, input.archive.as_deref())?;
-    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let opened = ratarmount_index::checked_open::open_reclassifying(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ratarmount_index::checked_open::NameMode::Path,
+    )?;
+    let conn = &opened.conn;
     let has_xattrs: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='xattrs')",
         [],
@@ -242,7 +252,7 @@ fn read_rows(input: &Input, mut emit: impl FnMut(ExportRow) -> Result<()>) -> Re
     let hash_sql = if has_xattrs {
         format!(
             "(SELECT CAST(x.value AS TEXT) FROM xattrs x WHERE x.offsetheader=f.offsetheader AND x.key='user.hash.sha256' AND f.offsetheader NOT IN ({}))",
-            ratarmount_index::shared_xattr_slots_sql(&conn)?
+            ratarmount_index::shared_xattr_slots_sql(conn)?
         )
     } else {
         "NULL".to_string()
@@ -513,6 +523,7 @@ pub(super) fn run(args: &ExportArgs, stdout: &mut dyn Write) -> Result<()> {
 mod tests {
     use super::*;
     use crate::shard;
+    use rusqlite::Connection;
 
     fn run(args: &ExportArgs) -> Result<()> {
         super::run(args, &mut io::sink())
@@ -987,5 +998,74 @@ mod tests {
             "the frame scan kept this process's lock on the archive"
         );
         drop(holder);
+    }
+    /// Regression: export's discovery and row-reading connections bypassed
+    /// #193. A swap at either acquisition must select the replacement rows.
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_endian = "little",
+        any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+    ))]
+    #[test]
+    fn regression_193_export_connections_reclassify() {
+        use ratarmount_index::checked_open::test_seams::{Seam, Seams};
+        for discovery in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("index.sqlite");
+            let next = dir.path().join("next.sqlite");
+            for (file, name) in [(&path, "old"), (&next, "new")] {
+                let index = SqliteIndex::create_writable(Some(file)).unwrap();
+                index
+                    .insert_file(
+                        "", name, 0, 0, 1, 0.0, 0o100644, 0, "", 0, 0, false, false, false, 0,
+                    )
+                    .unwrap();
+                drop(index.into_read_only().unwrap());
+            }
+            let onto = path.clone();
+            let mut opens = 0;
+            let seam = Seams::set(move |seam| {
+                if seam == Seam::AfterLowFdFill {
+                    opens += 1;
+                    // Row export opens a catalog before its SQL row reader.
+                    if opens == if discovery { 1 } else { 2 } {
+                        fs::rename(&next, &onto).unwrap();
+                    }
+                }
+            });
+            if discovery {
+                let parsed = inputs(&args(
+                    std::slice::from_ref(&path),
+                    &dir.path().join("out"),
+                    "jsonl",
+                ))
+                .unwrap();
+                assert_eq!(parsed.len(), 1);
+                drop(seam);
+                let conn = Connection::open(&path).unwrap();
+                assert_eq!(
+                    conn.query_row("SELECT name FROM files", [], |r| r.get::<_, String>(0))
+                        .unwrap(),
+                    "new"
+                );
+            } else {
+                let mut names = Vec::new();
+                read_rows(
+                    &Input {
+                        archive: None,
+                        index: Some(path),
+                        shard: None,
+                    },
+                    |row| {
+                        names.push(row.name);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                drop(seam);
+                assert_eq!(names, ["new"]);
+            }
+        }
     }
 }

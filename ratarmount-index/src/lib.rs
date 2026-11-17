@@ -492,10 +492,9 @@ pub fn serialize_tarstats(stats: &TarStats) -> String {
 }
 
 struct BudgetConnection {
-    inner: Arc<Mutex<Connection>>,
-    /// Keeps a republished inode's mismatch descriptors until this connection
-    /// drops. Declared after `inner` so the connection closes first (#193).
-    hold: Mutex<Option<ratarmount_core::db_inodes::DbLockHold>>,
+    // A pressure callback can upgrade a weak reference past this owner's
+    // lifetime. Keep the connection and its hold together inside that Arc.
+    inner: Arc<Mutex<LookupConn>>,
     memory: Arc<Mutex<Option<ratarmount_core::budget::Reservation>>>,
     bytes: u64,
     _shrink: Option<ratarmount_core::budget::PressureHook>,
@@ -510,6 +509,9 @@ impl BudgetConnection {
         conn: Connection,
         hold: Option<ratarmount_core::db_inodes::DbLockHold>,
     ) -> Result<Self> {
+        // Bundle before any fallible operation: separate parameters/locals
+        // would drop the hold before the connection on an error exit.
+        let conn = LookupConn { conn, hold };
         let pool = ratarmount_core::budget::MemoryPool::global(
             "sqlite",
             64 * 1024 * 1024 + 256 * 1024 * 1024,
@@ -557,7 +559,6 @@ impl BudgetConnection {
         };
         Ok(Self {
             inner,
-            hold: Mutex::new(hold),
             memory,
             bytes,
             _shrink: shrink,
@@ -568,8 +569,8 @@ impl BudgetConnection {
     /// acquired, so a same-inode reopen never drops the count to zero.
     /// The old connection closes before the old hold drops.
     fn install(&self, conn: Connection, hold: Option<ratarmount_core::db_inodes::DbLockHold>) {
-        *self.inner.lock().expect("sqlite mutex poisoned") = conn;
-        *self.hold.lock().unwrap_or_else(|e| e.into_inner()) = hold;
+        let opened = LookupConn { conn, hold };
+        *self.inner.lock().expect("sqlite mutex poisoned") = opened;
     }
     fn configure(conn: &Connection, bytes: u64) -> Result<()> {
         conn.execute_batch(&format!(
@@ -589,7 +590,7 @@ impl BudgetConnection {
         }
         Ok(())
     }
-    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Connection>> {
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, LookupConn>> {
         self.inner.lock()
     }
 }
@@ -823,13 +824,6 @@ fn open_database(
     })
 }
 
-fn plain_lookup(path: &Path, flags: OpenFlags) -> rusqlite::Result<LookupConn> {
-    Ok(LookupConn {
-        conn: Connection::open_with_flags(path, flags)?,
-        hold: None,
-    })
-}
-
 /// A read-only connection for a pure LOOKUP of an existing index. Nothing is
 /// created beside the index for ANY set of companion files.
 ///
@@ -857,10 +851,10 @@ fn plain_lookup(path: &Path, flags: OpenFlags) -> rusqlite::Result<LookupConn> {
 pub(crate) fn open_lookup_connection(path: &Path) -> rusqlite::Result<LookupConn> {
     let plain = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let Ok(absolute) = path.canonicalize() else {
-        return plain_lookup(path, plain);
+        return open_database(path, plain, checked_open::NameMode::Path).map_err(Into::into);
     };
     if !absolute.is_file() {
-        return plain_lookup(path, plain);
+        return open_database(path, plain, checked_open::NameMode::Path).map_err(Into::into);
     }
     let side = |suffix: &str| {
         let mut name = absolute.clone().into_os_string();
@@ -1015,6 +1009,11 @@ pub fn vacuum_into(conn: &Connection, dest: &Path) -> rusqlite::Result<()> {
         ));
     }
     let name = ToSqlOutput::Borrowed(ValueRef::Text(dest.as_os_str().as_encoded_bytes()));
+    // SQLite opens and locks the output internally, outside the checked
+    // source connection. It detaches/closes that temporary database before
+    // execute returns, including on error. Defer raw mismatch closes until
+    // then; otherwise an alias of the output could release its write lock.
+    let _output_locks = ratarmount_core::db_inodes::defer_untracked_db_closes();
     conn.execute("VACUUM INTO ?1", [name])?;
     Ok(())
 }
@@ -1362,9 +1361,10 @@ impl SqliteIndex {
             Self::open_catalog_prepared(path)?;
             return Ok(());
         }
-        let conn = Connection::open_with_flags(
+        let conn = open_database(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            checked_open::NameMode::Path,
         )?;
         conn.busy_timeout(std::time::Duration::ZERO)?;
         let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
@@ -1464,7 +1464,7 @@ impl SqliteIndex {
     /// Also starts a [`MemIndexBuilder`] so path/name strings are interned and
     /// compact rows are filled at insert time (no fat dual maps at seal).
     pub fn create_writable(path: Option<&Path>) -> Result<Self> {
-        let (conn, hold, path_buf, publish_target) = match path {
+        let (conn, path_buf, publish_target) = match path {
             Some(dest) => {
                 if let Some(parent) = dest.parent() {
                     #[expect(
@@ -1477,10 +1477,16 @@ impl SqliteIndex {
                 reap_stale_writable_tmps(dest);
                 let tmp = writable_tmp_path(dest);
                 let opened = open_database(&tmp, OPEN_RWC, checked_open::NameMode::Path)?;
-                let (conn, hold) = opened.into_parts();
-                (conn, hold, Some(tmp), Some(dest.to_path_buf()))
+                (opened, Some(tmp), Some(dest.to_path_buf()))
             }
-            None => (Connection::open_in_memory()?, None, None, None),
+            None => (
+                LookupConn {
+                    conn: Connection::open_in_memory()?,
+                    hold: None,
+                },
+                None,
+                None,
+            ),
         };
         // Match Python `SQLiteIndex._open_sql_db` — large speedup for bulk inserts.
         // WHY: exclusive + tmp+rename is the publish lock; NTFS supports SQLite's
@@ -1497,6 +1503,7 @@ impl SqliteIndex {
         // Python creates compression side tables lazily; we ensure them on build so
         // writers can store seek indexes without a separate ensure step.
         conn.execute_batch(CREATE_COMPRESSION_TABLES_SQL)?;
+        let (conn, hold) = conn.into_parts();
         Ok(Self {
             path: path_buf,
             conn: BudgetConnection::with_hold(conn, hold)?,
@@ -3522,7 +3529,10 @@ impl Drop for SqliteIndex {
         // unlinked name; dest's inode is never removed here.
         if let Ok(mut guard) = self.conn.lock() {
             if let Ok(dummy) = Connection::open_in_memory() {
-                *guard = dummy;
+                *guard = LookupConn {
+                    conn: dummy,
+                    hold: None,
+                };
             }
         }
         unlink_sqlite_path_and_journals(&tmp);

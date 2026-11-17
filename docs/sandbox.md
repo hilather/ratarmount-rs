@@ -2376,14 +2376,30 @@ Ordinary index, SQLAR, digest-cache and publication connections are checked
 opens that keep SQLite's default `"unix"` VFS (auto locking on macOS; the
 wrappers sit on the `"unix"` syscall table, which `"unix-posix"` shares). When
 the name is another regular file or not a regular file, they reclassify and
-retry, at most 3 times and within 100 ms, then fail with an error that says
-the database did not settle. Overlay-database opens are not retried. A retained
+retry for at most 3 attempts, starting no retry after 100 ms has elapsed.
+The running attempt may finish later; this is a retry budget, not an I/O
+timeout. Exhaustion fails with an error that says the database did not settle. Overlay-database opens are not retried. A retained
 regular mismatch descriptor goes to the database-inode coordinator (#193,
 #167): it is closed when this process does not hold that inode, and kept until
-the last holder drops when it does. The checked `overlay pack --include-index`
+the last holder drops when it does. Temporary databases opened internally by
+SQLite (`VACUUM INTO` outputs) defer these closes until the operation closes
+them, including error cleanup. Overlay staging validation/redaction uses the same
+close deferral until its temporary connections close. Export-index and CLI
+publication sources also use checked opens. Connection holds follow shared ownership and
+remain live through connection teardown. The checked `overlay pack --include-index`
 snapshot uses the pinned VFS above (`"unix-posix"` on macOS) and does not
 retry: it is one open of the inode classified at the name (a different file
 is refused; a replacement that reuses that inode counts as the same file).
+Prepared immutable readers retain their existing no-recovery, no-companion-write
+policy. Their writable preparation/finalization connections use checked opens.
+SQLAR acquisition refusals are propagated before any password probing.
+
+The coordinator covers connections opened through these APIs. An embedder
+using a raw SQLite connection to the same inode must keep a `DbLockHold`
+(or overlay registration) from before querying until after closing it. The
+registry cannot discover arbitrary raw connections or other SQLite instances.
+An unidentified refused descriptor is still kept for the process lifetime.
+
 Managed byte readers are not connections; see
 [Internal reads of index and database files](#internal-reads-of-index-and-database-files).
 

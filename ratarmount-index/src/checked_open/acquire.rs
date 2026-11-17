@@ -175,9 +175,10 @@ pub struct Acquired {
     pub retained_low_fd: Option<i32>,
     /// This process holds locks on [`Self::id`] until this is dropped.
     /// Declared after `conn`, so dropping an [`Acquired`] closes the
-    /// connection first. `None` from [`open_checked`] and from a plain
-    /// fallback. A caller that moves `conn` out keeps this for as long as
-    /// the connection.
+    /// connection first. `None` when the open has no verified identity.
+    /// A caller that moves `conn` out must keep this until after the
+    /// connection closes, or transfer protection to an overlay registration
+    /// before using the connection.
     pub lock_hold: Option<ratarmount_core::db_inodes::DbLockHold>,
 }
 
@@ -681,7 +682,7 @@ pub fn open_checked(
         require_installed().map_err(refuse_none)?;
         open_armed(path, flags, mode, expect, PINNED_VFS)
     })();
-    recheck_symlink(acquired, path, flags)
+    recheck_symlink(acquired, path, flags).map(hold_acquired)
 }
 
 /// Open an index, SQLAR or digest-cache database.
@@ -790,21 +791,11 @@ fn hold_acquired(mut acquired: Acquired) -> Acquired {
 }
 
 fn plain_open(path: &Path, flags: OpenFlags, mode: NameMode) -> Result<Acquired, Refusal> {
-    let (name, flags) = match mode {
-        NameMode::Path => (path.to_path_buf(), flags),
-        NameMode::Immutable => {
-            let absolute = std::path::absolute(path).map_err(|_| {
-                refuse_none(AcquireError::InvalidRequest(
-                    "the path cannot be made absolute",
-                ))
-            })?;
-            (
-                PathBuf::from(immutable_uri(&absolute)),
-                flags | OpenFlags::SQLITE_OPEN_URI,
-            )
-        }
-    };
-    let conn = Connection::open_with_flags(name, flags)
+    // Preserve request validation and literal pathname handling even when
+    // descriptor verification is unavailable. Fresh leaves CREATE unchanged;
+    // this fallback deliberately makes no identity or pathname-type claim.
+    let request = request(path, flags, mode, Expect::Fresh).map_err(refuse_none)?;
+    let conn = Connection::open_with_flags(request.name, request.flags)
         .map_err(|e| refuse_none(AcquireError::Sqlite(e)))?;
     Ok(Acquired {
         conn,

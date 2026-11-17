@@ -95,10 +95,7 @@ fn open_checked_sqlar(path: &Path) -> Result<OpenedDb> {
     )
     .map_err(|refusal| match refusal.error {
         ratarmount_index::checked_open::AcquireError::Sqlite(error) => SqlarError::Sqlite(error),
-        other => SqlarError::Sqlite(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
-            Some(other.to_string()),
-        )),
+        other => SqlarError::CheckedOpen(other.to_string()),
     })?;
     let ratarmount_index::checked_open::Acquired {
         conn, lock_hold, ..
@@ -123,6 +120,9 @@ pub const fn sqlcipher_enabled() -> bool {
 
 #[derive(Debug, Error)]
 pub enum SqlarError {
+    /// An acquisition refusal must not trigger password probing or another open.
+    #[error("{0}")]
+    CheckedOpen(String),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -204,6 +204,7 @@ impl SqlarMountSource {
         let header = read_header(&path)?;
         let opened = match open_plain_for_open(&path, options) {
             Ok(c) => c,
+            Err(error @ SqlarError::CheckedOpen(_)) => return Err(error),
             Err(plain_err) if options.read_only_index => return Err(plain_err),
             Err(plain_err) => {
                 if header_is_sqlite_magic(&header) {
@@ -541,7 +542,8 @@ fn try_sqlcipher_passwords(path: &Path, passwords: &[String], salt: &[u8; 16]) -
 
     for password in passwords {
         // 1) Passphrase mode — SQLCipher derives the key itself.
-        if let Ok(opened) = open_checked_sqlar(path) {
+        {
+            let opened = open_checked_sqlar(path)?;
             if apply_pragma_key_passphrase(&opened.conn, password).is_ok()
                 && verify_sqlar_readable(&opened.conn).is_ok()
             {
@@ -552,7 +554,8 @@ fn try_sqlcipher_passwords(path: &Path, passwords: &[String], salt: &[u8; 16]) -
         // 2) Raw key from PBKDF2-HMAC-SHA512 (Python / sqlcipher3 parity; safe for any password chars).
         let mut key = [0u8; 32];
         pbkdf2_hmac::<Sha512>(password.as_bytes(), salt, SQLCIPHER_KDF_ITER, &mut key);
-        if let Ok(opened) = open_checked_sqlar(path) {
+        {
+            let opened = open_checked_sqlar(path)?;
             if apply_pragma_key_raw(&opened.conn, &key).is_ok()
                 && verify_sqlar_readable(&opened.conn).is_ok()
             {
@@ -937,6 +940,88 @@ impl MountSource for SqlarMountSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Regression: a SQLAR republished during its checked open is adopted;
+    /// refused descriptors stay parked until the SQLAR connection closes.
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_endian = "little",
+        any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+    ))]
+    #[test]
+    fn regression_193_sqlar_swap_and_hold_lifetime() {
+        use ratarmount_index::checked_open::test_seams::{Seam, Seams};
+        use std::os::{fd::IntoRawFd, unix::fs::MetadataExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.sqlar");
+        let next = dir.path().join("b.sqlar");
+        write_sample_sqlar(&path, &[("v", 0o100644, 3, Some(b"old"))]);
+        write_sample_sqlar(&next, &[("v", 0o100644, 3, Some(b"new"))]);
+        let swapped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let fired = swapped.clone();
+        let onto = path.clone();
+        let seam = Seams::set(move |seam| {
+            if seam == Seam::AfterLowFdFill && !fired.replace(true) {
+                std::fs::rename(&next, &onto).unwrap();
+            }
+        });
+        let source = SqlarMountSource::open(&path, &OpenOptions::default()).unwrap();
+        drop(seam);
+        assert!(swapped.get());
+        let info = source.lookup("/v", 0).unwrap();
+        let mut payload = Vec::new();
+        source
+            .open(&info, 0)
+            .unwrap()
+            .read_to_end(&mut payload)
+            .unwrap();
+        assert_eq!(payload, b"new");
+        let meta = std::fs::metadata(&path).unwrap();
+        let id = (meta.dev(), meta.ino());
+        let fd = std::fs::File::open(&path).unwrap().into_raw_fd();
+        unsafe { ratarmount_core::db_inodes::coordinate_retained_fd(fd) };
+        assert!(ratarmount_core::db_inodes::coordinated_parked(id) > 0);
+        drop(source);
+        assert_eq!(ratarmount_core::db_inodes::coordinated_parked(id), 0);
+    }
+
+    /// Regression: a checked refusal on a non-SQLite header must not be
+    /// replaced by a password/support error or retried through SQLCipher.
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_endian = "little",
+        any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+    ))]
+    #[test]
+    fn regression_193_sqlar_refusal_does_not_probe_passwords() {
+        use ratarmount_index::checked_open::test_seams::{Seam, Seams};
+        for passwords in [vec![], vec!["secret".into()]] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("encrypted.sqlar");
+            std::fs::write(&path, [7u8; 64]).unwrap();
+            let at = path.clone();
+            let saved = dir.path().join("original");
+            let mut fired = false;
+            let seam = Seams::set(move |seam| {
+                if seam == Seam::AfterLowFdFill && !fired {
+                    fired = true;
+                    std::fs::rename(&at, &saved).unwrap();
+                    std::fs::create_dir(&at).unwrap();
+                }
+            });
+            let options = OpenOptions {
+                passwords,
+                ..Default::default()
+            };
+            let error = SqlarMountSource::open(&path, &options)
+                .err()
+                .expect("unstable database");
+            drop(seam);
+            assert!(error.to_string().contains("did not settle"), "{error}");
+        }
+    }
+
     fn prepared_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
         std::fs::read_dir(dir)
             .unwrap()
