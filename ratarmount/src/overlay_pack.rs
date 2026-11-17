@@ -194,6 +194,10 @@ fn staged_db(
     packed: &OverlayMeta,
     previously_required: bool,
 ) -> io::Result<PathBuf> {
+    // The staged copy and VACUUM's own temporary databases are opened by
+    // SQLite below. Keep refused aliases until all those connections close,
+    // including every validation/redaction error exit.
+    let _staging_locks = ratarmount_core::db_inodes::defer_untracked_db_closes();
     // The overlay's own name (the open classifies it with its markers); the
     // checked open resolves the directory and builds the immutable URI.
     let source = directory.join(HIDDEN_DB);
@@ -5559,5 +5563,52 @@ pub(crate) mod tests {
             "included index snapshot read through a managed reader: {probes:?}"
         );
         assert!(probes.iter().all(|(_, kept)| *kept), "{probes:?}");
+    }
+    /// Regression: staged overlay validation/redaction opens and VACUUM's
+    /// temporary databases must defer mismatch closes through all exits.
+    #[test]
+    fn regression_193_staged_database_defers_mismatch_closes() {
+        use std::os::fd::IntoRawFd;
+        const CHILD: &str = "RATARMOUNT_193_STAGE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = std::thread::current().name().unwrap().to_owned();
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        for fail in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("layer");
+            let stage = tmp.path().join("stage");
+            fs::create_dir(&dir).unwrap();
+            fs::create_dir(&stage).unwrap();
+            let db = dir.join(HIDDEN_DB);
+            let setup = rusqlite::Connection::open(&db).unwrap();
+            setup.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT); INSERT INTO meta VALUES ('base_url','https://u:secret@example.com/a.tar');").unwrap();
+            let meta = OverlayMeta::from_connection(&setup).unwrap().unwrap();
+            drop(setup);
+            let temporary = tmp.path().join("temporary-db");
+            fs::write(&temporary, []).unwrap();
+            let stat = fs::metadata(&temporary).unwrap();
+            let id = (stat.dev(), stat.ino());
+            let result = with_pack_record_hook(
+                &BEFORE_STAGED_DB_ACQUIRE,
+                move || {
+                    let fd = File::open(&temporary).unwrap().into_raw_fd();
+                    unsafe { ratarmount_core::db_inodes::coordinate_retained_fd(fd) };
+                    assert_eq!(ratarmount_core::db_inodes::coordinated_parked(id), 1);
+                    if fail {
+                        fs::remove_file(db).unwrap();
+                    }
+                },
+                || staged_db(&dir, &stage, &meta, &meta, false),
+            );
+            assert_eq!(result.is_err(), fail, "{result:?}");
+            assert_eq!(ratarmount_core::db_inodes::coordinated_parked(id), 0);
+        }
     }
 }

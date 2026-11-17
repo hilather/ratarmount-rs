@@ -560,9 +560,10 @@ pub(crate) fn snapshot_index_id_on(
 }
 
 fn vacuum_snapshot(source: &Path, tmp: &Path) -> Result<()> {
-    let conn = rusqlite::Connection::open_with_flags(
+    let conn = crate::open_database(
         source,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        crate::checked_open::NameMode::Path,
     )?;
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     conn.execute_batch("PRAGMA synchronous = FULL")?;
@@ -3356,5 +3357,46 @@ mod tests {
         // Restore directory permissions portably so TempDir can remove it.
         std::fs::set_permissions(&rodir, std::fs::metadata(dir.path()).unwrap().permissions())
             .unwrap();
+    }
+    /// Regression: publication's VACUUM source bypassed #193's checked opens,
+    /// so the coordinator could close an alias while its read lock was held.
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_endian = "little",
+        any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+    ))]
+    #[test]
+    fn regression_193_publication_snapshot_reclassifies() {
+        use crate::checked_open::test_seams::{Seam, Seams};
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.sqlite");
+        let next = dir.path().join("next.sqlite");
+        let snapshot = dir.path().join("snapshot.sqlite");
+        for (path, value) in [(&source, 1), (&next, 2)] {
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .execute_batch(&format!(
+                    "CREATE TABLE t(x); INSERT INTO t VALUES ({value});"
+                ))
+                .unwrap();
+        }
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let swapped = fired.clone();
+        let onto = source.clone();
+        let seam = Seams::set(move |seam| {
+            if seam == Seam::AfterLowFdFill && !swapped.replace(true) {
+                std::fs::rename(&next, &onto).unwrap();
+            }
+        });
+        vacuum_snapshot(&source, &snapshot).unwrap();
+        drop(seam);
+        assert!(fired.get(), "publication bypassed the checked open");
+        let copy = rusqlite::Connection::open(snapshot).unwrap();
+        assert_eq!(
+            copy.query_row("SELECT x FROM t", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 }

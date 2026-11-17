@@ -47,6 +47,19 @@
 //! never across `open(2)`, `fstat(2)` or a SQLite open, so a payload FIFO that
 //! blocks its opener cannot stall a database open elsewhere in the process
 //! (R10-D). Lock order: innermost (no other lock is taken while it is held).
+//! The coordinator below uses its own mutex and never takes this one.
+//!
+//! Checked index, SQLAR and digest-cache opens (#193) hand a regular
+//! descriptor they refused to [`coordinate_retained_fd`]. An inode this
+//! process holds — an overlay registration, or [`hold_db_locks`] for a
+//! non-overlay connection — keeps that descriptor until the last holder
+//! drops. Temporary SQLite outputs defer all such closes with [`DbLockScope`]
+//! until their internal connections close. A descriptor of any other inode
+//! is then closed, so a republish does not
+//! leak one for the life of the process (#167). A descriptor whose inode
+//! cannot be read stays open for the process life (one per refusal): closing
+//! it could release a lock. Index holds are not overlay registrations, so a
+//! payload open of an index file is still admitted.
 //!
 //! Residual (docs/sandbox.md lists it): payload descriptors opened BEFORE the
 //! inode is first opened as a database here, generic folder sources, backing
@@ -55,6 +68,8 @@
 
 use std::collections::BTreeMap;
 use std::io;
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -80,19 +95,29 @@ pub struct DbInodeRegistration {
 
 impl Drop for DbInodeRegistration {
     fn drop(&mut self) {
-        let mut dbs = open_dbs();
-        if let Some(entry) = dbs.get_mut(&self.id) {
-            entry.count -= 1;
-            if entry.count == 0 {
-                dbs.remove(&self.id);
+        let id = self.id;
+        {
+            let mut dbs = open_dbs();
+            if let Some(entry) = dbs.get_mut(&id) {
+                entry.count -= 1;
+                if entry.count == 0 {
+                    dbs.remove(&id);
+                }
             }
         }
+        // After the registry lock is released (it stays innermost).
+        #[cfg(unix)]
+        unix::overlay_release(id);
     }
 }
 
 /// Register the overlay database `db` (its `(dev, ino)` as `id`) as open
 /// until the returned value is dropped.
 pub fn register_db_inode(id: (u64, u64), db: &Path) -> DbInodeRegistration {
+    // Before the connection is handed back: a mismatch descriptor of this
+    // inode that arrives now is kept, not closed.
+    #[cfg(unix)]
+    unix::overlay_acquire(id);
     let mut dbs = open_dbs();
     dbs.entry(id)
         .and_modify(|e| e.count += 1)
@@ -128,6 +153,128 @@ pub fn is_db_inode(id: (u64, u64)) -> bool {
     open_dbs().contains_key(&id)
 }
 
+/// One non-overlay database connection (index, SQLAR, digest-cache) whose
+/// inode this process holds locks on. Not an overlay registration: payload
+/// opens of the inode stay admitted. Dropping the last hold closes mismatch
+/// descriptors of that inode the coordinator kept.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct DbLockHold {
+    id: (u64, u64),
+}
+
+#[cfg(unix)]
+impl Drop for DbLockHold {
+    fn drop(&mut self) {
+        unix::hold_release(self.id);
+    }
+}
+
+/// Remember that this process holds locks on `id` until the result is dropped.
+#[cfg(unix)]
+pub fn hold_db_locks(id: (u64, u64)) -> DbLockHold {
+    unix::hold_acquire(id);
+    DbLockHold { id }
+}
+
+/// Defer mismatch closes while SQLite owns temporary databases whose inode
+/// is not exposed to the caller (for example the output of VACUUM INTO).
+/// All such connections must close before this scope drops. Known inode
+/// holds continue protecting their descriptors after the last scope drops.
+#[derive(Debug)]
+#[must_use]
+pub struct DbLockScope {
+    _private: (),
+}
+
+impl Drop for DbLockScope {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unix::scope_release();
+    }
+}
+
+pub fn defer_untracked_db_closes() -> DbLockScope {
+    #[cfg(unix)]
+    unix::scope_acquire();
+    DbLockScope { _private: () }
+}
+
+/// Take ownership of a descriptor a checked open retained.
+///
+/// # Safety
+///
+/// `fd` is open, owned by this process, and not closed by the caller. The
+/// coordinator closes it or keeps it; either way the caller must not touch it
+/// again. Every connection that may hold POSIX locks on this inode must keep
+/// a [`DbLockHold`], [`DbInodeRegistration`] or [`DbLockScope`] before its first query
+/// until after it closes. This registry cannot discover arbitrary raw SQLite
+/// connections or locks acquired outside the coordinated APIs.
+#[cfg(unix)]
+pub unsafe fn coordinate_retained_fd(fd: i32) {
+    if fd < 0 {
+        return;
+    }
+    // Safety: the caller owns `fd` and transfers it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-193-01","item":"ratarmount_core::db_inodes::coordinate_retained_fd","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"Own the refused SQLite descriptor for coordinated close after the last database holder (#193).","creation":{"policy":"none","basis":"Ownership transfer of an already opened descriptor; no pathname acquisition."}}"###
+    )]
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    unix::coordinate(owned);
+}
+
+/// How many retained descriptors the coordinator has closed.
+#[cfg(unix)]
+pub fn coordinated_closed() -> usize {
+    unix::coordinated_closed()
+}
+
+/// How many retained descriptors the coordinator is still keeping.
+#[cfg(unix)]
+pub fn coordinated_quarantined() -> usize {
+    unix::coordinated_quarantined()
+}
+
+/// How many retained descriptors of `id` the coordinator is still keeping.
+#[cfg(unix)]
+pub fn coordinated_parked(id: (u64, u64)) -> usize {
+    unix::coordinated_parked(id)
+}
+
+/// Non-Unix has no fcntl lock released by `close`, and checked opens retain
+/// no descriptor.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct DbLockHold;
+
+#[cfg(not(unix))]
+pub fn hold_db_locks(_: (u64, u64)) -> DbLockHold {
+    DbLockHold
+}
+
+#[cfg(not(unix))]
+/// No descriptor is retained on non-Unix platforms.
+///
+/// # Safety
+/// The argument must be a sentinel, not an owned descriptor.
+pub unsafe fn coordinate_retained_fd(_: i32) {}
+
+#[cfg(not(unix))]
+pub fn coordinated_closed() -> usize {
+    0
+}
+
+#[cfg(not(unix))]
+pub fn coordinated_quarantined() -> usize {
+    0
+}
+
+#[cfg(not(unix))]
+pub fn coordinated_parked(_: (u64, u64)) -> usize {
+    0
+}
+
 /// The refusal for a payload open of an open database's inode.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn refused(path: &Path, db: &Path) -> io::Error {
@@ -148,6 +295,7 @@ pub use unix::{admit_fd, open_admitted, openat_admitted, quarantined};
 
 #[cfg(unix)]
 mod unix {
+    use std::collections::BTreeMap;
     use std::ffi::CString;
     use std::io;
     use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -612,6 +760,131 @@ mod unix {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Index / SQLAR / digest-cache holds and the overlay mirror. Separate
+    /// from [`QUARANTINE`] (those counts stay the admitted-open ones) and from
+    /// `OPEN_DBS` (never held together with this mutex).
+    struct State {
+        scopes: usize,
+        holds: BTreeMap<(u64, u64), usize>,
+        overlay: BTreeMap<(u64, u64), usize>,
+        parked: BTreeMap<(u64, u64), Vec<OwnedFd>>,
+        unidentified: Vec<OwnedFd>,
+        closed: usize,
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State {
+        scopes: 0,
+        holds: BTreeMap::new(),
+        overlay: BTreeMap::new(),
+        parked: BTreeMap::new(),
+        unidentified: Vec::new(),
+        closed: 0,
+    });
+
+    fn state() -> std::sync::MutexGuard<'static, State> {
+        STATE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn held(state: &State, id: (u64, u64)) -> bool {
+        state.scopes > 0
+            || state.holds.get(&id).copied().unwrap_or(0) > 0
+            || state.overlay.get(&id).copied().unwrap_or(0) > 0
+    }
+
+    /// Close descriptors parked for `id` once nothing in this process holds it.
+    /// Called with `STATE` already locked; dropping the descriptors does not
+    /// take it again.
+    fn release_unlocked(state: &mut State, id: (u64, u64)) {
+        if held(state, id) {
+            return;
+        }
+        if let Some(fds) = state.parked.remove(&id) {
+            state.closed += fds.len();
+            drop(fds);
+        }
+    }
+
+    fn inc(map: &mut BTreeMap<(u64, u64), usize>, id: (u64, u64)) {
+        *map.entry(id).or_insert(0) += 1;
+    }
+
+    fn dec(map: &mut BTreeMap<(u64, u64), usize>, id: (u64, u64)) {
+        let Some(n) = map.get_mut(&id) else {
+            return;
+        };
+        if *n <= 1 {
+            map.remove(&id);
+        } else {
+            *n -= 1;
+        }
+    }
+
+    pub(super) fn overlay_acquire(id: (u64, u64)) {
+        inc(&mut state().overlay, id);
+    }
+
+    pub(super) fn overlay_release(id: (u64, u64)) {
+        let mut state = state();
+        dec(&mut state.overlay, id);
+        release_unlocked(&mut state, id);
+    }
+
+    pub(super) fn hold_acquire(id: (u64, u64)) {
+        inc(&mut state().holds, id);
+    }
+
+    pub(super) fn scope_acquire() {
+        state().scopes += 1;
+    }
+
+    pub(super) fn scope_release() {
+        let mut state = state();
+        state.scopes -= 1;
+        if state.scopes == 0 {
+            let ids: Vec<_> = state.parked.keys().copied().collect();
+            for id in ids {
+                release_unlocked(&mut state, id);
+            }
+        }
+    }
+
+    pub(super) fn hold_release(id: (u64, u64)) {
+        let mut state = state();
+        dec(&mut state.holds, id);
+        release_unlocked(&mut state, id);
+    }
+
+    pub(super) fn coordinate(fd: OwnedFd) {
+        // `fstat` before the mutex (R10-D: no lock across a stat).
+        let st = fstat(fd.as_raw_fd());
+        let mut state = state();
+        match st {
+            Err(_) => state.unidentified.push(fd),
+            Ok(st) => {
+                let id = id(&st);
+                if held(&state, id) {
+                    state.parked.entry(id).or_default().push(fd);
+                } else {
+                    state.closed += 1;
+                    drop(fd);
+                }
+            }
+        }
+    }
+
+    pub(super) fn coordinated_closed() -> usize {
+        state().closed
+    }
+
+    pub(super) fn coordinated_quarantined() -> usize {
+        let state = state();
+        state.unidentified.len() + state.parked.values().map(Vec::len).sum::<usize>()
+    }
+
+    pub(super) fn coordinated_parked(id: (u64, u64)) -> usize {
+        state().parked.get(&id).map(Vec::len).unwrap_or(0)
     }
 }
 
@@ -1284,5 +1557,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Regression: (#193, #167): a retained mismatch descriptor of an inode this
+    /// process does not hold is closed; one of an inode held by
+    /// [`hold_db_locks`] or an overlay registration stays open until the last
+    /// holder drops.
+    #[test]
+    fn regression_coordinated_retained_fd_closes_unheld_and_keeps_held() {
+        use std::os::fd::IntoRawFd;
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f");
+        fs::write(&file, b"x").unwrap();
+        let id = id_of(&file);
+        let closed = coordinated_closed();
+        let quarantined = coordinated_quarantined();
+
+        let fd = fs::File::open(&file).unwrap().into_raw_fd();
+        unsafe { coordinate_retained_fd(fd) };
+        assert_eq!(coordinated_parked(id), 0);
+        assert_eq!(coordinated_closed(), closed + 1);
+        assert_eq!(coordinated_quarantined(), quarantined);
+
+        let hold = hold_db_locks(id);
+        let fd = fs::File::open(&file).unwrap().into_raw_fd();
+        unsafe { coordinate_retained_fd(fd) };
+        assert_eq!(coordinated_parked(id), 1);
+        assert_eq!(coordinated_closed(), closed + 1);
+        drop(hold);
+        assert_eq!(coordinated_parked(id), 0);
+        assert_eq!(coordinated_closed(), closed + 2);
+
+        let registration = register_db_inode(id, &file);
+        let fd = fs::File::open(&file).unwrap().into_raw_fd();
+        unsafe { coordinate_retained_fd(fd) };
+        assert_eq!(coordinated_parked(id), 1);
+        assert_eq!(coordinated_closed(), closed + 2);
+        drop(registration);
+        assert_eq!(coordinated_parked(id), 0);
+        assert_eq!(coordinated_closed(), closed + 3);
+        assert!(!is_db_inode(id));
+    }
+
+    /// Regression: temporary SQLite outputs need nested global close deferral;
+    /// ending that deferral must still respect ordinary per-inode holders.
+    #[test]
+    fn regression_coordinated_retained_scopes_preserve_known_holds() {
+        use std::os::fd::IntoRawFd;
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("temporary");
+        let b = dir.path().join("known");
+        fs::write(&a, []).unwrap();
+        fs::write(&b, []).unwrap();
+        let (a_id, b_id) = (id_of(&a), id_of(&b));
+        let first = defer_untracked_db_closes();
+        let second = defer_untracked_db_closes();
+        let hold = hold_db_locks(b_id);
+        for path in [&a, &b] {
+            unsafe { coordinate_retained_fd(fs::File::open(path).unwrap().into_raw_fd()) };
+        }
+        drop(first);
+        assert_eq!(coordinated_parked(a_id), 1);
+        assert_eq!(coordinated_parked(b_id), 1);
+        drop(second);
+        assert_eq!(coordinated_parked(a_id), 0);
+        assert_eq!(coordinated_parked(b_id), 1);
+        drop(hold);
+        assert_eq!(coordinated_parked(b_id), 0);
     }
 }

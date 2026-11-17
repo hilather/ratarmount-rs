@@ -172,6 +172,24 @@ fn acquire_child() {
         "reenter" => reenter_row(),
         "rwretry" => rw_retry_row(),
         "uri_relative" => uri_relative_row(),
+        "not_fresh" => not_fresh_row(),
+        "unheld" => unheld_row(),
+        "budget" => budget_row(),
+        "lookup_nonregular" => lookup_nonregular_row(),
+        "vacuum_lock" => vacuum_lock_row(),
+        "getlk" => getlk_row(),
+        "one_shot" => {
+            regression_193_one_shot_checked_connection_keeps_its_lock();
+            "one_shot".into()
+        }
+        "budget_hold" => {
+            regression_193_budget_hold_follows_the_last_connection_owner();
+            "budget_hold".into()
+        }
+        "held" => {
+            regression_193_publish_tmp_during_checked_open_keeps_the_mismatch_fd();
+            "held".into()
+        }
         other => panic!("unknown row {other}"),
     };
     write_result(&format!("ok {detail}"));
@@ -1892,12 +1910,13 @@ fn regression_snapshot_index_refuses_partial_companions_and_keeps_locks() {
     }
 }
 
-/// Regression: (#156 fix round): the index was checked for a symlink and then
+/// Regression: (#156, #193): the index was checked for a symlink and then
 /// opened by a canonicalized name, so a symlink (or another database)
 /// substituted in between was copied. The checked acquisition opens the
 /// final component without following it and judges SQLite's own descriptor
 /// against the classified file: both substitutions are refused and nothing
-/// is written.
+/// is written. Ordinary index opens retry a swap (#193); this snapshot does
+/// not.
 ///
 /// Regression: (R11-CI, #199): the other database was substituted by deleting
 /// the index and then copying a new file to its name, and on Linux CI the
@@ -2138,4 +2157,621 @@ fn regression_snapshot_index_rollback_writer_after_classify_never_copies_uncommi
             .unwrap(),
         256
     );
+}
+
+/// The coordinator's counts are process-wide. These tests share one lock.
+fn serial_193() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL_193: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL_193.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+struct ClearReclassifyHook;
+
+impl Drop for ClearReclassifyHook {
+    fn drop(&mut self) {
+        clear_reclassify_after_classify_hook();
+    }
+}
+
+fn marked_index(dest: &Path, value: i64) -> crate::SqliteIndex {
+    let idx = crate::SqliteIndex::create_writable(Some(dest)).unwrap();
+    idx.with_conn(|conn| {
+        conn.execute_batch(&format!(
+            "CREATE TABLE marker(v INTEGER); INSERT INTO marker VALUES ({value});"
+        ))?;
+        Ok(())
+    })
+    .unwrap();
+    idx
+}
+
+fn publish_marked(dest: &Path, value: i64) {
+    let mut idx = marked_index(dest, value);
+    idx.publish_tmp().unwrap();
+}
+
+/// Regression: (#193): `publish_tmp`'s `rename(2)` landing after
+/// `findReusableFd`'s selection `stat` and before `open` used to keep the
+/// new inode's descriptor for the process life. The open adopts the
+/// published index. That descriptor stays open while the publisher holds
+/// the inode (closing it would drop the publisher's lock) and is released
+/// with the hold.
+///
+/// `publish_tmp` itself cannot run in the seam: the seam is inside SQLite's
+/// unix mutex. The replacement is the file `publish_tmp` wrote; the seam
+/// performs the same rename, once, in the window that retains a descriptor.
+/// A rename that finishes before the selection `stat` latches `OtherFile`
+/// with no descriptor (nothing to hand over) and the retry adopts it.
+#[test]
+fn regression_193_publish_tmp_during_checked_open_keeps_the_mismatch_fd() {
+    if std::env::var(CHILD_ENV).ok().as_deref() != Some("held") {
+        run_child("held", None);
+        return;
+    }
+    let _serial = serial_193();
+    let (_dir, dir) = tempdir();
+    let dest = dir.join("idx.index.sqlite");
+    let side = dir.join("next.index.sqlite");
+    publish_marked(&dest, 1);
+    let mut publisher = marked_index(&side, 2);
+    publisher.publish_tmp().unwrap();
+    // `publish_tmp` leaves a query-only WAL connection. Drop it so the
+    // replacement can leave WAL (those locks sit on `-shm`, which the probe
+    // does not see and which the rename leaves behind) and re-hold the inode
+    // the connection just released.
+    drop(publisher);
+    let extra = Connection::open(&side).unwrap();
+    extra
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    let mode: String = extra
+        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete", "the published index stayed in {mode} mode");
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name = side.clone().into_os_string();
+        name.push(suffix);
+        let _ = std::fs::remove_file(name);
+    }
+    let published = id_of(&side);
+    let hold = ratarmount_core::db_inodes::hold_db_locks(published);
+    extra.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    let once = std::rc::Rc::new(std::cell::Cell::new(false));
+    let fired = once.clone();
+    let (from, onto) = (side.clone(), dest.clone());
+    // Filesystem only: this runs under SQLite's unix mutex.
+    let seams = Seams::set(move |seam| {
+        if matches!(seam, Seam::AfterArmedStat(1)) && !fired.get() {
+            fired.set(true);
+            std::fs::rename(&from, &onto).unwrap();
+        }
+    });
+    let reader = crate::SqliteIndex::open_read_only(&dest).unwrap();
+    drop(seams);
+    assert!(once.get(), "the selection stat never ran");
+    assert_eq!(id_of(&dest), published);
+    reader
+        .with_conn(|conn| {
+            assert_eq!(crate::managed_read::connection_vfs_name(conn), "unix");
+            let value: i64 = conn.query_row("SELECT v FROM marker", [], |row| row.get(0))?;
+            assert_eq!(value, 2);
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        ratarmount_core::db_inodes::coordinated_parked(published) >= 1,
+        "the mismatch descriptor was closed while the publisher holds it"
+    );
+    assert!(
+        other_process_sees_lock(&dest),
+        "closing the mismatch descriptor released the lock"
+    );
+    drop(reader);
+    assert!(ratarmount_core::db_inodes::coordinated_parked(published) >= 1);
+    assert!(other_process_sees_lock(&dest));
+    drop(extra);
+    drop(hold);
+    assert_eq!(ratarmount_core::db_inodes::coordinated_parked(published), 0);
+    assert!(!other_process_sees_lock(&dest));
+}
+
+/// Regression: (#193): `publish_tmp` that finishes before SQLite's selection
+/// `stat` latches `OtherFile` with no descriptor. The retry adopts the
+/// published index. Nothing is handed to the coordinator.
+#[test]
+fn regression_193_publish_tmp_before_selection_stat_adopts() {
+    use std::sync::{Arc, Mutex};
+    let _serial = serial_193();
+    let (_dir, dir) = tempdir();
+    let dest = dir.join("idx.index.sqlite");
+    publish_marked(&dest, 1);
+    let slot = Arc::new(Mutex::new(Some(marked_index(&dest, 2))));
+    let hook_slot = Arc::clone(&slot);
+    let hook_dest = dest.clone();
+    set_reclassify_after_classify_hook(move || {
+        let mut publisher = hook_slot.lock().unwrap().take().unwrap();
+        publisher.publish_tmp().unwrap();
+        *hook_slot.lock().unwrap() = Some(publisher);
+    });
+    let _clear = ClearReclassifyHook;
+    let reader = crate::SqliteIndex::open_read_only(&hook_dest).unwrap();
+    reader
+        .with_conn(|conn| {
+            assert_eq!(crate::managed_read::connection_vfs_name(conn), "unix");
+            let value: i64 = conn.query_row("SELECT v FROM marker", [], |row| row.get(0))?;
+            assert_eq!(value, 2);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        ratarmount_core::db_inodes::coordinated_parked(id_of(&dest)),
+        0
+    );
+    drop(reader);
+    drop(slot.lock().unwrap().take());
+}
+
+/// Regression: (#193): a rename of a closed index over the classified path is
+/// adopted, and the mismatch descriptor is closed because nobody holds it.
+///
+/// Runs in a child. In the parent, another test's connection makes SQLite
+/// `stat` the new inode before `open`, so `OtherFile` is latched with no
+/// descriptor and the close count does not move.
+#[test]
+fn regression_193_unheld_rename_closes_the_mismatch_fd() {
+    run_child("unheld", None);
+}
+
+fn unheld_row() -> String {
+    let (_dir, dir) = tempdir();
+    let dest = dir.join("idx.index.sqlite");
+    let other = dir.join("other.index.sqlite");
+    publish_marked(&dest, 1);
+    publish_marked(&other, 2);
+    let closed = ratarmount_core::db_inodes::coordinated_closed();
+    let quarantined = ratarmount_core::db_inodes::coordinated_quarantined();
+    let hook_dest = dest.clone();
+    let hook_other = other.clone();
+    set_reclassify_after_classify_hook(move || {
+        std::fs::rename(&hook_other, &hook_dest).unwrap();
+    });
+    let _clear = ClearReclassifyHook;
+    let reader = crate::SqliteIndex::open_read_only(&dest).unwrap();
+    reader
+        .with_conn(|conn| {
+            let value: i64 = conn.query_row("SELECT v FROM marker", [], |row| row.get(0))?;
+            assert_eq!(value, 2);
+            Ok(())
+        })
+        .unwrap();
+    let id = id_of(&dest);
+    assert_eq!(ratarmount_core::db_inodes::coordinated_parked(id), 0);
+    assert_eq!(ratarmount_core::db_inodes::coordinated_closed(), closed + 1);
+    assert_eq!(
+        ratarmount_core::db_inodes::coordinated_quarantined(),
+        quarantined
+    );
+    drop(reader);
+    "unheld".into()
+}
+
+/// Regression: (#193): a directory or a FIFO is not a database. The open
+/// starts at most 3 attempts within its retry budget and never blocks on a FIFO.
+#[test]
+fn regression_193_non_regular_stops_at_three_attempts() {
+    let (_dir, dir) = tempdir();
+    let flags = RO | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let refusal = open_reclassifying(&dir, flags, NameMode::Path).unwrap_err();
+    match refusal.error {
+        AcquireError::Unsettled {
+            attempts,
+            elapsed_ms,
+            ..
+        } => {
+            assert!((1..=3).contains(&attempts));
+            assert!(attempts == 3 || elapsed_ms >= 100);
+        }
+        other => panic!("directory: {other}"),
+    }
+    assert!(refusal.to_string().contains("did not settle"), "{refusal}");
+
+    let fifo = dir.join("blocked");
+    mkfifo(&fifo);
+    let refusal = open_reclassifying(&fifo, flags, NameMode::Path).unwrap_err();
+    match refusal.error {
+        AcquireError::Unsettled {
+            attempts,
+            elapsed_ms,
+            ..
+        } => {
+            assert!((1..=3).contains(&attempts));
+            assert!(attempts == 3 || elapsed_ms >= 100);
+        }
+        other => panic!("fifo: {other}"),
+    }
+    assert!(refusal.to_string().contains("did not settle"), "{refusal}");
+    assert_eq!(
+        ratarmount_core::db_inodes::coordinated_parked(id_of(&fifo)),
+        0
+    );
+}
+
+/// Regression: (#193): once 100 ms have passed, a swapped file is not adopted.
+/// The retained descriptor of the unheld inode is closed. See
+/// [`regression_193_unheld_rename_closes_the_mismatch_fd`] for why this is a
+/// child.
+#[test]
+fn regression_193_time_budget_does_not_adopt_the_new_file() {
+    run_child("budget", None);
+}
+
+fn budget_row() -> String {
+    let (_dir, dir) = tempdir();
+    let dest = dir.join("idx.index.sqlite");
+    let other = dir.join("other.index.sqlite");
+    publish_marked(&dest, 1);
+    publish_marked(&other, 2);
+    let closed = ratarmount_core::db_inodes::coordinated_closed();
+    let hook_dest = dest.clone();
+    let hook_other = other.clone();
+    set_reclassify_after_classify_hook(move || {
+        std::thread::sleep(Duration::from_millis(120));
+        std::fs::rename(&hook_other, &hook_dest).unwrap();
+    });
+    let _clear = ClearReclassifyHook;
+    let error = match crate::SqliteIndex::open_read_only(&dest) {
+        Err(error) => error,
+        Ok(_) => panic!("the swapped file was adopted after the time budget"),
+    };
+    assert!(error.to_string().contains("did not settle"), "{error}");
+    assert!(error.to_string().contains("1 attempts"), "{error}");
+    let plain = Connection::open(&dest).unwrap();
+    assert_eq!(
+        plain
+            .query_row("SELECT v FROM marker", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2,
+        "the swap happened and was not adopted"
+    );
+    assert_eq!(
+        ratarmount_core::db_inodes::coordinated_parked(id_of(&dest)),
+        0
+    );
+    assert_eq!(ratarmount_core::db_inodes::coordinated_closed(), closed + 1);
+    "budget".into()
+}
+
+/// Regression: (#193): a file planted where none existed is `NotFresh`, not a
+/// retry, and its descriptor is closed when nobody holds the inode.
+///
+/// Runs in a child. In the parent, another test's connection makes SQLite
+/// `stat` the planted file before `open`, so `NotFresh` is latched with no
+/// descriptor and the close count does not move.
+#[test]
+fn regression_193_not_fresh_is_not_retried() {
+    run_child("not_fresh", None);
+}
+
+fn not_fresh_row() -> String {
+    let (_dir, dir) = tempdir();
+    let path = dir.join("new.sqlite");
+    let planted = path.clone();
+    set_reclassify_after_classify_hook(move || {
+        let conn = Connection::open(&planted).unwrap();
+        conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+    });
+    let _clear = ClearReclassifyHook;
+    let closed = ratarmount_core::db_inodes::coordinated_closed();
+    let refusal = open_reclassifying(&path, RWC, NameMode::Path).unwrap_err();
+    assert!(
+        matches!(refusal.error, AcquireError::NotFresh { .. }),
+        "{refusal}"
+    );
+    assert!(!refusal.to_string().contains("did not settle"), "{refusal}");
+    assert_eq!(
+        ratarmount_core::db_inodes::coordinated_parked(id_of(&path)),
+        0
+    );
+    assert_eq!(ratarmount_core::db_inodes::coordinated_closed(), closed + 1);
+    "not_fresh".into()
+}
+
+/// Regression: (#193): an overlay acquisition still refuses in one attempt.
+#[test]
+fn regression_193_overlay_open_does_not_retry() {
+    let (_dir, dir) = tempdir();
+    let refusal = open_checked(
+        &dir,
+        RO,
+        NameMode::Path,
+        Expect::Existing {
+            id: (1, 1),
+            require_nonempty: false,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        !matches!(refusal.error, AcquireError::Unsettled { .. }),
+        "{refusal}"
+    );
+    assert!(!refusal.to_string().contains("did not settle"), "{refusal}");
+}
+
+/// Regression: #193 released a live connection's lock when a memory-pressure
+/// callback had upgraded its weak Arc and outlived the BudgetConnection owner.
+#[test]
+fn regression_193_budget_hold_follows_the_last_connection_owner() {
+    if std::env::var(CHILD_ENV).ok().as_deref() != Some("budget_hold") {
+        run_child("budget_hold", None);
+        return;
+    }
+    use std::os::fd::IntoRawFd;
+    let _serial = serial_193();
+    let (_dir, dir) = tempdir();
+    let path = dir.join("held.sqlite");
+    make_db(&path, 1);
+    let opened = open_reclassifying(&path, RW, NameMode::Path).unwrap();
+    opened.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let budget = crate::BudgetConnection::with_hold(opened.conn, opened.lock_hold).unwrap();
+    let callback = std::sync::Arc::downgrade(&budget.inner).upgrade().unwrap();
+    let id = id_of(&path);
+    let fd = std::fs::File::open(&path).unwrap().into_raw_fd();
+    unsafe { ratarmount_core::db_inodes::coordinate_retained_fd(fd) };
+    assert_eq!(ratarmount_core::db_inodes::coordinated_parked(id), 1);
+    drop(budget);
+    assert_eq!(ratarmount_core::db_inodes::coordinated_parked(id), 1);
+    assert!(other_process_sees_lock(&path));
+    drop(callback);
+    assert_eq!(ratarmount_core::db_inodes::coordinated_parked(id), 0);
+    assert!(!other_process_sees_lock(&path));
+}
+
+/// Regression: #193's coordinator did not know about one-shot checked
+/// connections (including snapshot_index_into), and closed an alias of their
+/// locked inode when an ordinary index open encountered it during a swap.
+#[test]
+fn regression_193_one_shot_checked_connection_keeps_its_lock() {
+    if std::env::var(CHILD_ENV).ok().as_deref() != Some("one_shot") {
+        run_child("one_shot", None);
+        return;
+    }
+    let _serial = serial_193();
+    let (_dir, dir) = tempdir();
+    let holder = dir.join("holder.sqlite");
+    let dest = dir.join("dest.sqlite");
+    let alias = dir.join("alias.sqlite");
+    make_db(&holder, 1);
+    make_db(&dest, 2);
+    std::fs::hard_link(&holder, &alias).unwrap();
+    let opened = open_checked(&holder, RW, NameMode::Path, existing(&holder, true)).unwrap();
+    opened.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let swapped = std::rc::Rc::new(std::cell::Cell::new(false));
+    let fired = swapped.clone();
+    let onto = dest.clone();
+    let seams = Seams::set(move |seam| {
+        if matches!(seam, Seam::AfterArmedStat(1)) && !fired.replace(true) {
+            std::fs::rename(&alias, &onto).unwrap();
+        }
+    });
+    let reader = open_reclassifying(&dest, RO, NameMode::Path).unwrap();
+    drop(seams);
+    assert!(swapped.get());
+    assert!(
+        other_process_sees_lock(&holder),
+        "the refused fd released the snapshot lock"
+    );
+    drop(reader);
+    assert!(other_process_sees_lock(&holder));
+    drop(opened);
+    assert!(!other_process_sees_lock(&holder));
+}
+
+/// Regression: #193's ordinary fallback accepted requests the checked path
+/// refuses, including a writable immutable URI and shared-cache acquisitions.
+#[test]
+fn regression_193_fallback_validates_requests() {
+    let (_dir, dir) = tempdir();
+    let path = dir.join("never-created.sqlite");
+    for (flags, mode) in [
+        (RWC, NameMode::Immutable),
+        (RWC | OpenFlags::SQLITE_OPEN_SHARED_CACHE, NameMode::Path),
+        (RWC | OpenFlags::SQLITE_OPEN_MEMORY, NameMode::Path),
+    ] {
+        let refused = plain_open(&path, flags, mode).unwrap_err();
+        assert!(
+            matches!(refused.error, AcquireError::InvalidRequest(_)),
+            "{refused}"
+        );
+        assert!(!path.exists());
+    }
+}
+
+/// Regression: the prepared-index finalizer added on main bypassed #193's
+/// reclassification and lifetime tracking when checkpointing a leftover WAL.
+#[test]
+fn regression_193_prepared_finalizer_reclassifies() {
+    let (_dir, dir) = tempdir();
+    let dest = dir.join("index.sqlite");
+    let next = dir.join("next.sqlite");
+    publish_marked(&dest, 1);
+    publish_marked(&next, 2);
+    std::fs::write(dir.join("index.sqlite-wal"), []).unwrap();
+    let swapped = std::rc::Rc::new(std::cell::Cell::new(false));
+    let fired = swapped.clone();
+    let onto = dest.clone();
+    let seams = Seams::set(move |seam| {
+        if seam == Seam::AfterLowFdFill && !fired.replace(true) {
+            std::fs::rename(&next, &onto).unwrap();
+        }
+    });
+    crate::SqliteIndex::finalize_prepared(&dest).unwrap();
+    drop(seams);
+    assert!(swapped.get(), "finalization bypassed the checked open");
+    let prepared = crate::open_prepared_connection(&dest).unwrap();
+    assert_eq!(
+        prepared
+            .query_row("SELECT v FROM marker", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+/// Regression: a lookup of a non-regular path bypassed checked acquisition
+/// and could block in SQLite's ordinary FIFO open instead of failing closed.
+#[test]
+fn regression_193_lookup_nonregular_fails_closed() {
+    // The directory is a nonblocking negative control for the same early
+    // return as a FIFO; exercising the FIFO itself is watchdog-protected.
+    run_child("lookup_nonregular", None);
+}
+
+fn lookup_nonregular_row() -> String {
+    let (_dir, dir) = tempdir();
+    let fifo = dir.join("fifo");
+    mkfifo(&fifo);
+    for path in [&dir, &fifo] {
+        let error = crate::open_lookup_connection(path)
+            .err()
+            .expect("not a database");
+        assert!(error.to_string().contains("did not settle"), "{error}");
+    }
+    "lookup_nonregular".into()
+}
+
+/// Regression: repeated substitutions must stop at the attempt bound, and a
+/// checked refusal in a pure lookup must never fall through to a raw snapshot.
+#[test]
+fn regression_193_repeated_swaps_exhaust_without_lookup_fallback() {
+    let _serial = serial_193();
+    let (_dir, dir) = tempdir();
+    let dest = dir.join("index.sqlite");
+    make_db(&dest, 0);
+    let replacements: Vec<_> = (1..=3)
+        .map(|n| {
+            let path = dir.join(format!("next{n}.sqlite"));
+            make_db(&path, n);
+            path
+        })
+        .collect();
+    let count = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = count.clone();
+    let onto = dest.clone();
+    let seams = Seams::set(move |seam| {
+        if seam == Seam::AfterLowFdFill {
+            let n = seen.get();
+            std::fs::rename(&replacements[n], &onto).unwrap();
+            seen.set(n + 1);
+        }
+    });
+    let error = crate::open_lookup_connection(&dest)
+        .err()
+        .expect("unstable index");
+    drop(seams);
+    assert!(error.to_string().contains("did not settle"), "{error}");
+    assert!((1..=3).contains(&count.get()));
+    // No snapshot succeeds behind the caller's back; the current database
+    // remains ordinary and readable after the refusals.
+    let conn = Connection::open(dest).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT x FROM t", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        count.get() as i64
+    );
+}
+
+fn getlk_row() -> String {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(std::env::var_os(DB_ENV).unwrap()).unwrap();
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as _;
+    lock.l_whence = libc::SEEK_SET as _;
+    lock.l_start = 0x4000_0000;
+    lock.l_len = 512;
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) },
+        0
+    );
+    if lock.l_type as i32 == libc::F_UNLCK as i32 {
+        "unlocked"
+    } else {
+        "locked"
+    }
+    .into()
+}
+
+/// Regression: VACUUM INTO opens its destination internally. Closing a
+/// refused alias must not release that temporary connection's write lock.
+/// Exercise both normal completion and SQLite's interrupted cleanup.
+#[test]
+fn regression_193_vacuum_output_lock_survives_mismatch_close() {
+    run_child("vacuum_lock", None);
+}
+
+fn vacuum_lock_row() -> String {
+    struct Progress {
+        db: *mut rusqlite::ffi::sqlite3,
+        path: PathBuf,
+        fired: bool,
+        interrupt: bool,
+        panic: Option<Box<dyn std::any::Any + Send>>,
+    }
+    unsafe extern "C" fn progress(arg: *mut std::ffi::c_void) -> i32 {
+        use std::os::fd::IntoRawFd;
+        let state = unsafe { &mut *arg.cast::<Progress>() };
+        if state.fired
+            || unsafe { rusqlite::ffi::sqlite3_txn_state(state.db, c"vacuum_db".as_ptr()) }
+                != rusqlite::ffi::SQLITE_TXN_WRITE
+        {
+            return 0;
+        }
+        state.fired = true;
+        state.panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(run_child("getlk", Some(&state.path)).trim(), "ok locked");
+            let fd = std::fs::File::open(&state.path).unwrap().into_raw_fd();
+            unsafe { ratarmount_core::db_inodes::coordinate_retained_fd(fd) };
+            assert_eq!(run_child("getlk", Some(&state.path)).trim(), "ok locked");
+        }))
+        .err();
+        i32::from(state.interrupt || state.panic.is_some())
+    }
+    let (_dir, dir) = tempdir();
+    let source = dir.join("source.sqlite");
+    let opened = open_reclassifying(&source, RWC, NameMode::Path).unwrap();
+    opened
+        .conn
+        .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+        .unwrap();
+    for interrupt in [false, true] {
+        let path = dir.join(format!("copy-{interrupt}.sqlite"));
+        let mut state = Progress {
+            db: unsafe { opened.conn.handle() },
+            path: path.clone(),
+            fired: false,
+            interrupt,
+            panic: None,
+        };
+        unsafe {
+            rusqlite::ffi::sqlite3_progress_handler(
+                state.db,
+                1,
+                Some(progress),
+                (&mut state as *mut Progress).cast(),
+            )
+        };
+        let result = crate::vacuum_into(&opened.conn, &path);
+        unsafe { rusqlite::ffi::sqlite3_progress_handler(state.db, 0, None, std::ptr::null_mut()) };
+        if let Some(panic) = state.panic {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(state.fired, "the output write transaction was not observed");
+        assert_eq!(result.is_err(), interrupt, "{result:?}");
+        assert_eq!(
+            ratarmount_core::db_inodes::coordinated_parked(id_of(&path)),
+            0
+        );
+        assert_eq!(run_child("getlk", Some(&path)).trim(), "ok unlocked");
+    }
+    "vacuum_lock".into()
 }

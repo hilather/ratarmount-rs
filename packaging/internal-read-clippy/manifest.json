@@ -15148,6 +15148,32 @@
       "rule_reason": "inventory-op:File::open"
     },
     {
+      "configured_path": "std::os::fd::FromRawFd::from_raw_fd",
+      "item": "ratarmount_core::db_inodes::coordinate_retained_fd",
+      "leaf_digest": "c129d560bfe88022f6f5f23b6a5365440b087c99be8e4c45b5ccbd8014d0e6e1",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "runtime-resource-or-descriptor-handoff",
+        "creation": {
+          "basis": "Ownership transfer of an already opened descriptor; no pathname acquisition.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-193-01",
+        "item": "ratarmount_core::db_inodes::coordinate_retained_fd",
+        "reason": "Own the refused SQLite descriptor for coordinated close after the last database holder (#193)."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-193-01\",\"item\":\"ratarmount_core::db_inodes::coordinate_retained_fd\",\"disposition\":\"out-of-family\",\"category\":\"runtime-resource-or-descriptor-handoff\",\"reason\":\"Own the refused SQLite descriptor for coordinated close after the last database holder (#193).\",\"creation\":{\"policy\":\"none\",\"basis\":\"Ownership transfer of an already opened descriptor; no pathname acquisition.\"}}",
+      "resolved": "std::os::fd::raw::FromRawFd::from_raw_fd",
+      "rule_reason": "inventory-op:from_raw_fd"
+    },
+    {
       "configured_path": "ratarmount_core::db_inodes::openat_admitted",
       "item": "ratarmount_core::db_inodes::unix::open_admitted",
       "leaf_digest": "b1ed7acb4dfb0f0944b2075f7f1f87733a48518a1b411e0b9739791b64b8f019",
