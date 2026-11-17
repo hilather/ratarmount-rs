@@ -184,6 +184,8 @@ pub enum DbEntry {
 /// symlink; and EVERY other `lstat` or followed-`stat` error (`ENOTDIR`,
 /// `EACCES`, `ELOOP`, `EIO`, ...), which is never read as "present" or
 /// "absent": an unresolved target proves nothing about the record.
+/// I/O errors retain their kind and path context; the original error and its
+/// raw OS code remain reachable through [`std::error::Error::source`].
 pub fn overlay_db_entry(dir: &Path) -> Result<DbEntry> {
     let markers = overlay_markers(dir)?;
     let marked = !markers.is_empty();
@@ -246,6 +248,10 @@ thread_local! {
     /// database in [`overlay_db_regular`] on this thread fails with this errno.
     pub(crate) static FOLLOWED_STAT_ERRNO: std::cell::Cell<Option<i32>> =
         const { std::cell::Cell::new(None) };
+    /// Test seam (#176): change the entry after its metadata was read, before
+    /// the classifier consumes that observation. Runs once on this thread.
+    pub(crate) static AFTER_FOLLOWED_DB_STAT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -262,15 +268,44 @@ fn followed_db_stat(db_path: &Path) -> io::Result<fs::Metadata> {
     if let Some(errno) = FOLLOWED_STAT_ERRNO.with(|seam| seam.get()) {
         return Err(io::Error::from_raw_os_error(errno));
     }
-    fs::metadata(db_path)
+    let metadata = fs::metadata(db_path);
+    #[cfg(test)]
+    if let Some(hook) = AFTER_FOLLOWED_DB_STAT.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+    metadata
 }
 
-/// `e` (its kind kept) with what failed on which path in its text.
+/// An I/O error with what failed on which path (#179): the text names both,
+/// and the original error stays reachable as the [`std::error::Error::source`]
+/// (its `raw_os_error()` included), never flattened into a string.
+#[derive(Debug)]
+struct PathIoError {
+    context: String,
+    source: io::Error,
+}
+
+impl std::fmt::Display for PathIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.context, self.source)
+    }
+}
+
+impl std::error::Error for PathIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// `e` with `context` in its text; its kind is kept and `e` is the source.
+pub(crate) fn io_with_context(e: io::Error, context: String) -> io::Error {
+    io::Error::new(e.kind(), PathIoError { context, source: e })
+}
+
+/// `e` (its kind kept, itself the source) with what failed on which path in
+/// its text.
 fn io_with_path(e: io::Error, what: &str, path: &Path) -> OverlayError {
-    OverlayError::Io(io::Error::new(
-        e.kind(),
-        format!("{what} {}: {e}", path.display()),
-    ))
+    OverlayError::Io(io_with_context(e, format!("{what} {}", path.display())))
 }
 
 /// The overlay database at `db_path` as `Connection::open` would see it:
@@ -298,11 +333,11 @@ fn overlay_db_regular(db_path: &Path, marked: bool) -> Result<Option<fs::Metadat
              created through the symlink: restore its target or remove the symlink",
             db_path.display()
         ))),
-        Err(e) => Err(OverlayError::Io(io::Error::new(
-            e.kind(),
+        Err(e) => Err(OverlayError::Io(io_with_context(
+            e,
             format!(
                 "cannot resolve the overlay database {} (it is neither proved present nor \
-                 missing): {e}",
+                 missing)",
                 db_path.display()
             ),
         ))),
@@ -342,7 +377,8 @@ CREATE TABLE IF NOT EXISTS meta (
 "#;
 
 /// Optional metadata changes. Missing times mean UTIME_OMIT; frontends resolve
-/// UTIME_NOW once per request. Ownership changes are refused with EPERM.
+/// UTIME_NOW once per request. Ownership changes are refused with EPERM;
+/// frontends drop a uid/gid equal to the presented owner first (#327).
 #[derive(Clone, Debug, Default)]
 pub struct OverlayMetadata {
     pub mode: Option<u32>,
@@ -764,6 +800,13 @@ pub enum OverlayMutation {
 /// existing overlay. External host writes are outside this interface.
 pub trait OverlayPolicy: Send + Sync {
     fn check_mutation(&self, op: OverlayMutation, paths: &[&str]) -> io::Result<()>;
+    /// Authorize removing the directory `path`. `exists_in_lower` says whether
+    /// the composed lower view (base plus any `--lower` layers) has `path`;
+    /// a policy may allow removing a directory the overlay itself created.
+    /// Wrappers must forward this method, not `check_mutation(Rmdir)`.
+    fn check_rmdir(&self, path: &str, _exists_in_lower: bool) -> io::Result<()> {
+        self.check_mutation(OverlayMutation::Rmdir, &[path])
+    }
     fn check_write(&self, path: &str, offset: u64, len: u64, current_size: u64) -> io::Result<()>;
     fn bytes_changed(&self, _path: &str, _added: u64, _removed: u64) {}
     fn file_created(&self, _path: &str) {}
@@ -825,6 +868,8 @@ impl Drop for CowReservation<'_> {
 /// Union of a read-only base with a writable overlay folder + deletion DB.
 pub struct WriteOverlay {
     policy: Option<Arc<dyn OverlayPolicy>>,
+    /// Also serializes directory initialization and metadata without a policy.
+    /// Unpoliced payload I/O must not hold this gate (a FIFO open can block).
     policy_gate: Mutex<()>,
     #[cfg(unix)]
     policy_fds: Mutex<PolicyFds>,
@@ -836,6 +881,10 @@ pub struct WriteOverlay {
     /// metadata and the file fsync, before `persist_noclobber`.
     #[cfg(test)]
     cow_before_persist_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    parent_before_create_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(all(test, unix))]
+    parent_before_mode_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     base: Arc<dyn MountSource>,
     /// The classified base this overlay was opened with (`None` for the
     /// legacy constructors). A commit re-points it at the archive it wrote.
@@ -914,6 +963,10 @@ pub struct WriteOverlay {
     /// Set for the duration of remote on-exit so the interval thread cannot start
     /// another PUT while on-exit is waiting.
     interval_suppressed: AtomicBool,
+    /// `--overlay-durability=relaxed` is active on `db` (#328): the marker row
+    /// is recorded and `synchronous=OFF`. Cleared, under `synchronous=FULL`,
+    /// when the overlay drops.
+    relaxed: AtomicBool,
     /// Test-only: after the host rename, before one tombstone attempt (#88).
     /// `Err` fails that attempt. Later attempts still run. The rename returns
     /// success either way, and the in-memory tombstones match the completed
@@ -985,6 +1038,14 @@ impl WriteOverlay {
             .map(|_| self.policy_gate.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// Directory mutations already hold policy_lock when configured. Supply
+    /// the same exclusion without a policy, only for directory/metadata work.
+    fn parent_lock(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        self.policy
+            .is_none()
+            .then(|| self.policy_gate.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// Reserved control name (only while the control folder is served).
     fn is_control_path(&self, path: &str) -> bool {
         self.control_reserved && is_control_reserved_path(path)
@@ -1005,6 +1066,18 @@ impl WriteOverlay {
             let paths: Vec<String> = paths.iter().map(|p| normpath(p)).collect();
             let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
             policy.check_mutation(op, &refs)?;
+        }
+        Ok(())
+    }
+
+    fn check_rmdir_policy(&self, path: &str) -> io::Result<()> {
+        self.refuse_control_path(path)?;
+        if let Some(policy) = &self.policy {
+            let path = normpath(path);
+            // Same source as `mark_deleted`'s `hides_base`: the composed
+            // lower view, so a root a sealed `--lower` provides stays anchored.
+            let exists_in_lower = self.current_base().exists(&path);
+            policy.check_rmdir(&path, exists_in_lower)?;
         }
         Ok(())
     }
@@ -1380,6 +1453,21 @@ impl WriteOverlay {
                     "overlay is sealed; mount it with --lower, or `overlay unseal`".into(),
                 ));
             }
+            // #328: a relaxed mount that did not survive a reboot leaves a
+            // database that may be corrupt; one of this boot (a killed
+            // process) is intact, and its marker is cleared below.
+            let relaxed_marker = crate::relaxed_durability::read_marker(&transaction)?;
+            if let crate::relaxed_durability::MarkerState::Unclean(value) =
+                crate::relaxed_durability::classify(relaxed_marker.as_deref())
+            {
+                return Err(OverlayError::Msg(format!(
+                    "{}; then retry the writable mount",
+                    crate::relaxed_durability::unclean_message(&value)
+                )));
+            }
+            if relaxed_marker.is_some() {
+                crate::relaxed_durability::clear_marker(&transaction)?;
+            }
             crate::overlay_meta::initialize(
                 &transaction,
                 had_files,
@@ -1470,6 +1558,10 @@ impl WriteOverlay {
             cow_before_read_hook: Mutex::new(None),
             #[cfg(test)]
             cow_before_persist_hook: Mutex::new(None),
+            #[cfg(test)]
+            parent_before_create_hook: Mutex::new(None),
+            #[cfg(all(test, unix))]
+            parent_before_mode_hook: Mutex::new(None),
             base,
             identity: Mutex::new(identity.cloned()),
             force_base_mismatch: info.is_some_and(|info| info.force_base_mismatch),
@@ -1501,6 +1593,7 @@ impl WriteOverlay {
             spool: Mutex::new(None),
             persist_count: AtomicU64::new(0),
             interval_suppressed: AtomicBool::new(false),
+            relaxed: AtomicBool::new(false),
             #[cfg(test)]
             rename_before_tx_hook: Mutex::new(None),
             #[cfg(test)]
@@ -1751,11 +1844,16 @@ impl WriteOverlay {
         let hides_base = self.current_base().exists(path);
         let path = normpath(path);
         // The host entry is already gone. Queue instead of returning an error
-        // when older rows are still unsaved or this write fails.
-        self.persist_files_op(PendingFilesOp::Deleted {
-            path: path.clone(),
-            hides_base,
-        })?;
+        // when older rows are still unsaved or this write fails. A name the
+        // lower view lacks needs no tombstone: with no rows of its own there
+        // is nothing to write (#328, see `persist_files_op_unless_redundant`).
+        self.persist_files_op_unless_redundant(
+            PendingFilesOp::Deleted {
+                path: path.clone(),
+                hides_base,
+            },
+            !hides_base,
+        )?;
         if hides_base {
             self.tombstone_remember(&path);
         } else {
@@ -1766,28 +1864,113 @@ impl WriteOverlay {
 
     fn mark_present(&self, path: &str, mode: u32) -> Result<()> {
         let path = normpath(path);
-        self.persist_files_op(PendingFilesOp::Present {
-            path: path.clone(),
-            mode,
-        })?;
+        // Only a regular file the lower view lacks may go without a row
+        // (#328): the commit plan needs the rows of created directories, and
+        // symlinks keep theirs. The host file carries the mode.
+        let overlay_only = mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFREG
+            && !self.current_base().exists(&path);
+        self.persist_files_op_unless_redundant(
+            PendingFilesOp::Present {
+                path: path.clone(),
+                mode,
+            },
+            overlay_only,
+        )?;
         self.tombstone_forget(&path);
         Ok(())
     }
 
     fn ensure_parent(&self, path: &str) -> Result<()> {
+        let _parents = self.parent_lock();
         let (parent, _) = Self::split(path);
         if parent.is_empty() || parent == "/" {
             return Ok(());
         }
         let real_parent = self.realpath(&parent);
         self.ensure_under_root(&real_parent)?;
-        if !real_parent.exists() && self.current_base().is_dir(&parent) {
+        if real_parent.exists() || !self.current_base().is_dir(&parent) {
+            return Ok(());
+        }
+        let mut prefix = String::new();
+        for component in parent.split('/').filter(|c| !c.is_empty()) {
+            prefix.push('/');
+            prefix.push_str(component);
+            let real = self.realpath(&prefix);
+            match fs::symlink_metadata(&real) {
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            self.ensure_under_root(&real)?;
+            #[cfg(test)]
+            {
+                let hook = self.parent_before_create_hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
             #[expect(
                 clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0008-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_parent","disposition":"output-owner","category":"overlay-directory","reason":"Materialize an archive parent directory inside the checked overlay root before a mutation.","creation":{"policy":"recursive-directory","basis":"Only a missing parent represented as a base directory is materialized; host directory creation keeps existing default/umask behavior."}}"###
+                reason = r###"internal-read:v1 {"id":"IR-E0008-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_parent","disposition":"output-owner","category":"overlay-directory","reason":"Materialize an archive parent directory inside the checked overlay root before a mutation.","creation":{"policy":"exclusive-directory","basis":"Create checked ancestors one at a time; only successful mkdir calls initialize the base mode under the mutation gate. Host owner rwx is retained, with the visible mode preserved in overlay metadata when needed."}}"###
             )]
-            fs::create_dir_all(&real_parent)?;
+            let created = fs::create_dir(&real);
+            match created {
+                Ok(()) => self.restore_base_dir_mode(&prefix)?,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    // Another host writer owns this entry, including its mode.
+                    self.ensure_under_root(&real)?;
+                    if !fs::metadata(&real)?.is_dir() {
+                        return Err(e.into());
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
+        Ok(())
+    }
+
+    /// Initialize a newly created parent while holding the mutation gate.
+    /// Restore each level before creating its children (including setgid).
+    /// Host owner rwx is needed for backing storage; preserve a more restrictive
+    /// visible mode using the same metadata overrides as chmod and sealing.
+    fn restore_base_dir_mode(&self, dir: &str) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let base = self.current_base();
+            let Some(mut fi) = base.lookup(dir, 0) else {
+                return Ok(());
+            };
+            self.apply_metadata(dir, &mut fi);
+            if !ratarmount_core::is_dir_mode(fi.mode) {
+                return Ok(());
+            }
+            let mode = fi.mode & 0o7777;
+            #[cfg(test)]
+            {
+                let hook = self.parent_before_mode_hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            let real = self.realpath(dir);
+            self.ensure_under_root(&real)?;
+            if mode & 0o700 != 0o700 {
+                self.db.lock().expect("overlay db").execute(
+                    "INSERT INTO overlay_metadata(path,mode) VALUES (?1,?2)
+                     ON CONFLICT(path) DO UPDATE SET mode=COALESCE(overlay_metadata.mode,excluded.mode)",
+                    params![dir, mode],
+                )?;
+            }
+            set_host_metadata(
+                &real,
+                &OverlayMetadata {
+                    mode: Some(mode | 0o700),
+                    ..Default::default()
+                },
+            )?;
+        }
+        #[cfg(not(unix))]
+        let _ = dir;
         Ok(())
     }
 
@@ -1849,6 +2032,12 @@ impl WriteOverlay {
         self.apply_metadata(path, &mut fi);
         self.remember_base_xattrs(path, self.current_base().as_ref(), &fi)?;
         if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
+            let _parents = self.parent_lock();
+            self.ensure_under_root(&real)?;
+            if fs::symlink_metadata(&real).is_ok() {
+                return Ok(());
+            }
+            self.apply_metadata(path, &mut fi);
             #[expect(
                 clippy::disallowed_methods,
                 reason = r###"internal-read:v1 {"id":"IR-E0009-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_modifiable_inner","disposition":"output-owner","category":"overlay-directory","reason":"Materialize a base directory during copy-on-write and then apply the archived directory metadata.","creation":{"policy":"recursive-directory","basis":"The path passes overlay confinement checks; set_host_metadata restores the base directory metadata after creation."}}"###
@@ -2528,27 +2717,61 @@ impl WriteOverlay {
         }
     }
 
+    /// Create the directory `path` (POSIX `mkdir`).
+    ///
+    /// Any visible entry at `path` (a base or overlay directory, a file, a
+    /// symlink, or `/`) fails with `AlreadyExists` (EEXIST) and is left as it
+    /// was (#316). A tombstoned base entry is not visible, so mkdir over it
+    /// succeeds. As in Linux `mkdir(2)` on a read-only mount, EEXIST takes
+    /// precedence over a read-only policy rule's EROFS for an existing path;
+    /// reserved names are still refused first.
     pub fn mkdir(&self, path: &str, mode: u32) -> Result<()> {
         if is_overlay_internal_path(path) {
             return Err(internal_name_refused(path));
         }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
+        self.refuse_control_path(path)?;
+        self.refuse_existing_mkdir(path)?;
         self.check_mutation(OverlayMutation::Mkdir, &[path])?;
         self.ensure_parent(path)?;
+        let _parents = self.parent_lock();
+        // Without a policy nothing above serializes two mkdirs of one name.
+        self.refuse_existing_mkdir(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
+        if let Some(parent) = real.parent() {
+            self.ensure_under_root(parent)?;
+            // Keep automatic parent creation, but never use recursive mkdir
+            // for the leaf: it accepts a host directory that wins the race
+            // after lookup, letting the losing request change its mode.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-316-MKDIR-PARENTS","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir","disposition":"output-owner","category":"overlay-directory","reason":"Preserve automatic parent creation separately from the exclusive mkdir leaf.","creation":{"policy":"recursive-directory","basis":"The parent is confined under the overlay root; existing parent permissions are unchanged, and new parents retain directory defaults."}}"###
+            )]
+            fs::create_dir_all(parent)?;
+        }
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0014-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir","disposition":"output-owner","category":"overlay-directory","reason":"Create the directory requested by the overlay mkdir operation and mark it present.","creation":{"policy":"recursive-directory","basis":"Confinement/mutation checks precede creation; Unix permissions are explicitly set to caller mode masked to 07777."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-E0014-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir","disposition":"output-owner","category":"overlay-directory","reason":"Exclusively create the directory requested by mkdir before initializing its mode and row.","creation":{"policy":"exclusive-directory","basis":"Confinement/mutation checks precede creation; an existing host leaf returns EEXIST without chmod or row changes, and only our newly created directory receives caller mode masked to 07777."}}"###
         )]
-        fs::create_dir_all(&real)?;
+        fs::create_dir(&real)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&real, fs::Permissions::from_mode(mode & 0o7777))?;
         }
         self.mark_present(path, mode | ratarmount_core::S_IFDIR)?;
+        Ok(())
+    }
+
+    fn refuse_existing_mkdir(&self, path: &str) -> Result<()> {
+        if MountSource::lookup(self, path, 0).is_some() {
+            return Err(OverlayError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("mkdir destination exists: {}", normpath(path)),
+            )));
+        }
         Ok(())
     }
 
@@ -2593,6 +2816,11 @@ impl WriteOverlay {
         } else {
             None
         };
+        // Keep removal and tombstone publication together with mkdir/rmdir,
+        // including without a policy. Otherwise a mkdir over an old tombstone
+        // can finish here and then be hidden by this unlink's late row update.
+        // Acquire after parking so unpoliced descriptor opens hold no gate.
+        let _parents = self.parent_lock();
         let _account = self.account_path(&path);
         // remove_file unlinks symlinks without following them.
         if fs::symlink_metadata(&real).is_ok() {
@@ -2608,7 +2836,8 @@ impl WriteOverlay {
         }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
-        self.check_mutation(OverlayMutation::Rmdir, &[path])?;
+        let _parents = self.parent_lock();
+        self.check_rmdir_policy(path)?;
         self.refuse_sealed_delete(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
@@ -2917,6 +3146,28 @@ impl WriteOverlay {
     /// sleep lets another writer see an empty queue and commit a later rename
     /// that this retry then marks present again.
     fn persist_files_op(&self, op: PendingFilesOp) -> Result<()> {
+        self.persist_files_op_unless_redundant(op, false)
+    }
+
+    /// [`Self::persist_files_op`], skipping the transaction when `op` would
+    /// change nothing a consumer reads (#328).
+    ///
+    /// `overlay_only` is the caller's claim that the lower view has no entry
+    /// at the path: a `Present` of a regular file, or a `Deleted` with
+    /// `hides_base == false`. Such an op is skipped only when, under the
+    /// `pending_rows` lock, the queue is empty (a queued `Present` or
+    /// `Rename` of the same name would otherwise replay into a row with no
+    /// host entry) and the path has no `files` or `overlay_metadata` row and,
+    /// for `Deleted`, no `xattrs` row other than the reset row `Deleted`
+    /// would write back. Every reader of a row-less host file (lookup,
+    /// listing, commit plan, change set, fsck `unrowed`, seal, pack) takes
+    /// its presence and mode from the host entry. A probe error writes the
+    /// row as before. See docs/tasks/plans/issue-328-option-a.md.
+    fn persist_files_op_unless_redundant(
+        &self,
+        op: PendingFilesOp,
+        overlay_only: bool,
+    ) -> Result<()> {
         if let Err(e) = self.replay_pending_rows() {
             log::warn!(
                 "overlay could not replay earlier files rows: {e}; queueing the next update behind them"
@@ -2930,6 +3181,15 @@ impl WriteOverlay {
         let mut pending_op = Some(op);
         let mut last_err = None;
         let mut queued = self.pending_rows.lock().expect("overlay pending rows");
+        if overlay_only && queued.is_empty() {
+            match self.files_op_is_redundant(pending_op.as_ref().expect("files op")) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => log::warn!(
+                    "overlay could not check existing rows ({e}); writing the files update"
+                ),
+            }
+        }
         for attempt in 1..=attempts {
             if !queued.is_empty() {
                 let op = pending_op.take().expect("files op");
@@ -2986,6 +3246,35 @@ impl WriteOverlay {
         );
         queued.push(op);
         Ok(())
+    }
+
+    /// True when `op` is a `Present` or `Deleted` for a path without rows
+    /// (see [`Self::persist_files_op_unless_redundant`]). Caller holds
+    /// `pending_rows`; this takes `db` (documented lock order).
+    fn files_op_is_redundant(&self, op: &PendingFilesOp) -> Result<bool> {
+        let (path, xattrs_sql) = match op {
+            PendingFilesOp::Present { path, .. } => (path, "0"),
+            PendingFilesOp::Deleted {
+                path,
+                hides_base: false,
+            } => (
+                path,
+                "EXISTS(SELECT 1 FROM xattrs WHERE path=?3 AND name<>'')",
+            ),
+            _ => return Ok(false),
+        };
+        let (folder, name) = Self::split(path);
+        let db = self.db.lock().expect("overlay db");
+        let any: bool = db.query_row(
+            &format!(
+                r#"SELECT EXISTS(SELECT 1 FROM "files" WHERE path=?1 AND name=?2)
+                   OR EXISTS(SELECT 1 FROM overlay_metadata WHERE path=?3)
+                   OR {xattrs_sql}"#
+            ),
+            params![folder, name, path],
+            |r| r.get(0),
+        )?;
+        Ok(!any)
     }
 
     /// Write queued rows, retrying a few times. Empty queue is success.
@@ -3276,6 +3565,11 @@ impl WriteOverlay {
         size: Option<u64>,
         attrs: &OverlayMetadata,
     ) -> Result<()> {
+        // A frontend may have removed a same-owner chown. It still needs the
+        // policy and existence checks, without writing metadata or copying up.
+        if size.is_none() && attrs.is_empty() {
+            return self.set_metadata(path, attrs);
+        }
         if !attrs.is_empty() {
             let _policy = self.policy_lock();
             self.check_mutation(OverlayMutation::Write, &[path])?;
@@ -3319,6 +3613,69 @@ impl WriteOverlay {
         crate::overlay_meta::record_base_digest_required(&db, pending, digest, true)
     }
 
+    /// Switch the mount's overlay connection between `synchronous=FULL` and
+    /// the opt-in `synchronous=OFF` (#328, `--overlay-durability`). Relaxed
+    /// first commits the `relaxed_durability` marker under `FULL`, so it is on
+    /// disk before any unsynced write; `Full` (and dropping the overlay)
+    /// restores `FULL` and deletes the marker in a commit whose fsync also
+    /// flushes every earlier relaxed write. No other connection changes.
+    pub fn set_durability(&self, durability: crate::OverlayDurability) -> Result<()> {
+        match durability {
+            crate::OverlayDurability::Full => self.restore_full_durability(),
+            crate::OverlayDurability::Relaxed => {
+                let db = self.db.lock().expect("overlay db");
+                db.execute_batch("PRAGMA synchronous = FULL;")?;
+                db.execute_batch(crate::overlay_meta::META_SCHEMA)?;
+                crate::overlay_meta::OverlayMeta::set(
+                    &db,
+                    crate::relaxed_durability::RELAXED_DURABILITY_KEY,
+                    &crate::relaxed_durability::marker_value(),
+                )?;
+                db.execute_batch("PRAGMA synchronous = OFF;")?;
+                self.relaxed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+    }
+
+    /// The overlay connection's current durability.
+    pub fn durability(&self) -> crate::OverlayDurability {
+        if self.relaxed.load(Ordering::SeqCst) {
+            crate::OverlayDurability::Relaxed
+        } else {
+            crate::OverlayDurability::Full
+        }
+    }
+
+    fn restore_full_durability(&self) -> Result<()> {
+        if !self.relaxed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
+        db.execute_batch("PRAGMA synchronous = FULL;")?;
+        crate::relaxed_durability::clear_marker(&db)?;
+        self.relaxed.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Clean close of a relaxed overlay. A failure leaves the marker, which
+    /// the next open of this boot accepts and clears.
+    fn finish_relaxed_durability(&self) {
+        if let Err(error) = self.restore_full_durability() {
+            log::warn!(
+                "could not clear the relaxed-durability marker of overlay {}: {error}",
+                self.root.display()
+            );
+        }
+    }
+
+    /// Test-only: the overlay connection's `PRAGMA synchronous` level.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn synchronous_level_for_test(&self) -> Result<i64> {
+        let db = self.db.lock().expect("overlay db");
+        crate::relaxed_durability::synchronous_level(&db)
+    }
+
     /// Record one overlay-level `meta` key (for example `readonly_rules`).
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         let db = self.db.lock().expect("overlay db");
@@ -3359,11 +3716,36 @@ impl WriteOverlay {
         }
     }
 
+    /// [`Self::test_hold_open_transaction`] on its own thread, for a serving
+    /// mount (#183): the thread waits until the test creates the ready file's
+    /// path plus `.go` (once the mount is up: requests that need the
+    /// database wait while the transaction is held), then holds it. No-op in
+    /// release builds and without the seam's variable.
+    pub fn spawn_test_hold_open_transaction(self: &Arc<Self>) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(ready) = std::env::var_os("RATARMOUNT_TEST_JOURNAL_HOLD") {
+            let overlay = Arc::clone(self);
+            let mut go = ready;
+            go.push(".go");
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                while !Path::new(&go).exists() {
+                    if std::time::Instant::now() > deadline {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                overlay.test_hold_open_transaction();
+            });
+        }
+    }
+
     /// Change metadata through the same policy gate as data writes. Archive-only
     /// members retain their original read cookie and never copy payload data.
     pub fn set_metadata(&self, path: &str, attrs: &OverlayMetadata) -> Result<()> {
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
+        let _parents = self.parent_lock();
         let path = normpath(path);
         self.check_mutation(OverlayMutation::Write, &[&path])?;
         if is_overlay_internal_path(&path) {
@@ -3441,6 +3823,7 @@ impl WriteOverlay {
         use std::os::unix::fs::PermissionsExt;
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
+        let _parents = self.parent_lock();
         self.check_mutation(OverlayMutation::Write, &[path])?;
         validate_metadata(attrs)?;
         if let Some(mode) = attrs.mode {
@@ -4348,9 +4731,20 @@ impl WriteOverlay {
         let archive_path = self.commit_archive_path(archive);
         let archive = archive_path.as_path();
         self.gate_pending_journal(archive)?;
-        if let Err(e) = self.recover_journal_after_gate(archive) {
-            self.refuse_base_after_commit_failure();
-            return Err(e);
+        if let Err(error) = self.recover_journal_raw(archive, None) {
+            // A refusal (the authorizer or the #150 guard) wrote nothing: it
+            // refuses this commit only and the mount keeps serving (R6-2,
+            // #166). A recovery that could not finish may have written, so
+            // the base is refused until a remount.
+            let wrote = !matches!(
+                error,
+                ratarmount_compress::commit_journal::RecoverError::Refused(_)
+            );
+            let error = self.recover_error(error);
+            if wrote {
+                self.refuse_base_after_commit_failure();
+            }
+            return Err(error);
         }
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
@@ -4794,18 +5188,27 @@ impl WriteOverlay {
         archive: &Path,
         admitted: Option<&crate::MountRecords>,
     ) -> Result<Option<ratarmount_compress::commit_journal::Applied>> {
-        use ratarmount_compress::commit_journal::RecoverError;
         self.recover_journal_raw(archive, admitted)
-            .map_err(|error| match error {
-                RecoverError::Committed(e) => {
-                    self.refuse_base_after_commit_failure();
-                    OverlayError::Msg(format!(
-                        "{e}; the archive holds the committed bytes but the recorded baseline \
+            .map_err(|error| self.recover_error(error))
+    }
+
+    /// A recovery error as this overlay answers it; committed bytes whose
+    /// baseline could not be updated refuse the base until a remount.
+    fn recover_error(
+        &self,
+        error: ratarmount_compress::commit_journal::RecoverError,
+    ) -> OverlayError {
+        use ratarmount_compress::commit_journal::RecoverError;
+        match error {
+            RecoverError::Committed(e) => {
+                self.refuse_base_after_commit_failure();
+                OverlayError::Msg(format!(
+                    "{e}; the archive holds the committed bytes but the recorded baseline \
                      could not be updated (remount required)"
-                    ))
-                }
-                other => OverlayError::Io(other.into_io()),
-            })
+                ))
+            }
+            other => OverlayError::Io(other.into_io()),
+        }
     }
 
     /// The recorded base digest kind and digest, read through the mount's own
@@ -5183,6 +5586,8 @@ impl Drop for WriteOverlay {
         // Recover poisoned locks. A panic here aborts the process.
         // `std::process::exit` skips this; callers drop the overlay first.
         self.replay_pending_on_drop();
+        // After the replay: its writes are covered by the FULL commit below.
+        self.finish_relaxed_durability();
     }
 }
 
@@ -5295,13 +5700,20 @@ pub(crate) fn file_info_from_overlay_meta(
     host: &Path,
     meta: &fs::Metadata,
 ) -> FileInfo {
+    let mut userdata = Vec::new();
     let linkname = if meta.file_type().is_symlink() {
         fs::read_link(host)
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| {
+                userdata.push(UserData::SymlinkTarget(
+                    p.as_os_str().as_encoded_bytes().to_vec(),
+                ));
+                p.to_string_lossy().into_owned()
+            })
             .unwrap_or_default()
     } else {
         String::new()
     };
+    userdata.push(UserData::Other(format!("overlay:{path}")));
     let mut fi = FileInfo {
         size: meta.len(),
         mtime: metadata_mtime_secs(meta) as f64,
@@ -5309,7 +5721,7 @@ pub(crate) fn file_info_from_overlay_meta(
         linkname,
         uid: metadata_uid(meta),
         gid: metadata_gid(meta),
-        userdata: vec![UserData::Other(format!("overlay:{path}"))],
+        userdata,
     };
     #[cfg(unix)]
     {
@@ -7175,14 +7587,22 @@ fn recover_error_to_overlay(
 /// `root` (when it exists) from the locked descriptor before the journal is
 /// unlinked. `authorize` decides under the archive lock. The only offline
 /// recovery: a failed replacement cleans up after itself.
+/// `seen_present`: the entry gate saw the database (`Some(marked)`); see
+/// [`crate::journal_recovery::recover_journal_at_seen`] (#164).
 fn recover_offline(
     archive: &Path,
     root: &Path,
     owner: crate::journal_recovery::Owner<'_>,
+    seen_present: Option<bool>,
 ) -> Result<()> {
-    crate::journal_recovery::recover_journal_at(archive, Some(&root.join(HIDDEN_DB)), owner)
-        .map(|_| ())
-        .map_err(recover_error_to_overlay)
+    crate::journal_recovery::recover_journal_at_seen(
+        archive,
+        &root.join(HIDDEN_DB),
+        owner,
+        seen_present,
+    )
+    .map(|_| ())
+    .map_err(recover_error_to_overlay)
 }
 
 fn append_uncompressed_tar_plan(
@@ -7388,7 +7808,7 @@ fn commit_overlay_locked(
     opts: &CommitOverlayOptions,
 ) -> Result<bool> {
     crate::overlay_db::validate_overlay_state(&write_overlay.join(HIDDEN_DB))?;
-    match overlay_db_entry(write_overlay)? {
+    let required = std::cell::Cell::new(match overlay_db_entry(write_overlay)? {
         DbEntry::Absent => {
             return Err(OverlayError::Msg(format!(
                 "overlay {} has no database; use commit_overlay_raw_dir for a raw directory",
@@ -7396,25 +7816,36 @@ fn commit_overlay_locked(
             )))
         }
         DbEntry::Lost { markers, .. } => return Err(lost_record_error(write_overlay, &markers)),
-        DbEntry::Present { marked, .. } => {
-            ensure_overlay_unsealed_required(write_overlay, marked, write_overlay)?;
-        }
-    }
-    if let Err(refusal) =
-        crate::overlay_gate::check_commit_base_offline(write_overlay, base, archive_file)
-    {
+        DbEntry::Present { marked, .. } => marked,
+    });
+    ensure_overlay_unsealed_required(write_overlay, &required, write_overlay)?;
+    if let Err(refusal) = crate::overlay_gate::check_commit_base_offline_with(
+        write_overlay,
+        base,
+        archive_file,
+        None,
+        &required,
+    ) {
         if !opts.force_base_mismatch || refusal.is_policy() {
             return Err(refusal.into_overlay_error());
         }
         log::warn!("{refusal} (--force-base-mismatch: committing anyway)");
     }
-    commit_overlay_inner(write_overlay, archive_file, Some(base), opts)
+    commit_overlay_inner(
+        write_overlay,
+        archive_file,
+        Some(base),
+        opts,
+        Some(required.get()),
+    )
 }
 
 /// Serializes seal and offline commit for one overlay, including when callers
 /// name different copies of its base. Always acquire before an archive guard.
 /// An O_RDONLY | O_DIRECTORY handle locks the root itself without changing
-/// permissions or creating bookkeeping. Closing the handle releases the flock.
+/// permissions or creating bookkeeping. Dropping the guard unlocks it
+/// explicitly (#187): a child forked meanwhile (tar, git) holds a copy of the
+/// descriptor until it execs, so closing ours alone may not release it.
 pub(crate) struct SealCommitGuard {
     #[cfg(unix)]
     _fd: std::os::fd::OwnedFd,
@@ -7471,6 +7902,22 @@ impl SealCommitGuard {
     }
 }
 
+impl Drop for SealCommitGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the guard owns the descriptor until after this call.
+            if unsafe { libc::flock(self._fd.as_raw_fd(), libc::LOCK_UN) } != 0 {
+                log::warn!(
+                    "releasing the overlay seal/commit lock: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
 #[cfg(all(test, not(unix)))]
 #[test]
 fn regression_nonunix_commit_guard_accepts_unsealed_overlay() {
@@ -7494,24 +7941,23 @@ fn ensure_overlay_unsealed_display(write_overlay: &Path, display_path: &Path) ->
         DbEntry::Lost { markers, .. } => return Err(lost_record_error(write_overlay, &markers)),
         DbEntry::Present { marked, .. } => marked,
     };
-    ensure_overlay_unsealed_required(write_overlay, marked, display_path)
+    ensure_overlay_unsealed_required(write_overlay, &std::cell::Cell::new(marked), display_path)
 }
 
 fn ensure_overlay_unsealed_required(
     write_overlay: &Path,
-    marked: bool,
+    required: &std::cell::Cell<bool>,
     display_path: &Path,
 ) -> Result<()> {
-    if crate::OverlayMeta::read_no_recovery_required(write_overlay, marked)?
-        .as_ref()
-        .is_some_and(crate::OverlayMeta::layer_sealed)
-    {
+    let meta = crate::OverlayMeta::read_no_recovery_required(write_overlay, required)?;
+    if meta.as_ref().is_some_and(crate::OverlayMeta::layer_sealed) {
         return Err(OverlayError::Msg(format!(
             "overlay {} is sealed; mount it with --lower, or `overlay unseal`",
             display_path.display()
         )));
     }
-    Ok(())
+    // #328: never commit a relaxed overlay that did not survive a reboot.
+    crate::relaxed_durability::refuse_unclean(meta.as_ref())
 }
 
 /// What [`commit_overlay_raw_dir`] did.
@@ -7542,33 +7988,41 @@ fn commit_overlay_raw_dir_locked(
 ) -> Result<RawDirCommit> {
     let db = write_overlay.join(HIDDEN_DB);
     crate::overlay_db::validate_overlay_state(&db)?;
-    if let DbEntry::Lost { markers, .. } = overlay_db_entry(write_overlay)? {
-        return Err(lost_record_error(write_overlay, &markers));
-    }
-    if !overlay_db_absent(write_overlay) {
-        return Err(OverlayError::Msg(format!(
-            "overlay database {} exists (or something else is at its path); its base \
-             identity must be checked, so commit it with a classified base \
-             (commit_overlay), not as a raw directory",
-            db.display()
-        )));
+    // One classification (#176): a second one could disagree under a race and
+    // misname an unresolvable entry as an existing database. Its own error
+    // (an unresolvable or non-regular entry) propagates with its own text.
+    match overlay_db_entry(write_overlay)? {
+        DbEntry::Absent => {}
+        DbEntry::Lost { markers, .. } => {
+            return Err(lost_record_error(write_overlay, &markers));
+        }
+        DbEntry::Present { .. } => {
+            return Err(OverlayError::Msg(format!(
+                "overlay database {} exists; its base identity must be checked, so \
+                 commit it with a classified base (commit_overlay), not as a raw directory",
+                db.display()
+            )));
+        }
     }
     if !opts.force_base_mismatch {
         crate::overlay_gate::ensure_journal_is_for_archive(archive_file)
             .map_err(OverlayError::Msg)?;
     }
-    let committed = commit_overlay_inner(write_overlay, archive_file, None, opts)?;
+    let committed = commit_overlay_inner(write_overlay, archive_file, None, opts, None)?;
     Ok(RawDirCommit {
         committed,
         identity_checked: false,
     })
 }
 
+/// `seen_present`: the entry gate saw the overlay database (`Some(marked)`);
+/// `None` for a raw directory (no database).
 fn commit_overlay_inner(
     write_overlay: &Path,
     archive_file: &Path,
     identity: Option<&crate::ClassifiedBase>,
     opts: &CommitOverlayOptions,
+    seen_present: Option<bool>,
 ) -> Result<bool> {
     if !write_overlay.is_dir() {
         return Err(OverlayError::Msg(
@@ -7603,7 +8057,7 @@ fn commit_overlay_inner(
             },
             _ => Owner::Inode,
         };
-        recover_offline(archive_file, write_overlay, owner)?;
+        recover_offline(archive_file, write_overlay, owner, seen_present)?;
     }
     // The one snapshot every write of this commit compares against: the file
     // the gate accepts after recovery (one stat when no identity applies).

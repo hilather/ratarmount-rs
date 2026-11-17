@@ -8,7 +8,7 @@
 //! append-time eviction rule; compaction rewrites the live last lines verbatim.
 
 use super::daemon::validate_name;
-use super::protocol::{one, ApiError, OperationV2, Overlay, VERSION_2};
+use super::protocol::{one, ApiError, OperationV2, Overlay, OverlayDurability, VERSION_2};
 pub use super::state_log::Append;
 #[cfg(test)]
 pub use super::state_log::Fault;
@@ -48,7 +48,9 @@ const RECORD_BYTES: u64 = 4 << 20;
 /// (Keystone N4). A `done` line is at most the per-record cap; the largest
 /// `failed` line (4,096 kept IDs twice and an escaped 8 KiB `mount.log`
 /// excerpt) is about 185 KB. R1b's lower re-check messages are cut to the
-/// same 8 KiB (`lowers::MESSAGE_BYTES`).
+/// same 8 KiB (`lowers::MESSAGE_BYTES`). A finalize `done` line stores the
+/// report, whose `journal_summary` coverage (`complete` and at most the six
+/// fixed `reasons`) adds under 200 bytes; `retained::widest_report` pins it.
 pub const LINE_BOUND: u64 = RECORD_BYTES + (512 << 10);
 /// The answer to a retry of a request cut off by a restart (§5.3).
 pub const INTERRUPTED: &str = "request was cut off by a supervisor restart before it finished; any attempts it created were discarded; retry with a new request_id";
@@ -401,6 +403,7 @@ fn defaults(operation: &OperationV2) -> Vec<(&'static str, Value)> {
             ("readonly_globs", json!(Vec::<String>::new())),
             ("lowers", json!(Vec::<String>::new())),
             ("retain", json!(false)),
+            ("overlay_durability", json!(OverlayDurability::Full)),
         ],
         OperationV2::Finalize { .. } => vec![("pack", json!(false))],
         _ => Vec::new(),

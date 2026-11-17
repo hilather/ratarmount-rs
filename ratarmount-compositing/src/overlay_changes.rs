@@ -193,6 +193,21 @@ impl Entry {
             _ => "file",
         }
     }
+
+    /// Pins need the native target bytes even though the canonical change
+    /// format uses FileInfo's historical UTF-8 representation.
+    #[cfg(unix)]
+    pub(crate) fn symlink_target_bytes(&self) -> &[u8] {
+        self.info
+            .userdata
+            .iter()
+            .rev()
+            .find_map(|data| match data {
+                ratarmount_core::UserData::SymlinkTarget(bytes) => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.target.as_deref().unwrap_or_default())
+    }
     pub fn git_mode(&self) -> u32 {
         if self.mode & S_IFMT == S_IFLNK {
             0o120000
@@ -1116,7 +1131,13 @@ pub fn compare_paths(
     for (path, old, new) in candidates {
         let before = old
             .map(|fi| entry(lower.as_ref().unwrap().clone(), fi, opts, true))
-            .transpose()?;
+            .transpose()
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("{path}: cannot read the base entry: {error}"),
+                )
+            })?;
         let after = new
             .map(|fi| entry(top.clone(), fi, opts, false))
             .transpose()?;
@@ -1147,6 +1168,21 @@ pub fn compare_paths(
     changes.sort_by(|a, b| a.path.cmp(&b.path));
     changes.dedup_by(|a, b| a.path == b.path);
     Ok(changes)
+}
+
+/// The base side of `path` in `lower` as [`compare_paths`] resolves it (no
+/// lookup through a symlinked ancestor, the same hashing), or `None` when
+/// nothing is there. Re-checks a seal's preimage pins (#341).
+#[cfg(unix)]
+pub(crate) fn base_entry(
+    lower: Arc<dyn MountSource>,
+    path: &str,
+    opts: &ChangeOptions,
+) -> io::Result<Option<Entry>> {
+    validate_relative_path(path)?;
+    safe_lookup(lower.as_ref(), path)
+        .map(|fi| entry(lower.clone(), fi, opts, true))
+        .transpose()
 }
 
 fn entry(
@@ -1188,6 +1224,9 @@ fn entry(
             if tag.strip_prefix("overlay-layer:").and_then(|s| s.split_once(':')).is_some_and(|(_, rest)| rest.starts_with("host:")))
     });
     if lower
+        // A metadata-only lower can override this xattr while its bytes still
+        // come from a mutable directory. Such a claim is not a preimage read.
+        && result.source.is_immutable()
         && !replaced_payload
         && kind == S_IFREG
         && opts.normalize == Normalize::Exact
@@ -1259,6 +1298,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join("base")).unwrap();
         fs::write(tmp.path().join("base/a"), b"old\n").unwrap();
+        // Rowed edits create `/a` with 0644; fix the base's mode so a
+        // group-writable umask (0002) does not add a mode change.
+        fs::set_permissions(
+            tmp.path().join("base/a"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
         let base = Arc::new(FolderMountSource::new(tmp.path().join("base")).unwrap());
         (tmp, base)
     }
@@ -1343,6 +1389,52 @@ mod tests {
         assert_eq!(digest, canonical_hash(&rowed, &opts).unwrap());
     }
 
+    /// Regression: fixing comparison fixtures to 0644 must not hide COW mode
+    /// loss or make a real 0664-to-0644 difference disappear from the hash.
+    #[test]
+    fn regression_cow_changes_match_rowed_edits_for_group_writable_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, base) = fixture();
+        fs::set_permissions(tmp.path().join("base/a"), fs::Permissions::from_mode(0o664)).unwrap();
+        let opts = ChangeOptions::default();
+        let cow = edits(tmp.path(), "cow", base.clone(), b"new\n", &opts);
+        assert_eq!(cow.len(), 1);
+        assert_eq!(cow[0].old.as_ref().unwrap().mode, 0o100664);
+        assert_eq!(cow[0].new.as_ref().unwrap().mode, 0o100664);
+        let digest = canonical_hash(&cow, &opts).unwrap();
+
+        let dir = tmp.path().join("rowed");
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+        put(&ov, "/a", b"new\n");
+        drop(ov);
+        let rowed = change_set(&dir, base.clone(), &opts).unwrap();
+        assert_eq!(rowed.len(), 1);
+        assert_eq!(rowed[0].new.as_ref().unwrap().mode, 0o100644);
+        assert_ne!(digest, canonical_hash(&rowed, &opts).unwrap());
+        let ignore_mode = ChangeOptions {
+            ignore_mode: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            canonical_hash(&cow, &ignore_mode).unwrap(),
+            canonical_hash(&rowed, &ignore_mode).unwrap()
+        );
+
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+        ov.set_metadata(
+            "/a",
+            &OverlayMetadata {
+                mode: Some(0o664),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(ov);
+        let rowed = change_set(&dir, base, &opts).unwrap();
+        assert_eq!(rowed[0].new.as_ref().unwrap().mode, 0o100664);
+        assert_eq!(digest, canonical_hash(&rowed, &opts).unwrap());
+    }
+
     /// Regression: between and base-less diff ignored host-only edits on either side.
     #[test]
     fn regression_cow_between_and_without_base() {
@@ -1393,7 +1485,6 @@ mod tests {
         let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         cow_write(&ov, "/lib/f", b"changed");
         drop(ov);
-        fs::set_permissions(dir.join("lib"), fs::Permissions::from_mode(0o755)).unwrap();
         let opts = ChangeOptions::default();
         let changes = change_set(&dir, base.clone(), &opts).unwrap();
         assert_eq!(changes.len(), 1);
@@ -1419,6 +1510,164 @@ mod tests {
             (changes[1].path.as_slice(), changes[1].status),
             (b"lib".as_slice(), Status::Modified)
         );
+    }
+
+    fn host_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// Regression: #326 residual. Directories materialized only as parents
+    /// (COW of `d/b/c/f`) took the daemon's umask, so every level showed up as
+    /// a mode-only Modified entry. Modes no umask produces (0750, setgid 2775,
+    /// 0700) must be copied exactly at every level.
+    #[test]
+    fn regression_326_materialized_parents_keep_base_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, base) = fixture();
+        let b = tmp.path().join("base");
+        fs::create_dir_all(b.join("d/b/c")).unwrap();
+        fs::write(b.join("d/b/c/f"), b"base").unwrap();
+        for (dir, mode) in [("d", 0o750), ("d/b", 0o2775), ("d/b/c", 0o700)] {
+            fs::set_permissions(b.join(dir), fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(host_mode(&b.join(dir)), mode, "{dir}: fixture mode");
+        }
+        let dir = tmp.path().join("overlay");
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+        cow_write(&ov, "/d/b/c/f", b"changed");
+        drop(ov);
+        for (sub, mode) in [("d", 0o750), ("d/b", 0o2775), ("d/b/c", 0o700)] {
+            assert_eq!(host_mode(&dir.join(sub)), mode, "{sub}: materialized mode");
+        }
+        let opts = ChangeOptions::default();
+        let changes = change_set(&dir, base.clone(), &opts).unwrap();
+        let paths: Vec<_> = changes.iter().map(|c| c.path.as_slice()).collect();
+        assert_eq!(paths, [b"d/b/c/f".as_slice()]);
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+        cow_write(&ov, "/d/b/c/f", b"base");
+        drop(ov);
+        assert!(change_set(&dir, base, &opts).unwrap().is_empty());
+    }
+
+    /// Regression: #326 residual. `mkdir t/agent`, a file in it, then
+    /// `rm -rf t/agent` left `t` (0750 in the base) as a mode-only change
+    /// because creating `t/agent` materialized `t` with the daemon's umask.
+    /// An explicit chmod of `t` must still be a change.
+    #[test]
+    fn regression_326_removed_child_leaves_no_parent_mode_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, base) = fixture();
+        let t = tmp.path().join("base/t");
+        fs::create_dir(&t).unwrap();
+        fs::write(t.join("keep.t"), b"base").unwrap();
+        fs::set_permissions(&t, fs::Permissions::from_mode(0o750)).unwrap();
+        let dir = tmp.path().join("overlay");
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+        ov.mkdir("/t/agent", 0o755).unwrap();
+        put(&ov, "/t/agent/x.t", b"1\n");
+        assert_eq!(host_mode(&dir.join("t")), 0o750);
+        ov.unlink("/t/agent/x.t").unwrap();
+        ov.rmdir("/t/agent").unwrap();
+        drop(ov);
+        let opts = ChangeOptions::default();
+        assert!(change_set(&dir, base.clone(), &opts).unwrap().is_empty());
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+        ov.set_metadata(
+            "/t",
+            &OverlayMetadata {
+                mode: Some(0o755),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(ov);
+        let changes = change_set(&dir, base, &opts).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            (changes[0].path.as_slice(), changes[0].status),
+            (b"t".as_slice(), Status::Modified)
+        );
+        assert_eq!(changes[0].new.as_ref().unwrap().mode & 0o7777, 0o755);
+    }
+
+    /// Regression: #326 residual. A base directory without owner rwx (0555)
+    /// must remain writable as backing storage without becoming a visible
+    /// mode change. Metadata overrides and a read-only lower retain their
+    /// visible modes too, including across reopening the writer.
+    #[test]
+    fn regression_326_write_protected_base_parent_stays_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        for (mode, lower) in [(0o555, false), (0o500, false), (0o550, true)] {
+            let (tmp, base) = fixture();
+            let mut ro = tmp.path().join("base/ro");
+            if !lower {
+                fs::create_dir(&ro).unwrap();
+                fs::write(ro.join("f"), b"base").unwrap();
+                fs::set_permissions(&ro, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            let base: Arc<dyn MountSource> = if lower {
+                let lower_dir = tmp.path().join("lower");
+                ro = lower_dir.join("ro");
+                let ov = WriteOverlay::new_for_tests(base.clone(), &lower_dir).unwrap();
+                ov.mkdir("/ro", 0o755).unwrap();
+                put(&ov, "/ro/f", b"base");
+                ov.set_metadata(
+                    "/ro",
+                    &OverlayMetadata {
+                        mode: Some(0o2550),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                drop(ov);
+                Arc::new(ReadOnlyOverlayLayer::new(base, lower_dir, Immutability::Shared).unwrap())
+            } else {
+                base
+            };
+            let visible = if lower { 0o2550 } else { mode };
+            let dir = tmp.path().join("overlay");
+            let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+            // Existing time-only rows must gain the saved mode, retaining time.
+            ov.set_metadata(
+                "/ro",
+                &OverlayMetadata {
+                    mtime: Some(42.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            put(&ov, "/ro/new", b"x");
+            cow_write(&ov, "/ro/f", b"changed");
+            assert_eq!(ov.lookup("/ro", 0).unwrap().mode & 0o7777, visible);
+            drop(ov);
+            assert_eq!(host_mode(&dir.join("ro")), visible | 0o700);
+            let conn = Connection::open(dir.join(HIDDEN_DB)).unwrap();
+            let saved: (u32, f64) = conn
+                .query_row(
+                    "SELECT mode,mtime FROM overlay_metadata WHERE path='/ro'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(saved, (visible, 42.0));
+            drop(conn);
+            let opts = ChangeOptions::default();
+            let changes = change_set(&dir, base.clone(), &opts).unwrap();
+            assert_eq!(
+                changes
+                    .iter()
+                    .map(|c| c.path.as_slice())
+                    .collect::<Vec<_>>(),
+                [b"ro/f".as_slice(), b"ro/new".as_slice()]
+            );
+            let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+            cow_write(&ov, "/ro/f", b"base");
+            ov.unlink("/ro/new").unwrap();
+            drop(ov);
+            assert!(change_set(&dir, base, &opts).unwrap().is_empty());
+            assert_eq!(host_mode(&ro), visible, "base/lower must be untouched");
+            fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     /// Regression: host walking followed symlinks or exposed staging and bookkeeping entries.
@@ -1879,6 +2128,7 @@ mod tests {
         inner: Arc<dyn MountSource>,
         opens: Arc<AtomicUsize>,
         cached: bool,
+        immutable: bool,
     }
     impl MountSource for Counting {
         fn list(&self, path: &str) -> Option<ListResult> {
@@ -1892,7 +2142,7 @@ mod tests {
             self.inner.open(fi, buffering)
         }
         fn is_immutable(&self) -> bool {
-            self.inner.is_immutable()
+            self.immutable
         }
         fn get_xattr(&self, _: &FileInfo, key: &str) -> Option<Vec<u8>> {
             (self.cached && key == "user.hash.sha256").then(|| {
@@ -1913,6 +2163,7 @@ mod tests {
             inner: base,
             opens: count.clone(),
             cached: false,
+            immutable: false,
         });
         let dir = tmp.path().join("overlay");
         let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
@@ -1931,33 +2182,37 @@ mod tests {
         assert_eq!(count.load(Ordering::Relaxed), 0);
         assert_eq!(TOP_OPENS.get(), 0);
     }
-    /// Regression: cached lower SHA-256 avoids reads only for exact SHA-256.
+    /// Regression: cached lower SHA-256 avoids reads only for immutable
+    /// sources and exact SHA-256; a mutable source must read its bytes.
     #[test]
     fn regression_changes_cached_lower_hash() {
-        let (tmp, source) = fixture();
-        let count = Arc::new(AtomicUsize::new(0));
-        let base: Arc<dyn MountSource> = Arc::new(Counting {
-            inner: source,
-            opens: count.clone(),
-            cached: true,
-        });
-        let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
-        put(&ov, "/a", b"new");
-        drop(ov);
-        count.store(0, Ordering::Relaxed);
-        change_set(&dir, base.clone(), &ChangeOptions::default()).unwrap();
-        assert_eq!(count.load(Ordering::Relaxed), 0);
-        change_set(
-            &dir,
-            base,
-            &ChangeOptions {
-                normalize: Normalize::Strict,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert!(count.load(Ordering::Relaxed) > 0);
+        for immutable in [false, true] {
+            let (tmp, source) = fixture();
+            let count = Arc::new(AtomicUsize::new(0));
+            let base: Arc<dyn MountSource> = Arc::new(Counting {
+                inner: source,
+                opens: count.clone(),
+                cached: true,
+                immutable,
+            });
+            let dir = tmp.path().join("overlay");
+            let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
+            put(&ov, "/a", b"new");
+            drop(ov);
+            count.store(0, Ordering::Relaxed);
+            change_set(&dir, base.clone(), &ChangeOptions::default()).unwrap();
+            assert_eq!(count.load(Ordering::Relaxed), usize::from(!immutable));
+            change_set(
+                &dir,
+                base,
+                &ChangeOptions {
+                    normalize: Normalize::Strict,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(count.load(Ordering::Relaxed) > 0);
+        }
     }
     /// Regression: gitignore globs respect anchoring, directory-only rules, classes and globstars.
     #[test]
@@ -2236,12 +2491,13 @@ mod tests {
             inner: source,
             opens: Arc::new(AtomicUsize::new(0)),
             cached: true,
+            immutable: true,
         });
         let lower_dir = tmp.path().join("lower");
         let ov = WriteOverlay::new_for_tests(base.clone(), &lower_dir).unwrap();
         put(&ov, "/a", b"prepared");
         drop(ov);
-        let lower = crate::compose_stack(base, &[(lower_dir, Immutability::Shared)]).unwrap();
+        let lower = crate::compose_stack(base, &[(lower_dir, Immutability::Immutable)]).unwrap();
         let top = tmp.path().join("top");
         let ov = WriteOverlay::new_for_tests(lower.clone(), &top).unwrap();
         put(&ov, "/a", b"old\n");

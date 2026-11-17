@@ -7,6 +7,9 @@ mod atomic_update;
 mod attribute_mapping;
 pub mod budget;
 pub mod db_inodes;
+pub mod held_lock;
+#[cfg(target_os = "linux")]
+pub mod owner_socket;
 mod quiet_print;
 mod redact;
 pub use atomic_update::{try_update_u64, try_update_usize};
@@ -401,6 +404,9 @@ pub struct SQLiteIndexedTarUserData {
 #[derive(Clone, Debug)]
 pub enum UserData {
     Tar(SQLiteIndexedTarUserData),
+    /// Native symlink target bytes for integrity checks. Kept separately
+    /// from FileInfo::linkname's historical lossy UTF-8 representation.
+    SymlinkTarget(Vec<u8>),
     /// Opaque payload for other backends until typed.
     Other(String),
 }

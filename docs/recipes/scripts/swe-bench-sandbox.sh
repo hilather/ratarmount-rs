@@ -19,11 +19,10 @@ fi
 mountpoint="$work/task"
 overlay="$work/attempt-overlay"
 mkdir "$mountpoint"
-cleanup() { "$ratarmount_bin" -u "$mountpoint" >/dev/null 2>&1 || true; }
 mount_pid=
 cleanup() { "$ratarmount_bin" -u "$mountpoint" >/dev/null 2>&1 || true; if [[ -n "$mount_pid" ]]; then wait "$mount_pid" 2>/dev/null || true; fi; rm -rf "$work"; }
 trap cleanup EXIT
-"$ratarmount_bin" --git-synthetic-head -w "$overlay" --overlay-readonly 'tests/**' "$source" "$mountpoint" &
+"$ratarmount_bin" -f --git-synthetic-head -w "$overlay" --overlay-readonly 'tests/**' "$source" "$mountpoint" &
 mount_pid=$!
 for _ in {1..100}; do
     mountpoint -q "$mountpoint" && break
@@ -32,6 +31,12 @@ for _ in {1..100}; do
 done
 mountpoint -q "$mountpoint" || { echo 'mount did not become ready' >&2; exit 1; }
 printf 'agent result\n' > "$mountpoint/result.txt"
-"$ratarmount_bin" diff "$overlay" --base "$source" --git > "$work/attempt.patch"
+"$ratarmount_bin" -u "$mountpoint"
+wait "$mount_pid"
+mount_pid=
+# diff exits 1 when it finds changes; other failures must still fail the recipe.
+status=0
+"$ratarmount_bin" diff "$overlay" --base "$source" --git > "$work/attempt.patch" || status=$?
+[[ "$status" == 1 ]] || { echo "expected diff changes, got exit $status" >&2; exit 1; }
 grep -q '^+agent result$' "$work/attempt.patch"
 echo "patch: $work/attempt.patch"

@@ -298,13 +298,37 @@ The complete status against the Python original is in the
 3. **7z solids.** AES+LZMA2 and BCJ/Delta+LZMA2 solids are progressive with a
    window cache but have no dictionary-reset resume; BCJ2 and multi-pack
    folders still decompress whole. The first read of a late member in a
-   multi-GB solid archive is slow.
+   multi-GB solid archive is slow. `--hashes` digests of members of a solid
+   folder are reported by the mount (`getfattr`, the payload cache) but not by
+   `find --hashes`, hash predicates in `find --xattr`, FTS search or `export-index`, whose index rows share one
+   `offsetheader` per solid folder. An index built with `--hashes` before the
+   #320 fix holds the last member's digest for the whole folder; it is not
+   reported, and `ratarmount --recreate-index --hashes sha256 ARCHIVE` stores
+   each member's own digest. Warm hash fills require each member's recorded
+   slot and requested key; a partial hashing pass does not count missing hashes
+   as kept. Old prepared FTS tables containing shared hashes must be rebuilt
+   with `ratarmount find --fts PATTERN ARCHIVE` before read-only searches.
+   Pack offsets at or above 2^61 bytes are refused to keep real offsets separate
+   from synthetic xattr slots. The Python-compatible `files`/`xattrs` layout
+   is unchanged; Python does not resolve the Rust per-member slots, and the
+   additive `sevenzip_member_xattrs` binding table is ignored by Python.
 4. **Writes.** ZIP commits rebuild the archive and cannot handle encrypted or
    multi-part ZIPs. Live commits cover uncompressed TAR and `.tar.zst` only
    and refuse to touch members in earlier zstd frames; the offline commit is
    the escape hatch. Gzip, bzip2 and xz TARs commit offline through GNU tar.
    Create-if-missing offline is uncompressed `.tar` only. Details in
-   [Writing into archives](write-overlay.md#known-limits).
+   [Writing into archives](write-overlay.md#known-limits). The opt-in
+   `--overlay-durability=relaxed` skips overlay database fsyncs and cannot be
+   combined with archive commits; explicit `full` retains commit support.
+   After a machine failure, a leftover relaxed marker requires
+   `overlay fsck --repair` before reuse. See
+   [Relaxed overlay durability](sandbox.md#relaxed-overlay-durability).
+   [Patch import](sandbox.md#overlay-import) accepts Git binary literals and
+   deltas; deltas require full SHA-1/SHA-256 index ids, a regular-file preimage
+   and sizes within `--max-patch-bytes`.
+   The supervisor accepts `sandbox new --overlay-durability relaxed` and
+   refuses to finalize an attempt with a foreign/unknown-boot marker; discard
+   that attempt. See [relaxed attempts](sandbox.md#relaxed-attempts).
 5. **Platforms.** Linux and macOS on Apple silicon. No Intel macOS package (no
    CI runner), no Windows CLI. The library crates compile on Windows.
 6. **Tensor manifests.** Local regular files only; no scheme paths, overlapping

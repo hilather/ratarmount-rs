@@ -83,7 +83,7 @@ smbclient //127.0.0.1/ratarmount -p 20445 -N -c 'get member -'
 | Item | Behavior |
 |------|----------|
 | Ops | NEGOTIATE, SESSION_SETUP (guest or `RATARMOUNT_SMB_USER`/`RATARMOUNT_SMB_PASSWORD`), TREE_CONNECT, CREATE (lease + durable-handle-v1 contexts), READ, WRITE, QUERY_DIRECTORY, CLOSE, QUERY_INFO, LEASE_BREAK / ACK |
-| Writes | CREATE-mkdir / WRITE / SET_INFO / DELETE only with `-w` |
+| Writes | CREATE-mkdir / WRITE / SET_INFO / DELETE only with `-w`. Directory `FILE_OPEN_IF` opens a concurrent mkdir winner with `FILE_OPENED`; `FILE_CREATE` remains exclusive. |
 | Guest | Password unset: unsigned; `smbclient -N` is the bar. Username match only if `RATARMOUNT_SMB_USER` is set. Guest picks 2.1 when offered (`CAP_LEASING`); 2.0.2-only stays 2.0.2 without leases. 3.1.1-only still unsigned (no encryption) |
 | Password / signing | `RATARMOUNT_SMB_PASSWORD` set: NTLMv2 NT proof required; `SIGNING_REQUIRED`; HMAC-SHA256 (2.0.2) or AES-CMAC (3.1.1) after SESSION_SETUP. Guest `-N` is off |
 | Encryption / SMB 3.1.1 | 3.1.1 preauth SHA-512 when that dialect is selected. AES-128-GCM (prefer) / CCM transform when the client offers an encryption context **and** a password is set. Guest encryption is residual |

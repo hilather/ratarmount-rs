@@ -118,6 +118,13 @@ ratarmount find --offset-order '*.fits' archive.tar # results in archive order, 
 ratarmount find --xattr train_ok=false traces.tar.zst   # by provenance attribute
 ```
 
+For solid 7z archives, content hashes are available through mount xattrs;
+index-only searches omit hashes stored at shared pack offsets, including
+`find --xattr hash.sha256=...`. Rebuild an older hashed index with
+`ratarmount --no-mount --recreate-index --hashes sha256 archive.7z`.
+If a read-only FTS search reports ambiguous shared hashes, stop workers and
+run `ratarmount find --fts PATTERN archive.7z` to rebuild FTS before reuse.
+
 A mounted archive answers the same question through its control interface:
 
 ```bash
@@ -180,8 +187,8 @@ ZIP. Live commits (on exit or on an interval) support uncompressed TAR and
 `.tar.zst`, rewriting only the last zstd frame. Everything about overlays,
 including the safety rules and what happens on a crash, is in
 [Writing into archives](write-overlay.md). Policies for untrusted writers
-(`--overlay-readonly`, `--overlay-quota`, `--sandbox`) are in
-[Sandboxes](sandbox.md).
+(`--overlay-readonly`, `--overlay-quota`, `--sandbox`) and fast throwaway
+overlays (`--overlay-durability=relaxed`) are in [Sandboxes](sandbox.md).
 
 ### Agent attempts and grading
 
@@ -194,6 +201,10 @@ layer, syncs it and prints a report (`--pack` adds a bundle). An attempt
 created with `sandbox new --retain` is then kept in the state directory's
 `retained/ID`, where later attempts over TAR or Git bases can stack on it,
 including after a daemon restart restores it.
+Use `sandbox new --overlay-durability relaxed` for disposable attempts that
+can tolerate loss after a machine crash. Finalize refuses a leftover
+foreign/unknown-boot marker; destroy that attempt. Cleanly finalized retained
+layers have full durability. See [relaxed attempts](sandbox.md#relaxed-attempts).
 [Finalize](sandbox.md#finalize) covers its scope (Linux; local TAR, directory
 and Git bases) and the storage it needs.
 
@@ -204,9 +215,12 @@ then be shared across independent writable attempts:
 ratarmount snapshot repo@HEAD base.tar.zst --with-index --json
 ratarmount overlay import --no-seal prepared.patch prepared base.tar.zst
 ratarmount overlay seal prepared
-ratarmount --lower prepared -w attempt base.tar.zst mnt/
+ratarmount -f --lower prepared -w attempt base.tar.zst mnt/ &
+mount_pid=$!
+# Wait for mount readiness before editing (see the checkpoint recipe).
 # Run the agent and its edits through mnt/ before unmounting.
 ratarmount -u mnt/
+wait "$mount_pid"  # flush queued writes and release the overlay lock
 ratarmount overlay fsck attempt --repair
 ratarmount overlay seal attempt
 ratarmount overlay info attempt --json
@@ -219,6 +233,11 @@ ratarmount overlay pack attempt attempt.tar.zst --include-index
 ratarmount overlay unpack attempt.tar.zst restored
 ratarmount overlay verify restored
 ```
+
+The patch importer accepts `git diff --binary --full-index` output, including
+binary delta sections for modified fixtures. Delta sections require full SHA-1
+or SHA-256 index ids and verify both the merged preimage and the result. See
+[Overlay import](sandbox.md#overlay-import) for limits and `--reject` behavior.
 
 `overlay unseal restored --i-know` explicitly makes a sealed copy writable again.
 For a stopped kernel overlayfs upperdir, use
@@ -239,6 +258,10 @@ ratarmount journal summarize next-attempt.journal.jsonl --json
 
 The runner needs Linux FUSE and a local Docker/Podman runtime. Its own exit 0
 means the pipeline completed; inspect JSON `exit_code` for the container result.
+Journal summaries include [coverage and completeness](sandbox.md#coverage-and-completeness).
+An incomplete summary cannot establish observed zero; `journal_summary: null`
+means observation was disabled. Missing read records remain inconclusive even
+when coverage is complete.
 For turn boundaries during a journaled mount, use
 `ratarmount journal mark mnt 'turn 1'`. See the
 [offline worked example and reference](sandbox.md) for scratch-fixture setup,
@@ -286,6 +309,12 @@ in `/etc/fuse.conf` and mount with `-o allow_other`. `-o uid=,gid=,umask=`
 present the tree with different ownership without changing the archive.
 
 ## Stopping a mount
+
+Unmounting detaches the kernel mount before the server finishes flushing its
+overlay. Before offline `overlay fsck`, `seal`, `info`, `diff`, or `pack`, wait
+for the serving process to exit. Scripts can run `-f` in the background and
+wait for its saved PID after unmounting; a daemonized overlay otherwise reports
+"in use" until shutdown finishes. See the [shutdown and retry guidance](sandbox.md#hard-links-of-the-overlay-database).
 
 `ratarmount -u mnt/` retries `fusermount3 -u` for about a second while the mount
 is busy; desktop watchers (gvfsd-trash, gvfs-udisks2-volume-monitor) probe every

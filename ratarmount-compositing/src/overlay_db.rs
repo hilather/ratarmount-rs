@@ -103,7 +103,7 @@ pub(crate) struct OverlayStateError(pub(crate) String);
 
 /// Whether an error reports a strict overlay-state policy refusal.
 ///
-/// Several journal error types intentionally do not expose a source, and
+/// Some journal error types do not expose a source, and
 /// transparent I/O wrappers can skip their inner error's own identity.
 pub fn is_overlay_state_error(error: &(dyn std::error::Error + 'static)) -> bool {
     if error.is::<OverlayStateError>() {
@@ -518,6 +518,53 @@ fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     file_id(a) == file_id(b)
 }
 
+/// The libtest `--exact` filter naming the child test `child` (#159): the
+/// path is the function's own, so a renamed or moved child is a compile
+/// error here instead of a filter that silently matches no test.
+#[cfg(all(test, unix))]
+pub(crate) fn child_test_filter<F: Fn()>(child: F) -> String {
+    let full = std::any::type_name_of_val(&child);
+    let (_crate, path) = full
+        .split_once("::")
+        .unwrap_or_else(|| panic!("child test path without a crate: {full}"));
+    path.to_owned()
+}
+
+/// Run `child` (a no-op test unless `env` is set) in a child of this test
+/// binary with `env=db`; the child must exit successfully and its stdout
+/// must contain one of `markers`, which is returned.
+#[cfg(all(test, unix))]
+fn run_probe_child<F: Fn()>(
+    child: F,
+    env: &str,
+    db: &Path,
+    markers: &[&'static str],
+) -> &'static str {
+    let filter = child_test_filter(child);
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &filter, "--nocapture", "--test-threads=1"])
+        .env(env, db)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "probe child {filter} failed ({}): {stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    markers
+        .iter()
+        .copied()
+        .find(|marker| stdout.contains(marker))
+        .unwrap_or_else(|| {
+            panic!(
+                "probe child {filter} printed none of {markers:?} (did the filter \
+                 match no test?): {stdout}"
+            )
+        })
+}
+
 /// Set by [`lock_probe_is_busy`] for the child it spawns.
 #[cfg(all(test, unix))]
 pub(crate) const BEGIN_IMMEDIATE_PROBE_ENV: &str = "RATARMOUNT_TEST_BEGIN_IMMEDIATE_PROBE";
@@ -527,27 +574,12 @@ pub(crate) const BEGIN_IMMEDIATE_PROBE_ENV: &str = "RATARMOUNT_TEST_BEGIN_IMMEDI
 /// when that statement itself reports busy. The child must exit successfully.
 #[cfg(all(test, unix))]
 pub(crate) fn lock_probe_is_busy(db: &Path) -> bool {
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "overlay_db::tests::begin_immediate_probe_child",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(BEGIN_IMMEDIATE_PROBE_ENV, db)
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "probe child failed: {stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if stdout.contains("PROBE:busy") {
-        return true;
-    }
-    assert!(stdout.contains("PROBE:acquired"), "probe child: {stdout}");
-    false
+    run_probe_child(
+        tests::begin_immediate_probe_child,
+        BEGIN_IMMEDIATE_PROBE_ENV,
+        db,
+        &["PROBE:busy", "PROBE:acquired"],
+    ) == "PROBE:busy"
 }
 
 /// Set by [`other_process_sees_lock`] for the child it spawns.
@@ -561,27 +593,12 @@ pub(crate) const GETLK_PROBE_ENV: &str = "RATARMOUNT_TEST_GETLK_PROBE";
 /// file can be probed. The child opens the file read-only and writes nothing.
 #[cfg(all(test, unix))]
 pub(crate) fn other_process_sees_lock(db: &Path) -> bool {
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "overlay_db::tests::getlk_probe_child",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(GETLK_PROBE_ENV, db)
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "probe child failed: {stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if stdout.contains("GETLK:locked") {
-        return true;
-    }
-    assert!(stdout.contains("GETLK:unlocked"), "probe child: {stdout}");
-    false
+    run_probe_child(
+        tests::getlk_probe_child,
+        GETLK_PROBE_ENV,
+        db,
+        &["GETLK:locked", "GETLK:unlocked"],
+    ) == "GETLK:locked"
 }
 
 fn acquired_error(db: &Path, refusal: checked_open::Refusal) -> OverlayDbError {
@@ -878,7 +895,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "overlay_db::tests::hot_journal_writer_child",
+                &child_test_filter(hot_journal_writer_child),
                 "--nocapture",
             ])
             .env("RATARMOUNT_TEST_HOT_JOURNAL", &db)
@@ -1183,34 +1200,10 @@ mod tests {
         assert!(!is_db_inode(id_a), "deregistered with the connection");
     }
 
-    /// Set by [`regression_open_overlay_db_keeps_other_connections_locks`]
-    /// for the child it spawns.
-    const PROBE_DB_ENV: &str = "RATARMOUNT_TEST_OVERLAY_DB_LOCK_PROBE";
-
-    /// The child half of the lock regression: try to take the write lock
-    /// without waiting and print what happened. A no-op unless spawned.
-    #[test]
-    fn overlay_db_lock_probe_child() {
-        let Some(db) = std::env::var_os(PROBE_DB_ENV) else {
-            return;
-        };
-        let conn = Connection::open(db).unwrap();
-        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
-        match conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (2); COMMIT") {
-            Ok(()) => println!("PROBE:acquired"),
-            Err(rusqlite::Error::SqliteFailure(e, _))
-                if e.code == rusqlite::ErrorCode::DatabaseBusy =>
-            {
-                println!("PROBE:busy")
-            }
-            Err(e) => println!("PROBE:error {e}"),
-        }
-    }
-
     /// The child half of [`lock_probe_is_busy`]: `BEGIN IMMEDIATE` alone, so
     /// a busy result is the lock statement's own. A no-op unless spawned.
     #[test]
-    fn begin_immediate_probe_child() {
+    pub(super) fn begin_immediate_probe_child() {
         let Some(db) = std::env::var_os(BEGIN_IMMEDIATE_PROBE_ENV) else {
             return;
         };
@@ -1235,7 +1228,7 @@ mod tests {
 
     /// The child half of [`other_process_sees_lock`]. A no-op unless spawned.
     #[test]
-    fn getlk_probe_child() {
+    pub(super) fn getlk_probe_child() {
         use std::os::fd::AsRawFd;
         let Some(db) = std::env::var_os(GETLK_PROBE_ENV) else {
             return;
@@ -1287,24 +1280,15 @@ mod tests {
         ] {
             drop(open_overlay_db(&db, flags, DbName::Path).unwrap());
         }
-        assert!(lock_probe_is_busy(&db), "BEGIN IMMEDIATE alone is busy");
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "overlay_db::tests::overlay_db_lock_probe_child",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(PROBE_DB_ENV, &db)
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        // `BEGIN IMMEDIATE` itself must report busy in another process,
+        // and that child must exit successfully (#159).
         assert!(
-            stdout.contains("PROBE:busy"),
+            lock_probe_is_busy(&db),
             "a second process must still see the holder's write lock after \
-             open_overlay_db; child stdout: {stdout}\nstderr: {}",
-            String::from_utf8_lossy(&output.stderr)
+             open_overlay_db"
         );
         holder.execute_batch("COMMIT").unwrap();
+        // Control: the same probe acquires once the holder released it.
+        assert!(!lock_probe_is_busy(&db), "probe acquires after COMMIT");
     }
 }

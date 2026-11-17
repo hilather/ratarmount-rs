@@ -95,7 +95,8 @@ pub(super) fn host_identity(result: io::Result<libc::utsname>) -> io::Result<Hos
     let value = result.map_err(|e| io::Error::other(format!("uname failed: {e}")))?;
     // Bound each field even for malformed input; nodename is deliberately omitted.
     let text = |name, p: &[libc::c_char]| -> io::Result<String> {
-        let bytes: Vec<u8> = p.iter().map(|&c| c as u8).collect();
+        // `c_char` is `i8` on x86_64 and `u8` on aarch64; reinterpret the byte either way.
+        let bytes: Vec<u8> = p.iter().map(|&c| c.to_ne_bytes()[0]).collect();
         CStr::from_bytes_until_nul(&bytes)
             .map(|s| s.to_string_lossy().into_owned())
             .map_err(|_| io::Error::other(format!("uname field {name} missing NUL terminator")))
@@ -571,6 +572,37 @@ mod tests {
             );
         }
     }
+    // Regression: uname bytes with the high bit set survive either signed or unsigned c_char.
+    #[test]
+    fn regression_bench_uname_preserves_non_ascii_bytes() {
+        // SAFETY: utsname contains only c_char arrays, for which zero is valid.
+        let mut value: libc::utsname = unsafe { std::mem::zeroed() };
+        for field in [
+            &mut value.sysname[..],
+            &mut value.release[..],
+            &mut value.version[..],
+            &mut value.machine[..],
+        ] {
+            for (slot, &byte) in field
+                .iter_mut()
+                .zip(b"A\xc3\xa9\xf0\x9f\xa6\x80\xff\0ignored")
+            {
+                *slot = libc::c_char::from_ne_bytes([byte]);
+            }
+        }
+        value.nodename.fill(1);
+        let host = host_identity(Ok(value)).unwrap();
+        assert_eq!(
+            serde_json::to_value(host).unwrap(),
+            json!({
+                "sysname": "Aé🦀\u{fffd}",
+                "release": "Aé🦀\u{fffd}",
+                "version": "Aé🦀\u{fffd}",
+                "machine": "Aé🦀\u{fffd}",
+            })
+        );
+    }
+
     fn records(dir: &Path, kind: RuntimeKind) -> (OwnedFd, Value, Vec<schedule::Entry>) {
         let bytes = serde_json::to_vec(&super::super::tests::fixture()).unwrap();
         let entries = schedule::build(&bytes, &super::super::Selection::default()).unwrap();

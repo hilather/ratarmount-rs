@@ -1849,10 +1849,26 @@ mod tests {
 mod hub_handoff_tests {
     use super::*;
 
+    /// The payload root is checked as a private cache directory, which a
+    /// default temporary directory is not under a group-writable umask (0002).
+    #[cfg(unix)]
+    fn private_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
+    #[cfg(not(unix))]
+    fn private_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
     /// Regression: reopening a completed cache pathname could hand passthrough an unverified replacement.
     #[test]
     fn regression_range_cache_backing_fd_survives_complete_path_replacement() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let cache = RangeCache::with_dirs(dir.path().join("range-v1"), dir.path().into(), 1024, 4);
         let token = ContentToken::Sha256 {
             sha256: crate::sha256_hex(b"original"),
@@ -1873,7 +1889,7 @@ mod hub_handoff_tests {
     /// Regression: handing a whole file to the Hub left chunks and a complete copy under the shared budget.
     #[test]
     fn regression_range_cache_hub_handoff_removes_only_its_identity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let cache = RangeCache::with_dirs(dir.path().join("range-v1"), dir.path().into(), 1024, 4);
         let id = ContentToken::Sha256 {
             sha256: crate::sha256_hex(b"abcdefgh"),

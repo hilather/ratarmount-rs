@@ -111,7 +111,7 @@ JSON-encoded `lower_layers`), plus the numeric `overlay-stats` fields
 the overlay directory, so its permissions determine `files_dir_writable`.
 Success exits 0. Missing or damaged databases fail without being created or
 repaired. A mounted overlay's exclusive database lock is reported as "in use"
-(a foreground `-f` mount; a daemonized mount holds no lock, #183).
+(foreground or daemonized, until the serving process exits; #183).
 
 | Key | Meaning |
 |---|---|
@@ -254,8 +254,10 @@ without size or mtime). The walk only reads directory entries and `lstat`s
 them: no file is opened, so a 1 GiB base mounts in milliseconds and FIFOs or
 unreadable files cannot break creation. Mode, owner and ctime are excluded.
 **A mount never hashes a base it was not asked to.** The consequence: a content
-edit that keeps a file's size and mtime is invisible to a weak digest. When a
-strong identity is needed, compute it once and supply it:
+edit that keeps a file's size and mtime is invisible to a weak digest. The one
+exception is a sealed layer's **preimage pins** (below): every reuse rehashes
+the few base files the layer modifies or deletes, never the rest of the base.
+When a strong identity of the whole base is needed, compute it once and supply it:
 
 ```bash
 digest=$(ratarmount overlay digest-base ./repo --exclude-overlay ./repo/.ov)
@@ -346,6 +348,12 @@ mount keeps serving, and `--force-base-mismatch` accepts the new base. A swap of
 the base with the same size and mtime cannot be caught without hashing; only
 `overlay verify` with a strong digest catches it (`overlay seal` of an
 already-strong base compares the stamp and does not rehash).
+A commit-journal recovery guard that refuses before recovery writes also keeps
+the mount serving and interval commits enabled. Restore the required overlay
+database state before retrying; `--force-base-mismatch` does not bypass that
+guard. During a live commit, a recovery failure that may have written disables
+later live commits and refuses base reads until a remount. Overlay payloads
+remain readable.
 `--commit-overlay` on a raw directory of files (no overlay database) has no
 identity to check and says so. Only an absent database path in an unused
 overlay counts as "no database".
@@ -422,14 +430,34 @@ mount's top and directory lowers, the offline overlay, the live mount's own
 database, which must still be the file it opened) is classified again under
 the archive lock; a lost record or one whose database path cannot be resolved
 refuses the recovery with the locator, the archive and any journal left as
-they were. Every named overlay database and its `-wal`, `-journal`, and `-shm`
+they were. Offline commits retain the entry check's database-presence requirement
+and every marker requirement observed by its metadata read or identity gate.
+Removing both the database and marker, or removing the marker and emptying the
+database or dropping its `files` table, therefore refuses before recovery
+writes, including stale-locator cleanup and under `--force-base-mismatch`.
+A raw directory that never had a database keeps its usual recovery behavior.
+Every named overlay database and its `-wal`, `-journal`, and `-shm`
 companions are checked again before recovery mutations; offline recovery and
 mount recovery both refuse symlinks with exit 1, including under force. That
 refusal is a refused recovery, also next to a complete journal: a live mount
 is not marked as having a base changed by a failed commit, and the next gate
 still refuses. The restamp after a roll-forward re-checks the record too, and a
 used overlay's database must still have its `files` table, else the journal is
-kept. A stale prepare locator without a journal is otherwise cleared
+kept. A hot overlay rollback journal is a separate refusal: its record cannot be read
+without first modifying the database, so archive recovery must not defer it to
+a writable open that checks identity, sealing and relaxed durability afterward.
+This applies to the `-w` top and directory lowers, even with force or a pending
+complete commit journal. A stale prepare locator beside a hot overlay journal is kept, with the archive, database and hot journal unchanged.
+The error names the explicit recovery route: `ratarmount --no-mount ARCHIVE`
+without `-w` or `--lower`. That command recovers only the archive; it does not
+open the overlay. Inspect the overlay on a writable copy before retrying:
+SQLite can roll its hot journal back on that copy before sealed or unclean
+metadata becomes readable. Ordinary writable opens without archive recovery
+retain that SQLite behavior. The same refusal runs before `--no-mount` returns,
+before export servers or interval commits start, and in a daemonized mount's
+serving child after its early fork (#163).
+
+A stale prepare locator without a journal is otherwise cleared
 after a directory sync; a complete locator whose journal cannot be found is
 refused, never cleared (the commit's hook may not have run), and the error
 names the manual escape: verify the archive, then remove its
@@ -546,7 +574,7 @@ ratarmount --lower prepared --overlay-tmpfs=2G source.tar scratch/
 Lower layers must have `sealed_at` metadata. `--allow-unsealed-lower` also accepts
 unsealed and legacy overlays; these open read-only without SQLite's immutable
 option and may fail with “in use” if another mount holds the database
-(a foreground `-f` mount; a daemonized mount holds no lock, #183). They use
+(foreground or daemonized, until the serving process exits; #183). They use
 a construction-time row snapshot, so stop writers before using them. Sealed
 lowers use immutable SQLite and can be shared by concurrent mounts.
 
@@ -570,9 +598,14 @@ base's tree id with `base_git_tree`. A difference refuses the mount with
 `overlay verify PATH BASE` to compare digests, or pass --force-stack-mismatch to
 mount anyway`. A lower recorded with `--base-digest none`, or one that predates
 these keys, has no identity to compare and is accepted. A same-size edit with a
-restored mtime passes at mount; `overlay verify` (which rehashes) catches it.
+restored mtime passes this check; `overlay verify` catches it for an archive or
+a strong digest (it rehashes the base). Over a local directory base, a sealed
+lower's preimage pins are then rehashed (see "Preimage pins"), so such an edit
+of a file the lower modifies or deletes refuses the mount; an edit elsewhere in
+the base still passes.
 Offline commands (`overlay verify`, `seal`, `pack`, `diff`, `import`) do not
-apply this check.
+apply this identity check, so a byte-identical copy of the base works there; they
+do check the lowers' preimage pins, which hash content.
 
 Committing a layered stack is unsupported: `--commit-overlay`, on-exit commit,
 a nonzero commit interval, and rolling commits with `--lower` are refused with
@@ -598,7 +631,7 @@ metadata for such an overlay without inventing a base identity; keep supplying
 BASE to verify it.
 
 Seal refuses a database held by another mount (“in use by another ratarmount
-process”) (a foreground `-f` mount; a daemonized mount holds no lock, #183).
+process”) (foreground or daemonized, until the serving process exits; #183).
 It runs fsck without repair under a writer reservation and refuses
 inconsistencies with an `overlay fsck --repair` hint. The digest is the canonical
 SHA-256 change hash against the composed lower view, with exact bytes, modes,
@@ -666,12 +699,69 @@ symlinks and never follows them. `.ratarmount-sealed` contains the digest and
 is hidden from mounted listings. Sealed layers are accepted by `--lower` and
 `diff --strict`; writable mounts with `-w` are refused.
 
+**Preimage pins** (#341). A canonical row carries the layer's side only (the
+new mode and content hash), so recomputing the change set notices a base edit
+only when it makes a recorded change disappear. A base file edited to a third
+value with its size and mtime kept leaves a `modified` row unchanged, and
+neither a weak digest nor a directory's supplied strong digest (which a mount
+never rehashes) sees it. A layer sealed over a **local directory** base whose
+recorded identity is `weak` or `strong` therefore also records, in a
+`seal_preimages` table, the base side of every row that has one: a `modified`,
+`deleted` or `type_changed` path (a rename's source is a `deleted` row), as
+its type, mode (none for a symlink), size and content hash (a symlink's
+target, including non-UTF-8 target bytes). A base directory is not pinned; its
+removed descendants are. Regular-file hashes come from the seal's change set;
+symlink pins hash the native target bytes preserved during lookup. Sealing reads
+nothing more. The meta row `base_preimage_digest` binds the rows to the
+layer's `layer_digest`; a changed, added or deleted pin row fails that binding.
+Duplicate pin paths and a missing table with a remaining binding are refused.
+Pins are not part of the canonical hash, `layer_digest`, `stack_digest` or the
+sentinel (canonical hash format stays `2`); they travel in bundles with the
+layer database and `meta.json` (bundle layout unchanged). Every reuse rehashes
+only the pinned entries in the view beneath the layer (the base and the lowers
+under it, so a nested lower's pins are checked against what its own lower view
+serves): `--lower` (directory or bundle, read-only or under a `-w` top, the
+sandbox supervisor's attempts), `diff` of a top over sealed lowers (including
+`--between` and supervisor diff after retained restore), supervisor finalize,
+`overlay verify` and `overlay unpack`, the bundle cache, and every `overlay
+pack`. Pack reuses the preimage hashes already computed for its manifest.
+Cached hash attributes are trusted only for immutable sources; a mutable
+directory base is read even when a lower overrides `user.hash.sha256`.
+A mismatch is refused
+naming each path (`content changed`, `size changed`, `mode changed`, `type
+changed`, or `missing`) and how to recover: restore the base, or seal the layer
+again over the base as it is now (`overlay unseal --i-know`, then `overlay
+seal`, with `--force-base-mismatch` if the base's identity changed too).
+`--force-stack-mismatch` does not bypass pins. Pins include the file mode,
+so they are stricter than a strong directory digest (contents and symlink
+targets only): a byte-identical copy of the base with other mtimes passes,
+one whose pinned file has another mode does not. An mtime-only touch of a pinned
+file is accepted by the pins (they hash content); the weak manifest check at
+mount still sees the touch. Not pinned, by design: `--base-digest none` (no
+identity was asked for), archive bases (their identity is the archive's bytes;
+the cheap mount check's same-size limit for archives is described under "The
+lower must match the mounted base"), Git trees (the tree id covers content) and
+remote bases. A layer sealed before #341 records no pins and keeps the old
+behaviour; unseal and seal it again to add them. Pins guard against accidental
+or casual base edits; anyone who can rewrite the overlay database without
+resealing can also remove the table and its meta row together, and the layer
+then reads as an unpinned seal.
+On non-Unix platforms, a pin binding or leftover pin rows refuse reuse because
+their contents cannot be checked there.
+
 Verify opens the top database immutable and read-only, recomputes the exact
 hash and compares both metadata and sentinel. Exit 0 means a match; exit 1
 reports differing, added, or removed paths (or a sentinel mismatch); exit 2
 means an operational error, including an unsealed overlay. `--json` also returns
-`ok`, `recorded`, `computed`, `sentinel_ok`, and `mismatched`. It works on the
+`ok`, `recorded`, `computed`, `sentinel_ok`, `mismatched`, `preimages_bound`
+(`null` when the layer records no preimage pins, `false` when its pin rows do
+not match their binding) and `preimage_mismatched` (`path: reason` per pinned
+base entry that differs; text output prints `base preimage changed: ...`
+lines); any of them failing makes `ok` false. It works on the
 read-only tree and detects unindexed host additions as well as changed bytes.
+For a weak or strong local-directory seal, `preimages_bound: null` explicitly
+means an older, unpinned seal; successful verification does not establish its
+preimage integrity. Unseal and seal it again to add pins.
 
 Verify also compares the **base** with the digest recorded at creation (mounts
 never do; this is where a supplied `--base-digest` is checked). The base is the
@@ -690,12 +780,14 @@ or `null` when skipped), `base_check` (`strong`, `weak` or `skipped`) and
 `base_current`, so a grader can tell what `true` means. A weak digest cannot see
 a same-size content edit whose mtime was restored (pass a strong digest from
 `overlay digest-base` for that); it does catch size changes, added or removed
-entries and a retargeted symlink. `--no-base-check` (experimental) skips the
-comparison and never opens the base, for bases too large to rehash.
+entries and a retargeted symlink. Under a path the layer modifies or deletes,
+the layer's preimage pins catch that edit too (`ok` false, `base_ok` still
+`true`). `--no-base-check` (experimental) skips only the whole-base identity
+comparison. It still opens the base to recompute changes and check preimage pins.
 
 Unseal requires `--i-know` (otherwise exit 2), restores owner write permission
-on files and directories, removes the sentinel, clears the seal and per-path
-hashes, and records `unsealed_at`. Saved mode overrides stay in place. Host
+on files and directories, removes the sentinel, clears the seal, per-path
+hashes and preimage pins, and records `unsealed_at`. Saved mode overrides stay in place. Host
 permissions and SQLite cannot be changed in one transaction: after an interrupted
 seal, run unseal, fsck, and seal again. Stop direct host writers during these
 commands; chmod is not a security boundary against the owner or root. The seal
@@ -717,8 +809,10 @@ pending database rows were saved. The checker makes one directory walk and one
 1 for unrepaired inconsistencies, and 2 for an operational error.
 
 Host entries without a `files` row are normal: copy-on-write edits of existing
-base or lower-layer files publish host content without inserting a row. Their
-count, including implicit parent directories, is informational (`unrowed`);
+base or lower-layer files publish host content without inserting a row, and
+regular files created (or unlinked) under names the base and lower layers do
+not have write no row at all, which keeps those operations free of a durable
+SQLite transaction (#328). Their count, including implicit parent directories, is informational (`unrowed`);
 the compatibility field `orphan_content`
 is always 0 and does not contribute to errors. Repair does not invent rows for
 these entries.
@@ -737,10 +831,15 @@ mount-relative parent, not a host absolute path.
 Unsealed checks record `fsck_at` and `fsck_result` (`ok`, `errors:N`, or
 `repaired:N`). Sealed overlays can be checked without modifying any metadata;
 `--repair` is refused. A database locked by a mount returns “in use”
-(a foreground `-f` mount; a daemonized mount holds no lock, #183). Repairs
+(foreground or daemonized, until the serving process exits; #183). Repairs
 hold an exclusive SQLite transaction, but host changes and SQLite are not one
 atomic transaction: stop direct host writers and rerun after an interrupted
 repair. A consistency check does not verify content hashes.
+
+A leftover `relaxed_durability` marker from another boot (see "Relaxed
+overlay durability") makes the check exit 2 with the cause; `--repair` first
+runs `PRAGMA integrity_check` (exit 2 and nothing changed if it fails), then
+clears the marker. `--repair` also clears a marker of the current boot.
 
 ## diff
 
@@ -763,8 +862,8 @@ base and a note goes to stderr. Repeat `--lower DIR` in bottom-to-top order, or
 omit it to use `meta.lower_layers`. Sealed lowers open immutable; other lowers
 open read-only. `--strict` refuses any unsealed top or lower. Without it, unsealed
 and legacy overlays produce warnings. Stop writers before comparing: offline
-diff refuses a database locked by a mount (a foreground `-f` mount; a
-daemonized mount holds no lock, #183), and files/SQLite are separate stores.
+diff refuses a database locked by a mount (foreground or daemonized, until the
+serving process exits; #183), and files/SQLite are separate stores.
 
 Choose one output mode (default `--patch`):
 
@@ -941,14 +1040,29 @@ folder, committed Git source and remote source forms as other offline overlay
 commands. Import pins Git references before opening the source and records the
 base identity and lower-layer stack identity.
 
-Accepted patches include `git diff --binary` literal sections (Git base85 plus
-zlib), additions, deletions, executable mode changes, symlinks, rename/copy
-headers and ordinary unified hunks. Rename means copy the preimage to the new
-name, apply its hunks, then delete the old name. Copy keeps the old name.
-Reverse binary literals are validated and ignored. Binary delta sections and
-`Binary files … differ` without content are errors naming the affected file;
-regenerate these as literal patches, for example with `ratarmount diff --git`.
-Index object IDs are accepted without verification.
+Accepted patches include `git diff --binary` literal and delta sections (Git
+base85 plus zlib), additions, deletions, executable mode changes, symlinks,
+rename/copy headers and ordinary unified hunks. Rename means copy the preimage
+to the new name, apply its hunks, then delete the old name. Copy keeps the old
+name. The reverse section (literal or delta) is validated and ignored.
+`Binary files … differ` without content is an error naming the affected file;
+regenerate such a patch with `git diff --binary` or `ratarmount diff --git`.
+
+A delta section modifies an existing regular file: its copy and insert opcodes
+are applied to the preimage in the merged view (base, lower layers and this
+import's earlier sections), as `git apply` does. A delta needs an `index
+<old>..<new>` line: the preimage's Git blob id must equal `<old>` and the
+result's must equal `<new>`. Both ids must use the same object format: full
+40-hex SHA-1 or full 64-hex SHA-256, as required by `git apply`. Abbreviated
+ids are refused. The delta's source size must equal the preimage, every copy must lie inside it, and the
+output must have exactly the declared size. A delta without an index line or
+with an all-zero id, for an added or deleted file, or with text hunks is
+refused. A mismatching blob id or size, or a missing, symlink or directory
+preimage fails like a hunk: without `--reject` import exits 2 naming the file; with
+`--reject` the path keeps its lower content and `PATH.rej` receives the complete
+binary section, including its original paths, rename/copy, mode and index
+headers. A rejected type change restores the lower subtree as a whole. Index
+ids of text hunks and literal sections are accepted without verification.
 
 Hunks require exact context bytes. Their location may move; context is never
 trimmed to force a match. CRLF, Latin-1 file content and missing final newlines
@@ -960,6 +1074,9 @@ NUL, empty, `.` or `..` components, reserved overlay bookkeeping names, the
 a virtual folder there, so imported bytes would be hashed and sealed but
 invisible; refused whatever flags the later mount uses), and
 symlink parents in either the lower view or the new overlay are refused.
+This includes deleted lower symlinks: the folder source can still resolve
+descendants through their targets, so importing a symlink-to-directory change
+is refused. Deleted lower regular files can become directory parents.
 Symlink targets are stored as link data, never followed. Paths and symlink
 targets must be UTF-8 because the workspace's mount and overlay APIs use
 strings; non-UTF-8 names are refused, rather than changed silently.
@@ -967,7 +1084,17 @@ strings; non-UTF-8 names are refused, rather than changed silently.
 If a hunk fails, the default is to abort and remove the partial overlay.
 `--reject` keeps that file's original lower content and writes only its failed
 hunks to `PATH.rej`, while applying other files. Later sections for an already
-rejected file cannot replace its original content. Import exits 0 on success, 1 when hunks
+rejected file cannot replace its original content. File/directory type
+changes import in Git's section order: `delete x` then `add x/y` replaces the
+file with a directory, and `add x` before the deletions of everything below
+the directory `x` applies those deletions first and removes the emptied tree
+(only that directory; other emptied directories stay). Directory replacement
+is refused if any lower directory in that subtree cannot be listed.
+With `--reject` a failed section anywhere in a type change restores the lower
+`x` and everything below it, undoing earlier sections and restoring pruned
+empty subdirectories.
+A directory replacement also rejects if any child was already rejected.
+The rejected hunks are collected in `x.rej`. Import exits 0 on success, 1 when hunks
 were rejected with `--reject`, and 2 on invalid input or I/O errors. A preexisting
 nonempty destination is left intact.
 
@@ -988,9 +1115,14 @@ but still opens so the partial result can be inspected. Delete the directory and
 import again.
 
 `--max-patch-bytes N` defaults to 268435456 (256 MiB). It bounds input bytes,
-the total retained decoded literals, each reverse literal, and each file's
-preimage/postimage. Import buffers the bounded patch and one file's text at a
-time; increase the limit explicitly for larger patches.
+the total retained decoded literals and delta streams, each reverse section,
+each delta's declared postimage size (checked while parsing, before allocating
+the postimage or writing the overlay), and each file's preimage/postimage.
+Inflation is bounded by each section's declared size; delta preimages are
+processed as bytes without constructing text line tables. Import buffers the
+bounded patch and one file's preimage/postimage at a time; increase the limit
+explicitly for larger patches. This is not a total size limit on generated
+overlay files.
 
 Git/unified patches cannot represent empty directories, directory metadata or
 extended attributes. Empty directories therefore do not round-trip, and Git
@@ -1016,7 +1148,7 @@ ratarmount journal summarize attempt.jsonl --since-mark 'turn 1' --until-mark 't
 
 | Record | Fields / meaning |
 | --- | --- |
-| Header | `journal: 1`, `mount`, `base_digest`, `stack_digest`, `overlay`, `t0`, `clock` |
+| Header | `journal: 1`, `mount`, `base_digest`, `stack_digest`, `overlay`, `t0`, `clock`, `observation` |
 | `open` | Path, access `flags`, caller `pid`/`uid`/`gid`, optional `comm`, source `layer` |
 | `read`, `write` | Per-handle `bytes`, `count`, `ranges`, `first_ts`, `layer`; optional `ranges_truncated` |
 | `create`, `mkdir`, `unlink`, `rmdir`, `symlink`, `truncate`, `chmod` | Successful path mutation and caller |
@@ -1024,9 +1156,13 @@ ratarmount journal summarize attempt.jsonl --since-mark 'turn 1' --until-mark 't
 | `readdir` | First successful directory listing, `entries` count |
 | `denied` | Attempted `what`, path and numeric `errno` |
 | `mark` | UTF-8 `label` identifying a turn boundary |
+| `end` | Last record of a cleanly finished segment: `records` written after the header, `excluded` records suppressed by `--journal-exclude` |
 
 Each mount appends a version-1 header containing `mount`, `base_digest`,
 `stack_digest`, `overlay`, UTC RFC 3339 `t0`, and `clock: "monotonic_ns"`.
+Only one cooperating writer may hold a journal inode at a time. An overlapping
+mount using the same file (including a hard-link alias) fails before appending;
+sequential mounts append separate segments after the earlier writer finishes.
 Subsequent `ts` values are monotonic nanoseconds since that header. Paths are
 mount-relative, without a leading slash; the root is `""`. JSON writers use
 `path_b64` for invalid UTF-8 bytes, although the FUSE frontend currently rejects
@@ -1065,7 +1201,8 @@ the writer and flushes pending records; `--journal-sync` also fsyncs the file.
 Write failures appear in the daemon log and `user.ratarmount.stats`'s `journal_error`; mark
 requests then fail with EIO and unmount reports the failure. Abrupt termination
 can lose buffered records. Summaries tolerate an incomplete final record and
-an incomplete record immediately before a subsequent mount header.
+an incomplete record immediately before a subsequent mount header, and report
+either as incomplete coverage (below).
 
 `summarize` streams the input, keeping a per-path table and mark-to-path sets.
 It reports first read/write timestamps, bytes, read request counts, layer and
@@ -1078,7 +1215,68 @@ errors. Because read records emit at RELEASE, a handle spanning marks is
 assigned to its release bucket; close file handles before marking a turn when
 exact turn attribution matters. Byte-path fallback keys appear as
 `path_b64:BASE64` in the summary. Both `journal` commands exit 0 on success and
-2 on argument, input, or I/O errors.
+2 on argument, input, or I/O errors; incomplete coverage is still exit 0.
+
+### Coverage and completeness
+
+The journal is positive evidence: it lists operations that reached the mount.
+Whether a missing entry means "not touched" or "unknown" depends on coverage,
+which the journal and `summarize` make explicit.
+
+Each header's `observation` records what the segment can show: `reads`
+(`all` or `first`), `exclude` (the `--journal-exclude` globs as given), `sync`,
+and a fixed `not_observed` list of what no journal records: `lookup`,
+`getattr`, `page_cache_reads`, `mmap_reads`, `other_protocols` and
+`outside_mount`. A segment is one mount's records, from its header. The writer
+ends a segment with `{"op":"end","ts":…,"records":N,"excluded":M}` only after
+flushing every record and, with `--journal-sync`, successfully fsyncing those
+records. A flush or fsync failure leaves no `end`. The end marker is written
+directly, without a trailing newline or subsequent flush/fsync: its closing
+brace is the last byte, so a partial write cannot become a valid marker when
+another session appends its separating newline. The marker itself is not
+guaranteed durable across a power loss; losing it makes coverage incomplete.
+A killed mount or a mount still running normally leaves no `end`.
+
+`summarize --json` adds `coverage`:
+
+| Field | Meaning |
+| --- | --- |
+| `complete` | True only if every segment overlapping the selected window recorded valid `observation` settings and ended `clean` with a matching count. The segment holding the `--until-mark` can instead use that mark to establish the FIFO prefix enqueued before it, unless settings, end records or counts contradict completeness. A live journal can therefore be complete for a closed turn |
+| `reasons` | Sorted subset of `missing_end`, `truncated_tail`, `record_count_mismatch`, `pre_coverage_journal` (a header without observation settings), `invalid_observation` (missing or unsupported settings), `invalid_end` (malformed, duplicate or nonterminal end); empty when complete |
+| `windowed` | Whether `--since-mark` or `--until-mark` selected a window |
+| `excluded_globs`, `reads_mode` | Unions of the `observation` settings over the segments in the window |
+| `segments` | One per readable header: `mount`, `t0`, `observation` (`null` before coverage), `ended` (`clean`, `missing_end`, `truncated_tail`, `closed_by_mark`, `invalid_end`), `records` read (excluding header and end), `records_match` and `excluded` from the first end (`null` without it), `in_window`. A torn initial header also makes whole-journal coverage incomplete |
+| `semantics` | Fixed values: `complete: "every_emitted_record_present"`, `read_absence: "unknown"`, `bytes_read: "fuse_callback_bytes"`, `open_absence` (`conclusive` or `unknown`) |
+
+`complete` means the file holds every record the daemon emitted for the
+window. **It is never negative evidence of reads**: page-cache and mmap hits
+produce no READ callback, so a path missing from `files_read` is always
+unknown as a read. `bytes_read` counts bytes returned in FUSE callbacks: cache
+hits can omit application reads, while kernel page filling/readahead can fetch
+more bytes than the application consumes. It is not a bound on application
+read bytes. The strongest negative
+the summary offers is `open_absence: "conclusive"`, set only for a complete,
+unwindowed summary whose every segment's `end` reports `excluded: 0`: then a
+path absent from `paths` had no successful file OPEN through this mount. It
+says nothing about lookups, stats, other export protocols or access outside
+the mount. Segments after the until-mark are read only to judge the window;
+an unreadable record there ends the scan rather than failing the summary.
+
+These conclusions assume an unmodified journal from the trusted writer.
+Counts detect missing records, and malformed, duplicate or nonterminal ends
+cannot certify completeness; they do not authenticate the file. A forged
+header, matching count and end can fabricate coverage. A mark establishes only
+the queue prefix that reached the file, not durable storage or a barrier for
+concurrent callbacks. Read/write records for handles still open at the mark
+are emitted at release (or drained at unmount) and belong to that later bucket.
+`reads: "first"` retains only the first nonempty range per handle; total bytes
+and request counts still include every observed callback. `excluded` counts
+suppressed records, including handle aggregates, rather than individual reads.
+
+`sandbox run` and supervisor `finalize` reports carry `complete` and `reasons`
+in `journal_summary`; the full `coverage` object is in the summary file it
+names. `journal_summary: null` means observation was disabled (no
+`--journal`): nothing was observed, which is not the same as observing zero.
 
 The journal describes operations reaching FUSE. Kernel page-cache hits, mmap
 accesses and accesses through other export protocols do not produce read
@@ -1206,8 +1404,31 @@ For these rules:
 
 | Operation | `t/suite` | `t/agent` | `t/agent/leaf` | `outside` |
 | --- | --- | --- | --- | --- |
-| Create, mkdir, write, truncate, unlink, chmod, setxattr | EROFS | allowed | allowed | allowed |
-| Rename endpoint, rmdir, reset | EROFS | EROFS | allowed | allowed |
+| Create, mkdir², write, truncate, unlink, chmod, setxattr | EROFS | allowed | allowed | allowed |
+| Rename endpoint, rmdir, reset | EROFS | EROFS¹ | allowed | allowed |
+
+¹ `rmdir` of an exception root is allowed when the overlay created it: an empty
+`t/agent` that neither the base nor any `--lower` layer has can be removed again
+(`rm -rf t/agent` after `mkdir t/agent`), leaving no tombstone and no entry for
+`t/agent`. Through FUSE, `rmdir` still returns `ENOTEMPTY` for a nonempty
+overlay-created root and `ENOTDIR` for a file. On Unix, the base parent `t`,
+which mkdir materializes on the host, keeps its visible base mode, so it is
+not reported as a change afterwards; the same holds for every parent a
+copy-on-write edit materializes (`lib` for `lib/Foo.pm`), including parents
+provided by a read-only `--lower` layer. The daemon's umask does not change
+these visible modes. Only newly created parents are initialized; an existing
+directory's mode is retained, and initialization is serialized with mounted
+chmod/mkdir operations even without an overlay policy.
+A base directory without owner `rwx` (e.g. `0555` or `0500`) gains them on the
+host for backing storage, while an overlay metadata row preserves its visible
+mode for the mount, diff, seal and pack. Existing chmod overrides take precedence;
+an explicit chmod still counts as a change. Setgid and sticky bits are retained.
+A `t/agent` the base or a lower layer provides stays anchored (EROFS), as do
+rename and reset of either.
+
+² mkdir of a name that already exists (for example `t/suite` itself) fails
+with `EEXIST` before any rule is checked, as on a read-only Linux mount, and is
+not counted as a denial; only a new name under a protected path gets `EROFS`.
 
 The second row also checks possible protected descendants. Exception roots inside
 protected subtrees stay anchored: renaming `t` or `t/agent` is refused; renaming an allowed leaf within
@@ -1217,8 +1438,10 @@ These are policy decisions; normal filesystem errors and directory-rename
 limitations still apply.
 
 A protected path rejects creation, write opens, writes, truncate, COW copy-up,
-unlink, rmdir, mkdir, chmod, timestamp updates, setxattr and symlink creation
-with `EROFS` (read-only filesystem).
+unlink, rmdir, mkdir, chmod, chown (including a same-owner request), timestamp
+updates, setxattr and symlink creation with `EROFS` (read-only filesystem).
+This also applies to unsupported POSIX ACL sets: policy denials take precedence
+over `EOPNOTSUPP` and are counted and journaled once.
 Both rename endpoints are checked. Host parent symlinks are resolved as well,
 so a symlink alias cannot bypass rules for pre-existing overlay content; unlinking
 the alias itself remains allowed. Rename, rmdir and overlay reset also reject
@@ -1501,7 +1724,10 @@ ratarmount sandbox run --base source.tar.zst --lower prepared \
 Repeat `--lower`, `--readonly`, `--allow`, and `--env K=V` for multiple values.
 The default container working directory and bind destination are `/repo`; change
 both with `--bind /path`. `--cpus N` and `--memory SIZE` are passed to the runtime.
-`--network` accepts `none` (default), `bridge`, or `host`. The command runs as the
+`--network` accepts `none` (default), `bridge`, or `host`.
+`--overlay-durability relaxed` passes the mount's `--overlay-durability=relaxed`
+(see "Relaxed overlay durability"); the default `full` leaves the mount's argv
+unchanged. The command runs as the
 calling user's UID/GID. The container is hardened by default:
 `--cap-drop ALL`, `--security-opt no-new-privileges` and `--pids-limit 4096`
 are always passed. `--pids-limit N` changes the process cap (`0` or `-1`
@@ -1618,11 +1844,14 @@ Docker daemon with the `busybox` image.
 ## Branching an episode
 
 A harness can fork an attempt at
-turn *k* by stopping writers, unmounting, and sealing that attempt. Then each
+turn *k* by stopping writers, unmounting, waiting for its serving process to
+exit, and sealing that attempt. Run the original attempt with `-f` in the
+background and save its PID as `attempt_pid`. Then each
 branch gets its own writable top over the same ordered lower stack:
 
 ```sh
 fusermount3 -u attempt-mnt
+wait "$attempt_pid"  # the server has flushed and released its overlay lock
 ratarmount overlay fsck attempt-k --repair
 ratarmount overlay seal attempt-k
 ratarmount --lower prepared --lower attempt-k -w branch-a source.tar branch-a-mnt/
@@ -1730,10 +1959,31 @@ NFSv3/v4 SETATTR, 9P Tsetattr and SFTP SETSTAT also apply mode and time changes.
 SFTP OPEN honors requested creation permissions. The current NFSv3 server dependency
 does not forward MKDIR attributes to the filesystem adapter, so newly created
 NFSv3 directories initially use mode 0755; SETATTR can change it afterwards.
-Ownership changes are refused
-with `EPERM` (the corresponding permission status for SFTP); they neither chown
-host files nor invent stored owners. Use `-o uid=...,gid=...` for presentation
-mapping. chmod on a symlink itself is unsupported. SMB Basic Information has no
+In a write overlay (`-w`), mkdir on any frontend of a name that is already visible (a base, lower or
+overlay directory, a file or a symlink) fails with `EEXIST` (NFS3ERR_EXIST,
+NFS4ERR_EXIST, SMB `STATUS_OBJECT_NAME_COLLISION`, WebDAV MKCOL 405, SFTP v3
+`SSH_FX_FAILURE`) and leaves the entry and its mode unchanged; it used to
+change the existing directory's mode. As with `mkdir(2)` on a read-only Linux
+mount, `EEXIST` takes precedence over a read-only rule's `EROFS` and is not
+counted as a denial. A name deleted in the overlay is not visible, so mkdir
+over it succeeds. Unlink serializes its removal and tombstone update with mkdir
+so a concurrent recreation stays visible. Host leaf creation is exclusive: a directory created by a
+concurrent host writer returns `EEXIST` without changing its permissions.
+SMB directory `FILE_OPEN_IF` opens the winning directory after a creation race
+and reports `FILE_OPENED`; `FILE_CREATE` still returns a collision. (#316)
+A chown on a writable path to the owner an entry is already shown with (after any
+`-o uid=...,gid=...` mapping) succeeds as a no-op, so ownership-preserving tools
+such as `cp -p` and `sed -i` work, also as root; each ID is
+compared separately. Any other ownership change is refused with `EPERM` (the
+corresponding permission status for SFTP); it neither chowns host files nor
+invents stored owners. Read-only mounts and protected paths still return `EROFS`,
+even for a same-owner request. Detached FUSE inodes compare against their held
+descriptor's presented owner; a read-only descriptor permits the ownership
+no-op but still cannot truncate. Use `-o uid=...,gid=...` for presentation mapping.
+POSIX ACLs are not stored: setting `system.posix_acl_access` or
+`system.posix_acl_default` over FUSE returns `EOPNOTSUPP`, which `cp -p` and
+`sed -i` read as "no ACL support" and fall back to the mode without a
+warning. chmod on a symlink itself is unsupported. SMB Basic Information has no
 Unix mode field; unsupported SET_INFO classes continue to return an error.
 
 ## overlay-stats
@@ -1773,6 +2023,25 @@ octal (`000` through `777`). These presentation options do not change stored own
 credentials; chmod and timestamp updates use the overlay metadata behavior above. SMB and WebDAV expose no Unix uid/gid fields.
 This mapping can avoid Git's “dubious ownership” check when a container uses a
 different user; see [Git mounts](git-mounts.md).
+
+Ratarmount does not pass `default_permissions`, so the kernel forwards every
+chown and chmod to the daemon, including one from a container root without
+`CAP_CHOWN` (`--cap-drop ALL`). A chown succeeds only when it names the owner
+already shown, which is what `cp -p` and `sed -i` request, so `cp -p` works
+whichever owner is presented. Setting a POSIX ACL is different: the kernel
+refuses it with `EPERM` before the daemon sees it unless the caller is the
+presented owner (or has `CAP_FOWNER`), and `sed -i` then warns
+"preserving permissions … Operation not permitted" (the edit still succeeds).
+Present the IDs the container runs as to avoid that: `-o uid=0,gid=0` for a
+root container (`--sandbox` otherwise presents the host caller), or
+`uid: 0, gid: 0` in a supervisor request:
+
+```sh
+ratarmount -f --sandbox -o uid=0,gid=0 -w overlay source.tar mnt/
+docker run --rm --cap-drop ALL --security-opt no-new-privileges \
+  -v "$PWD/mnt:/workspace:rw" -w /workspace debian:stable-slim \
+  sh -c 'cp -p f g && cp -p g f && sed -i s/a/b/ f'
+```
 
 `--sandbox` expands to `-o allow_other,noatime`, caller uid/gid (using
 `SUDO_UID` / `SUDO_GID` when present), and a RAM overlay unless `-w` supplies
@@ -1834,6 +2103,84 @@ Changes are discarded by default. `--commit-overlay-on-exit` or
 `--overlay-tmpfs-allow-commit` flag with `--overlay-tmpfs`; this deliberately
 allows changes to reach the base archive and retains the existing supported
 live-commit archive formats. Temporary overlay data is removed after commit.
+
+## Relaxed overlay durability
+
+By default every create, unlink, rename or chmod in a `-w` overlay is one
+SQLite transaction on the overlay database that waits for the disk (about
+7 ms on an ordinary SSD; a build that creates and deletes thousands of
+temporary files spends most of its time there). `--overlay-durability=relaxed`
+runs the mount's own overlay connection with `PRAGMA synchronous=OFF`: SQLite
+still writes every transaction into the kernel page cache, so a killed or
+crashed ratarmount process loses nothing, but it no longer waits for the disk
+(about 0.1 ms per operation, like `--overlay-tmpfs`). The journal mode stays
+`DELETE`; no other connection (indexes, `overlay` verbs, seal, import)
+changes. The default is `--overlay-durability=full`. The flag requires
+`-w`, `--overlay-tmpfs` or `--sandbox`. `relaxed` conflicts with every
+archive commit (`--commit-overlay`, `--commit-overlay-on-exit`,
+`--commit-overlay-interval`, `--roll-every`): a relaxed overlay is
+throwaway. Explicit `full` permits archive commits; a zero interval (including
+`0s`, `0m` and `0h`) disables interval commits in either mode.
+Either mistake exits 2. On `--overlay-tmpfs` it changes
+nothing that matters: RAM is gone after a crash anyway.
+
+What a crash costs: after an OS crash or power loss while the mount was
+relaxed, the overlay database may be corrupt, or structurally intact but
+missing (or half-applying) the last changes, for example deletions that
+reappear. Use relaxed durability for throwaway attempt overlays on disk
+that are discarded rather than repaired after a machine failure; keep `full`
+for overlays whose edits must survive one, or that are committed into an
+archive. `full` protects the database transactions; it does not itself fsync
+every payload file and parent directory, so it does not guarantee that every
+acknowledged filesystem edit survives power loss.
+
+The mount records the meta row `relaxed_durability` = `<boot_id>:<pid>`
+(`/proc/sys/kernel/random/boot_id`; `unknown` off Linux or when it cannot be
+read) in a `synchronous=FULL` commit before its first relaxed write. A clean
+unmount restores `FULL` and deletes the row in a commit whose fsync also
+flushes every earlier relaxed write. The pid is diagnostic only (a daemonized
+mount records its launcher's). A leftover row is judged by its boot ID:
+
+| Leftover marker | Meaning | Behavior |
+|-----------------|---------|----------|
+| none | clean unmount, or `full` | normal |
+| this boot | the process died; its writes reached the kernel | accepted; the next writable open (or `overlay seal`) clears it; read-only checks accept it |
+| another boot, or `unknown` | the machine went down while relaxed | the writable open, `overlay fsck`, `overlay seal`, `diff` and offline `--commit-overlay` refuse, naming the cause and `overlay fsck --repair` |
+
+Startup also refuses archive-journal recovery when its overlay record has an
+unclean marker, including with `--force-base-mismatch`. Admitted archive
+recovery finishes under `FULL` before the mount enables relaxed writes, so
+the updated base identity is durable before its recovery journal is removed.
+Forced sealing also checks the marker before replacing any recorded base identity.
+
+`ratarmount overlay fsck --repair DIR` runs `PRAGMA integrity_check` inside
+its exclusive transaction before any other repair. If it reports a problem,
+fsck exits 2 and changes nothing: discard the overlay. If it passes, the
+marker is cleared and the normal repair runs. A passing check proves only that
+the database structure is intact: recent changes may still be lost. SQLite
+rolls back a hot `-journal` on the first open before the marker can be read,
+and the rollback journal itself was not synced while relaxed. Without a
+readable boot ID (macOS, masked `/proc`), every leftover marker is treated as
+a machine failure, so a killed mount also needs `fsck --repair`. A seal never
+carries the marker into a sealed layer. A daemonized mount's serving process
+holds the database lock until it has flushed and cleared the marker and exited
+(#183); a verb run in that window is refused as "in use".
+
+The sandbox supervisor takes the same option per attempt (protocol version 2
+`new` with `overlay_durability`); see [relaxed attempts](#relaxed-attempts).
+
+Measured with `benchmarks/overlay-create-unlink.sh` on one ext4 disk
+(N=200, REPS=3; see the #328 profile in
+`docs/tasks/plans/issue-328-overlay-create-unlink-profile.md`): about **58×**
+faster for the combined create/unlink workload (2.72 s → 0.047 s).
+
+| Variant | create ms/op | unlink ms/op | 200 create+unlink, s |
+|---------|-------------:|-------------:|---------------------:|
+| plain ext4 directory (no FUSE) | 0.009 | 0.007 | 0.003 |
+| `-w` disk, `full` | 7.04 | 6.55 | 2.72 |
+| `-w` disk, `relaxed` | 0.155 | 0.078 | 0.047 |
+| `-w` disk, `relaxed` + read-only rules | 0.132 | 0.084 | 0.043 |
+| `--overlay-tmpfs` | 0.111 | 0.065 | 0.035 |
 
 ## Image + repository rootfs
 
@@ -1908,11 +2255,27 @@ and a message naming the database (logged once per inode). On
 Linux the check runs on an `O_PATH` descriptor, whose close releases nothing,
 and the file is then reopened through `/proc/self/fd`; `O_TRUNC` and the
 create mode apply only after the check. Elsewhere (macOS, or Linux without
-`/proc`) the refused descriptor, or one whose identity could not be read, is
-kept open for the life of the process (one descriptor per refused open).
-Remove the extra link to read the file. The
+`/proc`) the first refused descriptor of an inode, or one whose identity could
+not be read, is kept open for the life of the process. Further opens of that
+inode are refused before `open` once the external-alias epoch cap (one
+descriptor) is reached, including after the database registration is dropped
+and created again; those refusals keep no further descriptor. An exclusive
+create (`O_CREAT` with `O_EXCL`) over an existing name is `EEXIST` and does
+not open, including after the cap. Two opens that
+both pass the check before either is recorded can each keep one descriptor.
+An unidentified descriptor is still kept and does not count toward the cap.
+Linux `O_PATH` refusals do not count. Descriptors are not pooled. Remove the
+extra link to read the file while the database is open; while it is not
+registered the name opens normally, and the next registration of the same
+inode is refused again without another descriptor. The
 check never holds its lock across an open, so a FIFO under a payload name
 blocks only the request that opens it, never another overlay-database open.
+Unlike `open(2)`, a checked open with `O_CREAT` but neither `O_NOFOLLOW` nor
+`O_EXCL` does not create the target of a dangling symlink; it is refused
+(`EINVAL`, naming the symlink), on Linux and macOS alike. Creating through a symlink
+needs a non-exclusive open that could reach an existing inode before the check.
+The mount's own creates pass `O_NOFOLLOW` and get `ELOOP` there, as `open(2)`
+does.
 
 Not covered: a payload descriptor opened before its inode is first opened as
 a database in this process (no mount path does this: the database is opened
@@ -1927,28 +2290,80 @@ snapshot) by one that gets the same inode number from the filesystem counts
 as the same file; some filesystems (ext4, for example) reuse freed inode
 numbers. Nor are these opens, which
 do not go through the check: the journal file `overlay pack --include-journal`
-reads (a JSON log, not a database) and the commit journal's opens of the
-archive itself. Opens that used to bypass the check no longer open a data
+reads (a JSON log, not a database) and the commit path's opens of the
+archive itself (the commit journal's, and the `is_zip_archive` and
+`is_uncompressed_tar` format probes that pick the commit method). Opens that
+used to bypass the check no longer open a data
 descriptor at all: `overlay seal`'s and `unseal`'s permission walk and the
 unpack stage's mode pass change modes through an `O_PATH` pin on Linux (by
 name with `AT_SYMLINK_NOFOLLOW` elsewhere, where a swap of the name between the
 check and the change is not detected) (#149); a failed first open leaves an
 existing 0-byte database to SQLite's rollback instead of truncating it (#160);
 and `overlay pack` ships SQLite copies of the layer database and of the base
-index (#156). Of the checked sites, the ZIP commit reader, the
-read-only layer, live diff, the seal sentinels, the pack sentinel and lock
+index (#156). Not every `overlay pack` / `unpack` open is checked either:
+reads of a bundle file (`overlay unpack`, a bundle `--lower` and the sandbox
+supervisor's lower checks), the `--lower` bundle cache's private copy of it,
+and the `<staging directory>.lock` file that `overlay pack`, `unpack` and the
+cache fill create (or reuse) beside their staging directory use ordinary opens.
+The bundle output and its temporary files, extracted regular-file members,
+and cache verification markers are created new (`O_EXCL` or anonymous).
+Unpack finalization opens directories for metadata updates; its regular-file
+mode pass uses the lock-preserving `O_PATH` pins on Linux and no data descriptor
+elsewhere, as described above (#149). Of the checked sites, the ZIP commit
+reader, the read-only layer, live diff, the seal sentinels, the pack sentinel and lock
 reads and the macOS park share the tested helper but have no test of their
 own. Pack payload append has a direct registered-alias refusal/lock regression.
+The `--journal` operation log is not checked either: a FUSE mount opens it
+for appending (creating it if absent) after any overlay database is open and
+keeps that descriptor in its writer thread. Its path must lie outside the mount
+point and the overlay directory, but another hard link of the overlay database
+elsewhere is not refused: the journal's lines would be appended to the
+database file, and closing the descriptor (when the journal is finished at
+unmount, when its writer fails, or when the journal open fails after the file
+was opened) would release this process's locks on the database. Do not point `--journal` at a link of an overlay
+database.
 
 These protections keep the SQLite locks of a process that holds the database
-for its whole life: a foreground mount or export server (`-f`; `sandbox run`
-and the sandbox supervisor run ratarmount that way), or a library or Python
-user. A daemonized ratarmount (the default without `-f`, for a FUSE mount and
-for an export server alike) currently holds no kernel lock on its overlay
-database at all: the database is opened and locked before the fork, POSIX
-locks are not inherited by the child, and the parent's exit releases them
-(#183). Until that is fixed, run with `-f` when another process may open the
-same overlay.
+for its whole life: a mount or export server, foreground (`-f`; `sandbox run`
+and the sandbox supervisor run ratarmount that way) or daemonized, or a library
+or Python user. POSIX locks are not inherited by a `fork()` child, so a
+daemonized FUSE mount (the default without `-f`) forks before opening any
+database or log and before starting worker threads. The launcher holds no
+database lock; it relays the
+serving process's exit status while that process starts (startup errors and
+their exit statuses are unchanged) and then waits for the mount. The serving
+process recovers journals, opens the base and its index and opens the overlay
+database itself, so it holds the overlay database's exclusive lock and the
+index's shared lock for its whole life (#183). No lock is handed over between
+processes, so there is no window in which another process could take one.
+Before this, the database was locked before the fork and the launcher's exit
+released the lock: any process could write the live database, or take the
+serving process's live rollback journal for a hot one and roll back a write
+the server then believed committed.
+
+`fusermount3 -u` and `ratarmount -u` return when the kernel has detached the
+mount, before the serving process has finished: it still joins its threads,
+replays queued rows, runs an on-exit commit and clears the relaxed-durability
+marker under its lock. A verb that opens the overlay in that window (`overlay
+fsck`, `seal`, `info`, `diff`, `pack`) is refused with "in use" and changes
+nothing; a reader can no longer roll back the mount's in-flight journal. Wait
+for the serving process to exit (or retry on "in use") before running them
+right after an unmount. For scripts, run the mount with `-f` in the background,
+save `$!`, wait for mount readiness, and `wait "$mount_pid"` after unmounting;
+see the [checkpoint recipe](recipes/scripts/checkpoint-archives.sh). This also
+lets the script check the server's exit status. `pgrep -f MOUNTPOINT` is not a
+reliable completion check: the path is a regular expression and can match the
+calling shell or unrelated processes.
+
+For a daemon whose PID is unavailable, retry only a refusal whose diagnostic
+contains "in use", with a bounded timeout; CLI exit codes alone do not
+distinguish that refusal from other errors. A separate SQLite connection can
+instead probe `BEGIN IMMEDIATE; ROLLBACK;` against the existing
+`.ratarmount.overlay.sqlite` (open read/write without creating it, and use a
+zero busy timeout). Retry `SQLITE_BUSY`, stop on other errors, and close the
+connection after each attempt. Always roll back a successful probe so the
+probe itself does not keep the next operation out. Stop competing writers
+first: a successful probe does not reserve access for a later command.
 
 
 A required-record observation is a **one-way session latch**. Once an overlay
@@ -1987,6 +2402,20 @@ opens: they keep SQLite's default `"unix"` VFS (auto locking on macOS). The
 checked `overlay pack --include-index` snapshot uses the checked family above
 (`"unix-posix"` on macOS). Managed byte readers are not connections; see
 [Internal reads of index and database files](#internal-reads-of-index-and-database-files).
+
+On an unsupported Unix ABI the overlay row above stays a refusal. Index, SQLAR,
+digest-cache and publication connections on that host stay ordinary default-VFS
+opens and are labeled `LegacyUnverified`: no descriptor check, no reuse check,
+and no pathname type check. On Linux glibc, macOS and Windows those same
+non-overlay connections stay ordinary default-VFS opens and are not
+`LegacyUnverified`. Windows overlay opens stay pathname type checks
+(`WindowsPathTypeOnly`). `disk_open_state` is that table (#196):
+
+| Host | Overlay database | Non-overlay disk DB |
+|---|---|---|
+| Verified Unix (64-bit little-endian Linux glibc, macOS) | Checked (`UnixDescriptor` or `UnixReuse`) | Ordinary default VFS |
+| Windows | Pathname type only (`WindowsPathTypeOnly`) | Ordinary default VFS |
+| Unsupported Unix | Refused | `LegacyUnverified` |
 
 The optional `sqlcipher` feature links SQLCipher's SQLite (older than 3.46.0),
 which is checked the same way. One difference: when its read-write open is
@@ -2057,7 +2486,11 @@ SQLAR byte probes; export-index inputs; shard artifact hashes; the private
 lookup copy of an index with a hot journal; and the sync of a published index.
 
 Not covered, by design of this slice (#196; each site has a residual entry with
-its reason, and the list is open): generic folder reads and backing extents,
+its reason, and the list is open). The rule for a `.sqlar` in the factory is:
+`FormatBackend::Sqlar`'s own `looks_like_sqlar` and `SqlarMountSource::open` are
+managed reads; every earlier backend's `looks_like_*` of that same file is a
+residual `File::open` (one open and close per backend) and stays uncovered.
+Also uncovered: generic folder reads and backing extents,
 overlay payload descriptors (admitted opens) and the TAR commit helper, the
 plain TAR backend, the HF payload cache and its repository backing, the range
 and payload caches (the payload-v1 header read and staging reopen included),
@@ -2339,8 +2772,10 @@ batch (see [protocol version 2](#protocol-version-2)). Repeated `--lower PATH`
 [lower stacks](#lower-stacks) and [journals](#journals)); the three journal
 options need `--journal`. Lower paths are sent unchanged: a relative one is
 refused by the daemon, never resolved by the client. `--retain` sends version 2
-too (see [retained attempts](#retained-attempts)). Without these flags, `new`
-sends exactly the version 1 request. `finalize ID [--pack] [--request-id ID]`
+too (see [retained attempts](#retained-attempts)), and so does
+`--overlay-durability relaxed` (see [relaxed attempts](#relaxed-attempts));
+`--overlay-durability full` is the default and sends nothing. Without these
+flags, `new` sends exactly the version 1 request. `finalize ID [--pack] [--request-id ID]`
 (version 2, Linux only) prints the [finalize](#finalize) report, and
 `list --all` sends a version 2 `list` with `all`, which adds served retained
 attempts, including ones restored after a restart; without `--all`, `list`
@@ -2457,7 +2892,8 @@ errors include a bounded excerpt of the failing mount's log when available.
 ### Protocol version 2
 
 Version 2 has the version 1 operations, fields and defaults; `new` also takes
-a `request_id`, `lowers`, a `journal` and `retain`, `list` takes `all`, and
+a `request_id`, `lowers`, a `journal`, `retain` and `overlay_durability`,
+`list` takes `all`, and
 `finalize` exists only in version 2. Field defaults never change within version
 2; later releases only add fields, and a daemon refuses fields it does not know
 with `invalid_request`, so an older daemon fails closed on a newer client.
@@ -2479,11 +2915,14 @@ with `invalid_request`, so an older daemon fails closed on a newer client.
   ASCII letter or digit first, then letters, digits, `.`, `_` or `-`. A
   malformed ID is `invalid_request` and writes nothing. `"request_id": null`
   is refused (`invalid_request`), never read as "no ID". Without a
-  `request_id`, `lowers`, `journal` or `retain`, a version 2 `new` behaves as
-  version 1's.
+  `request_id`, `lowers`, `journal`, `retain` or a relaxed
+  `overlay_durability`, a version 2 `new` behaves as version 1's.
 - **`lowers` and `journal`** (`new` only) stack sealed layers under every
   attempt and record a per-attempt operation journal; see
   [lower stacks](#lower-stacks) and [journals](#journals).
+- **`overlay_durability`** (`new` only) is `"full"` (the default; never
+  serialized, so it hashes as absent) or `"relaxed"`; see
+  [relaxed attempts](#relaxed-attempts).
 - **`finalize` and `retain`** stop, seal and hash an attempt and keep it in
   `retained/ID` (Linux only); see [finalize](#finalize),
   [retained attempts](#retained-attempts) and [durability](#durability).
@@ -2887,7 +3326,7 @@ Nothing is undone, and what completed (the seal, the bundle, the first
 | `bytes_written` | The logical overlay payload size after the stop, as for `sandbox run` |
 | `erofs_denied` | The number of writes the read-only rules refused, from the last read while the mount process served; `null` if it was never read |
 | `manifest_path` | `attempts/ID/manifest.jsonl` |
-| `journal_summary` | `{path,files_read,files_read_then_written,files_written_blind}` of `attempts/ID/journal.summary.json`, or `null` without a journal |
+| `journal_summary` | `{path,files_read,files_read_then_written,files_written_blind,complete,reasons}` of `attempts/ID/journal.summary.json` (see [Coverage and completeness](#coverage-and-completeness)), or `null` without a journal (observation disabled) |
 | `bundle` | `attempts/ID/bundle.tar.zst` with `pack`, else `null` |
 
 **Repeating a finalize.** A finalize of a `finalized` attempt runs the
@@ -2940,6 +3379,62 @@ locked overlay each hold it for up to the smaller of `--timeout` and 10 s. On
 `writers_active`, wait at least
 1 s and back off. `destroy` keeps its own policy: it still unmounts lazily if
 it must and stops the mount process, also for a `finalizing` attempt.
+
+#### Relaxed attempts
+
+```json
+{"version":2,"op":"new","base":"task","count":8,"overlay_durability":"relaxed"}
+```
+
+A version 2 `new` with `overlay_durability: "relaxed"` (CLI `sandbox new
+--overlay-durability relaxed`, Python `new(..., overlay_durability="relaxed")`)
+starts each attempt's mount with `--overlay-durability=relaxed` (see
+[relaxed overlay durability](#relaxed-overlay-durability)): its overlay
+database stops waiting for the disk on every create, unlink and rename (200
+creates plus 100 unlinks through FUSE took about 2.2 s with `full` and 0.1 s
+relaxed on one SSD). Only the string `"full"` or `"relaxed"` is accepted;
+`null`, another spelling or an unknown value is `invalid_request` before
+anything exists. `"full"` is never serialized, so it hashes like an absent
+field; `"relaxed"` is another body for a `request_id`. A relaxed `new` is
+checked by the mount CLI's parser, like a layered or journaled one, before the
+RAM root, any attempt directory or child exists. The mount refuses relaxed
+durability only with archive commits, which the supervisor never passes, so
+it works with lowers, journals and `retain`, subject to their existing
+restrictions (`retain` requires a disk overlay). It also works with `tmpfs`
+overlays, whose contents are lost on reboot regardless of this setting.
+
+What a crash costs here: an attempt's mount clears its marker when it is
+unmounted cleanly, and `finalize` seals only after that unmount. A finalize
+whose top still carries a marker of this boot (its mount process was killed;
+its writes reached the kernel) proceeds, and the seal clears the marker. A
+marker of another boot (or an unknown one) means the machine went down while
+the attempt was relaxed: `finalize` answers `io` naming the marker and "destroy
+it" after the stop (the attempt is then unmounted and `finalizing`) but before
+fsck repair, and it never seals or retains that layer
+(`overlay fsck --repair` would clear the marker once `PRAGMA integrity_check`
+passes, but that does not bring back lost rows, so finalize does not repair
+it). This refusal is checked again inside fsck's exclusive transaction, so a
+marker that appeared after the initial check cannot be cleared by automated
+repair. Reading an unsealed top may first roll back a hot SQLite journal;
+that recovery does not acknowledge its relaxed crash marker.
+
+`diff` and `stats` also refuse a foreign/unknown-boot marker on the top,
+including through a live child's inspection socket and after it detaches.
+Lower admission checks directory and bundle markers; diff/finalize recheck
+recorded lowers, and composition checks the marker in the same database
+snapshot as the rows. Finalized and retained attempts' fresh finalize calls
+check their top too. Restart leaves a retained top with such a marker reserved
+but unserved, without repairing it. Request-ID replays still return their
+stored answers; use a fresh request ID for a current check. Stats describes
+only the top and does not read its base or lowers.
+
+In ordinary operation a restart discards
+every attempt that is not retained, whatever its durability or boot, so a
+relaxed attempt that lived through an OS crash is removed, never served. A
+retained attempt was finalized with `full` semantics already: its marker was
+cleared in a `synchronous=FULL` commit and step S synced its tree before its
+`retained.jsonl` record, so a retained relaxed layer survives a crash like any
+other.
 
 #### Retained attempts
 
@@ -3357,9 +3852,11 @@ journal, and `None` otherwise, including for `list()` results.
 
 `finalize(id, pack=False, request_id=None)` and
 `Attempt.finalize(pack=False, request_id=None)` send protocol version 2 and
-return the [finalize](#finalize) report; `new(..., retain=True)` and
-`list(all=True)` send version 2 too (`retain=False` sends no key, and
-`list(all=False)` is the version 1 request). An `Attempt` the client owns takes
+return the [finalize](#finalize) report; `new(..., retain=True)`,
+`new(..., overlay_durability="relaxed")` and `list(all=True)` send version 2
+too (`retain=False` and `overlay_durability="full"`, the default, send no key,
+and `list(all=False)` is the version 1 request; see
+[relaxed attempts](#relaxed-attempts)). An `Attempt` the client owns takes
 `status`, `path`, `overlay_dir` and, when set, `journal_path` from the report's
 `attempt`, also when `finalize` is called on the client. A finalized attempt
 that was not retained stays owned

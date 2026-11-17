@@ -14,6 +14,67 @@ use sha2::Sha256;
 
 use crate::{IndexError, Result, SqliteIndex};
 
+/// SQL subquery listing the `offsetheader`s that more than one real `files`
+/// row uses (members of one solid 7z folder, ASAR entries, ...).
+///
+/// `xattrs` rows are keyed by `offsetheader` alone, so a `user.hash.*` value
+/// stored under such a slot cannot be attributed to any one member. Readers
+/// that join `xattrs` to `files` must exclude these slots (#320): an older build
+/// stored the last solid 7z member's digest there for every member. Generated
+/// parent rows hold placeholder offsets and do not count; without an
+/// `isgenerated` column every row counts.
+pub fn shared_xattr_slots_sql(conn: &rusqlite::Connection) -> rusqlite::Result<&'static str> {
+    let has_generated: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('files') WHERE name = 'isgenerated')",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(if has_generated {
+        "SELECT offsetheader FROM files WHERE offsetheader IS NOT NULL \
+         AND COALESCE(isgenerated, 0) = 0 GROUP BY offsetheader HAVING COUNT(*) > 1"
+    } else {
+        "SELECT offsetheader FROM files WHERE offsetheader IS NOT NULL \
+         GROUP BY offsetheader HAVING COUNT(*) > 1"
+    })
+}
+
+/// First per-member xattr slot of a `SevenZipMountSource` index (#320).
+///
+/// Members of a solid 7z folder share their files rows' `offsetheader` (the
+/// folder's pack offset), so the 7z backend stores their build-time content
+/// hashes under `SEVENZIP_MEMBER_XATTR_BASE + entry_index` instead. The 7z
+/// opener rejects pack offsets at or above it and member counts above it;
+/// folderless members use `2^62 + entry_index`.
+pub const SEVENZIP_MEMBER_XATTR_BASE: i64 = 1 << 61;
+
+impl SqliteIndex {
+    /// Record the exact `(pack offset, unpack offset, xattr slot)` binding of
+    /// solid 7z members. Python ignores this additive table; `files` and
+    /// `xattrs` retain their existing meaning. Warm hash fills need the binding
+    /// because directories/empty entries also occupy archive member indices.
+    pub fn store_sevenzip_member_xattr_slots(&self, rows: &[(i64, i64, i64)]) -> Result<()> {
+        if self.is_read_only() {
+            return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS sevenzip_member_xattrs (
+                offsetheader INTEGER NOT NULL, offset INTEGER NOT NULL,
+                slot INTEGER NOT NULL UNIQUE, PRIMARY KEY(offsetheader, offset))",
+            )?;
+            let mut stmt =
+                conn.prepare("INSERT INTO sevenzip_member_xattrs VALUES (?1, ?2, ?3)")?;
+            for &(pack, unpack, slot) in rows {
+                stmt.execute(rusqlite::params![pack, unpack, slot])?;
+            }
+            Ok(())
+        })
+    }
+}
+
 /// Algorithms implemented by this crate (Python CLI names).
 pub const SUPPORTED_HASH_ALGORITHMS: &[&str] = &["crc32", "md5", "sha1", "sha256"];
 
@@ -327,11 +388,7 @@ fn prepare_fill(index: &SqliteIndex, algorithms: &[String]) -> Result<FillState>
         // parents have no archive content; their placeholder offsets do not count.
         // NULL is not proof of generation. A missing column still fails closed in
         // regular_file_payloads above, without guessing which rows are generated.
-        let mut stmt = conn.prepare(
-            "SELECT offsetheader FROM files WHERE offsetheader IS NOT NULL
-             AND COALESCE(isgenerated, 0) = 0
-             GROUP BY offsetheader HAVING COUNT(*) > 1",
-        )?;
+        let mut stmt = conn.prepare(shared_xattr_slots_sql(conn)?)?;
         let shared = stmt
             .query_map([], |r| r.get::<_, i64>(0))?
             .collect::<std::result::Result<HashSet<_>, _>>()?;
@@ -342,10 +399,40 @@ fn prepare_fill(index: &SqliteIndex, algorithms: &[String]) -> Result<FillState>
             .collect::<std::result::Result<HashSet<_>, _>>()?;
         Ok((sparse, shared, existing))
     })?;
+    // Hashing is best-effort: one member's key proves nothing about another
+    // member, even in the same folder. Require the exact persisted binding.
+    let sevenzip =
+        index.metadata()?.get("backendName").map(String::as_str) == Some("SevenZipMountSource");
+    let member_slots = index.with_conn(|conn| {
+        if !sevenzip || !crate::table_exists(conn, "sevenzip_member_xattrs")? {
+            return Ok(HashMap::new());
+        }
+        let mut stmt =
+            conn.prepare("SELECT offsetheader, offset, slot FROM sevenzip_member_xattrs")?;
+        let slots = stmt
+            .query_map([], |r| {
+                Ok((
+                    (r.get::<_, i64>(0)?, r.get::<_, i64>(1)?),
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+        Ok(slots)
+    })?;
     for (i, (oh, offset, size)) in rows.into_iter().enumerate() {
         let missing: Vec<_> = algos
             .iter()
-            .filter(|a| !existing.contains(&(oh, format!("user.hash.{a}"))))
+            .filter(|a| {
+                let key = format!("user.hash.{a}");
+                if shared.contains(&oh) {
+                    !member_slots.get(&(oh, offset)).is_some_and(|slot| {
+                        (SEVENZIP_MEMBER_XATTR_BASE..1 << 62).contains(slot)
+                            && existing.contains(&(*slot, key))
+                    })
+                } else {
+                    !existing.contains(&(oh, key))
+                }
+            })
             .cloned()
             .collect();
         if missing.len() != algos.len() {
@@ -881,36 +968,15 @@ mod tests {
         );
     }
 
-    // Capture actual emitted warnings/reports on this test thread only.
-    thread_local! { static MESSAGES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; }
-    struct TestLog;
-    impl log::Log for TestLog {
-        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-            true
-        }
-        fn log(&self, record: &log::Record<'_>) {
-            MESSAGES.with(|m| m.borrow_mut().push(record.args().to_string()));
-        }
-        fn flush(&self) {}
-    }
-    fn capture_logs() {
-        static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| {
-            log::set_logger(&TestLog).unwrap();
-            log::set_max_level(log::LevelFilter::Info);
-        });
-        MESSAGES.with(|m| m.borrow_mut().clear());
-    }
+    use crate::test_log::{capture_logs, MESSAGES};
     fn assert_remedy() {
-        MESSAGES.with(|m| {
-            assert!(
-                m.borrow()
-                    .iter()
-                    .any(|s| s.contains("--recreate-index --hashes sha256,crc32")),
-                "{:?}",
-                m.borrow()
-            )
-        });
+        let messages = crate::test_log::messages();
+        assert!(
+            messages
+                .iter()
+                .any(|s| s.contains("--recreate-index --hashes sha256,crc32")),
+            "{messages:?}"
+        );
     }
 
     /// Regression: outer compression must not change any member digest.
@@ -1745,6 +1811,124 @@ mod tests {
             b"keep"
         );
         assert!(idx.get_xattr(32, "user.hash.crc32").unwrap().is_none());
+    }
+
+    /// Regression: #320 an older build stored the last solid 7z member's digest
+    /// under the folder's shared pack offset; `--hashes` must not count it as
+    /// kept for any member, and must leave the index unchanged.
+    #[test]
+    fn regression_320_stale_shared_slot_hash_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("A.7z");
+        std::fs::write(&path, [9; 100]).unwrap();
+        let idx = make_index(
+            None,
+            &[(32, 0, 12), (32, 12, 13), (32, 25, 13)],
+            Some("SevenZipMountSource"),
+        );
+        for algo in algorithms() {
+            idx.insert_xattr(32, &format!("user.hash.{algo}"), b"stale")
+                .unwrap();
+        }
+        let (report, result) = report_fill(&idx, &path);
+        result.unwrap();
+        assert_eq!(
+            report,
+            FillReport {
+                unverifiable: 3,
+                ..FillReport::default()
+            }
+        );
+        for algo in algorithms() {
+            assert_eq!(
+                idx.get_xattr(32, &format!("user.hash.{algo}"))
+                    .unwrap()
+                    .unwrap(),
+                b"stale"
+            );
+        }
+    }
+
+    /// Regression: #320 a 7z index built since the fix holds solid members'
+    /// hashes in per-member slots; a warm `--hashes` of the same algorithm
+    /// keeps them, a new algorithm still reports them unverifiable (rebuild).
+    #[test]
+    fn regression_320_per_member_slots_count_as_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("A.7z");
+        std::fs::write(&path, [9; 100]).unwrap();
+        let rows = [(32, 0, 12), (32, 12, 13), (32, 25, 13)];
+        let base = SEVENZIP_MEMBER_XATTR_BASE;
+        for (backend, kept) in [
+            (Some("SevenZipMountSource"), 3),
+            (Some("ASARMountSource"), 0),
+        ] {
+            let idx = make_index(None, &rows, backend);
+            idx.store_sevenzip_member_xattr_slots(&[
+                (32, 0, base),
+                (32, 12, base + 1),
+                (32, 25, base + 2),
+            ])
+            .unwrap();
+            for i in 0..3 {
+                idx.insert_xattr(base + i, "user.hash.sha256", b"own")
+                    .unwrap();
+            }
+            let fill = prepare_fill(&idx, &["sha256".to_string()]).unwrap();
+            assert_eq!(fill.report.kept_existing, kept, "{backend:?}");
+            assert_eq!(fill.rows.iter().all(|r| r.algos.is_empty()), kept == 3);
+            if kept == 3 {
+                let mut fill = prepare_fill(&idx, &["sha256".into(), "crc32".into()]).unwrap();
+                let cursor = crate::managed_read::ManagedReadCursor::open(&path).unwrap();
+                let report = fill_content_hashes_report(&idx, &path, cursor, &mut fill).unwrap();
+                assert_eq!((report.kept_existing, report.unverifiable), (3, 3));
+                assert_eq!(report.filled, 0);
+            }
+        }
+    }
+
+    /// Regression: #320 one successful member must not hide missing hashes on
+    /// other solid members (unsupported folders and failed reads are skipped).
+    #[test]
+    fn regression_320_partial_member_hashes_are_not_all_kept() {
+        let rows = [(32, 0, 12), (32, 12, 13), (64, 0, 13), (64, 13, 12)];
+        let idx = make_index(None, &rows, Some("SevenZipMountSource"));
+        let base = SEVENZIP_MEMBER_XATTR_BASE;
+        idx.insert_xattr(base + 5, "user.hash.sha256", b"own")
+            .unwrap();
+        // A slot alone carries no binding to a files row.
+        assert_eq!(
+            prepare_fill(&idx, &["sha256".into()])
+                .unwrap()
+                .report
+                .kept_existing,
+            0
+        );
+        idx.store_sevenzip_member_xattr_slots(&[
+            (32, 0, base + 1),
+            (32, 12, base + 5),
+            (64, 0, base + 7),
+            (64, 13, base + 8),
+        ])
+        .unwrap();
+        idx.insert_xattr(base + 5, "user.hash.sha256", b"own")
+            .unwrap();
+        idx.insert_xattr(base + 9, "user.hash.sha256", b"orphan")
+            .unwrap();
+        idx.insert_xattr(base + 1, "user.hash.crc32", b"own crc")
+            .unwrap();
+        let fill = prepare_fill(&idx, &["sha256".into()]).unwrap();
+        assert_eq!(fill.report.kept_existing, 1);
+        assert_eq!(
+            fill.rows
+                .iter()
+                .map(|r| r.algos.is_empty())
+                .collect::<Vec<_>>(),
+            [false, true, false, false]
+        );
+        let fill = prepare_fill(&idx, &["sha256".into(), "crc32".into()]).unwrap();
+        assert_eq!(fill.report.kept_existing, 2);
+        assert!(fill.rows.iter().all(|r| !r.algos.is_empty()));
     }
 
     fn copy_7z_bytes(payload: &[u8]) -> Vec<u8> {

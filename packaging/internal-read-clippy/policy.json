@@ -185,6 +185,12 @@
       "reason": "Reviewed target predicates are test-only. The only target predicate gates a Linux cfg(test) quiet-print pipe failure module."
     },
     {
+      "file": "ratarmount-compositing/src/relaxed_durability.rs",
+      "reviewer": "Codex review for #328",
+      "provenance": "Review of the db17e99 relaxed overlay durability implementation",
+      "reason": "Reviewed Linux boot-ID read from the fixed /proc/sys/kernel/random/boot_id path; other platforms return an unknown boot and fail closed for leftover markers. Unix-only overlay-verb regressions and the Linux proc-read regression are test-only."
+    },
+    {
       "file": "ratarmount-compositing/src/write_overlay.rs",
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",

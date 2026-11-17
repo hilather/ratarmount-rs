@@ -48,6 +48,40 @@ fn fixture(root: &Path) -> (String, String) {
     (base.to_str().unwrap().into(), dir.to_str().unwrap().into())
 }
 
+/// Regression (#328): forced sealing must refuse an unclean relaxed marker
+/// before it writes a new base identity, retaining the original repair evidence.
+#[test]
+fn regression_relaxed_forced_seal_preserves_unclean_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, dir) = fixture(tmp.path());
+    let db = Path::new(&dir).join(HIDDEN_DB);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES ('relaxed_durability','unknown:42')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let other = tmp.path().join("other");
+    fs::create_dir(&other).unwrap();
+    fs::write(other.join("file"), b"different base\n").unwrap();
+    let before = fs::read(&db).unwrap();
+    let out = command(&[
+        "overlay",
+        "seal",
+        &dir,
+        other.to_str().unwrap(),
+        "--force-base-mismatch",
+    ]);
+    assert!(!out.status.success());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("fsck --repair"), "{error}");
+    assert!(
+        fs::read(&db).unwrap() == before,
+        "failed seal rewrote the base identity"
+    );
+}
+
 /// Regression: offline commit must name a sealed overlay as supplied, including `./`.
 #[test]
 fn regression_240_sealed_commit_diagnostic_preserves_supplied_path() {
