@@ -748,6 +748,47 @@ mod native {
         assert!(f.calls().is_empty());
         assert!(!f.dir.path().join("out").exists());
     }
+    // Regression: socket admission must retain the selection prefix, exit 2 and create nothing.
+    #[test]
+    fn regression_bench_fuse_socket_admission_selection_stderr() {
+        let mut f = Fixture::new();
+        f.value["tasks"][0]["backends"] = json!(["native", "fuse"]);
+        let mut evidence =
+            f.value["tasks"][0]["platforms"][0]["qualification"]["evidence"][0].clone();
+        evidence["backend"] = "fuse".into();
+        f.value["tasks"][0]["platforms"][0]["qualification"]["evidence"]
+            .as_array_mut()
+            .unwrap()
+            .push(evidence);
+        f.save();
+        let work = f.dir.path().join("w".repeat(100));
+        std::fs::create_dir(&work).unwrap();
+        let output = f
+            .command_at(
+                &f.dir.path().join("out"),
+                Some(&work),
+                "native,fuse",
+                "warm",
+            )
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+        assert!(output.stdout.is_empty());
+        let error = stderr(&output);
+        assert_eq!(error.lines().count(), 1, "{error}");
+        assert!(
+            error.starts_with("sandbox bench: selection: Unix socket path"),
+            "{error}"
+        );
+        assert!(error.contains("choose a shorter --work-root"), "{error}");
+        assert!(
+            error.contains("must contain no NUL and be shorter than"),
+            "{error}"
+        );
+        assert!(!f.dir.path().join("out").exists());
+        assert_eq!(std::fs::read_dir(&work).unwrap().count(), 0);
+        assert!(f.calls().is_empty());
+    }
     // Regression: execution accepted unresolved pins, invalid deadlines or unsupported selections before setup.
     // Extraction refusals must record the failure and remove partial trees without starting a runtime.
     #[test]

@@ -201,6 +201,8 @@ A successful new writes `<index>-recovery.json` before runtime startup, adding
 runtime, container, request_id, finalize_request_id, attempt and returned mount.
 Only that returned mount is bound to `/repo`. Each new has a distinct id;
 finalize always uses its own `<batch_id>-<index>-finalize` id and `pack:false`.
+Resolved artifact paths for tasks with selected FUSE entries must be UTF-8;
+admission refuses them before setup rather than changing their bytes.
 Held-fd re-verification before create_base protects bench's admitted artifact;
 it does not cover the daemon's later pathname open. A swap between remains a risk.
 
@@ -215,9 +217,44 @@ FUSE new/finalize/destroy; batch wall_ms includes shared preparation once.
 Probes run startup only, never suite-grade, and pass only if startup and every
 lifecycle step succeeds; nonzero startup is an error with the exit status retained.
 
-Any uncertain create_base/new, readiness failure/interrupt, live-attempt interrupt,
-writers_active, or stop/finalize/destroy error keeps state: bench calls its owned
-Child::kill, reaps, sends neither destroy nor Shutdown, and leaves the sibling.
+Finalize retries only a decoded `writers_active` code. All tries reuse the exact
+attempt, `pack:false` and finalize request ID under one deadline, first try +3600 s.
+A full 1 s backoff fits inside that deadline; interrupt checks run every 10 ms.
+Other codes, transport failures and incomplete replies are single-shot and keep.
+`lifecycle_ms.finalize` includes failed tries and backoff, also on failure.
+
+Before destroy, copy full artifacts through held no-follow directory descriptors:
+
+| Source under supervisor state | Output filename | Maximum |
+|---|---|---|
+| attempts/ID/manifest.jsonl (required after finalize, empty allowed) | `<index>-fuse-manifest.jsonl` | 16 MiB |
+| attempts/ID/mount.log (required) | `<index>-fuse-mount.log` | 64 KiB |
+| indexes/BASE/prepare.log (required) | `<index>-fuse-prepare.log` | 64 KiB |
+| exact referenced attempts/ID/journal.summary.json (when present) | `<index>-fuse-journal.summary.json` | 1 MiB |
+
+Files must be caller-owned, regular, single-link and fully within their cap.
+Missing/unsafe paths, a non-null bundle, overflow or read/write/sync failure keep
+state; a truncated prefix is never a completed artifact. Exclusive 0600 output
+files are synced individually, then the output directory is synced once. Only
+then does `supervisor_artifacts` publish `{kind,source,path,bytes}` descriptors.
+A failed directory sync publishes none; partial private files may remain.
+`finalize` retains original report paths. Copied output survives leaf removal.
+
+An interrupt destroys first only for a decoded, known idle attempt, after runtime
+stop/remove/reap succeeds and required diagnostic copies succeed. It skips finalize,
+copies mount/prepare logs and records `manifest_not_applicable` when unfinalized.
+Interrupt destroy has one flag-tolerant 15 s connect/write/read deadline (four
+3 s unmount helpers plus 3 s margin), no request retry, and never clears the flag.
+Successful destroy is followed by exactly one one-slice Shutdown. Outcomes remain
+interrupted and successors blocked. Leftover multi-mount cleanup can exceed 15 s;
+a client timeout does not cancel the server. A missed/late reply is uncertain
+destroy: keep, no Shutdown, Child::kill/reap, retain the remaining FUSE sibling
+leaf. The server may already have removed the attempt root.
+
+Aborted create_base/new, readiness failure/interrupt, failed or in-flight/uncertain
+finalize/destroy, failed stop, a coexisting ordinary lifecycle I/O error or copy
+failure keeps: owned Child::kill/reap, no further destroy or Shutdown.
+An interrupt during an in-flight Stats request is not idle: keep the attempt, with no artifact copy, destroy or Shutdown.
 An aborted in-flight new has no per-entry record; row.recovery points to
 `<out>/fuse-recovery.json`. Look under `<state>/attempts` for a late attempt.
 A kept attempt is a dead FUSE mount (ENOTCONN) plus on-disk overlay and state:
@@ -229,7 +266,27 @@ destroys. Whenever the interrupt flag is set at send time, including batch end,
 use one 1 s deadline covering connect/write/read, tolerate the existing flag and
 make no retry; failure/expiry keeps. Otherwise Shutdown gets an ordinary 3600 s
 exchange. Poll reap for at most 2 s, then kill and keep on timeout; only a reaped
-daemon permits removing the leaf, before records are finished.
+daemon permits removing the leaf, before records are finished. Immediately before
+removal (also for an owned pre-spawn leaf), mount-table errors or mounts equal to
+or beneath the leaf cause keep and Child::kill/reap. This namespace snapshot is
+not a race-free mount lock.
+
+FUSE preflight/lifecycle errors and runtime Phase.error values (timeout, poll I/O,
+interrupt) attach `privilege_status:{uid,gid,no_new_privs,cap_eff,error}` to writable
+rows. uid/gid are four numeric real/effective/saved/filesystem IDs, no_new_privs is
+numeric 0/1, cap_eff is hexadecimal. The fixed `/proc/self/status` read is bounded
+to 64 KiB; acquisition/parse failures yield null fields and an explicit error.
+Diagnostics never change primary errors or keep eligibility. When no row can be
+written, execute prints the unchanged primary first, then
+`sandbox bench: privilege status: <json>`. Completed rows are never rewritten.
+Selection exit-2, native-only execution and ordinary grading failures (including
+count drift without Phase.error) do not trigger the diagnostic.
+
+`row["overlay_usage"]` is the exact Stats payload: bytes_in_overlay, files_present,
+files_deleted, directories_created and symlinks. It is collected after workload,
+before runtime.stop, including probes. This logical snapshot is neither cumulative
+I/O nor kernel counters, and can change while external writers run. Native and
+blocked rows, and rows whose Stats never completes, omit it; no zeros are fabricated.
 
 For a kept leaf, inspect/copy needed overlay and state first. Unmount each attempt
 with `fusermount3 -u <mount>` (or a lazy unmount if a dead mount is busy), confirm
@@ -242,10 +299,8 @@ signal; never kill a reused PID. For teardown prefer
 If preserving an attempt, do not Shutdown or restart: unmount if needed, inspect
 and copy state, then remove. Do not kill a raw recorded PID without cmdline confirmation.
 
-Slice B5a1a-1 keeps writers_active without retry and interrupts with live attempts
-without destroy. It does not copy supervisor diagnostics before successful destroy,
-check leftover mountpoints before leaf removal, or exercise real FUSE acceptance.
-Those refinements belong to B5a1a-2/B5a1b. B5a1a-1 and B5a1a-2 must land as separate
+B5a1a-1 plus B5a1a-2 provide these refinements through injected effects and the
+same-user runtime stub. Real FUSE acceptance remains B5a1b. Both slices require separate
 squash commits in sequence, and neither may merge before B5a1b real acceptance
 at the combined exact tip and hosted macOS clippy/tests. Help/about remains deferred.
 
