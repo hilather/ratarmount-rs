@@ -34,7 +34,12 @@ impl Daemon {
 
     /// `start` with `env` added to the daemon's environment.
     fn start_with_env(env: Vec<(&'static str, OsString)>) -> Self {
-        let root = tempfile::tempdir().unwrap();
+        // The daemon refuses a socket parent that others can write to; under a
+        // group-writable umask (0002) a default temporary directory is one.
+        let root = tempfile::Builder::new()
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .tempdir()
+            .unwrap();
         let socket = root.path().join("api.sock");
         let child = Self::spawn(root.path(), &socket, &env);
         let mut daemon = Self {
@@ -1435,6 +1440,82 @@ fn regression_sandbox_v2_lower_other_base_fuse() {
     );
 }
 
+/// Regression (#341): a lower sealed over a directory base with a supplied
+/// strong digest passes the supervisor's admission (`check_stack`) and the
+/// child's cheap identity check (the directory's size/mtime manifest), but its
+/// preimage pins refuse a same-size base edit with a restored mtime under a
+/// path it modifies: `new` is `mount_failed`, naming the path, and nothing is
+/// left behind. The unchanged base is admitted.
+#[test]
+fn regression_sandbox_v2_lower_preimage_pin_fuse() {
+    use ratarmount_compositing::{
+        BaseDigestRequest, CreateOptions, FolderMountSource, WriteOverlay,
+    };
+    use std::sync::Arc;
+    if !prepared_fuse() {
+        return;
+    }
+    let daemon = Daemon::start();
+    let root = daemon.root.as_ref().unwrap().path().to_owned();
+    let base = root.join("dirbase");
+    fs::create_dir(&base).unwrap();
+    let file = base.join("f.txt");
+    fs::write(&file, b"old\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    daemon.call(json!({"op":"create_base", "name":"task", "source":base}));
+    let lower = root.join("pinned");
+    {
+        let source: Arc<dyn ratarmount_core::MountSource> =
+            Arc::new(FolderMountSource::new(&base).unwrap());
+        let classified = token::ClassifiedBaseOver::folder(source.clone(), &base);
+        let overlay = WriteOverlay::open(
+            &classified,
+            source.clone(),
+            &lower,
+            &CreateOptions {
+                base_digest: BaseDigestRequest::Supplied(format!("sha256:{}", "5".repeat(64))),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        overlay.unlink("/f.txt").unwrap();
+        let fd = overlay.create_file("/f.txt", 0o644).unwrap();
+        overlay.close_overlay_fd(fd);
+        drop(overlay);
+        fs::write(lower.join("f.txt"), b"new\n").unwrap();
+        ratarmount_compositing::overlay_seal::seal(&lower, &classified, source).unwrap();
+    }
+    let meta = ratarmount_compositing::OverlayMeta::read(&lower)
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.base_digest_kind(), Some("strong"));
+    assert!(meta.get("base_preimage_digest").is_some(), "{meta:?}");
+    let attempts =
+        daemon.call(json!({"version": 2, "op": "new", "base": "task", "lowers": [lower]}));
+    let path = Path::new(attempts[0]["path"].as_str().unwrap());
+    assert_eq!(fs::read(path.join("f.txt")).unwrap(), b"new\n");
+    daemon.call(json!({"op": "destroy", "base": "task"}));
+    let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+    fs::write(&file, b"alt\n").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(mtime))
+        .unwrap();
+    let reply =
+        daemon.envelope(json!({"version": 2, "op": "new", "base": "task", "lowers": [lower]}));
+    assert_eq!(reply["error"]["code"], "mount_failed", "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(message.contains("f.txt: content changed"), "{message}");
+    assert!(message.contains(lower.to_str().unwrap()), "{message}");
+    assert_eq!(daemon.call(json!({"op": "list"})), json!([]));
+    assert_eq!(
+        fs::read_dir(root.join("state/attempts")).unwrap().count(),
+        0
+    );
+}
+
 /// R1b timings (Keystone note (a), Risk 1): F1's `new` with `count` 2 and 8
 /// over its small bundle; the supervisor's validation of a bundle with 256 MiB
 /// of payload (refused by the stack check after its full read, so validation
@@ -2000,8 +2081,12 @@ fn regression_sandbox_v2_finalize_layered_fuse() {
             "files_read": count("files_read"),
             "files_read_then_written": count("files_read_then_written"),
             "files_written_blind": count("files_written_blind"),
+            "complete": summary["coverage"]["complete"],
+            "reasons": summary["coverage"]["reasons"],
         })
     );
+    // The attempt's mount was stopped cleanly before the summary was taken.
+    assert_eq!(summary["coverage"]["complete"], true, "{summary}");
     assert!(
         summary["files_written_blind"]
             .as_array()
@@ -2508,4 +2593,88 @@ fn regression_sandbox_restart_serve_retained_fuse() {
         report
     );
     assert_eq!(daemon.call(json!({"op":"diff","id":id,"git":true})), patch);
+}
+
+/// Regression (#328): a real relaxed supervisor attempt (v2 `new` with
+/// `overlay_durability: relaxed`, retained) records the relaxed marker while
+/// it serves, creates and unlinks files through FUSE, then finalizes: the
+/// clean unmount clears the marker, the layer is sealed and retained, and
+/// only the surviving files are in its change set. A `full` attempt beside it
+/// never records a marker. Timings are printed, never asserted.
+#[test]
+fn regression_sandbox_v2_relaxed_attempt_fuse() {
+    if !prepared_fuse() {
+        return;
+    }
+    const KEY: &str = "relaxed_durability";
+    const FILES: usize = 200;
+    let mut daemon = Daemon::start();
+    daemon.base();
+    let mut timings = Vec::new();
+    for durability in ["full", "relaxed"] {
+        let mut request = json!({
+            "version": 2, "op": "new", "base": "task", "retain": true,
+            "request_id": format!("new-{durability}")
+        });
+        if durability == "relaxed" {
+            request["overlay_durability"] = json!("relaxed");
+        }
+        let attempts = daemon.call(request);
+        let id = attempts[0]["id"].as_str().unwrap().to_owned();
+        let mnt = PathBuf::from(attempts[0]["path"].as_str().unwrap());
+        let overlay = PathBuf::from(attempts[0]["overlay_dir"].as_str().unwrap());
+        let marker = meta_unlocked(&overlay).get(KEY).cloned();
+        if durability == "relaxed" {
+            let marker = marker.expect("a relaxed child records its marker before serving");
+            assert!(marker.contains(':'), "{marker}");
+        } else {
+            assert_eq!(marker, None);
+        }
+        let started = Instant::now();
+        for i in 0..FILES {
+            let path = mnt.join(format!("f{i}.txt"));
+            fs::write(&path, format!("{i}\n")).unwrap();
+            if i % 2 == 1 {
+                fs::remove_file(&path).unwrap();
+            }
+        }
+        timings.push((durability, started.elapsed()));
+        let stats = daemon.call(json!({"op": "stats", "id": id}));
+        assert_eq!(stats["files_present"], FILES / 2, "{stats}");
+        let patch = daemon.call(json!({"op": "diff", "id": id, "git": true}));
+        assert!(patch["patch"]
+            .as_str()
+            .unwrap()
+            .contains("diff --git a/f0.txt b/f0.txt"));
+        let report = finalize_done(
+            &daemon,
+            &json!({"version": 2, "op": "finalize", "id": id, "request_id": format!("fin-{durability}")}),
+            &mnt,
+        );
+        assert_eq!(report["status"], "retained", "{report}");
+        assert_eq!(report["patch_hash"]["files"], FILES / 2, "{report}");
+        let kept = PathBuf::from(report["attempt"]["overlay_dir"].as_str().unwrap());
+        let meta = meta_unlocked(&kept);
+        assert_eq!(meta.get(KEY), None, "{durability}: {meta:?}");
+        assert!(meta.contains_key("sealed_at"), "{meta:?}");
+        // A clean relaxed layer remains valid after restart, including as a
+        // lower of another real FUSE attempt.
+        daemon.restart();
+        assert_eq!(
+            daemon.call(json!({"version": 2, "op": "finalize", "id": id})),
+            report
+        );
+        assert_eq!(
+            daemon.call(json!({"op": "diff", "id": id, "git": true})),
+            patch
+        );
+        let children =
+            daemon.call(json!({"version": 2, "op": "new", "base": "task", "lowers": [kept]}));
+        let child = &children[0];
+        let path = PathBuf::from(child["path"].as_str().unwrap());
+        assert_eq!(fs::read(path.join("f0.txt")).unwrap(), b"0\n");
+        assert!(!path.join("f1.txt").exists());
+        daemon.call(json!({"op": "destroy", "id": child["id"]}));
+    }
+    eprintln!("create/unlink {FILES} files through FUSE: {timings:?}");
 }

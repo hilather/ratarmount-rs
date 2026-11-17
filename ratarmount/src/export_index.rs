@@ -238,10 +238,14 @@ fn read_rows(input: &Input, mut emit: impl FnMut(ExportRow) -> Result<()>) -> Re
         [],
         |r| r.get(0),
     )?;
+    // #320: a hash in a slot several members share belongs to none of them.
     let hash_sql = if has_xattrs {
-        "(SELECT CAST(x.value AS TEXT) FROM xattrs x WHERE x.offsetheader=f.offsetheader AND x.key='user.hash.sha256')"
+        format!(
+            "(SELECT CAST(x.value AS TEXT) FROM xattrs x WHERE x.offsetheader=f.offsetheader AND x.key='user.hash.sha256' AND f.offsetheader NOT IN ({}))",
+            ratarmount_index::shared_xattr_slots_sql(&conn)?
+        )
     } else {
-        "NULL"
+        "NULL".to_string()
     };
     let mut query = conn.prepare(&format!("SELECT f.path,f.name,f.size,f.mode,f.mtime,f.type,f.linkname,f.offsetheader,f.offset,{hash_sql} FROM files f ORDER BY f.path COLLATE BINARY,f.name COLLATE BINARY,f.offsetheader"))?;
     let mut rows = query.query([])?;
@@ -531,6 +535,59 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    /// Regression: #320 a `user.hash.sha256` under an `offsetheader` two members
+    /// share (solid 7z from an older build) is exported for neither of them.
+    #[test]
+    fn regression_320_export_shared_slot_hash_is_null() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        fs::create_dir(&input).unwrap();
+        shard::tests::dataset(&input);
+        let output = temp.path().join("shards");
+        let manifest = shard::run(&shard::tests::args(&input, &output, &[])).unwrap();
+        let index_path = output.join(manifest.shards[0].index.as_ref().unwrap());
+        let index = SqliteIndex::open_writable(&index_path).unwrap();
+        let conn = Connection::open(&index_path).unwrap();
+        let rows: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT name, offsetheader FROM files WHERE offsetheader IS NOT NULL \
+                 AND NOT isgenerated AND mode & 61440 = 32768 ORDER BY offsetheader LIMIT 3",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        conn.execute(
+            "UPDATE files SET offsetheader=?1 WHERE name=?2",
+            rusqlite::params![rows[0].1, rows[1].0],
+        )
+        .unwrap();
+        drop(conn);
+        index
+            .insert_xattr(rows[0].1, "user.hash.sha256", b"stale-shared")
+            .unwrap();
+        index
+            .insert_xattr(rows[2].1, "user.hash.sha256", b"own-slot")
+            .unwrap();
+        index.wal_checkpoint_truncate().unwrap();
+        drop(index);
+        let target = temp.path().join("rows.jsonl");
+        run(&args(&[output.join("shards.json")], &target, "jsonl")).unwrap();
+        let exported = json_rows(&target);
+        let sha = |name: &str| {
+            exported
+                .iter()
+                .find(|r| r["shard"] == manifest.shards[0].name && r["name"] == name)
+                .unwrap()["sha256"]
+                .clone()
+        };
+        assert!(sha(&rows[0].0).is_null());
+        assert!(sha(&rows[1].0).is_null());
+        assert_eq!(sha(&rows[2].0), "own-slot");
     }
 
     /// Regression: exported offsets/hashes must match the catalog and locate the sample's frame.

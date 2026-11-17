@@ -180,11 +180,14 @@ fn query_index_cli(
         .iter()
         .map(|s| parse_xattr_filter(s))
         .collect::<Result<Vec<_>, _>>()?;
+    let filter_hashes = predicates
+        .iter()
+        .any(|(name, _, _)| name.starts_with("user.hash."));
     let mut hits = Vec::new();
     let mut cursor: Option<(String, Option<i64>)> = None;
     loop {
         let q = SearchQuery {
-            include_hashes: loc.include_hashes,
+            include_hashes: loc.include_hashes || filter_hashes,
             offset_order: false,
             after: cursor
                 .as_ref()
@@ -204,12 +207,20 @@ fn query_index_cli(
         if let Some(last) = page.last() {
             cursor = Some((last.path.clone(), last.offsetheader));
         }
-        for hit in page {
+        for mut hit in page {
             let mut matches = true;
             for (name, op, expected) in &predicates {
-                let value = match hit.offsetheader {
-                    Some(offset) => idx.get_xattr(offset, name).map_err(|e| e.to_string())?,
-                    None => None,
+                let value = if name.starts_with("user.hash.")
+                    && !hit.hashes.iter().any(|(key, _)| key == name)
+                {
+                    // Use the same ambiguity filtering as --hashes, including
+                    // presence and != predicates when hashes are not printed.
+                    None
+                } else {
+                    match hit.offsetheader {
+                        Some(offset) => idx.get_xattr(offset, name).map_err(|e| e.to_string())?,
+                        None => None,
+                    }
                 };
                 matches &= match op {
                     0 => value.is_some(),
@@ -218,6 +229,9 @@ fn query_index_cli(
                 };
             }
             if matches {
+                if !loc.include_hashes {
+                    hit.hashes.clear();
+                }
                 hits.push(hit);
             }
             if hits.len() == DEFAULT_SEARCH_LIMIT {
@@ -369,8 +383,21 @@ fn sidecar_tarstats_ok(idx_path: &Path, archive: &Path) -> bool {
 }
 
 /// Redirect stdout to `/dev/null` for `f`, then restore. Best-effort.
-fn silence_stdout<T>(f: impl FnOnce() -> T) -> T {
-    let _ = io::stdout().flush();
+///
+/// fd 1 is shared with `diff::ProgressToStderr` (#298): while another thread's
+/// redirect is live, `f` runs under it (fd 1 is already away from stdout) and
+/// the last of them restores.
+pub(crate) fn silence_stdout<T>(f: impl FnOnce() -> T) -> T {
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.flush();
+    let mut state = crate::diff::stdout_redirect();
+    if let Some(guard) = crate::diff::ProgressToStderr::join(&mut state) {
+        drop(state);
+        drop(stdout);
+        let out = f();
+        drop(guard);
+        return out;
+    }
     // SAFETY: duplicating STDOUT_FILENO to restore after `/dev/null` redirect.
     #[expect(
         clippy::disallowed_methods,
@@ -378,12 +405,19 @@ fn silence_stdout<T>(f: impl FnOnce() -> T) -> T {
     )]
     let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
     if saved < 0 {
+        drop(state);
+        drop(stdout);
         return f();
     }
-    restore_stdout_after(saved, f)
+    restore_stdout_after(state, stdout, saved, f)
 }
 
-fn restore_stdout_after<T>(saved: RawFd, f: impl FnOnce() -> T) -> T {
+fn restore_stdout_after<T>(
+    mut state: std::sync::MutexGuard<'static, crate::diff::StdoutRedirect>,
+    stdout: io::StdoutLock<'static>,
+    saved: RawFd,
+    f: impl FnOnce() -> T,
+) -> T {
     let devnull = {
         #[expect(
             clippy::disallowed_types,
@@ -411,19 +445,40 @@ fn restore_stdout_after<T>(saved: RawFd, f: impl FnOnce() -> T) -> T {
                 )]
                 libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO);
             }
-            let out = f();
-            unsafe {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0019-M01","item":"ratarmount::find::restore_stdout_after","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )]
-                libc::dup2(saved, libc::STDOUT_FILENO);
-                libc::close(saved);
+            state.saved = Some(crate::diff::SavedStdout::Raw(saved));
+            state.guards = 1;
+            drop(state);
+            drop(stdout);
+            // Restore even when `f` panics, then resume the panic.
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let mut stdout = io::stdout().lock();
+            let mut state = crate::diff::stdout_redirect();
+            state.guards -= 1;
+            // A redirect that joined meanwhile restores when it ends.
+            let saved = if state.guards == 0 {
+                state.saved.take()
+            } else {
+                None
+            };
+            if let Some(saved) = saved {
+                // Drain partial progress lines to the redirected destination.
+                let _ = stdout.flush();
+                unsafe {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0019-M01","item":"ratarmount::find::restore_stdout_after","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )]
+                    libc::dup2(saved.raw(), libc::STDOUT_FILENO);
+                }
+                drop(saved);
             }
-            let _ = io::stdout().flush();
-            out
+            drop(state);
+            drop(stdout);
+            out.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         }
         Err(_) => {
+            drop(state);
+            drop(stdout);
             // SAFETY: `saved` is an unused dup we still own.
             unsafe {
                 libc::close(saved);
@@ -559,6 +614,46 @@ mod tests {
             assert_eq!(hits.len(), expected, "{filter}");
             if expected == 1 {
                 assert_eq!(hits[0].path, "/tagged");
+            }
+        }
+    }
+
+    /// Regression: #320 --xattr must not match ambiguous hashes through its
+    /// direct index lookup; ordinary shared attributes remain queryable.
+    #[test]
+    fn regression_320_find_xattr_refuses_shared_hash() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        for (name, oh, offset) in [("b.txt", 32, 0), ("text.txt", 32, 12), ("own.txt", 64, 0)] {
+            idx.insert_file(
+                "", name, oh, offset, 12, 0.0, 0o100644, 0, "", 0, 0, false, false, false, 0,
+            )
+            .unwrap();
+        }
+        idx.insert_xattr(32, "user.hash.sha256", b"stale").unwrap();
+        idx.insert_xattr(64, "user.hash.sha256", b"own").unwrap();
+        idx.insert_xattr(32, "user.teacher", b"shared").unwrap();
+        for (filter, expected) in [
+            ("hash.sha256", vec!["/own.txt"]),
+            ("hash.sha256=stale", vec![]),
+            ("hash.sha256!=own", vec![]),
+            ("hash.sha256=own", vec!["/own.txt"]),
+            ("hash.sha256!=stale", vec!["/own.txt"]),
+            ("teacher=shared", vec!["/b.txt", "/text.txt"]),
+        ] {
+            for include_hashes in [false, true] {
+                let filters = vec![filter.into()];
+                let options = LocateOptions {
+                    xattrs: &filters,
+                    include_hashes,
+                    ..Default::default()
+                };
+                let hits =
+                    query_index_cli(&idx, Path::new("unused.7z"), "*", &options, false).unwrap();
+                assert_eq!(
+                    hit_paths(&hits),
+                    expected,
+                    "{filter}, hashes={include_hashes}"
+                );
             }
         }
     }

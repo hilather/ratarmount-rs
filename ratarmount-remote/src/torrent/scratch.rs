@@ -141,7 +141,7 @@ impl TorrentStorage for Storage {
     }
 }
 
-pub(super) fn mark_owned(dir: &Path) -> std::io::Result<std::fs::File> {
+pub(super) fn mark_owned(dir: &Path) -> std::io::Result<ratarmount_core::held_lock::HeldLock> {
     let file = {
         #[expect(
             clippy::disallowed_types,
@@ -165,7 +165,10 @@ pub(super) fn mark_owned(dir: &Path) -> std::io::Result<std::fs::File> {
         __inventory_value_2
     }?;
     file.lock()?;
-    Ok(file)
+    Ok(ratarmount_core::held_lock::HeldLock::new(
+        file,
+        "torrent scratch owner",
+    ))
 }
 
 pub(super) fn sweep(dir: &Path, age: Duration) {
@@ -229,12 +232,41 @@ pub(super) fn sweep(dir: &Path, age: Duration) {
         if let Err(e) = std::fs::remove_dir_all(entry.path()) {
             log::debug!("torrent stale scratch cleanup: {e}");
         }
+        // Explicit (#187): a forked child may hold a copy of the descriptor.
+        ratarmount_core::held_lock::unlock_or_log(&file, "torrent scratch owner");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: swarm setup failures dropped a raw ownership file, keeping
+    /// the scratch lock held by any descriptor inherited by another child.
+    #[cfg(unix)]
+    #[test]
+    fn regression_187_scratch_owner_unlocks_on_setup_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut inherited = None;
+        let failed = (|| -> std::io::Result<()> {
+            let owner = mark_owned(dir.path())?;
+            inherited = Some(owner.file().try_clone()?);
+            let probe = std::fs::File::open(dir.path().join(OWNER))?;
+            assert!(matches!(
+                probe.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            Err(std::io::Error::other("injected runtime setup failure"))
+        })();
+        assert!(failed.is_err());
+        assert!(inherited.is_some());
+        std::fs::File::open(dir.path().join(OWNER))
+            .unwrap()
+            .try_lock()
+            .unwrap();
+        drop(inherited);
+    }
+
     /// Regression: an evicted verified piece was replaced by an unverified zero-filled scratch hole.
     #[test]
     fn regression_scratch_missing_slot_refuses_upload_read() {

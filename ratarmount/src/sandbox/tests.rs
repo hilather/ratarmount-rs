@@ -192,6 +192,7 @@ pub(super) struct SpawnRecord {
     pub(super) lowers: Vec<PathBuf>,
     pub(super) bundle_cache: Option<PathBuf>,
     pub(super) journal: Option<(PathBuf, protocol::JournalSpec)>,
+    pub(super) durability: protocol::OverlayDurability,
 }
 
 #[derive(Clone, Default)]
@@ -298,6 +299,7 @@ impl Mounter for Fake {
             journal: spec
                 .journal
                 .map(|(path, journal)| (path.into(), journal.clone())),
+            durability: spec.durability,
         });
         drop(state);
         if !spec.lowers.is_empty() {
@@ -2246,6 +2248,7 @@ fn regression_cli_v1_request_bytes_unchanged() {
             lowers: vec![],
             journal: None,
             retain: false,
+            overlay_durability: Default::default(),
         }),
     )
     .unwrap();
@@ -2253,4 +2256,321 @@ fn regression_cli_v1_request_bytes_unchanged() {
     assert_eq!(response.error.unwrap().code, "unsupported_version");
     recorder.line();
     recorder.finish();
+}
+
+/// Regression (#328): v2 `new` takes `overlay_durability` as the string
+/// `"full"` or `"relaxed"` only (absent is `full`); `null`, the map form,
+/// another case and unknown values are `invalid_request` in a v2 answer, and
+/// v1 `new` refuses the field as unknown. `full` is never serialized, so an
+/// explicit `full` reads and hashes as an absent field; `relaxed` hashes as
+/// another request, and has no v1 form.
+#[test]
+fn regression_supervisor_overlay_durability_protocol() {
+    use protocol::{Op, OperationV2, OverlayDurability, VERSION_2};
+    let parse = |line: &str| Request::parse(line.as_bytes());
+    let durability = |line: &str| match parse(line).unwrap().operation {
+        Op::V2(OperationV2::New {
+            overlay_durability, ..
+        }) => overlay_durability,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        durability(r#"{"version":2,"op":"new","base":"task"}"#),
+        OverlayDurability::Full
+    );
+    assert_eq!(
+        durability(r#"{"version":2,"op":"new","base":"task","overlay_durability":"full"}"#),
+        OverlayDurability::Full
+    );
+    assert_eq!(
+        durability(r#"{"version":2,"op":"new","base":"task","overlay_durability":"relaxed"}"#),
+        OverlayDurability::Relaxed
+    );
+    for value in [
+        "null",
+        r#"{"relaxed":null}"#,
+        r#""Relaxed""#,
+        r#""off""#,
+        r#""""#,
+        "true",
+        "1",
+    ] {
+        let line =
+            format!(r#"{{"version":2,"op":"new","base":"task","overlay_durability":{value}}}"#);
+        let rejection = parse(&line).unwrap_err();
+        assert_eq!(
+            (rejection.version, rejection.error.code.as_str()),
+            (VERSION_2, "invalid_request"),
+            "{value}: {}",
+            rejection.error.message
+        );
+    }
+    let rejection =
+        parse(r#"{"version":2,"op":"new","base":"task","overlay_durability":"off"}"#).unwrap_err();
+    assert!(
+        rejection
+            .error
+            .message
+            .contains("unknown variant `off`, expected `full` or `relaxed`"),
+        "{}",
+        rejection.error.message
+    );
+    // Only `new` takes it, and only in version 2.
+    for line in [
+        r#"{"version":1,"op":"new","base":"task","overlay_durability":"relaxed"}"#,
+        r#"{"version":2,"op":"finalize","id":"a","overlay_durability":"relaxed"}"#,
+        r#"{"version":2,"op":"create_base","name":"a","source":"/x","options":{"overlay_durability":"relaxed"}}"#,
+    ] {
+        assert_eq!(
+            parse(line).unwrap_err().error.code,
+            "invalid_request",
+            "{line}"
+        );
+    }
+    // Serialization omits `full`; the hash ignores it.
+    let hash = |line: &str| {
+        let Op::V2(operation) = parse(line).unwrap().operation else {
+            panic!("v2 line");
+        };
+        requests::op_hash(&operation)
+    };
+    let plain = hash(r#"{"version":2,"op":"new","base":"task","request_id":"r"}"#);
+    assert_eq!(
+        plain, "sha256:7c90b0d547f54b6b875948f96f3781758eb2820c17b9a32d2a8dd2536ebc135e",
+        "R1a's golden digest"
+    );
+    assert_eq!(
+        hash(
+            r#"{"version":2,"op":"new","base":"task","request_id":"r","overlay_durability":"full"}"#
+        ),
+        plain
+    );
+    let relaxed = hash(
+        r#"{"version":2,"op":"new","base":"task","request_id":"r","overlay_durability":"relaxed"}"#,
+    );
+    assert_ne!(relaxed, plain);
+    assert_eq!(
+        hash(
+            r#"{"overlay_durability":"relaxed","request_id":"other","base":"task","op":"new","version":2}"#
+        ),
+        relaxed
+    );
+    let full =
+        parse(r#"{"version":2,"op":"new","base":"task","overlay_durability":"full"}"#).unwrap();
+    assert!(!serde_json::to_string(&full)
+        .unwrap()
+        .contains("overlay_durability"));
+    let relaxed_request =
+        parse(r#"{"version":2,"op":"new","base":"task","overlay_durability":"relaxed"}"#).unwrap();
+    assert!(serde_json::to_string(&relaxed_request)
+        .unwrap()
+        .contains(r#""overlay_durability":"relaxed""#));
+}
+
+/// Regression (#328): only a relaxed attempt's child gets
+/// `--overlay-durability=relaxed` (one argument, before `--`), which the mount
+/// CLI parses back; `full` keeps R1a's argv. The supervisor never passes an
+/// archive-commit flag, the only thing the mount refuses with relaxed.
+#[test]
+fn regression_supervisor_overlay_durability_spawn_args() {
+    use protocol::OverlayDurability;
+    let base = Base {
+        name: "task".into(),
+        source: "/srv/base.tar".into(),
+        options: BaseOptions::default(),
+    };
+    let attempt = Attempt {
+        id: "attempt-1".into(),
+        base: "task".into(),
+        path: "/state/attempts/attempt-1/mnt".into(),
+        overlay_dir: "/state/attempts/attempt-1/overlay".into(),
+        status: "starting".into(),
+    };
+    let indexes = Path::new("/state/indexes/task");
+    let full = process::mount_args(&base, indexes, &attempt, &SpawnSpec::default());
+    let readonly = ["tests/**".to_owned()];
+    let relaxed_spec = SpawnSpec {
+        quota: Some(10),
+        readonly: &readonly,
+        durability: OverlayDurability::Relaxed,
+        ..Default::default()
+    };
+    let relaxed = process::mount_args(&base, indexes, &attempt, &relaxed_spec);
+    let flag = OsString::from("--overlay-durability=relaxed");
+    assert!(!full
+        .iter()
+        .any(|arg| arg.to_str().unwrap().starts_with("--overlay-durability")));
+    assert_eq!(relaxed.iter().filter(|arg| **arg == flag).count(), 1);
+    let at = relaxed.iter().position(|arg| *arg == flag).unwrap();
+    let separator = relaxed.iter().position(|arg| arg == "--").unwrap();
+    assert!(at < separator);
+    let mut without = relaxed.clone();
+    without.remove(at);
+    assert_eq!(
+        without,
+        process::mount_args(
+            &base,
+            indexes,
+            &attempt,
+            &SpawnSpec {
+                durability: OverlayDurability::Full,
+                ..relaxed_spec
+            }
+        )
+    );
+    for arg in &relaxed {
+        let arg = arg.to_str().unwrap();
+        assert!(
+            !arg.starts_with("--commit-overlay") && !arg.starts_with("--roll-every"),
+            "{arg}"
+        );
+    }
+    let parsed =
+        crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(relaxed))
+            .unwrap();
+    assert_eq!(parsed.overlay_durability, "relaxed");
+    let parsed =
+        crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(full)).unwrap();
+    assert_eq!(parsed.overlay_durability, "full");
+}
+
+/// Regression (#328): a v2 `new` with `relaxed` starts the attempts (disk
+/// and tmpfs tops) with the flag, through the request-ID layer too, and a
+/// refused body (unknown value, a v1 `new` naming it) creates no attempt
+/// directory, RAM root, child or request record.
+#[test]
+fn regression_supervisor_overlay_durability_new() {
+    use protocol::OverlayDurability;
+    let (root, mut supervisor, fake) = setup(8);
+    let respond = |supervisor: &mut Supervisor<Fake>, body: serde_json::Value| {
+        serde_json::from_slice::<serde_json::Value>(&daemon::respond(
+            supervisor,
+            &serde_json::to_vec(&body).unwrap(),
+        ))
+        .unwrap()
+    };
+    for body in [
+        json!({"version": 2, "op": "new", "base": "task", "overlay_durability": "fast"}),
+        json!({"version": 2, "op": "new", "base": "task", "overlay_durability": null, "request_id": "bad"}),
+        json!({"version": 1, "op": "new", "base": "task", "overlay_durability": "relaxed"}),
+    ] {
+        let reply = respond(&mut supervisor, body.clone());
+        assert_eq!(reply["error"]["code"], "invalid_request", "{body}: {reply}");
+        assert_eq!(
+            fs::read_dir(root.path().join("attempts")).unwrap().count(),
+            0
+        );
+        assert_eq!(fake.0.lock().unwrap().spawns, 0);
+        assert!(!root.path().join("ram-root.json").exists());
+        assert!(supervisor.requests.lookup("bad").is_none());
+    }
+    // Without a request ID, then with one (a retry replays, one batch).
+    let reply = respond(
+        &mut supervisor,
+        json!({"version": 2, "op": "new", "base": "task", "count": 2, "overlay_durability": "relaxed"}),
+    );
+    assert_eq!(
+        (reply["ok"].clone(), reply["version"].clone()),
+        (json!(true), json!(2)),
+        "{reply}"
+    );
+    let body = json!({"version": 2, "op": "new", "base": "task", "overlay_durability": "relaxed", "request_id": "r"});
+    let first = respond(&mut supervisor, body.clone());
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(respond(&mut supervisor, body), first);
+    // The same ID with `full` is another body.
+    let conflict = respond(
+        &mut supervisor,
+        json!({"version": 2, "op": "new", "base": "task", "request_id": "r"}),
+    );
+    assert_eq!(
+        conflict["error"]["code"], "idempotency_conflict",
+        "{conflict}"
+    );
+    // A v1 `new` and a v2 `new` naming `full` spawn without the flag.
+    supervisor.handle(new(1)).unwrap();
+    let full = respond(
+        &mut supervisor,
+        json!({"version": 2, "op": "new", "base": "task", "overlay_durability": "full"}),
+    );
+    assert_eq!(full["ok"], true, "{full}");
+    let specs: Vec<_> = fake
+        .0
+        .lock()
+        .unwrap()
+        .specs
+        .iter()
+        .map(|spec| spec.durability)
+        .collect();
+    assert_eq!(
+        specs,
+        [
+            OverlayDurability::Relaxed,
+            OverlayDurability::Relaxed,
+            OverlayDurability::Relaxed,
+            OverlayDurability::Full,
+            OverlayDurability::Full,
+        ]
+    );
+    supervisor.destroy_all().unwrap();
+    // A tmpfs top takes it too (it changes nothing that matters there).
+    let reply = respond(
+        &mut supervisor,
+        json!({"version": 2, "op": "new", "base": "task", "overlay": "tmpfs", "overlay_durability": "relaxed"}),
+    );
+    if reply["error"]["code"] == "unsupported" {
+        eprintln!("skip: tmpfs row: no writable tmpfs: {reply}");
+    } else {
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(
+            fake.0.lock().unwrap().specs.last().unwrap().durability,
+            OverlayDurability::Relaxed
+        );
+        supervisor.destroy_all().unwrap();
+    }
+}
+
+/// Regression (#328): `sandbox new --overlay-durability relaxed` sends v2
+/// with the field; `full` (explicit or absent) sends R1a's v1 bytes; an
+/// unknown value is a usage error.
+#[test]
+fn regression_cli_overlay_durability() {
+    for (argv, line) in [
+        (
+            &["new", "task", "--overlay-durability", "relaxed"][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"overlay_durability\":\"relaxed\"}\n",
+        ),
+        (
+            &["new", "task", "--overlay-durability", "relaxed", "--request-id", "r", "--retain"][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"request_id\":\"r\",\"retain\":true,\"overlay_durability\":\"relaxed\"}\n",
+        ),
+        (
+            &["new", "task", "--overlay-durability", "full"][..],
+            "{\"version\":1,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[]}\n",
+        ),
+        (
+            &["new", "task", "--overlay-durability=full", "--request-id", "r"][..],
+            "{\"version\":2,\"op\":\"new\",\"base\":\"task\",\"count\":1,\"overlay\":\"disk\",\"quota\":null,\"readonly_globs\":[],\"request_id\":\"r\"}\n",
+        ),
+    ] {
+        let version = if line.starts_with("{\"version\":2") { 2 } else { 1 };
+        let recorder = Recorder::start(vec![format!(
+            "{{\"version\":{version},\"ok\":true,\"result\":null}}\n"
+        )
+        .into_bytes()]);
+        run(&recorder.args(argv)).unwrap();
+        assert_eq!(String::from_utf8(recorder.line()).unwrap(), line, "{argv:?}");
+        recorder.finish();
+    }
+    let error = SandboxArgs::try_parse_from([
+        "sandbox",
+        "--socket",
+        "/x.sock",
+        "new",
+        "task",
+        "--overlay-durability",
+        "off",
+    ])
+    .expect_err("unknown value refused");
+    assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
 }

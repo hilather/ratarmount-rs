@@ -366,10 +366,27 @@ impl Ratarmount9p {
     pub fn setattr(&self, id: u64, size: Option<u64>, attrs: &OverlayMetadata) -> Result<(), i32> {
         let ov = self.overlay()?;
         let path = self.path_for_id(id)?;
-        ov.set_attributes(&path, size, attrs).map_err(|e| {
-            let e = overlay_to_io(e);
-            e.raw_os_error().unwrap_or_else(|| io_to_errno(&e))
-        })?;
+        let requested = size.is_some() || !attrs.is_empty();
+        let filtered;
+        let attrs = if attrs.uid.is_some() || attrs.gid.is_some() {
+            // A chown to the owner already presented is a no-op (#327).
+            let mut out = attrs.clone();
+            if let Ok(fi) = self.file_info(id) {
+                (out.uid, out.gid) = self
+                    .attribute_mapping
+                    .drop_presented_owner(fi.uid, fi.gid, attrs.uid, attrs.gid);
+            }
+            filtered = out;
+            &filtered
+        } else {
+            attrs
+        };
+        if requested {
+            ov.set_attributes(&path, size, attrs).map_err(|e| {
+                let e = overlay_to_io(e);
+                e.raw_os_error().unwrap_or_else(|| io_to_errno(&e))
+            })?;
+        }
         self.bump(id);
         Ok(())
     }
@@ -759,6 +776,24 @@ mod tests {
         (td, fs)
     }
 
+    /// Regression (#316): 9P TMKDIR of an existing directory changed its
+    /// mode instead of failing; it is EEXIST and the mode is kept.
+    #[test]
+    fn regression_316_mkdir_existing_is_eexist() {
+        use std::os::unix::fs::MetadataExt;
+        let (td, fs) = overlay_fs();
+        let (id, _) = fs.mkdir(ROOT_FILEID, "d", 0o750).expect("mkdir");
+        let before = fs.getattr(id).unwrap().mode;
+        assert_eq!(fs.mkdir(ROOT_FILEID, "d", 0o700).unwrap_err(), libc::EEXIST);
+        assert_eq!(fs.getattr(id).unwrap().mode, before);
+        assert_eq!(
+            std::fs::metadata(td.path().join("d")).unwrap().mode() & 0o7777,
+            0o750
+        );
+        fs.lcreate(ROOT_FILEID, "f", 0o644).expect("create");
+        assert_eq!(fs.mkdir(ROOT_FILEID, "f", 0o700).unwrap_err(), libc::EEXIST);
+    }
+
     /// Regression: write-then-cat empty when 9P READ used a stale size-0
     /// inode cache instead of re-lookup. Production path is `read`.
     #[test]
@@ -831,5 +866,94 @@ mod sandbox_attr_tests {
             .with_attribute_mapping(AttributeMapping::parse("uid=12345,gid=23456").unwrap());
         let attr = fs.getattr(root_id()).unwrap();
         assert_eq!((attr.uid, attr.gid), (12345, 23456));
+    }
+
+    /// Regression: 9P must retain read-only denials after filtering chown,
+    /// and refuse a real owner change before applying a combined truncate (#327).
+    #[test]
+    fn regression_327_chown_preserves_policy_and_readonly() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("member"), b"base").unwrap();
+        let source = Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+        for protected in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut ov =
+                crate::test_overlay::new_overlay(source.clone(), directory.path()).unwrap();
+            let rules = Arc::new(ratarmount_compositing::ReadOnlyGlobs::new(["member"]).unwrap());
+            if protected {
+                ov.set_policy(Some(rules.clone()));
+            }
+            let ov = Arc::new(ov);
+            for writable in [true, false] {
+                let fs = Ratarmount9p::with_overlay(ov.clone(), 0, 8, writable.then(|| ov.clone()))
+                    .with_attribute_mapping(
+                        ratarmount_core::AttributeMapping::parse("uid=12345,gid=23456").unwrap(),
+                    );
+                let id = fs.lookup_child(root_id(), "member").unwrap().0;
+                let chown = |size: Option<u64>, uid| {
+                    let attrs = OverlayMetadata {
+                        uid: Some(uid),
+                        gid: Some(23456),
+                        ..Default::default()
+                    };
+                    fs.setattr(id, size, &attrs)
+                };
+                if !writable || protected {
+                    assert_eq!(chown(None, 12345).unwrap_err(), libc::EROFS);
+                } else {
+                    assert!(chown(None, 12345).is_ok());
+                    assert_eq!(chown(Some(0), 12346).unwrap_err(), libc::EPERM);
+                }
+                if writable {
+                    // An empty request did not attempt an ownership change.
+                    fs.setattr(id, None, &OverlayMetadata::default()).unwrap();
+                }
+                assert!(!ov.has_file("/member"));
+                assert_eq!(ov.lookup("/member", 0).unwrap().size, 4);
+            }
+            assert_eq!(rules.erofs_denied(), u64::from(protected));
+        }
+    }
+
+    /// Regression: `cp -p` over 9P failed because a Tsetattr to the owner
+    /// already presented was refused with EPERM (#327).
+    #[test]
+    fn regression_9p_setattr_same_owner_chown_is_noop() {
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        for (mapping, shown) in [("", (uid, gid)), ("uid=12345,gid=23456", (12345, 23456))] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::write(base.path().join("member"), b"base").unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let source =
+                Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+            let ov = Arc::new(crate::test_overlay::new_overlay(source, directory.path()).unwrap());
+            let fs = Ratarmount9p::with_overlay(ov.clone(), 0, 8, Some(ov))
+                .with_attribute_mapping(AttributeMapping::parse(mapping).unwrap());
+            let (id, _) = fs.lookup_child(root_id(), "member").unwrap();
+            let chown = |uid: Option<u32>, gid: Option<u32>| {
+                fs.setattr(
+                    id,
+                    None,
+                    &OverlayMetadata {
+                        uid,
+                        gid,
+                        ..Default::default()
+                    },
+                )
+            };
+            assert_eq!(chown(Some(shown.0), Some(shown.1)), Ok(()), "{mapping}");
+            assert_eq!(chown(Some(shown.0), None), Ok(()), "{mapping}");
+            assert_eq!(chown(None, Some(shown.1)), Ok(()), "{mapping}");
+            assert_eq!(
+                chown(Some(shown.0.wrapping_add(1)), None),
+                Err(libc::EPERM),
+                "{mapping}"
+            );
+            assert_eq!(
+                chown(None, Some(shown.1.wrapping_add(1))),
+                Err(libc::EPERM),
+                "{mapping}"
+            );
+        }
     }
 }

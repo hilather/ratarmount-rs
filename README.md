@@ -121,6 +121,8 @@ ratarmount sandbox run --base base.tar.zst --top attempt-07 --image busybox \
 Each attempt gets a private top over the same snapshot and optional sealed
 `--lower` layers. The runner executes a container, cleans up the mount, and
 reports its exit status, strict patch hash, manifest and journal summary as JSON.
+Journal reports include [observation completeness](docs/sandbox.md#coverage-and-completeness);
+missing read records never prove that a file was not read.
 Offline commands import patches, seal and verify layers, compare attempts, and
 pack portable bundles. The supervisor API manages fleets of attempts. Registration
 prepares the shared base/index once; its writable workers use immutable prepared
@@ -254,7 +256,7 @@ Commands beyond mounting (see `ratarmount COMMAND --help`):
 |---|---|
 | `diff OVERLAY [BASE]` | Patch, manifest, canonical hash, names or statistics; compare attempts with `--between` |
 | `overlay info\|seal\|unseal\|verify\|fsck` | Inspect identity and manage layer integrity |
-| `overlay import\|import-upperdir\|pack\|unpack` | Replay patches or overlayfs upperdirs; transport sealed layers |
+| `overlay import\|import-upperdir\|pack\|unpack` | Replay Git/unified patches (including binary literals/deltas) or overlayfs upperdirs; transport sealed layers |
 | `journal summarize\|mark` | Summarize operation JSONL or mark an agent turn |
 | `tensors manifest PATH...` | Map local checkpoint tensors and expert slices to file byte ranges ([format and limits](docs/formats-tensors.md#expert-manifest)) |
 | `sandbox run` | Run one container command and finalize its attempt |
@@ -310,6 +312,11 @@ overlay until you commit them: offline into gzip, bzip2, xz TAR and ZIP, or
 live while the mount is served for uncompressed TAR and `.tar.zst`, where only
 the last zstd frame is rewritten. `--overlay-readonly`, `--overlay-quota` and
 `--sandbox` turn an overlay into a guard rail for untrusted code.
+`--overlay-durability=relaxed` skips the overlay database's fsyncs (about 58x
+faster in the measured create/unlink workload) for throwaway overlays that an
+OS crash may cost.
+The supervisor accepts the same choice per attempt with
+`sandbox new --overlay-durability relaxed`; see [relaxed attempts](docs/sandbox.md#relaxed-attempts).
 For concurrent attempts over one base, use a separate overlay and mountpoint
 per process with `--no-recreate-index` and one prepared index. This disables
 shared index writes and archive commits while each overlay remains writable.
@@ -459,6 +466,7 @@ and the [parity checklist](docs/parity-todo.md). The short version:
 
 - Gzip throughput is below Python's rapidgzip on small `.tar.gz` files; `--repack-seekable` or multi-frame zstd is the fix for archives you own.
 - Some formats are read-only or partial: NTFS compression, HFS+/APFS inside DMG, WIM LZX, QCOW2 zstd clusters, differencing VHD, ESXi VMDK, classic SquashFS LZMA, pure RAR.
+- Solid 7z hashes are available through mount xattrs; index-only searches omit shared-slot hashes. Older hashed indexes need rebuilding; see [7z limits](docs/formats.md#known-limits).
 - Writes commit TAR variants and ZIP; live commits cover uncompressed TAR and `.tar.zst` only, and ZIP commits rebuild the archive.
 - NFS has no Kerberos; SMB has no Kerberos or DFS; exports bind to localhost unless you say otherwise.
 - macOS is first-class on Apple silicon only; the CLI does not build for Windows (the core library crates do).

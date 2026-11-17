@@ -374,7 +374,7 @@ impl Session {
         }
         let Some(ud) = fi.userdata.iter().find_map(|data| match data {
             UserData::Tar(ud) => Some(ud),
-            UserData::Other(_) => None,
+            UserData::Other(_) | UserData::SymlinkTarget(_) => None,
         }) else {
             return Ok(None);
         };
@@ -735,7 +735,7 @@ fn dirent_from_file_info(path: &str, fi: &FileInfo) -> DirEnt {
 fn archive_offset_from_info(fi: &FileInfo) -> Option<u64> {
     fi.userdata.iter().rev().find_map(|ud| match ud {
         UserData::Tar(t) => t.offsetheader,
-        UserData::Other(_) => None,
+        UserData::Other(_) | UserData::SymlinkTarget(_) => None,
     })
 }
 

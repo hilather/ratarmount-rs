@@ -412,7 +412,7 @@ impl RatarmountNfs {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        let attrs = OverlayMetadata {
+        let mut attrs = OverlayMetadata {
             mode: match setattr.mode {
                 set_mode3::mode(v) => Some(v),
                 _ => None,
@@ -440,7 +440,16 @@ impl RatarmountNfs {
                 }
             },
         };
-        if !attrs.is_empty() || matches!(setattr.size, set_size3::size(_)) {
+        let requested = !attrs.is_empty() || matches!(setattr.size, set_size3::size(_));
+        if attrs.uid.is_some() || attrs.gid.is_some() {
+            // A chown to the owner already presented is a no-op (#327).
+            if let Ok(fi) = self.file_info_for_id(id) {
+                (attrs.uid, attrs.gid) = self
+                    .attribute_mapping
+                    .drop_presented_owner(fi.uid, fi.gid, attrs.uid, attrs.gid);
+            }
+        }
+        if requested {
             ov.set_attributes(
                 &path,
                 match setattr.size {
@@ -1257,6 +1266,37 @@ mod tests {
         (td, nfs)
     }
 
+    /// Regression (#316): NFSv3 MKDIR of an existing name re-moded the
+    /// directory (to the fixed 0755) instead of failing; it is NFS3ERR_EXIST
+    /// for an overlay directory or an archive file, which stay as they were.
+    #[test]
+    fn regression_316_v3_mkdir_existing_is_exist() {
+        let mut base = Synth::new();
+        base.add_file("/keep", b"archive", vec![UserData::Other("t".into())]);
+        let (td, nfs) = overlay_export(base);
+        let (id, _) = nfs.mkdir_sync(1, &name("sub")).expect("mkdir");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                td.path().join("sub"),
+                std::fs::Permissions::from_mode(0o750),
+            )
+            .unwrap();
+        }
+        let before = nfs.getattr_sync(id).unwrap().mode;
+        assert_eq!(
+            stat_u32(nfs.mkdir_sync(1, &name("sub")).unwrap_err()),
+            stat_u32(nfsstat3::NFS3ERR_EXIST)
+        );
+        assert_eq!(nfs.getattr_sync(id).unwrap().mode, before);
+        assert_eq!(
+            stat_u32(nfs.mkdir_sync(1, &name("keep")).unwrap_err()),
+            stat_u32(nfsstat3::NFS3ERR_EXIST)
+        );
+        let keep = nfs.lookup_sync(1, &name("keep")).unwrap();
+        assert_eq!(nfs.getattr_sync(keep).unwrap().size, 7);
+    }
+
     /// Regression: NFS SETATTR mode/time requests must reach the overlay.
     #[test]
     fn regression_overlay_chmod_nfs_setattr() {
@@ -1941,5 +1981,104 @@ mod sandbox_attr_tests {
         }
         let attr = mapped.getattr_sync(1).unwrap();
         assert_eq!((attr.uid, attr.gid), (12345, 23456));
+    }
+
+    /// Regression: NFSv3 must retain read-only denials after filtering chown,
+    /// and refuse a real owner change before applying a combined truncate (#327).
+    #[test]
+    fn regression_327_chown_preserves_policy_and_readonly() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("member"), b"base").unwrap();
+        let source = Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+        for protected in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut ov =
+                crate::test_overlay::new_overlay(source.clone(), directory.path()).unwrap();
+            let rules = Arc::new(ratarmount_compositing::ReadOnlyGlobs::new(["member"]).unwrap());
+            if protected {
+                ov.set_policy(Some(rules.clone()));
+            }
+            let ov = Arc::new(ov);
+            for writable in [true, false] {
+                let fs = RatarmountNfs::with_overlay(ov.clone(), 0, writable.then(|| ov.clone()))
+                    .with_attribute_mapping(
+                        ratarmount_core::AttributeMapping::parse("uid=12345,gid=23456").unwrap(),
+                    );
+                let id = fs
+                    .lookup_sync(1, &nfsserve::nfs::nfsstring(b"member".to_vec()))
+                    .unwrap();
+                let chown = |size: Option<u64>, uid| {
+                    let attrs = OverlayMetadata {
+                        uid: Some(uid),
+                        gid: Some(23456),
+                        ..Default::default()
+                    };
+                    fs.setattr_sync(
+                        id,
+                        sattr3 {
+                            uid: attrs.uid.map_or(set_uid3::Void, set_uid3::uid),
+                            gid: attrs.gid.map_or(set_gid3::Void, set_gid3::gid),
+                            size: size.map_or(set_size3::Void, set_size3::size),
+                            ..Default::default()
+                        },
+                    )
+                };
+                if !writable || protected {
+                    assert_eq!(
+                        chown(None, 12345).unwrap_err() as u32,
+                        nfsstat3::NFS3ERR_ROFS as u32
+                    );
+                } else {
+                    assert!(chown(None, 12345).is_ok());
+                    assert_eq!(
+                        chown(Some(0), 12346).unwrap_err() as u32,
+                        nfsstat3::NFS3ERR_PERM as u32
+                    );
+                }
+                assert!(!ov.has_file("/member"));
+                assert_eq!(ov.lookup("/member", 0).unwrap().size, 4);
+            }
+            assert_eq!(rules.erofs_denied(), u64::from(protected));
+        }
+    }
+
+    /// Regression: `cp -p` over NFS failed because a SETATTR to the owner
+    /// already presented was refused with EPERM (#327).
+    #[test]
+    fn regression_nfs_setattr_same_owner_chown_is_noop() {
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        for (mapping, shown) in [("", (uid, gid)), ("uid=12345,gid=23456", (12345, 23456))] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::write(base.path().join("member"), b"base").unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let source =
+                Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+            let ov = Arc::new(crate::test_overlay::new_overlay(source, directory.path()).unwrap());
+            let nfs = RatarmountNfs::with_overlay(ov.clone(), 0, Some(ov))
+                .with_attribute_mapping(AttributeMapping::parse(mapping).unwrap());
+            let id = nfs
+                .lookup_sync(1, &nfsserve::nfs::nfsstring(b"member".to_vec()))
+                .unwrap();
+            let chown = |uid: Option<u32>, gid: Option<u32>| {
+                nfs.setattr_sync(
+                    id,
+                    sattr3 {
+                        uid: uid.map_or(set_uid3::Void, set_uid3::uid),
+                        gid: gid.map_or(set_gid3::Void, set_gid3::gid),
+                        ..Default::default()
+                    },
+                )
+            };
+            let attr = chown(Some(shown.0), Some(shown.1)).unwrap();
+            assert_eq!((attr.uid, attr.gid), shown, "{mapping}");
+            assert!(chown(Some(shown.0), None).is_ok(), "{mapping}");
+            assert!(chown(None, Some(shown.1)).is_ok(), "{mapping}");
+            assert_eq!(
+                chown(Some(shown.0.wrapping_add(1)), None).unwrap_err() as u32,
+                nfsstat3::NFS3ERR_PERM as u32,
+                "{mapping}"
+            );
+            assert!(chown(None, Some(shown.1.wrapping_add(1))).is_err());
+        }
     }
 }

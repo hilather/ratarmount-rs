@@ -32,7 +32,7 @@ extern crate ratarmount_core;
 mod decode;
 mod parse;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -96,6 +96,9 @@ pub struct SevenZipMountSource {
     lzma2_decoders: Mutex<HashMap<usize, SharedLzma2Decoder>>,
     /// Sorted (pack_offset, unpack_offset) → file index (binary search).
     entry_by_offsets: EntryOffsetTable,
+    /// Pack offsets shared by several members (solid folders, #320): their
+    /// content hashes are keyed per member, see [`member_xattr_slot`].
+    solid_xattr_slots: HashSet<u64>,
     password: Option<String>,
     /// Encrypted archive mounted without a valid password: list/stat only.
     content_locked: bool,
@@ -159,6 +162,7 @@ impl SevenZipMountSource {
             (a, false)
         };
 
+        validate_xattr_slot_ranges(&archive)?;
         reader.seek(SeekFrom::Start(0))?;
         let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(reader)));
 
@@ -173,6 +177,7 @@ impl SevenZipMountSource {
             }
         }
         let entry_by_offsets = entry_offset_map(&archive);
+        let solid_xattr_slots = solid_xattr_slots(&archive);
         if from_structure {
             eprintln!(
                 "nested durable index: imported 7z file table + structure for {} ({} rows, no header re-parse)",
@@ -195,6 +200,7 @@ impl SevenZipMountSource {
             packed_cache: Mutex::new(HashMap::new()),
             lzma2_decoders: Mutex::new(HashMap::new()),
             entry_by_offsets,
+            solid_xattr_slots,
             password,
             content_locked,
             from_durable_structure: from_structure,
@@ -355,11 +361,13 @@ impl SevenZipMountSource {
             decode::decompress_folder(folder, packed, None)
                 .map_err(|e| parse::SevenZipError::Msg(e.to_string()))
         })?;
+        validate_xattr_slot_ranges(&archive)?;
         file.seek(SeekFrom::Start(0))?;
         let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(file)));
         let (password, content_locked) =
             Self::resolve_password_for_archive(&archive_io, &archive, options)?;
         let entry_by_offsets = entry_offset_map(&archive);
+        let solid_xattr_slots = solid_xattr_slots(&archive);
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
             archive,
@@ -369,6 +377,7 @@ impl SevenZipMountSource {
             packed_cache: Mutex::new(HashMap::new()),
             lzma2_decoders: Mutex::new(HashMap::new()),
             entry_by_offsets,
+            solid_xattr_slots,
             password,
             content_locked,
             from_durable_structure: false,
@@ -400,6 +409,7 @@ impl SevenZipMountSource {
             decode::decompress_folder(folder, packed, None)
                 .map_err(|e| parse::SevenZipError::Msg(e.to_string()))
         })?;
+        validate_xattr_slot_ranges(&archive)?;
 
         reader.seek(SeekFrom::Start(0))?;
         let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(reader)));
@@ -533,7 +543,7 @@ impl SevenZipMountSource {
 
         // Content hashes (`--hashes` / OpenOptions.hashes) → user.hash.* xattrs.
         // Skip when encrypted content is locked (no password); otherwise best-effort
-        // per member (decompress via pack offsets, store under offsetheader=pack_offset).
+        // per member (decompress via pack offsets, store under member_xattr_slot, #320).
         if !options.hashes.is_empty() {
             if content_locked {
                 warn!(
@@ -570,6 +580,7 @@ impl SevenZipMountSource {
 
         let index = index.into_read_only()?;
         let entry_by_offsets = entry_offset_map(&archive);
+        let solid_xattr_slots = solid_xattr_slots(&archive);
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
             archive,
@@ -579,6 +590,7 @@ impl SevenZipMountSource {
             packed_cache: Mutex::new(HashMap::new()),
             lzma2_decoders: Mutex::new(HashMap::new()),
             entry_by_offsets,
+            solid_xattr_slots,
             password,
             content_locked,
             from_durable_structure: false,
@@ -795,6 +807,12 @@ impl SevenZipMountSource {
     }
 
     fn find_entry(&self, file_info: &FileInfo) -> Result<&SevenZipFileEntry> {
+        let idx = self.find_entry_index(file_info)?;
+        Ok(&self.archive.files[idx])
+    }
+
+    /// Index into `archive.files` of the member `file_info` names (pack and unpack offset).
+    fn find_entry_index(&self, file_info: &FileInfo) -> Result<usize> {
         let ud = file_info.userdata.iter().rev().find_map(|u| match u {
             UserData::Tar(t) => Some(t),
             _ => None,
@@ -817,7 +835,7 @@ impl SevenZipMountSource {
                 let is_link =
                     (file_info.mode & ratarmount_core::S_IFMT) == ratarmount_core::S_IFLNK;
                 if entry.size == file_info.size || (is_link && file_info.size == 0) {
-                    return Ok(entry);
+                    return Ok(idx);
                 }
                 debug!(
                     "7z {}: offset map hit idx={idx} but size mismatch entry={} fi={} path={}",
@@ -829,7 +847,7 @@ impl SevenZipMountSource {
             }
         }
 
-        for entry in &self.archive.files {
+        for (idx, entry) in self.archive.files.iter().enumerate() {
             if entry.is_dir || entry.is_empty_stream {
                 continue;
             }
@@ -837,7 +855,7 @@ impl SevenZipMountSource {
                 let is_link =
                     (file_info.mode & ratarmount_core::S_IFMT) == ratarmount_core::S_IFLNK;
                 if entry.size == file_info.size || (is_link && file_info.size == 0) {
-                    return Ok(entry);
+                    return Ok(idx);
                 }
             }
         }
@@ -1298,11 +1316,61 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Files rows key a 7z member by its folder's pack offset (Python parity), so
+/// every member of a solid folder has the same `offsetheader`, and an xattr
+/// stored there would belong to all of them (#320). Such members are keyed
+/// `SEVENZIP_MEMBER_XATTR_BASE + entry_index` instead. The opener validates
+/// that pack offsets and member indices stay below 2^61; folderless members
+/// use `2^62 + entry_index`, so the ranges are disjoint without overflow.
+const SOLID_XATTR_BASE: u64 = ratarmount_index::SEVENZIP_MEMBER_XATTR_BASE as u64;
+
+fn validate_xattr_slot_ranges(archive: &SevenZipArchiveInfo) -> Result<()> {
+    if archive.files.len() as u64 > SOLID_XATTR_BASE
+        || archive
+            .files
+            .iter()
+            .any(|entry| entry.folder_index.is_some() && entry.pack_offset >= SOLID_XATTR_BASE)
+    {
+        return Err(SzError::Msg(
+            "7z member indices or pack offsets overlap reserved xattr slots".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Pack offsets that more than one member's files row uses as `offsetheader`.
+fn solid_xattr_slots(archive: &SevenZipArchiveInfo) -> HashSet<u64> {
+    let mut seen = HashSet::new();
+    let mut shared = HashSet::new();
+    for entry in &archive.files {
+        if entry.folder_index.is_some() && !seen.insert(entry.pack_offset) {
+            shared.insert(entry.pack_offset);
+        }
+    }
+    shared
+}
+
+/// Xattr slot of `archive.files[entry_index]`: its files row's `offsetheader`
+/// when no other member shares it, else a per-member slot (#320). The shared
+/// pack-offset slot itself is never read or written for such members, so a
+/// stale hash an older build stored there is not reported.
+fn member_xattr_slot(solid: &HashSet<u64>, entry_index: usize, entry: &SevenZipFileEntry) -> i64 {
+    if entry.folder_index.is_none() {
+        ((1u64 << 62) + entry_index as u64) as i64
+    } else if solid.contains(&entry.pack_offset) {
+        (SOLID_XATTR_BASE + entry_index as u64) as i64
+    } else {
+        entry.pack_offset as i64
+    }
+}
+
 /// Hash regular-file members into index xattrs (`user.hash.<algo>`).
 ///
 /// Unlike path-backed TAR `fill_content_hashes`, 7z payloads are not raw at
 /// `offset` — members must be decoded (Copy stencil or folder decompress).
-/// Uses the same `offsetheader` (= pack offset) as the files row / Python.
+/// Each digest is stored under [`member_xattr_slot`]: the files row's
+/// `offsetheader` (= pack offset) for a member alone in its folder, a
+/// per-member slot for members of a solid folder (#320).
 fn fill_member_content_hashes(
     index: &SqliteIndex,
     archive_io: &SharedArchiveIo,
@@ -1327,6 +1395,23 @@ fn fill_member_content_hashes(
     }
 
     let mut pending: Vec<(i64, String, Vec<u8>)> = Vec::new();
+    let solid = solid_xattr_slots(archive);
+    let slots: Vec<_> = archive
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.folder_index.is_some() && entry.size > 0 && solid.contains(&entry.pack_offset)
+        })
+        .map(|(i, entry)| {
+            (
+                entry.pack_offset as i64,
+                entry.unpack_offset as i64,
+                member_xattr_slot(&solid, i, entry),
+            )
+        })
+        .collect();
+    index.store_sevenzip_member_xattr_slots(&slots)?;
 
     for (entry_index, entry) in archive.files.iter().enumerate() {
         if entry.is_dir || entry.is_empty_stream || entry.size == 0 {
@@ -1362,11 +1447,7 @@ fn fill_member_content_hashes(
             continue;
         }
 
-        let header_offset = if entry.folder_index.is_some() {
-            entry.pack_offset as i64
-        } else {
-            ((1u64 << 62) + entry_index as u64) as i64
-        };
+        let header_offset = member_xattr_slot(&solid, entry_index, entry);
 
         let bytes = match read_member_bytes_io(archive_io, archive, entry, folder, password) {
             Ok(b) => b,
@@ -1402,12 +1483,26 @@ fn fill_member_content_hashes(
     Ok(())
 }
 
-/// `offsetheader` used as the xattrs table key (Python interop / pack offset).
+/// `offsetheader` of the files row (Python interop / pack offset).
 fn sz_offsetheader(file_info: &FileInfo) -> Option<i64> {
     file_info.userdata.iter().rev().find_map(|u| match u {
         UserData::Tar(t) => t.offsetheader.map(|v| v as i64),
         _ => None,
     })
+}
+
+impl SevenZipMountSource {
+    /// Xattr slot of `file_info` ([`member_xattr_slot`]). `None` for a member of
+    /// a solid folder that cannot be resolved: never fall back to the shared slot.
+    fn xattr_slot(&self, file_info: &FileInfo) -> Option<i64> {
+        let oh = sz_offsetheader(file_info)?;
+        if oh < 0 || !self.solid_xattr_slots.contains(&(oh as u64)) {
+            return Some(oh);
+        }
+        let idx = self.find_entry_index(file_info).ok()?;
+        let entry = &self.archive.files[idx];
+        Some(member_xattr_slot(&self.solid_xattr_slots, idx, entry))
+    }
 }
 
 impl MountSource for SevenZipMountSource {
@@ -1667,7 +1762,7 @@ impl MountSource for SevenZipMountSource {
 
     /// Xattr keys stored in the SQLite index (Python `user.hash.<algo>` content hashes).
     fn list_xattr(&self, file_info: &FileInfo) -> Vec<String> {
-        let Some(oh) = sz_offsetheader(file_info) else {
+        let Some(oh) = self.xattr_slot(file_info) else {
             return Vec::new();
         };
         self.index.list_xattr_keys(oh).unwrap_or_default()
@@ -1675,13 +1770,18 @@ impl MountSource for SevenZipMountSource {
 
     /// One xattr value from the index (e.g. hex digest for `user.hash.sha256`).
     fn get_xattr(&self, file_info: &FileInfo, key: &str) -> Option<Vec<u8>> {
-        let oh = sz_offsetheader(file_info)?;
+        let oh = self.xattr_slot(file_info)?;
         self.index.get_xattr(oh, key).ok().flatten()
     }
 }
 
 #[cfg(test)]
+#[path = "../../test-harness/sevenzip_fixture.rs"]
+mod sevenzip_fixture;
+
+#[cfg(test)]
 mod tests {
+    use super::sevenzip_fixture::copy_7z_fixture;
     use super::*;
     fn prepared_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
         std::fs::read_dir(dir)
@@ -3085,16 +3185,16 @@ sys.stdout.buffer.write(packed)
             .expect("user.hash.crc32 present");
         let got_sha = String::from_utf8(sha).unwrap();
         let got_crc = String::from_utf8(crc).unwrap();
-        // Solid Copy shares pack offsetheader; last INSERT OR REPLACE wins (Python parity).
-        assert!(
-            got_sha == a_sha || got_sha == b_sha,
-            "sha256 xattr should match a member digest, got {got_sha}"
-        );
-        assert!(got_crc == a_crc || got_crc == b_crc);
-        // Both members share offsetheader → same xattr view.
+        // Each member carries its own digest, also in a solid folder (#320).
+        assert_eq!(got_sha, a_sha);
+        assert_eq!(got_crc, a_crc);
         assert_eq!(
             m.get_xattr(&fi_b, "user.hash.sha256").as_deref(),
-            m.get_xattr(&fi_a, "user.hash.sha256").as_deref()
+            Some(b_sha.as_bytes())
+        );
+        assert_eq!(
+            m.get_xattr(&fi_b, "user.hash.crc32").as_deref(),
+            Some(b_crc.as_bytes())
         );
         assert!(m.get_xattr(&fi_a, "user.hash.md5").is_none());
         assert!(m.get_xattr(&fi_a, "missing").is_none());
@@ -3924,5 +4024,465 @@ sys.stdout.buffer.write(packed)
             "name-order control must have ≥1 backward Start (fixture shuffled), starts={:?}",
             name_reader.starts
         );
+    }
+
+    /// #320 issue repro contents and their true SHA-256 digests.
+    const B_TXT: &[u8] = b"second file\n";
+    const C_TXT: &[u8] = b"third member\n";
+    const TEXT_TXT: &[u8] = b"content hash\n";
+    const B_SHA: &str = "f957b19529906961933c5c30f8713c500a9bb5d9d0695c40d48c97a26a3594ec";
+    const C_SHA: &str = "0e4bd62c729336b0cb0910019e9945d827b2b2bd9b4829693ed6a9534fee4917";
+    const TEXT_SHA: &str = "5f7a83b14e42a9deeb5c211160d70058611223f6c6632db09decd708e6f6c7ad";
+
+    fn sha_opts() -> OpenOptions {
+        OpenOptions {
+            hashes: vec!["sha256".into()],
+            ..OpenOptions::default()
+        }
+    }
+
+    fn files_offsetheader(m: &SevenZipMountSource, path: &str) -> i64 {
+        sz_offsetheader(&m.lookup(path, 0).unwrap()).unwrap()
+    }
+
+    /// Every member's `user.hash.sha256` (via `get_xattr`) and key list (`list_xattr`).
+    fn assert_member_hashes(m: &SevenZipMountSource, expected: &[(&str, &str)], label: &str) {
+        for (path, sha) in expected {
+            let fi = m
+                .lookup(path, 0)
+                .unwrap_or_else(|| panic!("{label}: {path}"));
+            assert_eq!(
+                m.get_xattr(&fi, "user.hash.sha256").as_deref(),
+                Some(sha.as_bytes()),
+                "{label}: {path} must carry its own content hash"
+            );
+            assert_eq!(
+                m.list_xattr(&fi),
+                vec!["user.hash.sha256".to_string()],
+                "{label}: {path}"
+            );
+        }
+    }
+
+    /// Archive name, `(member, content, sha256)` and whether the folder is solid.
+    type Case<'a> = (&'a str, Vec<(&'a str, &'a [u8], &'a str)>, bool);
+
+    /// Regression: #320 real LZMA2 streams keep archive member indices across
+    /// directories, empty files, anti-items and symlinks, also on warm fills.
+    #[test]
+    fn regression_320_lzma2_solid_mixed_entries() {
+        let bytes = include_bytes!("../testdata/solid-hashes.7z");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.7z");
+        let index_path = dir.path().join("mixed.sqlite");
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            bytes[32] >= 0x80,
+            "fixture must contain a compressed LZMA2 chunk"
+        );
+        let bodies = [
+            ("/dir/b.txt", B_TXT.repeat(32)),
+            ("/dir/c.txt", C_TXT.repeat(32)),
+            ("/dir/text.txt", TEXT_TXT.repeat(32)),
+        ];
+        let hashes: Vec<_> = bodies
+            .iter()
+            .map(|(name, body)| (*name, hash_hex("sha256", body).unwrap()))
+            .collect();
+        let expected: Vec<_> = hashes
+            .iter()
+            .map(|(name, hash)| (*name, hash.as_str()))
+            .collect();
+        let source =
+            SevenZipMountSource::open(&path, Some(&index_path), &sha_opts(), "test", true).unwrap();
+        assert!(source.archive.solid);
+        assert_eq!(
+            source.archive.folders[0].coders[0].method,
+            parse::METHOD_LZMA2
+        );
+        assert_member_hashes(&source, &expected, "LZMA2 cold");
+        for (name, body) in &bodies {
+            let fi = source.lookup(name, 0).unwrap();
+            let mut actual = Vec::new();
+            source
+                .open(&fi, 0)
+                .unwrap()
+                .read_to_end(&mut actual)
+                .unwrap();
+            assert_eq!(&actual, body);
+        }
+        for name in ["/dir", "/empty", "/gone", "/link", "/emptydir"] {
+            let fi = source.lookup(name, 0).unwrap();
+            assert!(
+                source.get_xattr(&fi, "user.hash.sha256").is_none(),
+                "{name}"
+            );
+            assert!(source.list_xattr(&fi).is_empty(), "{name}");
+        }
+        assert_eq!(source.lookup("/link", 0).unwrap().linkname, "dir/b.txt");
+        drop(source);
+        let warm = SevenZipMountSource::open(
+            &path,
+            Some(&index_path),
+            &OpenOptions::default(),
+            "test",
+            false,
+        )
+        .unwrap();
+        assert_member_hashes(&warm, &expected, "LZMA2 warm");
+        drop(warm);
+        let index = SqliteIndex::open_writable(&index_path).unwrap();
+        let report =
+            ratarmount_index::fill_content_hashes(&index, &path, &["sha256".into()]).unwrap();
+        assert_eq!((report.kept_existing, report.unverifiable), (3, 0));
+        drop(index);
+        let nested = SevenZipMountSource::open_from_reader(
+            Cursor::new(bytes),
+            "nested.7z",
+            None,
+            &OpenOptions {
+                index_in_memory: true,
+                ..sha_opts()
+            },
+            "test",
+            true,
+        )
+        .unwrap();
+        assert_member_hashes(&nested, &expected, "LZMA2 nested");
+    }
+
+    /// Regression: #320 forged pack offsets must not alias either synthetic
+    /// xattr namespace, on cold, warm, or durable-structure opens.
+    #[test]
+    fn regression_320_reserved_pack_offsets_are_refused() {
+        let original = copy_7z_fixture(&[("b.txt", B_TXT), ("text.txt", TEXT_TXT)], true);
+        for offset in [SOLID_XATTR_BASE, SOLID_XATTR_BASE + 1, 1 << 62] {
+            let mut bytes = original.clone();
+            let header_start = 32 + B_TXT.len() + TEXT_TXT.len();
+            // Replace the single-byte PackPos with a 9-byte 7z uint.
+            bytes.splice(
+                header_start + 3..header_start + 4,
+                [vec![255], (offset - 32).to_le_bytes().to_vec()].concat(),
+            );
+            let header_len = (bytes.len() - header_start) as u64;
+            let header_crc = parse::crc32(&bytes[header_start..]);
+            bytes[20..28].copy_from_slice(&header_len.to_le_bytes());
+            bytes[28..32].copy_from_slice(&header_crc.to_le_bytes());
+            let start_crc = parse::crc32(&bytes[12..32]);
+            bytes[8..12].copy_from_slice(&start_crc.to_le_bytes());
+            let opts = OpenOptions {
+                index_in_memory: true,
+                ..Default::default()
+            };
+            let result = SevenZipMountSource::open_from_reader(
+                Cursor::new(bytes.clone()),
+                "forged.7z",
+                None,
+                &opts,
+                "test",
+                true,
+            );
+            assert!(
+                matches!(result, Err(ref e) if e.to_string().contains("reserved xattr slots")),
+                "cold offset {offset}"
+            );
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("forged.7z");
+            let index_path = dir.path().join("forged.sqlite");
+            std::fs::write(&path, &bytes).unwrap();
+            let index = SqliteIndex::create_writable(Some(&index_path)).unwrap();
+            index.begin_write().unwrap();
+            index
+                .store_metadata_key_value("backendName", BACKEND_NAME)
+                .unwrap();
+            index.commit_write().unwrap();
+            drop(index.into_read_only().unwrap());
+            let result = SevenZipMountSource::open_existing_path(
+                &path,
+                &index_path,
+                &OpenOptions::default(),
+            );
+            assert!(
+                matches!(result, Err(ref e) if e.to_string().contains("reserved xattr slots")),
+                "warm offset {offset}"
+            );
+
+            let source = SevenZipMountSource::open_from_reader(
+                Cursor::new(original.clone()),
+                "valid.7z",
+                None,
+                &opts,
+                "test",
+                true,
+            )
+            .unwrap();
+            let fp = ratarmount_index::NestedBodyFingerprint::from_seekable_body(
+                &mut Cursor::new(&original),
+                original.len() as u64,
+            )
+            .unwrap();
+            let mut blob = ratarmount_index::DurableNestedBlob::from_bytes(
+                &source.export_nested_durable(fp).unwrap(),
+            )
+            .unwrap();
+            for entry in &mut blob.sevenzip.as_mut().unwrap().files {
+                entry.pack_offset = offset;
+            }
+            let result = SevenZipMountSource::open_from_reader_with_durable(
+                Cursor::new(original.clone()),
+                "durable.7z",
+                &blob,
+                &opts,
+            );
+            assert!(
+                matches!(result, Err(ref e) if e.to_string().contains("reserved xattr slots")),
+                "durable offset {offset}"
+            );
+        }
+    }
+
+    /// Regression: #320 solid 7z stored the last member's hash on every member
+    /// of its folder (2- and 3-member blocks); `ms=off` control keeps the files-row slot.
+    #[test]
+    fn regression_320_solid_members_store_their_own_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases: [Case<'_>; 3] = [
+            (
+                "a.7z",
+                vec![("b.txt", B_TXT, B_SHA), ("text.txt", TEXT_TXT, TEXT_SHA)],
+                true,
+            ),
+            (
+                "s3.7z",
+                vec![
+                    ("b.txt", B_TXT, B_SHA),
+                    ("c.txt", C_TXT, C_SHA),
+                    ("text.txt", TEXT_TXT, TEXT_SHA),
+                ],
+                true,
+            ),
+            (
+                "ns.7z",
+                vec![("b.txt", B_TXT, B_SHA), ("text.txt", TEXT_TXT, TEXT_SHA)],
+                false,
+            ),
+        ];
+        for (name, members, solid) in cases {
+            let archive = dir.path().join(name);
+            let parts: Vec<(&str, &[u8])> = members.iter().map(|(n, b, _)| (*n, *b)).collect();
+            std::fs::write(&archive, copy_7z_fixture(&parts, solid)).unwrap();
+            let idx = dir.path().join(format!("{name}.index.sqlite"));
+            let expected: Vec<(String, &str)> = members
+                .iter()
+                .map(|(n, _, h)| (format!("/{n}"), *h))
+                .collect();
+            let expected: Vec<(&str, &str)> =
+                expected.iter().map(|(p, h)| (p.as_str(), *h)).collect();
+            for content in &members {
+                assert_eq!(hash_hex("sha256", content.1).unwrap(), content.2);
+            }
+
+            let m = SevenZipMountSource::open(&archive, Some(&idx), &sha_opts(), "0.1.0", true)
+                .unwrap();
+            let slots: Vec<i64> = expected
+                .iter()
+                .map(|(p, _)| files_offsetheader(&m, p))
+                .collect();
+            if solid {
+                // The files rows still share the pack offset (Python parity) ...
+                assert!(slots.iter().all(|&oh| oh == slots[0]), "{name}: {slots:?}");
+                // ... and the shared slot holds no hash a files join could misattribute.
+                assert!(m.index.list_xattr_keys(slots[0]).unwrap().is_empty());
+            } else {
+                let mut unique = slots.clone();
+                unique.dedup();
+                assert_eq!(unique.len(), slots.len(), "{name}: {slots:?}");
+                // Non-solid hashes stay under the files row's offsetheader.
+                for ((_, sha), oh) in expected.iter().zip(&slots) {
+                    assert_eq!(
+                        m.index
+                            .get_xattr(*oh, "user.hash.sha256")
+                            .unwrap()
+                            .as_deref(),
+                        Some(sha.as_bytes())
+                    );
+                }
+            }
+            assert_member_hashes(&m, &expected, name);
+            drop(m);
+
+            // Warm reopen (no rebuild, no hashing) keeps each member's own digest.
+            let warm = SevenZipMountSource::open(
+                &archive,
+                Some(&idx),
+                &OpenOptions::default(),
+                "0.1.0",
+                false,
+            )
+            .unwrap();
+            assert_member_hashes(&warm, &expected, &format!("{name} warm"));
+            for (path, _) in &expected {
+                let fi = warm.lookup(path, 0).unwrap();
+                let mut body = Vec::new();
+                warm.open(&fi, 0).unwrap().read_to_end(&mut body).unwrap();
+                let sha = warm.get_xattr(&fi, "user.hash.sha256").unwrap();
+                assert_eq!(
+                    hash_hex("sha256", &body).unwrap().as_bytes(),
+                    sha.as_slice()
+                );
+            }
+        }
+    }
+
+    /// Regression: #320 a nested solid 7z (opened from a reader, in-memory
+    /// index) stores and reports each member's own hash too.
+    #[test]
+    fn regression_320_nested_reader_solid_members_own_hashes() {
+        let parts: [(&str, &[u8]); 3] =
+            [("b.txt", B_TXT), ("c.txt", C_TXT), ("text.txt", TEXT_TXT)];
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..sha_opts()
+        };
+        let m = SevenZipMountSource::open_from_reader(
+            Cursor::new(copy_7z_fixture(&parts, true)),
+            "inner.7z",
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        )
+        .unwrap();
+        assert_member_hashes(
+            &m,
+            &[
+                ("/b.txt", B_SHA),
+                ("/c.txt", C_SHA),
+                ("/text.txt", TEXT_SHA),
+            ],
+            "nested",
+        );
+    }
+
+    /// Regression: #320 an index written by an older build has the last member's
+    /// digest under the shared pack offset; no solid member may report it, even
+    /// a member of the same size (the payload cache would serve the wrong bytes).
+    #[test]
+    fn regression_320_stale_shared_slot_hash_is_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("s3.7z");
+        let parts: [(&str, &[u8]); 3] =
+            [("b.txt", B_TXT), ("c.txt", C_TXT), ("text.txt", TEXT_TXT)];
+        std::fs::write(&archive, copy_7z_fixture(&parts, true)).unwrap();
+        let idx = dir.path().join("s3.7z.index.sqlite");
+        let m =
+            SevenZipMountSource::open(&archive, Some(&idx), &OpenOptions::default(), "0.1.0", true)
+                .unwrap();
+        let pack = files_offsetheader(&m, "/text.txt");
+        drop(m);
+        // What the buggy writer left behind: one row, last member's digest.
+        let writable = SqliteIndex::open_writable(&idx).unwrap();
+        writable
+            .insert_xattr(pack, "user.hash.sha256", TEXT_SHA.as_bytes())
+            .unwrap();
+        writable.wal_checkpoint_truncate().unwrap();
+        drop(writable);
+
+        let warm = SevenZipMountSource::open(
+            &archive,
+            Some(&idx),
+            &OpenOptions::default(),
+            "0.1.0",
+            false,
+        )
+        .unwrap();
+        for path in ["/b.txt", "/c.txt", "/text.txt"] {
+            let fi = warm.lookup(path, 0).unwrap();
+            assert!(warm.get_xattr(&fi, "user.hash.sha256").is_none(), "{path}");
+            assert!(warm.list_xattr(&fi).is_empty(), "{path}");
+        }
+        assert_eq!(C_TXT.len(), TEXT_TXT.len());
+    }
+
+    /// Archive name, extra `7z a` flags, inputs and expected `(path, sha256)`.
+    type CliCase<'a> = (
+        &'a str,
+        &'a [&'a str],
+        &'a [&'a str],
+        &'a [(&'a str, &'a str)],
+    );
+
+    /// Regression: #320 with the `7z` CLI (issue repro): default solid 2- and
+    /// 3-file blocks and `-ms=off`, LZMA2 rather than Copy.
+    #[test]
+    fn regression_320_cli_solid_and_non_solid_hashes() {
+        let Some(sevenz) = ["7z", "7za", "7zz"]
+            .into_iter()
+            .find(|c| std::process::Command::new(c).arg("--help").output().is_ok())
+        else {
+            eprintln!("skip: no 7z/7za/7zz for the #320 CLI repro");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        for (name, body) in [("b.txt", B_TXT), ("text.txt", TEXT_TXT), ("c.txt", C_TXT)] {
+            std::fs::write(src.join(name), body).unwrap();
+        }
+        let cases: [CliCase<'_>; 3] = [
+            (
+                "a.7z",
+                &[],
+                &["src/b.txt", "src/text.txt"],
+                &[("/src/b.txt", B_SHA), ("/src/text.txt", TEXT_SHA)],
+            ),
+            (
+                "s3.7z",
+                &[],
+                &["src/b.txt", "src/c.txt", "src/text.txt"],
+                &[
+                    ("/src/b.txt", B_SHA),
+                    ("/src/c.txt", C_SHA),
+                    ("/src/text.txt", TEXT_SHA),
+                ],
+            ),
+            (
+                "ns.7z",
+                &["-ms=off"],
+                &["src/b.txt", "src/text.txt"],
+                &[("/src/b.txt", B_SHA), ("/src/text.txt", TEXT_SHA)],
+            ),
+        ];
+        for (name, flags, inputs, expected) in cases {
+            let archive = dir.path().join(name);
+            let out = std::process::Command::new(sevenz)
+                .arg("a")
+                .args(flags)
+                .arg(&archive)
+                .args(inputs)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let idx = dir.path().join(format!("{name}.index.sqlite"));
+            let m = SevenZipMountSource::open(&archive, Some(&idx), &sha_opts(), "0.1.0", true)
+                .unwrap();
+            assert_member_hashes(&m, expected, name);
+            drop(m);
+            let warm = SevenZipMountSource::open(
+                &archive,
+                Some(&idx),
+                &OpenOptions::default(),
+                "0.1.0",
+                false,
+            )
+            .unwrap();
+            assert_member_hashes(&warm, expected, &format!("{name} warm"));
+        }
     }
 }

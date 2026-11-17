@@ -324,10 +324,13 @@ impl ReadOnlyGlobs {
     }
 
     pub fn protects(&self, path: &str) -> bool {
-        self.denies_path(path, false)
+        self.denies_path(path, false, true)
     }
 
-    fn denies_path(&self, path: &str, ancestors: bool) -> bool {
+    /// `anchor_roots` keeps allow-rule roots under a protected parent fixed for
+    /// ancestor-sensitive operations. Only [`OverlayPolicy::check_rmdir`] of a
+    /// directory absent from the lower view clears it (#326).
+    fn denies_path(&self, path: &str, ancestors: bool, anchor_roots: bool) -> bool {
         let allow = self
             .allows
             .iter()
@@ -343,6 +346,7 @@ impl ReadOnlyGlobs {
         // Keep exception roots inside protected subtrees anchored. Fully canceled
         // read-only rules have no protected boundary to preserve.
         let exception_root = ancestors
+            && anchor_roots
             && self.allows.iter().any(|g| g.is_root(path))
             && self.has_protected_parent(path);
         exception_root || readonly.is_some_and(|score| allow.is_none_or(|a| score > a))
@@ -354,8 +358,17 @@ impl ReadOnlyGlobs {
     }
 }
 
-impl OverlayPolicy for ReadOnlyGlobs {
-    fn check_mutation(&self, op: OverlayMutation, paths: &[&str]) -> io::Result<()> {
+impl ReadOnlyGlobs {
+    /// Shared body of `check_mutation` and `check_rmdir`: denial accounting,
+    /// the COW-parent guard and reservation bookkeeping stay identical.
+    /// `anchor_roots == false` applies to the requested path only; a resolved
+    /// host path that differs from it (symlinked parent) stays anchored.
+    fn check_paths(
+        &self,
+        op: OverlayMutation,
+        paths: &[&str],
+        anchor_roots: bool,
+    ) -> io::Result<()> {
         let ancestors = matches!(
             op,
             OverlayMutation::Rename | OverlayMutation::Rmdir | OverlayMutation::Reset
@@ -363,10 +376,10 @@ impl OverlayPolicy for ReadOnlyGlobs {
         let mut cow = self.cow.lock().unwrap_or_else(|e| e.into_inner());
         for path in paths {
             let resolved = self.resolved_parent_path(path);
-            if self.denies_path(path, ancestors)
+            if self.denies_path(path, ancestors, anchor_roots)
                 || resolved
                     .as_deref()
-                    .is_some_and(|p| self.denies_path(p, ancestors))
+                    .is_some_and(|p| self.denies_path(p, ancestors, anchor_roots || p != *path))
             {
                 drop(cow);
                 return Err(self.deny(path, op, format!("protected overlay path: {path}")));
@@ -410,6 +423,17 @@ impl OverlayPolicy for ReadOnlyGlobs {
         }
         cow.mutation(op, paths);
         Ok(())
+    }
+}
+
+impl OverlayPolicy for ReadOnlyGlobs {
+    fn check_mutation(&self, op: OverlayMutation, paths: &[&str]) -> io::Result<()> {
+        self.check_paths(op, paths, true)
+    }
+    /// An exception root the overlay created (absent from the lower view) may
+    /// be removed again; a lower-provided one stays anchored (#326).
+    fn check_rmdir(&self, path: &str, exists_in_lower: bool) -> io::Result<()> {
+        self.check_paths(OverlayMutation::Rmdir, &[path], exists_in_lower)
     }
     fn check_write(&self, path: &str, _: u64, _: u64, _: u64) -> io::Result<()> {
         self.check_mutation(OverlayMutation::Write, &[path])
@@ -640,6 +664,12 @@ impl OverlayPolicy for CompositeOverlayPolicy {
         }
         Ok(())
     }
+    fn check_rmdir(&self, path: &str, exists_in_lower: bool) -> io::Result<()> {
+        for policy in &self.0 {
+            policy.check_rmdir(path, exists_in_lower)?;
+        }
+        Ok(())
+    }
     fn check_write(&self, path: &str, offset: u64, len: u64, size: u64) -> io::Result<()> {
         for policy in &self.0 {
             policy.check_write(path, offset, len, size)?;
@@ -803,6 +833,258 @@ mod tests {
             );
         }
         assert!(rules.check_mutation(Reset, &["/"]).is_err());
+        // #326: `check_rmdir` relaxes only the exception-root anchor, and only
+        // for a directory absent from the lower view. The default
+        // `check_mutation(Rmdir)` row above is unchanged.
+        for (exists_in_lower, expected) in [
+            (false, [false, true, true, true]),
+            (true, [false, false, true, true]),
+        ] {
+            for (path, allowed) in paths.into_iter().zip(expected) {
+                let result = rules.check_rmdir(path, exists_in_lower);
+                assert_eq!(
+                    result.is_ok(),
+                    allowed,
+                    "check_rmdir {path} {exists_in_lower}: {result:?}"
+                );
+            }
+        }
+    }
+
+    /// Regression (#326): `rm -rf t/agent` under `t/**` with `t/agent/**`
+    /// allowed failed with EROFS on the empty directory the agent created.
+    /// An overlay-created exception root may be removed; a base-provided one,
+    /// protected descendants, rename and reset stay anchored. Also through
+    /// the composite policy and with the overlay root set (production shape).
+    #[test]
+    fn regression_rmdir_overlay_created_exception_root() {
+        use OverlayMutation::*;
+        let root = tempfile::tempdir().unwrap();
+        for allow in [&["t/agent/**"][..], &["t/agent/**", "t/agent"][..]] {
+            let plain = ReadOnlyGlobs::with_allow(["t/**"], allow).unwrap();
+            let rooted = Arc::new(
+                ReadOnlyGlobs::with_allow(["t/**"], allow)
+                    .unwrap()
+                    .with_overlay_root(root.path())
+                    .unwrap(),
+            );
+            let quota = OverlayQuota::new(root.path(), None, None).unwrap();
+            let composite = CompositeOverlayPolicy(vec![
+                rooted.clone() as Arc<dyn OverlayPolicy>,
+                Arc::new(quota),
+            ]);
+            let policies: [&dyn OverlayPolicy; 3] = [&plain, rooted.as_ref(), &composite];
+            for policy in policies {
+                let ro = |r: io::Result<()>| {
+                    assert_eq!(r.unwrap_err().kind(), io::ErrorKind::ReadOnlyFilesystem)
+                };
+                policy.check_rmdir("/t/agent", false).unwrap();
+                ro(policy.check_rmdir("/t/agent", true));
+                ro(policy.check_rmdir("/t/suite", false));
+                ro(policy.check_rmdir("/t", false));
+                ro(policy.check_mutation(Rmdir, &["/t/agent"]));
+                ro(policy.check_mutation(Rename, &["/t/agent", "/moved"]));
+                ro(policy.check_mutation(Reset, &["/t/agent"]));
+            }
+        }
+        // A more specific protected descendant keeps the root anchored.
+        let rules =
+            ReadOnlyGlobs::with_allow(["t/**", "t/agent/private/**"], ["t/agent/**"]).unwrap();
+        assert!(rules.check_rmdir("/t/agent", false).is_err());
+    }
+
+    /// Regression: an alias must not bypass the exception-root anchor when
+    /// the caller's lower-existence check describes a different spelling.
+    #[cfg(unix)]
+    #[test]
+    fn regression_rmdir_overlay_created_exception_root_host_alias() {
+        let aliased = tempfile::tempdir().unwrap();
+        fs::create_dir_all(aliased.path().join("t/agent")).unwrap();
+        std::os::unix::fs::symlink("t", aliased.path().join("alias")).unwrap();
+        let rules = ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**"])
+            .unwrap()
+            .with_overlay_root(aliased.path())
+            .unwrap();
+        assert_eq!(
+            rules.check_rmdir("/alias/agent", false).unwrap_err().kind(),
+            io::ErrorKind::ReadOnlyFilesystem
+        );
+        rules.check_rmdir("/t/agent", false).unwrap();
+    }
+
+    /// Regression: relaxing the exception-root anchor must still reject
+    /// nonempty directories and non-directories without changing their contents.
+    #[cfg(unix)]
+    #[test]
+    fn regression_rmdir_overlay_created_exception_root_requires_empty_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut overlay =
+            crate::WriteOverlay::new_for_tests(archive_with_paths(&["t/suite"]), root.path())
+                .unwrap();
+        let rules = Arc::new(
+            ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**"])
+                .unwrap()
+                .with_overlay_root(root.path())
+                .unwrap(),
+        );
+        overlay.set_policy(Some(Arc::new(CompositeOverlayPolicy(vec![
+            rules.clone(),
+            Arc::new(OverlayQuota::new(root.path(), None, None).unwrap()),
+        ]))));
+        overlay.mkdir("/t/agent", 0o755).unwrap();
+        let file = new_file(&overlay, "/t/agent/child");
+        overlay
+            .write_at(&file, "/t/agent/child", 0, b"keep")
+            .unwrap();
+        overlay.finish_owned_write_fd(file);
+        denied(overlay.rmdir("/t/agent"), io::ErrorKind::DirectoryNotEmpty);
+        assert_eq!(
+            fs::read(root.path().join("t/agent/child")).unwrap(),
+            b"keep"
+        );
+        assert!(!overlay.is_deleted("/t/agent"));
+
+        overlay.unlink("/t/agent/child").unwrap();
+        overlay.mkdir("/t/agent/empty", 0o755).unwrap();
+        denied(overlay.rmdir("/t/agent"), io::ErrorKind::DirectoryNotEmpty);
+        assert!(overlay.is_dir("/t/agent/empty"));
+        overlay.rmdir("/t/agent/empty").unwrap();
+        overlay.rmdir("/t/agent").unwrap();
+        assert!(overlay.lookup("/t/agent", 0).is_none());
+        assert!(!root.path().join("t/agent").exists());
+
+        let file = new_file(&overlay, "/t/agent");
+        overlay.write_at(&file, "/t/agent", 0, b"file").unwrap();
+        overlay.finish_owned_write_fd(file);
+        denied(overlay.rmdir("/t/agent"), io::ErrorKind::NotADirectory);
+        assert_eq!(fs::read(root.path().join("t/agent")).unwrap(), b"file");
+        assert_eq!(rules.erofs_denied(), 0);
+    }
+
+    /// Regression (#326): mkdir, write, unlink and rmdir of an exception root
+    /// the overlay created leaves no `files` row, no tombstone and an empty
+    /// change set (the issue's manifest difference against a re-import).
+    /// A base-provided root and one a sealed lower layer provides stay EROFS.
+    #[cfg(unix)]
+    #[test]
+    fn regression_rmdir_overlay_created_exception_root_leaves_no_residue() {
+        // Keep this helper under the test's Unix cfg too. Query failures must
+        // fail the test, rather than masquerading as an absent row.
+        fn files_row(root: &Path, parent: &str, name: &str) -> Option<i64> {
+            use rusqlite::OptionalExtension;
+            let db = Connection::open_with_flags(
+                root.join(crate::HIDDEN_DB),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            db.query_row(
+                r#"SELECT COALESCE(deleted, 0) FROM "files" WHERE path=?1 AND name=?2"#,
+                [parent, name],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+        }
+
+        let rules = |root: &Path| {
+            Arc::new(
+                ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**"])
+                    .unwrap()
+                    .with_overlay_root(root)
+                    .unwrap(),
+            )
+        };
+        let ro = io::ErrorKind::ReadOnlyFilesystem;
+        let base = archive_with_paths(&["t/suite"]);
+        let root = tempfile::tempdir().unwrap();
+        {
+            let mut overlay =
+                crate::WriteOverlay::new_for_tests(base.clone(), root.path()).unwrap();
+            overlay.set_policy(Some(rules(root.path())));
+            overlay.mkdir("/t/agent", 0o755).unwrap();
+        }
+        // The writer holds an exclusive database lock. Inspect durable rows
+        // only after it closes, and prove the probe sees the pre-removal row.
+        assert_eq!(files_row(root.path(), "/t", "agent"), Some(0));
+        {
+            let mut overlay =
+                crate::WriteOverlay::new_for_tests(base.clone(), root.path()).unwrap();
+            overlay.set_policy(Some(rules(root.path())));
+            let file = new_file(&overlay, "/t/agent/x.t");
+            overlay.write_at(&file, "/t/agent/x.t", 0, b"1\n").unwrap();
+            overlay.finish_owned_write_fd(file);
+            overlay.unlink("/t/agent/x.t").unwrap();
+            overlay.rmdir("/t/agent").unwrap();
+            assert!(!root.path().join("t/agent").exists());
+            assert!(overlay.lookup("/t/agent", 0).is_none());
+            assert!(!overlay.is_deleted("/t/agent"));
+            // A missing exception root is ENOENT, not a policy denial.
+            denied(overlay.rmdir("/t/agent"), io::ErrorKind::NotFound);
+        }
+        assert_eq!(files_row(root.path(), "/t", "agent"), None);
+        let changes = crate::overlay_changes::change_set(
+            root.path(),
+            base.clone(),
+            &crate::overlay_changes::ChangeOptions::default(),
+        )
+        .unwrap();
+        // Nothing for t/agent. `ensure_parent` materialized the base parent
+        // `t` with the process umask; a mode-only `t` row appears when that
+        // differs from the base's mode (pre-existing, not #326). Ignoring
+        // modes, the change set is empty.
+        assert!(changes.iter().all(|c| c.path == b"t"), "{changes:?}");
+        let changes = crate::overlay_changes::change_set(
+            root.path(),
+            base.clone(),
+            &crate::overlay_changes::ChangeOptions {
+                ignore_mode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(changes.is_empty(), "{changes:?}");
+        let reopened = crate::WriteOverlay::new_for_tests(base, root.path()).unwrap();
+        assert!(reopened.lookup("/t/agent", 0).is_none());
+        assert!(!reopened.is_deleted("/t/agent"));
+        drop(reopened);
+
+        // Base-provided exception root: anchored even when empty in the union.
+        let base = archive_with_paths(&["t/suite", "t/agent/base"]);
+        let root = tempfile::tempdir().unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(base, root.path()).unwrap();
+        let policy = rules(root.path());
+        overlay.set_policy(Some(policy.clone()));
+        overlay.ensure_modifiable("/t/agent").unwrap();
+        assert!(root.path().join("t/agent").is_dir());
+        overlay.unlink("/t/agent/base").unwrap();
+        denied(overlay.rmdir("/t/agent"), ro);
+        assert!(overlay.lookup("/t/agent", 0).is_some());
+        assert_eq!(policy.erofs_denied(), 1);
+        drop(overlay);
+
+        // Lower-provided: a sealed `--lower` layer created t/agent. The top's
+        // base is the composed stack, so the root stays anchored there.
+        let base = archive_with_paths(&["t/suite"]);
+        let lower = tempfile::tempdir().unwrap();
+        {
+            let overlay = crate::WriteOverlay::new_for_tests(base.clone(), lower.path()).unwrap();
+            overlay.mkdir("/t/agent", 0o755).unwrap();
+        }
+        let stack = crate::compose_stack(
+            base,
+            &[(lower.path().to_path_buf(), crate::Immutability::Immutable)],
+        )
+        .unwrap();
+        assert!(stack.is_dir("/t/agent"));
+        let root = tempfile::tempdir().unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(stack, root.path()).unwrap();
+        overlay.set_policy(Some(rules(root.path())));
+        overlay.ensure_modifiable("/t/agent").unwrap();
+        assert!(root.path().join("t/agent").is_dir());
+        denied(overlay.rmdir("/t/agent"), ro);
+        assert!(overlay.lookup("/t/agent", 0).is_some());
+        drop(overlay);
+        assert_eq!(files_row(root.path(), "/t", "agent"), None);
     }
 
     /// Regression: specificity counts whole literal components; allow wins ties,
@@ -996,7 +1278,11 @@ mod tests {
         };
         denied(overlay.set_metadata("/t/file", &attrs), ro);
         denied(overlay.set_xattr("/t/file", "user.test", b"x", 0), ro);
-        overlay.mkdir("/t/agent", 0o755).unwrap();
+        // `/t/agent` is an archive directory: mkdir is EEXIST (#316).
+        denied(
+            overlay.mkdir("/t/agent", 0o755),
+            io::ErrorKind::AlreadyExists,
+        );
         overlay.mkdir("/t/agent/dir", 0o755).unwrap();
         let file = new_file(&overlay, "/t/agent/dir/new");
         overlay

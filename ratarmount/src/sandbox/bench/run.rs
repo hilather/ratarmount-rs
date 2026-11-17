@@ -1012,6 +1012,7 @@ impl FuseBatch {
                 lowers: vec![],
                 journal: None,
                 retain: false,
+                overlay_durability: protocol::OverlayDurability::Full,
             },
             row,
             "new",
@@ -2468,6 +2469,7 @@ mod tests {
             lowers: vec![],
             journal: None,
             retain: false,
+            overlay_durability: protocol::OverlayDurability::Full,
         };
         let (result, elapsed) = client().exchange(op(), false);
         let error = result.unwrap_err();

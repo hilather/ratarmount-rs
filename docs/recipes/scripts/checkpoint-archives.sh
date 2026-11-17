@@ -22,7 +22,7 @@ cleanup() {
     rm -rf "$work"
 }
 trap cleanup EXIT
-"$ratarmount_bin" -w "$overlay" --commit-overlay-on-exit --commit-overlay-mode auto --commit-manifest "$archive" "$mountpoint" &
+"$ratarmount_bin" -f -w "$overlay" --commit-overlay-on-exit --commit-overlay-mode auto --commit-manifest "$archive" "$mountpoint" &
 mount_pid=$!
 for _ in {1..100}; do
     mountpoint -q "$mountpoint" && break
@@ -38,4 +38,6 @@ else
     echo 'skip: setfattr is not installed; provenance xattr step skipped'
 fi
 "$ratarmount_bin" -u "$mountpoint"
+wait "$mount_pid"
+mount_pid=
 test -s "$archive.manifest.jsonl"

@@ -413,7 +413,7 @@ fn cancelled(cancel: Option<&AtomicBool>) -> bool {
 fn is_generated(fi: &FileInfo) -> bool {
     fi.userdata.iter().rev().any(|ud| match ud {
         UserData::Tar(t) => t.isgenerated,
-        UserData::Other(_) => false,
+        UserData::Other(_) | UserData::SymlinkTarget(_) => false,
     })
 }
 

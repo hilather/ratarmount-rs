@@ -683,6 +683,66 @@ fn regression_directory_base_with_fifo_creates_weak() {
     );
 }
 
+/// Regression (#196): the folder weak walk identifies a FIFO and a device
+/// by `lstat`, not by opening them. A non-blocking write-open of a FIFO
+/// with no reader fails with `ENXIO` before any identification; the walk
+/// still returns, and the digest differs from an empty directory.
+#[cfg(unix)]
+#[test]
+fn regression_directory_weak_walk_identifies_fifo_and_device_by_lstat() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+    let root = tempfile::tempdir().unwrap();
+    let basedir = root.path().join("base");
+    fs::create_dir(&basedir).unwrap();
+    let empty = root.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+    let pipe = basedir.join("pipe");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&pipe)
+        .status()
+        .unwrap()
+        .success());
+    let c = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+        panic!("a FIFO with no reader accepted a non-blocking write-open");
+    }
+    let err = io::Error::last_os_error();
+    assert_eq!(err.raw_os_error(), Some(libc::ENXIO), "{err}");
+    let fifo_type = fs::symlink_metadata(&pipe).unwrap().file_type();
+    assert!(fifo_type.is_fifo());
+    assert_eq!(special_kind(&fifo_type), b'p');
+    let with_fifo = directory_weak_digest(&basedir, &BaseExcludes::default()).unwrap();
+    let bare = directory_weak_digest(&empty, &BaseExcludes::default()).unwrap();
+    assert_ne!(with_fifo, bare, "the FIFO is in the manifest");
+    let null = fs::symlink_metadata("/dev/null").unwrap();
+    assert!(null.file_type().is_char_device());
+    assert_eq!(special_kind(&null.file_type()), b'c');
+    // A device node inside the tree when the host allows it. Otherwise
+    // `/dev/null`'s type above is the device classification.
+    let node = basedir.join("nulldev");
+    let created = std::process::Command::new("mknod")
+        .args(["-m", "0666"])
+        .arg(&node)
+        .args(["c", "1", "3"])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if created {
+        let kind = fs::symlink_metadata(&node).unwrap().file_type();
+        assert!(kind.is_char_device());
+        assert_eq!(special_kind(&kind), b'c');
+        let _ = directory_weak_digest(&basedir, &BaseExcludes::default()).unwrap();
+    }
+}
+
 /// `verify_base` table: recorded kind and base type decide strength; a
 /// FIFO under a strong directory digest, `none` and a missing digest are
 /// `Skipped`, never an error.
@@ -1669,6 +1729,40 @@ fn regression_required_latch_survives_hot_journal_retry() {
     }
 }
 
+/// Regression: #164: a no-recovery read returned only metadata, forgetting a
+/// marker observed during acquisition before the caller started recovery.
+#[test]
+fn regression_164_no_recovery_read_returns_acquired_requirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join(HIDDEN_DB);
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch("CREATE TABLE files (path)")
+        .unwrap();
+    let marker = dir.path().join(crate::OVERLAY_MARKER);
+    fs::write(&marker, b"").unwrap();
+    crate::overlay_db::AFTER_ACQUIRE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_| {
+            fs::remove_file(&marker).unwrap();
+        }));
+    });
+    let required = std::cell::Cell::new(false);
+    let result = OverlayMeta::read_no_recovery_required(dir.path(), &required);
+    crate::overlay_db::AFTER_ACQUIRE.with(|hook| *hook.borrow_mut() = None);
+    assert!(result.unwrap().is_none(), "legacy record without metadata");
+    assert!(
+        required.get(),
+        "the operation retains the acquired requirement"
+    );
+
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP TABLE files")
+        .unwrap();
+    let error = OverlayMeta::read_no_recovery_required(dir.path(), &required).unwrap_err();
+    assert!(error.to_string().contains(NO_FILES_TABLE), "{error}");
+}
+
 // ---------------------------------------------------------------------
 // R11-S7 (#151): base hashing reads through managed readers.
 // ---------------------------------------------------------------------
@@ -1731,10 +1825,13 @@ fn regression_directory_strong_digest_keeps_sqlar_lock() {
     drop(h);
 }
 
-/// Regression: resolving a pending archive digest (the mount's background
-/// hasher and `resolve_pending_base_digest`) hashed the archive raw while
-/// a connection of this process had it open (the archive here is an
-/// ordinary index with a `files` table).
+/// Regression: resolving a pending archive digest hashed the archive raw
+/// while a connection of this process had it open. The archive here is an
+/// ordinary index with a `files` table, so the mount hasher's
+/// `cache_available` check does not return early (#196). A SQLAR has no
+/// `files` table; that premise is
+/// `regression_sqlar_pending_base_has_no_digest_cache`.
+/// `resolve_pending_base_digest` always calls `PendingBase::hash`.
 #[cfg(unix)]
 #[test]
 fn regression_pending_base_hash_keeps_index_lock() {
@@ -1765,6 +1862,47 @@ fn regression_pending_base_hash_keeps_index_lock() {
     resolve_pending_base_digest(&conn).unwrap();
     assert!(other_process_sees_lock(&archive), "resolution kept it");
     drop(h);
+}
+
+/// Regression (#196): a SQLAR has no `files` table, so it is not a digest
+/// cache. The mount hasher returns before `PendingBase::hash` when
+/// `cache_available` is false. An index with a `files` table is the case
+/// `regression_pending_base_hash_keeps_index_lock` hashes while open.
+#[cfg(unix)]
+#[test]
+fn regression_sqlar_pending_base_has_no_digest_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let sqlar = root.join("a.sqlar");
+    s7_database(&sqlar);
+    assert!(!ratarmount_index::archive_digest_cache_available(Some(
+        &sqlar
+    )));
+    assert!(!ratarmount_index::archive_digest_cache_available(None));
+    let pending = PendingBase {
+        path: sqlar.clone(),
+        index: Some(sqlar),
+        size: 0,
+        mtime_ns: 0,
+    };
+    assert!(
+        !pending.cache_available(),
+        "a SQLAR pending base is not hashed by the mount hasher"
+    );
+    let index = root.join("idx.sqlite");
+    let mut idx = ratarmount_index::SqliteIndex::create_writable(Some(&index)).unwrap();
+    idx.publish_tmp().unwrap();
+    drop(idx);
+    let indexed = PendingBase {
+        path: index.clone(),
+        index: Some(index),
+        size: 0,
+        mtime_ns: 0,
+    };
+    assert!(
+        indexed.cache_available(),
+        "an index with a files table is the hasher's cache"
+    );
 }
 
 /// Regression: `overlay verify`'s strong base check hashed the base raw

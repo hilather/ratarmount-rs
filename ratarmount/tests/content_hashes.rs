@@ -4,6 +4,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "../../test-harness/sevenzip_fixture.rs"]
+mod sevenzip_fixture;
+
 use ratarmount_index::hash_hex;
 use rusqlite::Connection;
 
@@ -312,5 +315,77 @@ fn regression_303_cli_pax_effective_size_filled() {
         for algo in ["sha256", "crc32"] {
             check(&path, &[("pax.bin", content.clone())], algo);
         }
+    }
+}
+
+/// Regression: #320 `--no-mount --hashes sha256` on a solid 7z stored the last
+/// member's digest under the folder's shared `offsetheader`, so every files
+/// join (find, FTS, export-index) gave each member that digest. Each member's
+/// digest now lives in its own slot; no join attributes a shared-slot value.
+#[test]
+fn regression_320_cli_solid_7z_hashes_are_not_shared() {
+    let members: [(&str, &[u8]); 3] = [
+        ("b.txt", b"second file\n"),
+        ("c.txt", b"third member\n"),
+        ("text.txt", b"content hash\n"),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let solid = dir.path().join("s3.7z");
+    let non_solid = dir.path().join("ns.7z");
+    fs::write(&solid, sevenzip_fixture::copy_7z_fixture(&members, true)).unwrap();
+    fs::write(
+        &non_solid,
+        sevenzip_fixture::copy_7z_fixture(&members, false),
+    )
+    .unwrap();
+    for path in [&solid, &non_solid] {
+        run(path, &["--no-mount", "--hashes", "sha256"]);
+    }
+    let parts: Vec<(&str, Vec<u8>)> = members.iter().map(|(n, b)| (*n, b.to_vec())).collect();
+    check(&non_solid, &parts, "sha256");
+    let stored: Vec<Vec<u8>> = index(&solid)
+        .prepare("SELECT value FROM xattrs WHERE key='user.hash.sha256' ORDER BY value")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let mut expected: Vec<Vec<u8>> = members
+        .iter()
+        .map(|(_, b)| hash_hex("sha256", b).unwrap().into_bytes())
+        .collect();
+    expected.sort();
+    assert_eq!(stored, expected, "one digest per solid member");
+    for (name, _) in &members {
+        assert_eq!(digest(&solid, name, "sha256"), None, "{name}");
+    }
+    // Warm rerun: the per-member digests count as kept, none unverifiable.
+    let out = run_with_env(
+        &solid,
+        &["--no-mount", "--hashes", "sha256"],
+        &[("RUST_LOG", "info")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("kept_existing=3"), "{stderr}");
+    assert!(stderr.contains("unverifiable=0"), "{stderr}");
+    assert!(
+        !stderr.contains("unverifiable content locations"),
+        "{stderr}"
+    );
+    let out = run(&solid, &["find", "--hashes", "*.txt"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let control = run(&non_solid, &["find", "--hashes", "*.txt"]);
+    let control = String::from_utf8_lossy(&control.stdout);
+    for (name, body) in &members {
+        let sha = hash_hex("sha256", body).unwrap();
+        assert!(stdout.contains(name), "{stdout}");
+        assert!(
+            !stdout.contains(&sha),
+            "find must not misattribute {sha}: {stdout}"
+        );
+        assert!(
+            control.contains(&sha),
+            "non-solid find shows {name}: {control}"
+        );
     }
 }

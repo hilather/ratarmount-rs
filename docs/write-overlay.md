@@ -40,6 +40,11 @@ and is never content-hashed by a mount (an archive base is hashed in the backgro
 a strong one. `import_in_progress` is set only while `overlay import` is writing;
 a leftover row means the import was killed (`overlay fsck` reports `import_incomplete`
 and `seal` refuses).
+`relaxed_durability` is set while a mount with `--overlay-durability=relaxed`
+(no database fsyncs; for throwaway overlays) is open; a leftover row from an
+earlier boot means the machine went down meanwhile, and the overlay is refused
+until `overlay fsck --repair` (see
+[Relaxed overlay durability](sandbox.md#relaxed-overlay-durability)).
 Copy-on-write stages each copy in a `.ratarmount.overlay.cow-*` temp next to
 its destination, hidden the same way (ASCII case ignored); `--commit-overlay`
 never picks a temp up, an archive member with that prefix is hidden but stays in

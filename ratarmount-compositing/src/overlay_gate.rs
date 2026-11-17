@@ -869,11 +869,13 @@ pub(crate) fn check_commit_base_offline(
     base: &ClassifiedBase,
     archive: &Path,
 ) -> std::result::Result<Option<std::fs::Metadata>, CommitBaseRefusal> {
-    check_commit_base_offline_with(overlay, base, archive, None)
+    check_commit_base_offline_with(overlay, base, archive, None, &std::cell::Cell::new(false))
 }
 
 /// [`check_commit_base_offline`] with the journal header and file metadata read
 /// under the archive lock (see [`check_commit_base_with`]).
+/// `required` retains every marker observation for the caller's operation,
+/// including acquisitions whose marker disappears before this gate returns.
 pub(crate) fn check_commit_base_offline_with(
     overlay: &Path,
     base: &ClassifiedBase,
@@ -882,17 +884,20 @@ pub(crate) fn check_commit_base_offline_with(
         &ratarmount_compress::commit_journal::PendingJournal,
         &std::fs::Metadata,
     )>,
+    required: &std::cell::Cell<bool>,
 ) -> std::result::Result<Option<std::fs::Metadata>, CommitBaseRefusal> {
     let db = overlay.join(HIDDEN_DB);
     crate::overlay_db::validate_overlay_state(&db).map_err(CommitBaseRefusal::policy)?;
-    let marked_before = !crate::write_overlay::overlay_markers(overlay)
-        .map_err(|e| {
-            CommitBaseRefusal::new(format!(
-                "cannot read the markers of {}: {e}",
-                overlay.display()
-            ))
-        })?
-        .is_empty();
+    let marked_before = required.get()
+        || !crate::write_overlay::overlay_markers(overlay)
+            .map_err(|e| {
+                CommitBaseRefusal::new(format!(
+                    "cannot read the markers of {}: {e}",
+                    overlay.display()
+                ))
+            })?
+            .is_empty();
+    required.set(marked_before);
     let conn = crate::overlay_db::open_overlay_db_required(
         &db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -908,6 +913,7 @@ pub(crate) fn check_commit_base_offline_with(
             CommitBaseRefusal::new(format!("cannot open {}: {e}", db.display()))
         }
     })?;
+    required.set(marked_before || conn.required_record());
     let marked = marked_before
         || conn.required_record()
         || !crate::write_overlay::overlay_markers(overlay)
@@ -918,6 +924,7 @@ pub(crate) fn check_commit_base_offline_with(
                 ))
             })?
             .is_empty();
+    required.set(marked);
     let result = check_commit_base_with(&conn, base, archive, locked, marked);
     if result.is_err() {
         // SQLite's Connection::path is UTF-8-only; this boundary retains the

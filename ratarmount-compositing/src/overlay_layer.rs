@@ -101,6 +101,14 @@ impl ReadOnlyOverlayLayer {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| database_error(&root, e))?;
+        // Read the marker and rows in the same snapshot, including when an
+        // immutable lower changed after the supervisor's preflight.
+        let marker = crate::relaxed_durability::read_marker(&tx).map_err(|error| match error {
+            crate::OverlayError::Sqlite(error) => database_error(&root, error),
+            other => io::Error::other(other),
+        })?;
+        crate::relaxed_durability::refuse_unclean_marker(marker.as_deref())
+            .map_err(|e| io::Error::other(format!("overlay {}: {e}", root.display())))?;
         let tables: Vec<String> = tx
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")
             .and_then(|mut stmt| stmt.query_map([], |r| r.get(0))?.collect())

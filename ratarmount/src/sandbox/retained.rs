@@ -500,6 +500,7 @@ fn restore_entry(dir: &Path, record: &Retained) -> Option<RetainedEntry> {
             return None;
         }
     };
+    ratarmount_compositing::relaxed_durability::refuse_unclean(Some(&meta)).ok()?;
     let prefix = meta.lower_layers().ok()?;
     if !meta.layer_sealed()
         || meta.get("layer_digest") != Some(record.layer_digest.as_str())
@@ -565,7 +566,9 @@ pub(super) fn widest_report(attempt: &Attempt, root: &Path) -> Value {
         "erofs_denied": u64::MAX,
         "manifest_path": path("manifest.jsonl"),
         "journal_summary": {"path": path("journal.summary.json"), "files_read": u64::MAX,
-            "files_read_then_written": u64::MAX, "files_written_blind": u64::MAX},
+            "files_read_then_written": u64::MAX, "files_written_blind": u64::MAX,
+            // Every reason of the closed set, the widest `reasons`.
+            "complete": false, "reasons": crate::journal_cmd::COVERAGE_REASONS},
         "bundle": path("bundle.tar.zst"),
     })
 }
@@ -1084,6 +1087,8 @@ impl<M: Mounter> Supervisor<M> {
             ));
         }
         let attempt = entry.attempt.clone();
+        super::inspection::check_offline_durability(&attempt.overlay_dir)
+            .map_err(|error| super::finalize::finalize_io_error(&id, error))?;
         let records = entry.records.clone().unwrap_or_default();
         lowers::recorded_layers(&records).map_err(super::finalize::lower_changed)?;
         let base = self.base(&attempt.base)?.clone();

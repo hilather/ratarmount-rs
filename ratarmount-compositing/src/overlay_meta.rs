@@ -120,7 +120,7 @@ pub(crate) fn plan_excludes(
 
 /// `SQLITE_READONLY_ROLLBACK`: a read-only open found a hot rollback journal
 /// (a writer died mid-transaction) that only a read-write open can play back.
-fn is_hot_journal(error: &rusqlite::Error) -> bool {
+pub(crate) fn is_hot_journal(error: &rusqlite::Error) -> bool {
     matches!(
         error,
         rusqlite::Error::SqliteFailure(code, _)
@@ -277,8 +277,12 @@ impl OverlayMeta {
 
     /// [`Self::read_no_recovery`] of a record that must have a `files` table
     /// when `required` (a marked overlay: its record is the one it used).
-    pub(crate) fn read_no_recovery_required(dir: &Path, required: bool) -> Result<Option<Self>> {
-        Self::read_with_required(dir, false, required)
+    /// Keep requirements observed during acquisition in the caller's latch.
+    pub(crate) fn read_no_recovery_required(
+        dir: &Path,
+        required: &std::cell::Cell<bool>,
+    ) -> Result<Option<Self>> {
+        Self::read_latched(dir, false, required)
     }
 
     fn read_with(dir: &Path, recover_hot: bool) -> Result<Option<Self>> {
@@ -1962,7 +1966,10 @@ pub(crate) fn record_base_rows_offline(
     )?;
     conn.busy_timeout(std::time::Duration::ZERO)?;
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let result = apply_comparison_rows(&conn, rows);
+    let result = (|| {
+        crate::relaxed_durability::refuse_unclean(OverlayMeta::from_opened(&conn)?.as_ref())?;
+        apply_comparison_rows(&conn, rows)
+    })();
     match result {
         Ok(()) => conn.execute_batch("COMMIT").map_err(Into::into),
         Err(e) => {

@@ -42,6 +42,7 @@ mod overlay_seal_unsupported_tests;
 mod path_intern;
 mod payload;
 mod prefix;
+pub mod relaxed_durability;
 mod rolling;
 mod transform;
 mod union;
@@ -102,6 +103,7 @@ pub use overlay_policy::{
 };
 pub use payload::{maybe_wrap_payload_cache, PayloadCacheLayer};
 pub use prefix::{validate_mount_path, PrefixMountSource, SourceBind};
+pub use relaxed_durability::OverlayDurability;
 pub use rolling::{RollPolicy, RollingMountSource, SeriesName};
 pub use transform::TransformMountSource;
 pub use union::{UnionMountOptions, UnionMountSource};
