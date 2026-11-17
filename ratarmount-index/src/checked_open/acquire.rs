@@ -8,8 +8,11 @@
 //!   database open of `unixOpen` carries it; housekeeping opens do not) is
 //!   `fstat`ed before SQLite sees it. A mismatch is never returned to SQLite:
 //!   a descriptor proved non-regular is closed, a regular or unidentifiable
-//!   one is retained for the life of the process (it may be an inode this
-//!   process holds POSIX locks on, and closing it would release them);
+//!   one is retained (it may be an inode this process holds POSIX locks on,
+//!   and closing it would release them). [`open_checked`] keeps that
+//!   descriptor for the life of the process. [`open_reclassifying`] hands it
+//!   to the database-inode coordinator, which closes it when this process
+//!   does not hold the inode and keeps it until the last holder drops;
 //! * a **reused descriptor** (SQLite's `findReusableFd`, no open): accepted
 //!   only for an existing file, when at least one successful armed `stat`
 //!   was seen and every one agreed.
@@ -85,6 +88,8 @@ pub enum Verification {
     /// check, and no pathname type check. Overlay databases on that host are
     /// refused instead of carrying this label (#196).
     LegacyUnverified,
+    /// Unchecked ordinary open when verified hooks are unavailable.
+    Plain,
 }
 
 /// Which host [`disk_open_state`] is evaluated on.
@@ -99,7 +104,7 @@ pub enum HostVerification {
 }
 
 /// Overlay databases go through [`open_checked`]. Index, SQLAR, digest-cache
-/// and publication connections do not (#193 is a separate change).
+/// and publication connections use [`open_reclassifying`] (#193).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiskDbClass {
     Overlay,
@@ -139,11 +144,9 @@ impl DiskOpenState {
 pub fn disk_open_state(host: HostVerification, class: DiskDbClass) -> DiskOpenState {
     match (host, class) {
         (HostVerification::VerifiedUnix, DiskDbClass::Overlay) => DiskOpenState::CheckedUnix,
-        (HostVerification::VerifiedUnix, DiskDbClass::NonOverlay) => {
-            DiskOpenState::OrdinaryDefaultVfs
-        }
+        (HostVerification::VerifiedUnix, DiskDbClass::NonOverlay) => DiskOpenState::CheckedUnix,
         (HostVerification::Windows, DiskDbClass::Overlay) => DiskOpenState::WindowsPathTypeOnly,
-        (HostVerification::Windows, DiskDbClass::NonOverlay) => DiskOpenState::OrdinaryDefaultVfs,
+        (HostVerification::Windows, DiskDbClass::NonOverlay) => DiskOpenState::WindowsPathTypeOnly,
         (HostVerification::UnsupportedUnix, DiskDbClass::Overlay) => DiskOpenState::Refused,
         (HostVerification::UnsupportedUnix, DiskDbClass::NonOverlay) => {
             DiskOpenState::LegacyUnverified
@@ -170,6 +173,12 @@ pub struct Acquired {
     /// A standard descriptor (0-2) on the database that was duplicated to a
     /// higher slot and kept open. Diagnostic only; never owned by the caller.
     pub retained_low_fd: Option<i32>,
+    /// This process holds locks on [`Self::id`] until this is dropped.
+    /// Declared after `conn`, so dropping an [`Acquired`] closes the
+    /// connection first. `None` from [`open_checked`] and from a plain
+    /// fallback. A caller that moves `conn` out keeps this for as long as
+    /// the connection.
+    pub lock_hold: Option<ratarmount_core::db_inodes::DbLockHold>,
 }
 
 #[derive(Debug)]
@@ -213,6 +222,14 @@ pub enum AcquireError {
         locks_may_be_released: bool,
     },
     Sqlite(rusqlite::Error),
+    /// A non-overlay open still saw another file, or a non-regular entry,
+    /// after the reclassify bound ([`RECLASSIFY_ATTEMPTS`] attempts or
+    /// [`RECLASSIFY_BUDGET`]).
+    Unsettled {
+        attempts: u32,
+        elapsed_ms: u128,
+        last: Box<AcquireError>,
+    },
 }
 
 impl fmt::Display for AcquireError {
@@ -267,6 +284,14 @@ impl fmt::Display for AcquireError {
                 Ok(())
             }
             Self::Sqlite(e) => write!(f, "{e}"),
+            Self::Unsettled {
+                attempts,
+                elapsed_ms,
+                last,
+            } => write!(
+                f,
+                "the database did not settle after {attempts} attempts ({elapsed_ms} ms): {last}"
+            ),
         }
     }
 }
@@ -275,6 +300,7 @@ impl std::error::Error for AcquireError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Sqlite(e) => Some(e),
+            Self::Unsettled { last, .. } => Some(last),
             _ => None,
         }
     }
@@ -470,12 +496,14 @@ pub(crate) fn decide(
             id: Some(id),
             verification: Verification::UnixDescriptor,
             retained_low_fd,
+            lock_hold: None,
         }),
         (None, Expect::Existing { id, .. }) if a.stats > 0 => Ok(Acquired {
             conn,
             id: Some(id),
             verification: Verification::UnixReuse,
             retained_low_fd,
+            lock_hold: None,
         }),
         _ => {
             drop(conn);
@@ -587,43 +615,348 @@ pub fn refuse_symlink(path: &Path, flags: OpenFlags) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Open `path` and prove which inode SQLite acquired. Every failure rechecks
-/// the named state with [`refuse_symlink`] before returning its refusal.
+/// VFS for overlay databases and [`crate::snapshot_index_into`]: `unix-posix`
+/// on macOS (POSIX locks only), `unix` elsewhere.
+pub(crate) const PINNED_VFS: &str = if cfg!(target_os = "macos") {
+    "unix-posix"
+} else {
+    "unix"
+};
+
+/// VFS for ordinary index, SQLAR and digest-cache connections. `"unix"` keeps
+/// macOS auto locking. The wrappers sit on this VFS's syscall table, which
+/// `"unix-posix"` shares after a successful install.
+const DEFAULT_VFS: &str = "unix";
+
+/// A non-overlay open reclassifies at most this many times.
+const RECLASSIFY_ATTEMPTS: u32 = 3;
+
+/// A non-overlay open stops retrying once this much time has passed. The
+/// attempt already running is finished; the next one is not started.
+const RECLASSIFY_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[cfg(test)]
+thread_local! {
+    static RECLASSIFY_AFTER_CLASSIFY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One-shot hook run after a non-overlay open has classified the path and
+/// before SQLite's open, so a swap is [`AcquireError::OtherFile`] on that
+/// attempt. Taken on entry, so a nested open from the hook does not see it.
+#[cfg(test)]
+pub(crate) fn set_reclassify_after_classify_hook(hook: impl FnOnce() + 'static) {
+    RECLASSIFY_AFTER_CLASSIFY.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_reclassify_after_classify_hook() {
+    RECLASSIFY_AFTER_CLASSIFY.with(|h| *h.borrow_mut() = None);
+}
+
+fn take_reclassify_hook() -> Option<Box<dyn FnOnce()>> {
+    #[cfg(test)]
+    {
+        RECLASSIFY_AFTER_CLASSIFY.with(|h| h.borrow_mut().take())
+    }
+    #[cfg(not(test))]
+    {
+        None
+    }
+}
+
+/// Open `path` and prove which inode SQLite acquired.
+///
+/// One attempt. A refused regular descriptor stays open for the life of the
+/// process ([`Refusal::retained_fd`]): this is the overlay acquisition, which
+/// does not retry and does not hand the descriptor on.
 pub fn open_checked(
     path: &Path,
     flags: OpenFlags,
     mode: NameMode,
     expect: Expect,
 ) -> Result<Acquired, Refusal> {
-    let refuse = |error| Refusal {
-        error,
-        retained_fd: None,
-    };
     let acquired = (|| {
-        let request = request(path, flags, mode, expect).map_err(refuse)?;
-        #[cfg(windows)]
-        return path_type_only::open(&request, expect);
         #[cfg(not(windows))]
-        {
-            if let Err(status) = super::install::installed() {
-                return Err(refuse(AcquireError::Unavailable(status)));
-            }
-            // F6 (r11 S6): the VFS and the two syscall slots still hold what the
-            // installation left; checked before arming, never repaired.
-            if let Err(reason) = super::install::hooks_intact() {
-                return Err(refuse(AcquireError::Unavailable(
-                    super::install::InstallStatus::HooksReplaced(reason),
-                )));
-            }
-            imp::open(&request.name, request.flags, expect)
-        }
+        require_installed().map_err(refuse_none)?;
+        open_armed(path, flags, mode, expect, PINNED_VFS)
     })();
-    acquired.map_err(|mut refusal| {
+    recheck_symlink(acquired, path, flags)
+}
+
+/// Open an index, SQLAR or digest-cache database.
+///
+/// Classifies the path, then opens it checked. [`AcquireError::OtherFile`] and
+/// [`AcquireError::NotRegular`] reclassify and retry, at most
+/// [`RECLASSIFY_ATTEMPTS`] times and within [`RECLASSIFY_BUDGET`], and then
+/// fail with [`AcquireError::Unsettled`] ("did not settle"). Any other refusal
+/// is returned as it is. A retained mismatch descriptor is handed to the
+/// database-inode coordinator. The connection keeps [`DEFAULT_VFS`].
+///
+/// When the wrappers are not installed (unsupported Unix or a process whose
+/// constructor abstained), this is an ordinary open ([`Verification::Plain`]),
+/// except [`InstallStatus::HooksReplaced`](super::install::InstallStatus::HooksReplaced),
+/// which fails closed.
+pub fn open_reclassifying(
+    path: &Path,
+    flags: OpenFlags,
+    mode: NameMode,
+) -> Result<Acquired, Refusal> {
+    recheck_symlink(
+        reclassify(
+            path,
+            flags,
+            mode,
+            Policy {
+                vfs: DEFAULT_VFS,
+                force_nonempty: false,
+                plain_fallback: true,
+            },
+        ),
+        path,
+        flags,
+    )
+}
+
+fn recheck_symlink(
+    result: Result<Acquired, Refusal>,
+    path: &Path,
+    flags: OpenFlags,
+) -> Result<Acquired, Refusal> {
+    result.map_err(|mut refusal| {
         if let Err(error) = refuse_symlink(path, flags) {
             refusal.error = AcquireError::Sqlite(error);
         }
         refusal
     })
+}
+
+struct Policy {
+    vfs: &'static str,
+    force_nonempty: bool,
+    plain_fallback: bool,
+}
+
+fn require_installed() -> Result<(), AcquireError> {
+    if let Err(status) = super::install::installed() {
+        return Err(AcquireError::Unavailable(status));
+    }
+    // F6 (r11 S6): the VFS and the two syscall slots still hold what the
+    // installation left; checked before arming, never repaired.
+    if let Err(reason) = super::install::hooks_intact() {
+        return Err(AcquireError::Unavailable(
+            super::install::InstallStatus::HooksReplaced(reason),
+        ));
+    }
+    Ok(())
+}
+
+fn plain_fallback_status(status: &super::install::InstallStatus) -> bool {
+    use super::install::InstallStatus;
+    matches!(
+        status,
+        InstallStatus::NotRun
+            | InstallStatus::AbstainedThreads(_)
+            | InstallStatus::NotPrivate(_)
+            | InstallStatus::Failed(_)
+            | InstallStatus::UnsupportedPlatform
+            | InstallStatus::UnsupportedAbi
+    )
+}
+
+fn refuse_none(error: AcquireError) -> Refusal {
+    Refusal {
+        error,
+        retained_fd: None,
+    }
+}
+
+/// Hand a retained descriptor to the coordinator. The caller does not keep it.
+fn hand_off(mut refusal: Refusal) -> AcquireError {
+    if let Some(fd) = refusal.retained_fd.take() {
+        // Safety: the acquisition retained `fd` and no longer uses it.
+        unsafe { ratarmount_core::db_inodes::coordinate_retained_fd(fd) };
+    }
+    refusal.error
+}
+
+fn hold_acquired(mut acquired: Acquired) -> Acquired {
+    if let Some(id) = acquired.id {
+        if id != (0, 0) {
+            acquired.lock_hold = Some(ratarmount_core::db_inodes::hold_db_locks(id));
+        }
+    }
+    acquired
+}
+
+fn plain_open(path: &Path, flags: OpenFlags, mode: NameMode) -> Result<Acquired, Refusal> {
+    let (name, flags) = match mode {
+        NameMode::Path => (path.to_path_buf(), flags),
+        NameMode::Immutable => {
+            let absolute = std::path::absolute(path).map_err(|_| {
+                refuse_none(AcquireError::InvalidRequest(
+                    "the path cannot be made absolute",
+                ))
+            })?;
+            (
+                PathBuf::from(immutable_uri(&absolute)),
+                flags | OpenFlags::SQLITE_OPEN_URI,
+            )
+        }
+    };
+    let conn = Connection::open_with_flags(name, flags)
+        .map_err(|e| refuse_none(AcquireError::Sqlite(e)))?;
+    Ok(Acquired {
+        conn,
+        id: None,
+        verification: if this_host() == HostVerification::UnsupportedUnix {
+            Verification::LegacyUnverified
+        } else {
+            Verification::Plain
+        },
+        retained_low_fd: None,
+        lock_hold: None,
+    })
+}
+
+fn file_id(metadata: &std::fs::Metadata) -> DbId {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        (0, 0)
+    }
+}
+
+fn mode_of(metadata: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.mode()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0
+    }
+}
+
+/// What the next armed open must find. A non-regular entry is
+/// [`AcquireError::NotRegular`] without opening it (a FIFO must not block).
+fn classify(path: &Path, flags: OpenFlags, force_nonempty: bool) -> Result<Expect, AcquireError> {
+    let path = std::path::absolute(path)
+        .map_err(|_| AcquireError::InvalidRequest("the path cannot be made absolute"))?;
+    let entry = if flags.contains(OpenFlags::SQLITE_OPEN_NOFOLLOW) {
+        std::fs::symlink_metadata(&path)
+    } else {
+        std::fs::metadata(&path)
+    };
+    match entry {
+        Ok(metadata) if !metadata.is_file() => Err(AcquireError::NotRegular {
+            mode: mode_of(&metadata),
+        }),
+        Ok(metadata) => Ok(Expect::Existing {
+            id: file_id(&metadata),
+            require_nonempty: force_nonempty || metadata.len() > 0,
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if flags.contains(OpenFlags::SQLITE_OPEN_CREATE) {
+                Ok(Expect::Fresh)
+            } else {
+                // A file that appears before the open is another file. A path
+                // that is still missing is SQLite's own error, not a retry.
+                Ok(Expect::Existing {
+                    id: (0, 0),
+                    require_nonempty: false,
+                })
+            }
+        }
+        Err(e) => Err(AcquireError::Fstat(e.raw_os_error().unwrap_or(0))),
+    }
+}
+
+fn open_armed(
+    path: &Path,
+    flags: OpenFlags,
+    mode: NameMode,
+    expect: Expect,
+    vfs: &str,
+) -> Result<Acquired, Refusal> {
+    let request = request(path, flags, mode, expect).map_err(refuse_none)?;
+    #[cfg(windows)]
+    {
+        let _ = vfs;
+        path_type_only::open(&request, expect)
+    }
+    #[cfg(not(windows))]
+    {
+        imp::open(&request.name, request.flags, expect, vfs)
+    }
+}
+
+fn retriable(error: &AcquireError) -> bool {
+    matches!(
+        error,
+        AcquireError::OtherFile { .. } | AcquireError::NotRegular { .. }
+    )
+}
+
+fn reclassify(
+    path: &Path,
+    flags: OpenFlags,
+    mode: NameMode,
+    policy: Policy,
+) -> Result<Acquired, Refusal> {
+    #[cfg(not(windows))]
+    if let Err(error) = require_installed() {
+        if policy.plain_fallback {
+            if let AcquireError::Unavailable(status) = &error {
+                if plain_fallback_status(status) {
+                    return plain_open(path, flags, mode);
+                }
+            }
+        }
+        return Err(refuse_none(error));
+    }
+    let started = std::time::Instant::now();
+    let mut hook = take_reclassify_hook();
+    let mut attempts = 0u32;
+    let mut last;
+    loop {
+        attempts += 1;
+        let classified = classify(path, flags, policy.force_nonempty);
+        if classified.is_ok() {
+            if let Some(hook) = hook.take() {
+                hook();
+            }
+        }
+        let error = match classified {
+            Err(error) => error,
+            Ok(expect) => match open_armed(path, flags, mode, expect, policy.vfs) {
+                Ok(acquired) => return Ok(hold_acquired(acquired)),
+                Err(refusal) => hand_off(refusal),
+            },
+        };
+        let again = retriable(&error);
+        last = Some(error);
+        let elapsed = started.elapsed();
+        if !again || attempts >= RECLASSIFY_ATTEMPTS || elapsed >= RECLASSIFY_BUDGET {
+            let last = last.expect("a finished attempt");
+            return if again {
+                Err(refuse_none(AcquireError::Unsettled {
+                    attempts,
+                    elapsed_ms: elapsed.as_millis(),
+                    last: Box::new(last),
+                }))
+            } else {
+                Err(refuse_none(last))
+            };
+        }
+    }
 }
 
 /// Windows (design §9): no syscall hook, so pathname type checks before and
@@ -693,6 +1026,7 @@ pub(crate) mod path_type_only {
             id: None,
             verification: Verification::WindowsPathTypeOnly,
             retained_low_fd: None,
+            lock_hold: None,
         })
     }
 }
@@ -810,13 +1144,6 @@ pub(crate) mod imp {
 
     use super::{
         decide, AcquireError, Acquired, Acquisition, Expect, Low, Mismatch, Refusal, Seen,
-    };
-
-    /// The VFS whose syscall table carries the wrappers (design §6).
-    const VFS: &str = if cfg!(target_os = "macos") {
-        "unix-posix"
-    } else {
-        "unix"
     };
 
     pub(crate) type RealOpen = unsafe extern "C" fn(*const c_char, c_int, c_int) -> c_int;
@@ -1188,13 +1515,18 @@ pub(crate) mod imp {
         rc
     }
 
-    pub(super) fn open(path: &Path, flags: OpenFlags, expect: Expect) -> Result<Acquired, Refusal> {
+    pub(super) fn open(
+        path: &Path,
+        flags: OpenFlags,
+        expect: Expect,
+        vfs: &str,
+    ) -> Result<Acquired, Refusal> {
         fill_low_descriptors();
         let guard = ArmGuard::arm(expect).map_err(|error| Refusal {
             error,
             retained_fd: None,
         })?;
-        let result = Connection::open_with_flags_and_vfs(path, flags, VFS);
+        let result = Connection::open_with_flags_and_vfs(path, flags, vfs);
         let a = guard.finish();
         decide(a, result)
     }
@@ -1284,7 +1616,7 @@ mod imp {
 
     use super::{AcquireError, Acquired, Expect, Refusal};
 
-    pub(super) fn open(_: &Path, _: OpenFlags, _: Expect) -> Result<Acquired, Refusal> {
+    pub(super) fn open(_: &Path, _: OpenFlags, _: Expect, _: &str) -> Result<Acquired, Refusal> {
         Err(Refusal {
             error: AcquireError::Unavailable(super::super::install::installed().err().unwrap_or(
                 if cfg!(unix) {
@@ -1317,19 +1649,17 @@ mod disk_open_state_tests {
     /// Regression (#196): unsupported-Unix non-overlay disk databases stay
     /// ordinary opens labeled [`Verification::LegacyUnverified`]. Overlay
     /// opens on that host stay refused. Verified Unix and Windows non-overlay
-    /// opens are ordinary default-VFS opens and are not that label.
+    /// opens are checked on the default VFS and are not that label.
     #[test]
     fn regression_disk_open_state_labels_unsupported_unix_non_overlay() {
         use DiskDbClass::{NonOverlay, Overlay};
-        use DiskOpenState::{
-            CheckedUnix, LegacyUnverified, OrdinaryDefaultVfs, Refused, WindowsPathTypeOnly,
-        };
+        use DiskOpenState::{CheckedUnix, LegacyUnverified, Refused, WindowsPathTypeOnly};
         use HostVerification::{UnsupportedUnix, VerifiedUnix, Windows};
         let rows = [
             (VerifiedUnix, Overlay, CheckedUnix),
-            (VerifiedUnix, NonOverlay, OrdinaryDefaultVfs),
+            (VerifiedUnix, NonOverlay, CheckedUnix),
             (Windows, Overlay, WindowsPathTypeOnly),
-            (Windows, NonOverlay, OrdinaryDefaultVfs),
+            (Windows, NonOverlay, WindowsPathTypeOnly),
             (UnsupportedUnix, Overlay, Refused),
             (UnsupportedUnix, NonOverlay, LegacyUnverified),
         ];
@@ -1359,7 +1689,7 @@ mod disk_open_state_tests {
             assert_eq!(host, Windows);
         } else if super::super::install::VERIFIED_TARGET {
             assert_eq!(host, VerifiedUnix);
-            assert_eq!(disk_open_state(host, NonOverlay), OrdinaryDefaultVfs);
+            assert_eq!(disk_open_state(host, NonOverlay), CheckedUnix);
         } else {
             assert_eq!(host, UnsupportedUnix);
             assert_eq!(disk_open_state(host, NonOverlay), LegacyUnverified);

@@ -18,8 +18,10 @@
 //!
 //! A database open never installs anything. [`installed`] reports the terminal
 //! result or why nothing was installed. The installed wrappers forward every
-//! call unchanged unless the calling thread is inside [`open_checked`], which
-//! refuses with [`AcquireError::Unavailable`] when nothing is installed.
+//! call unchanged unless the calling thread is inside [`open_checked`] or
+//! [`open_reclassifying`], which refuses with [`AcquireError::Unavailable`]
+//! when nothing is installed. Non-overlay opens retry a swapped file; overlay
+//! opens do not.
 //!
 //! The constructor runs in every binary that reaches `checked_open`
 //! ([`installed`] references the constructor, so the linker keeps it; a binary
@@ -77,9 +79,9 @@ mod install;
 ))]
 pub use acquire::imp::seams as test_seams;
 pub use acquire::{
-    disk_open_state, immutable_uri, open_checked, refuse_symlink, this_host, AcquireError,
-    Acquired, DbId, DiskDbClass, DiskOpenState, Expect, HostVerification, NameMode, Refusal,
-    Verification,
+    disk_open_state, immutable_uri, open_checked, open_reclassifying, refuse_symlink, this_host,
+    AcquireError, Acquired, DbId, DiskDbClass, DiskOpenState, Expect, HostVerification, NameMode,
+    Refusal, Verification,
 };
 pub use elf::{ElfError, SymbolName};
 
