@@ -3,7 +3,7 @@
     {
       "configured_path": "libc::dup2",
       "item": "<ratarmount::diff::ProgressToStderr as core::ops::drop::Drop<ratarmount::diff::ProgressToStderr>>::drop",
-      "leaf_digest": "d11337ceb80cdbd49dd2306489c8e34416a7992f9174beb0e6c332d47b1ed171",
+      "leaf_digest": "a792ebb2498140201013dc3040bb2e4862b7377280223a46233612f14feadd45",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "runtime-resource-or-descriptor-handoff",
@@ -59,7 +59,7 @@
     {
       "configured_path": "std::os::fd::FromRawFd::from_raw_fd",
       "item": "<ratarmount::diff::ProgressToStderr>::new",
-      "leaf_digest": "889eb32c19b70569dc2f2a76d3fb4b809518493e1afa5640a328c1f6ff329f32",
+      "leaf_digest": "e544d779921c4671ca516849b9ace7d8984cc9f540bad2f33bbff0f07eab8fed",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "runtime-resource-or-descriptor-handoff",
@@ -6836,7 +6836,7 @@
     {
       "configured_path": "libc::dup2",
       "item": "ratarmount::find::restore_stdout_after",
-      "leaf_digest": "7674a5733c85861dbe219bf46871cd78d569bd3f00d9980035c30837bfb541d8",
+      "leaf_digest": "a792ebb2498140201013dc3040bb2e4862b7377280223a46233612f14feadd45",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "runtime-resource-or-descriptor-handoff",
