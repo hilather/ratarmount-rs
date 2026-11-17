@@ -93,6 +93,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 
 | Symptom / fix | Commands |
 |---------------|----------|
+| #246 PR2 S1: shell and inline cleanup skip recorded PIDs that are not currently running jobs of this shell; live/reaped jobs and the helper TERM trap are covered. The `jobs -pr` snapshot-to-kill race and same-shell PID reuse by another running job remain. | `bash test-harness/test-shell-kill-safety.sh` |
 | #180 review: database-inode admission docs must name the checked sites and ordinary bundle/staging-lock opens; unpack finalization also opens regular-file `O_PATH` pins on Linux, not only directories. | `cargo test -p ratarmount --test docs_base_identity regression_docs_db_inode_` · `cargo test -p ratarmount --bin ratarmount regression_finalize_stage_chmod_keeps_db_alias_lock` |
 | #169: the unchecked commit-path archive-open inventory named only the commit journal and omitted the ZIP/TAR format probes; keep both probes named among opens that bypass overlay-database admission. | `cargo test -p ratarmount --test docs_base_identity regression_docs_169_names_unchecked_commit_probes` |
 | #168: the overlay-database hard-link residuals omitted the unchecked `--journal` operation-log writer, its append/close hazards and the warning against database aliases. | `cargo test -p ratarmount --test docs_base_identity regression_docs_168_operation_log_unchecked_open` |
