@@ -661,6 +661,93 @@ mod native {
             assert!(!scratch.exists());
         }
     }
+    fn assert_stub_contract(f: &Fixture) {
+        let output = f.command().output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        let rows = f.rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            f.read("batch.json")["settings"]["fuse"],
+            json!({"applicable":false})
+        );
+        let mut trees = std::collections::BTreeSet::new();
+        for row in &rows {
+            assert_eq!(row["mount"], json!({"applicable":false}));
+            assert_eq!(row["outcome"], "passed");
+            assert_eq!(row["runtime"]["kind"], "stub");
+            assert_eq!(row["fixture"], true);
+            assert_eq!(row["publishable"], false);
+            assert_eq!(row["summary"]["tests"], 10);
+            let tree = row["tree"].as_str().unwrap();
+            assert!(trees.insert(tree.to_owned()), "fresh native bind per run");
+            assert_eq!(row["startup_argv"][7], format!("{tree}:/repo"));
+            assert!(!std::path::Path::new(tree).exists());
+            let phases = row["phases"].as_array().unwrap();
+            assert_eq!(
+                phases
+                    .iter()
+                    .map(|p| p["phase"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["run", "configure", "build", "test"]
+            );
+            assert!(phases
+                .iter()
+                .all(|p| p["exit_code"] == 0 && p["error"].is_null()));
+            for (phase, command) in phases[1..].iter().zip(["configure", "build", "test"]) {
+                let argv = phase["argv"].as_array().unwrap();
+                assert_eq!(&argv[argv.len() - 2..], &[json!(command), json!("1")]);
+            }
+            if row["schedule"]["kind"] != "reference" {
+                assert!(!row["reference"].is_null());
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(f.dir.path().join("state/phases")).unwrap(),
+            "configure\nbuild\ntest\n".repeat(3)
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.dir.path().join("state/stops")).unwrap(),
+            "kill\nrm\n".repeat(3)
+        );
+        f.no_containers(); // The stub asserts each bind exists during stop/remove.
+        assert_eq!(
+            std::fs::read_dir(f.dir.path().join("work"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+    // Regression: the NNP=1-safe stub contract must exercise real CLI binding, grading and cleanup.
+    #[test]
+    fn regression_bench_stub_contract() {
+        assert_stub_contract(&Fixture::new());
+    }
+    // Regression: qualified warm FUSE dry-run cells remained unavailable after lifecycle support.
+    #[test]
+    fn regression_bench_fuse_dry_run_is_runnable() {
+        let mut f = Fixture::new();
+        f.value["tasks"][0]["backends"] = json!(["native", "fuse"]);
+        let mut evidence =
+            f.value["tasks"][0]["platforms"][0]["qualification"]["evidence"][0].clone();
+        evidence["backend"] = "fuse".into();
+        f.value["tasks"][0]["platforms"][0]["qualification"]["evidence"]
+            .as_array_mut()
+            .unwrap()
+            .push(evidence);
+        f.save();
+        let rows = schedule_rows(bench(
+            &f.path,
+            "--dry-run --backend fuse --cache warm --base-form tar.zst-single-frame",
+        ));
+        assert!(rows
+            .iter()
+            .any(|r| r["backend"] == "fuse" && r["kind"] == "measured" && r["runnable"] == true));
+        assert!(rows
+            .iter()
+            .any(|r| r["kind"] == "empty-top-fuse-probe" && r["runnable"] == true));
+        assert!(f.calls().is_empty());
+        assert!(!f.dir.path().join("out").exists());
+    }
     // Regression: execution accepted unresolved pins, invalid deadlines or unsupported selections before setup.
     // Extraction refusals must record the failure and remove partial trees without starting a runtime.
     #[test]
@@ -733,7 +820,7 @@ mod native {
             };
             match case {
                 "fuse" => {
-                    // A cold native reference precedes FUSE; the whole selection must name B5a1a.
+                    // A cold native reference precedes FUSE; the whole selection must refuse runnable execution.
                     let dry = bench(
                         &f.path,
                         "--dry-run --backend fuse --cache cold --base-form tar.zst-single-frame",
@@ -779,7 +866,7 @@ mod native {
             assert!(!f.calls().contains("run -d"));
             if case == "fuse" {
                 assert!(stderr(&result)
-                    .contains("FUSE execution unavailable: lifecycle deferred to B5a1a"));
+                    .contains("execution requires qualified warm tar.zst-single-frame selections (native or FUSE)"));
             }
             if case == "pin" {
                 assert!(stderr(&result).starts_with("sandbox bench: unresolved pins:"));
@@ -1407,7 +1494,7 @@ mod native {
         assert_eq!(f.read("batch.json")["runtime"]["kind"], "stub");
         assert!(f.rows().iter().all(|r| r["runtime"]["kind"] == "stub"));
     }
-    // Regression: unqualified Podman reached inspect/setup, or hid the FUSE refusal (8/N1).
+    // Regression: unqualified Podman or an absent runtime kind reached inspect/setup (8/N1).
     #[test]
     fn regression_bench_podman_not_yet_qualified_refused_before_setup() {
         let f = Fixture::new();
@@ -1445,7 +1532,11 @@ mod native {
                 .unwrap();
             assert_eq!(output.status.code(), Some(2));
             assert!(
-                stderr(&output).contains("FUSE execution unavailable"),
+                stderr(&output).contains(if kind.is_none() {
+                    "--runtime-kind docker|stub is required"
+                } else {
+                    "not yet qualified"
+                }),
                 "{}",
                 stderr(&output)
             );

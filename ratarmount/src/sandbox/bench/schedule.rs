@@ -75,6 +75,9 @@ pub(super) struct Entry {
     reasons: Vec<String>,
 }
 impl Entry {
+    pub(super) fn is_probe(&self) -> bool {
+        self.kind == Kind::EmptyTopFuseProbe
+    }
     pub(super) fn is_reference(&self) -> bool {
         self.kind == Kind::Reference
     }
@@ -259,7 +262,7 @@ pub(super) fn build(bytes: &[u8], options: &Selection) -> Result<Vec<Entry>, Str
     }
     for entry in &mut entries {
         entry.execution_available = entry.qualified
-            && entry.backend == Backend::Native
+            && matches!(entry.backend, Backend::Native | Backend::Fuse)
             && entry.cell.base_form == BaseForm::TarZstSingleFrame
             && entry.cell.cache == Cache::Warm;
         entry.runnable = entry.execution_available;
@@ -267,7 +270,7 @@ pub(super) fn build(bytes: &[u8], options: &Selection) -> Result<Vec<Entry>, Str
             entry.reasons.pop();
             entry
                 .reasons
-                .push("execution available: graded against the native reference; stub runtime output is fixture-only".into());
+                .push(if entry.kind == Kind::EmptyTopFuseProbe { "execution available: lifecycle-only probe, not suite-graded; stub runtime output is fixture-only" } else { "execution available: graded against the native reference; stub runtime output is fixture-only" }.into());
         }
     }
     Ok(entries)
@@ -297,9 +300,13 @@ mod tests {
         assert!(first.iter().all(|e| e.qualified
             && e.execution_available == e.runnable
             && e.runnable
-                == (e.backend == Backend::Native
+                == (matches!(e.backend, Backend::Native | Backend::Fuse)
                     && e.cell.base_form == BaseForm::TarZstSingleFrame
                     && e.cell.cache == Cache::Warm)));
+        assert!(first
+            .iter()
+            .any(|e| e.backend == Backend::Fuse && e.kind == Kind::Measured && e.runnable));
+        assert!(first.iter().any(|e| e.kind == Kind::EmptyTopFuseProbe && e.runnable && e.reasons.iter().any(|r| r == "execution available: lifecycle-only probe, not suite-graded; stub runtime output is fixture-only")));
         let bytes = serde_json::to_vec(&first).unwrap();
         assert_eq!(bytes, serde_json::to_vec(&schedule(&options)).unwrap());
         let identities: Vec<_> = first

@@ -1,4 +1,4 @@
-# Sandbox benchmark validation, schedules and native lifecycle
+# Sandbox benchmark validation, schedules and native/FUSE lifecycles
 
 Linux builds expose the hidden validator:
 
@@ -110,7 +110,7 @@ files, work roots or prepared sources are created. Each entry records the cell,
 catalog revision, backend, kind, repeat, pairing, seed, repeats, attempts, CPU
 limit, admission override and availability. `qualified` describes the validated
 manifest claim. `execution_available` and `runnable` are true only for qualified
-native/warm/`tar.zst-single-frame` entries. Dry-run `runnable` does not check
+native or FUSE warm `tar.zst-single-frame` entries. Dry-run `runnable` does not check
 execution's `--out` strict pins or its N6 `timeout_seconds` range of **1..=86400**.
 Other entries retain an unavailable
 reason; executable entries are graded against the native reference when executed.
@@ -130,8 +130,8 @@ Within each cell, a native `reference` comes first, followed by one discarded
 `warmup` per selected backend for warm cells, then `measured` entries, then one
 `empty-top-fuse-probe` if FUSE is selected. Cold cells have no warm-up; native-only
 cells have no FUSE probe. References, warm-ups and probes have no measured repeat
-number; warm-ups explicitly set `discarded:true`. The probe is a lifecycle
-placeholder without suite phases. Scheduling performs no cache treatment,
+number; warm-ups explicitly set `discarded:true`. The probe is a lifecycle-only
+run without suite phases. Scheduling performs no cache treatment,
 mounting, source preparation or runtime execution, and produces no benchmark numbers.
 
 Native execution is available with an explicit local Docker-compatible executable:
@@ -145,7 +145,7 @@ An explicit `--work-root` requires `--out`; the default `/var/tmp` does not
 trigger that requirement, so default dry-run and validate-only remain valid.
 Work-root need not be under `--out`: the sibling layout above stays valid.
 Execution requires every manifest pin and qualification to be resolved and
-selected jobs to be supported. FUSE, Git and cold selections are refused as a
+selected jobs to be supported. Git and cold selections are refused as a
 whole before setup. Overlap checks compare the unique scratch leaf minted under
 work-root with canonical artifact, source, catalog, runtime, output and placement
 roots, resolving host symlinks. Source, output and scratch groups must not overlap.
@@ -160,11 +160,94 @@ After equality and under-source checks, the six reasons use
 `work-root is an ancestor of ...`, checked in order with these suffixes:
 `the runtime executable`, `--out`, `the catalog directory`, `the artifact parent`,
 `placement.source`, then `placement.output`.
-Any selected FUSE entry takes refusal precedence with
-`FUSE execution unavailable: lifecycle deferred to B5a1a`.
+Unrunnable selections are refused before setup with
+`execution requires qualified warm tar.zst-single-frame selections (native or FUSE)`.
 Artifact final symlinks are refused. Artifact SHA-256 and the exact local image's
 RepoDigests, OS and architecture are checked before private roots are created;
 there is no fetching, pulling or source substitution.
+
+FUSE execution uses one owned Linux supervisor daemon per batch and a private
+0700 sibling `<work>/<id>-fuse`, outside the native scratch leaf. Docker requests
+`allow_other`; non-root users need the existing `user_allow_other` configuration.
+The expected `-o` options are validated before any FUSE effect; the original
+PermissionDenied diagnostic is preserved, with no owner-only retry. Stub mounts
+are owner-only. Both disable passthrough (`off`), recursion, synthetic HEAD and
+auto-unmount. The runtime must bind from the local host mount namespace.
+
+Both supervisor.sock and the worst-case inspection socket are checked before
+creation. An id is about 37 bytes (7-digit PID, 19-digit nanos); inspect.sock adds
+`len(id)+49` bytes beyond the work root. The full path must be strictly shorter
+than the actual `sun_path` (108 bytes on Linux), leaving about 21 bytes of work-root
+headroom in that example. These are examples, not fixed validation constants.
+Default `/var/tmp` passes; deeper project paths often do not. Refusal exits 2 as
+`sandbox bench: selection: ... choose a shorter --work-root`, creating nothing.
+
+Each supervisor exchange has its own 3600 s deadline, shared by connect, writes
+and reads, recomputed after short writes and bare EINTR. Ordinary connect receives
+the full remaining exchange time; production bench remains single-threaded so
+SIGINT/SIGTERM interrupt that connect. Only the hand-written read/write loops use
+at most 1 s timeout slices. Readiness retries ENOENT/ECONNREFUSED every 10 ms for
+30 s from spawn, checking daemon exit and the interrupt flag before requests.
+Daemon `--timeout 3600` is a per-operation prepare/new-startup cap, not a batch
+window. The bench/daemon cap race can produce uncertainty keep; no margin is added.
+Readiness means the socket is bound, not that Supervisor::open succeeded. On a
+first-exchange transport error, check whether the daemon exited and read
+`fuse-daemon.stderr.log`; that error still keeps state.
+
+Output retains separate exclusive `fuse-daemon.stdout.log` and
+`fuse-daemon.stderr.log`. Immediately after spawn, before readiness or new,
+`fuse-recovery.json` records daemon_pid, socket, state, stdout_log and stderr_log.
+A successful new writes `<index>-recovery.json` before runtime startup, adding
+runtime, container, request_id, finalize_request_id, attempt and returned mount.
+Only that returned mount is bound to `/repo`. Each new has a distinct id;
+finalize always uses its own `<batch_id>-<index>-finalize` id and `pack:false`.
+Held-fd re-verification before create_base protects bench's admitted artifact;
+it does not cover the daemon's later pathname open. A swap between remains a risk.
+
+`settings.fuse` records runtime kind/executable, mount options, UID/GID, the leaf,
+base options and expected worker options (not observed argv). Native-only batches
+have `settings.fuse:{"applicable":false}`. Only executed rows add `mount`; native
+rows use `{"applicable":false}`, FUSE rows add the returned path and have `tree:null`
+and `lifecycle_ms.extract:null`. FUSE lifecycle_ms includes new/finalize/destroy;
+preparation_ms records shared setup on the triggering entry, outside its total.
+Ratios compare wall time, not equivalent phases: native extraction differs from
+FUSE new/finalize/destroy; batch wall_ms includes shared preparation once.
+Probes run startup only, never suite-grade, and pass only if startup and every
+lifecycle step succeeds; nonzero startup is an error with the exit status retained.
+
+Any uncertain create_base/new, readiness failure/interrupt, live-attempt interrupt,
+writers_active, or stop/finalize/destroy error keeps state: bench calls its owned
+Child::kill, reaps, sends neither destroy nor Shutdown, and leaves the sibling.
+An aborted in-flight new has no per-entry record; row.recovery points to
+`<out>/fuse-recovery.json`. Look under `<state>/attempts` for a late attempt.
+A kept attempt is a dead FUSE mount (ENOTCONN) plus on-disk overlay and state:
+Linux parent-death SIGKILL also kills the daemon's mount children.
+Known limit: the wait after Child::kill on the keep path is unbounded, matching runtime.rs:138–139.
+
+With no live attempt or uncertain create/new, send Shutdown once after all
+destroys. Whenever the interrupt flag is set at send time, including batch end,
+use one 1 s deadline covering connect/write/read, tolerate the existing flag and
+make no retry; failure/expiry keeps. Otherwise Shutdown gets an ordinary 3600 s
+exchange. Poll reap for at most 2 s, then kill and keep on timeout; only a reaped
+daemon permits removing the leaf, before records are finished.
+
+For a kept leaf, inspect/copy needed overlay and state first. Unmount each attempt
+with `fusermount3 -u <mount>` (or a lazy unmount if a dead mount is busy), confirm
+no mount remains under the leaf, run `chmod -R u+w <leaf>`, then remove it.
+Never restart a daemon on a kept leaf: startup reconciliation deletes attempts.
+After a bench crash the daemon may still run. Check `/proc/<daemon_pid>/cmdline`
+against `ratarmount sandbox ... daemon` and the recorded socket/state before any
+signal; never kill a reused PID. For teardown prefer
+`ratarmount sandbox --socket <socket> shutdown`, then unmount leftovers and remove.
+If preserving an attempt, do not Shutdown or restart: unmount if needed, inspect
+and copy state, then remove. Do not kill a raw recorded PID without cmdline confirmation.
+
+Slice B5a1a-1 keeps writers_active without retry and interrupts with live attempts
+without destroy. It does not copy supervisor diagnostics before successful destroy,
+check leftover mountpoints before leaf removal, or exercise real FUSE acceptance.
+Those refinements belong to B5a1a-2/B5a1b. B5a1a-1 and B5a1a-2 must land as separate
+squash commits in sequence, and neither may merge before B5a1b real acceptance
+at the combined exact tip and hosted macOS clippy/tests. Help/about remains deferred.
 
 A checked Linux `getloadavg` reading measures one-minute host load against the
 strictest selected `max_load`. Failure, invalid readings and excessive load
@@ -172,7 +255,7 @@ refuse execution unless `--allow-high-load` is supplied. Outcomes record the
 reading or failure and the override. CPU oversubscription remains a separate
 `--allow-oversubscription` admission decision.
 
-Every reference, discarded warm-up and measurement extracts a fresh tree from
+Every native reference, discarded warm-up and measurement extracts a fresh tree from
 the pinned single-frame zstd artifact and verifies the complete tar-stream digest.
 Extraction permits regular files and directories. Relative symlink targets are
 accepted only when they stay inside the tree lexically and do not pass through
@@ -344,8 +427,8 @@ division (the lower middle for even sample counts).
 `ratios` matches passed measured FUSE/native rows by repeat within a group and
 divides FUSE total by native total, skipping zero native totals and unmatched
 repeats. It reports pair count, median and p95 using the same nearest-rank rule.
-Real FUSE execution remains deferred to B5a; current producer batches have no
-ratios. Synthetic paired fixtures exercise this calculation in tests.
+Native/FUSE ratios are wall-time comparisons, including their different lifecycle
+operations. Stub pairs remain fixtures.
 
 `verified_attempts_per_hour` is passed measured count times 3,600,000 divided by
 the batch's `wall_ms`, only when status is passed. Shared preparation, references,
@@ -359,7 +442,7 @@ across all cells. Other statuses report null. Zero wall time reports null with
 Execution requires explicit `--runtime-kind docker|stub`; classification is not
 inferred from `--runtime PATH` and is not a manifest field. `podman` is parsed but
 refused as **not yet qualified** before runtime canonicalisation, load checks,
-artifact opening, inspect, uname or any creation. FUSE and unrunnable selections
+artifact opening, inspect, uname or any creation. Unrunnable selections
 retain refusal precedence. `docker` identifies real execution; `stub` records
 `fixture:true`, `publishable:false` in batch/run records, and appends
 `; stub fixture, not publishable` to successful completion. Docker records use

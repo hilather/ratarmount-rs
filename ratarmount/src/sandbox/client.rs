@@ -27,7 +27,7 @@ pub(super) fn call(socket: &Path, request: Request) -> Result<Response, String> 
     decode_response(&line, &request)
 }
 
-fn decode_response(line: &[u8], request: &Request) -> Result<Response, String> {
+pub(super) fn decode_response(line: &[u8], request: &Request) -> Result<Response, String> {
     if line.len() > protocol::MAX_RESPONSE || !line.ends_with(b"\n") {
         return Err("oversized or incomplete sandbox response".into());
     }
