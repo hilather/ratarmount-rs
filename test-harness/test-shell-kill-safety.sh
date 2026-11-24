@@ -160,18 +160,35 @@ fail_owned_job() {
     } >&2
     fail "$@"
 }
+# Stop an owned readiness job and observe the stop independently of Bash's
+# job-state filters. Readiness is printed before exec, and on macOS (XNU) execve
+# continues in a new proc and task: a SIGSTOP that lands mid-exec stops only the
+# discarded image and kill still succeeds. So first wait, bounded, until the PID
+# runs sleep, then repeat the idempotent SIGSTOP until ps reports T.
+stop_owned_job() {
+    local pid=$1 label=$2 attempt=0 comm stat
+    while :; do
+        comm=$(ps -o comm= -p "$pid") || fail_owned_job "$pid" "cannot inspect $label image"
+        comm=${comm#"${comm%%[![:space:]]*}"}
+        comm=${comm%"${comm##*[![:space:]]}"}
+        if [[ "$comm" == sleep || "$comm" == */sleep ]]; then break; fi
+        [[ $attempt -lt 100 ]] || fail_owned_job "$pid" "$label never started sleep (image: $comm)"
+        sleep 0.05 || fail_owned_job "$pid" "$label exec polling failed"
+        attempt=$((attempt + 1))
+    done
+    attempt=0
+    while :; do
+        builtin kill -STOP "$pid" || fail_owned_job "$pid" "cannot stop $label"
+        stat=$(ps -o stat= -p "$pid") || fail_owned_job "$pid" "cannot inspect stopped $label"
+        stat=${stat#"${stat%%[![:space:]]*}"}
+        if [[ "$stat" == T* ]]; then return 0; fi
+        [[ $attempt -lt 100 ]] || fail_owned_job "$pid" "$label never stopped"
+        sleep 0.05 || fail_owned_job "$pid" "$label stop polling failed"
+        attempt=$((attempt + 1))
+    done
+}
 # Regression: without job control, jobs -pr still selects a stopped owned job.
-# Observe the stop independently of Bash's job-state filters, within five seconds.
-builtin kill -STOP "$job" || fail_owned_job "$job" "cannot stop owned job"
-attempt=0
-while :; do
-    stat=$(ps -o stat= -p "$job") || fail_owned_job "$job" "cannot inspect stopped job"
-    stat=${stat#"${stat%%[![:space:]]*}"}
-    if [[ "$stat" == T* ]]; then break; fi
-    [[ $attempt -lt 100 ]] || fail_owned_job "$job" "owned job never stopped"
-    sleep 0.05 || fail_owned_job "$job" "stop polling failed"
-    attempt=$((attempt + 1))
-done
+stop_owned_job "$job" "owned job" || fail_owned_job "$job" "owned job stop failed"
 # Keep this call in the owning shell: (...) would discard its job table.
 kill_log="$logs/stopped.log-only"
 : > "$kill_log" || fail_owned_job "$job" "cannot create stopped-job log"
@@ -384,16 +401,7 @@ job=$!
 read -r -t 10 message <&4 || fail_owned_job "$job" "reap job never became ready"
 exec 4>&- || fail_owned_job "$job" "cannot close reap-job FIFO"
 [[ "$message" == ready ]] || fail_owned_job "$job" "unexpected reap-job readiness"
-builtin kill -STOP "$job" || fail_owned_job "$job" "cannot stop reap job"
-attempt=0
-while :; do
-    stat=$(ps -o stat= -p "$job") || fail_owned_job "$job" "cannot inspect stopped reap job"
-    stat=${stat#"${stat%%[![:space:]]*}"}
-    if [[ "$stat" == T* ]]; then break; fi
-    [[ $attempt -lt 100 ]] || fail_owned_job "$job" "reap job never stopped"
-    sleep 0.05 || fail_owned_job "$job" "reap stop polling failed"
-    attempt=$((attempt + 1))
-done
+stop_owned_job "$job" "reap job" || fail_owned_job "$job" "reap job stop failed"
 reap_owned "$job" || fail_owned_job "$job" "stopped reap job did not exit within five seconds"
 [[ $rc -eq 143 ]] || fail_owned_job "$job" "stopped reap job exited with $rc, want 143 (SIGTERM)"
 job=''
