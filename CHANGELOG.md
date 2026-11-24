@@ -25,6 +25,7 @@
 
 ### Fixes
 
+- Selected harness and inline cleanup handlers skip recorded PIDs that are not currently running jobs of this shell; the `jobs -pr` snapshot-to-kill race and same-shell PID reuse by another running job remain. Without job control, a stopped owned job is still signalled; it is our own child and the signal is delivered on resume. (#246)
 - Offline `--commit-overlay` could clear a stale commit-journal prepare locator when the overlay database and its marker were both removed between its entry check and its journal recovery; the recovery now keeps what the entry check saw and refuses with the locator kept. (#164)
 - Offline commit recovery also retains marker requirements discovered by the metadata read or identity gate after the initial classification. Removing the marker and emptying the database or dropping its `files` table now refuses before stale-locator cleanup, including with `--force-base-mismatch`. (#164 review)
 - A live commit refused by the commit-journal recovery guard before anything was written (the overlay database replaced or lost next to a stale prepare locator) disabled the live base: interval commits stopped and base reads failed until a remount. Such a refusal now refuses that commit only. Overlay payloads remain readable even when a recovery failure disables the base. (#166)

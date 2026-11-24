@@ -60,6 +60,9 @@ jobs:
       - name: canonical hash reference self-test
         run: python3 -I test-harness/canonical-hash/reference.py --self-test
 
+      - name: harness kill guard self-test
+        run: bash test-harness/test-shell-kill-safety.sh
+
       - name: wheel export audit self-test
         run: python3 -I packaging/audit_native_exports.py --self-test
 
@@ -374,6 +377,13 @@ jobs:
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
     steps:
       - uses: actions/checkout@v4
+
+      - name: harness kill guard self-test (native Bash 3.2)
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+        run: |
+          echo "BASH_VERSION=$BASH_VERSION"
+          [[ ${BASH_VERSINFO[0]} == 3 && ${BASH_VERSINFO[1]} == 2 ]]
+          /bin/bash test-harness/test-shell-kill-safety.sh
 
       - name: Homebrew deps
         # fuser on Darwin requires pkg-config package "fuse" or "osxfuse"

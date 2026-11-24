@@ -14,7 +14,7 @@ MOUNT_PIDS=()
 cleanup() {
     set +e
     for pid in "${MOUNT_PIDS[@]:-}"; do
-        kill "$pid" 2>/dev/null || true
+        kill_running_jobs "$pid"
     done
     for pid in "${MOUNT_PIDS[@]:-}"; do
         wait "$pid" 2>/dev/null || true

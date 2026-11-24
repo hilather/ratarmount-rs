@@ -122,7 +122,10 @@ cleanup() {
         umount -l "$MNT" 2>/dev/null || umount "$MNT" 2>/dev/null || true
     fi
     if [[ -n "${PID:-}" ]]; then
-        kill "$PID" 2>/dev/null || true
+        # Only while still a running job: once reaped, its pid may name another process.
+        if [[ " $(jobs -pr | tr '\n' ' ') " == *" $PID "* ]]; then
+            kill "$PID" 2>/dev/null || true
+        fi
         wait "$PID" 2>/dev/null || true
     fi
 }
