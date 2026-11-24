@@ -15,6 +15,7 @@ scratch=$(mktemp -d) || fail "cannot create scratch directory"
 logs=$(mktemp -d) || { rm -rf "$scratch"; fail "cannot create log directory"; }
 helper=''
 job=''
+finished=''
 # Independent of the guard under test, including during mutation failures.
 # Poll both running and stopped jobs before wait, so a stopped child cannot hang
 # this test. rc retains wait's status; a polling timeout is a separate failure.
@@ -31,20 +32,26 @@ wait_owned() {
     rc=0
     wait "$pid" 2>/dev/null || rc=$?
 }
+reap_signal() { builtin kill "$@"; }
 reap_owned() {
-    local pid running stopped
-    running=" $(jobs -pr | tr '\n' ' ') " || return 1
-    stopped=" $(jobs -ps | tr '\n' ' ') " || return 1
+    local pid owned
+    # Exclude finished jobs; without job control, stopped children remain in -pr.
+    owned=" $(jobs -pr | tr '\n' ' ') " || return 1
     for pid in "$@"; do
-        if [[ -n "$pid" && "$running$stopped" == *" $pid "* ]]; then
-            builtin kill -CONT "$pid" 2>/dev/null || true
-            builtin kill "$pid" 2>/dev/null || true
+        if [[ -n "$pid" && "$owned" == *" $pid "* ]]; then
+            reap_signal -CONT "$pid" 2>/dev/null || true
+            reap_signal "$pid" 2>/dev/null || true
         fi
         [[ -z "$pid" ]] || wait_owned "$pid" || return 1
     done
 }
 cleanup_test() {
     local status=$?
+    # The finished-job discriminator is wait-only, including on failure: its
+    # recorded PID must never reach reap_owned's signalling cleanup.
+    if [[ -n "$finished" ]]; then
+        wait "$finished" 2>/dev/null || status=1
+    fi
     reap_owned "$helper" "$job" || status=1
     exec 4>&- || status=1
     rm -rf "$scratch" "$logs" || status=1
@@ -132,45 +139,87 @@ builtin kill -0 "$unrelated" 2>/dev/null || fail "foreign child was signalled"
 ready="$scratch/job.ready"
 mkfifo "$ready" || fail "cannot create job FIFO"
 exec 4<> "$ready" || fail "cannot open job FIFO"
-# Noninteractive Bash tracks stopped status only with job control enabled.
-set -m
 "$BASH" -c 'printf "ready\n" > "$1" || exit 1; exec sleep 60' _ "$ready" 4>&- &
 job=$!
 read -r -t 10 message <&4 || fail "shared job never became ready"
 exec 4>&- || fail "cannot close job FIFO"
 [[ "$message" == ready ]] || fail "unexpected shared job readiness"
-# Regression: stopped jobs must be excluded by jobs -pr. Even a jobs -p
-# mutation reaches only this log-only stub. Observe the stop with a deadline.
-builtin kill -STOP "$job" || fail "cannot stop owned job"
+# Non-fatal diagnostics for both owning-shell job-state cases below.
+fail_owned_job() {
+    local pid=$1
+    shift || fail "missing diagnostic PID"
+    {
+        printf '%s\n' 'jobs -l:' || true
+        jobs -l || true
+        printf '%s\n' 'jobs -ps:' || true
+        jobs -ps || true
+        printf '%s\n' 'jobs -pr:' || true
+        jobs -pr || true
+        printf '%s\n' "ps -o pid,stat,command -p $pid:" || true
+        ps -o pid,stat,command -p "$pid" || true
+    } >&2
+    fail "$@"
+}
+# Regression: without job control, jobs -pr still selects a stopped owned job.
+# Observe the stop independently of Bash's job-state filters, within five seconds.
+builtin kill -STOP "$job" || fail_owned_job "$job" "cannot stop owned job"
 attempt=0
 while :; do
-    stopped=" $(jobs -ps | tr '\n' ' ') " || fail "cannot list stopped jobs"
-    [[ "$stopped" != *" $job "* ]] || break
-    [[ $attempt -lt 100 ]] || fail "owned job never stopped"
-    sleep 0.05 || fail "stop polling failed"
+    stat=$(ps -o stat= -p "$job") || fail_owned_job "$job" "cannot inspect stopped job"
+    stat=${stat#"${stat%%[![:space:]]*}"}
+    if [[ "$stat" == T* ]]; then break; fi
+    [[ $attempt -lt 100 ]] || fail_owned_job "$job" "owned job never stopped"
+    sleep 0.05 || fail_owned_job "$job" "stop polling failed"
     attempt=$((attempt + 1))
 done
 # Keep this call in the owning shell: (...) would discard its job table.
 kill_log="$logs/stopped.log-only"
-: > "$kill_log" || fail "cannot create stopped-job log"
-kill() { printf '%s\n' "$*" >> "$kill_log" || fail "cannot log signal"; }
-kill_running_jobs "$job" || fail "stopped-job cleanup failed"
-[[ ! -s "$kill_log" ]] || fail "stopped job reached log-only kill: $(cat "$kill_log")"
-unset -f kill || fail "cannot remove stopped-job signal stub"
-builtin kill -CONT "$job" || fail "cannot resume owned job"
+: > "$kill_log" || fail_owned_job "$job" "cannot create stopped-job log"
+# Preserve stderr for logging failures even though the guard silences kill.
+kill() { printf '%s\n' "$*" >> "$kill_log" || fail_owned_job "$job" "cannot log signal" 2>&6; }
+kill_running_jobs "$job" "$unrelated" 6>&2 || fail_owned_job "$job" "stopped-job cleanup failed"
+# Compare the file including its final newline, so extra blank calls also fail.
+printf '%s\n' "$job" > "$logs/stopped.expected" || fail_owned_job "$job" "cannot create stopped-job expectation"
+cmp -s "$kill_log" "$logs/stopped.expected" || fail_owned_job "$job" "stopped owned job was not signalled exactly once"
+unset -f kill || fail_owned_job "$job" "cannot remove stopped-job signal stub"
+builtin kill -CONT "$job" || fail_owned_job "$job" "cannot resume owned job"
 attempt=0
 while :; do
-    running=" $(jobs -pr | tr '\n' ' ') " || fail "cannot list running jobs"
-    [[ "$running" != *" $job "* ]] || break
-    [[ $attempt -lt 100 ]] || fail "owned job never resumed"
-    sleep 0.05 || fail "resume polling failed"
+    stat=$(ps -o stat= -p "$job") || fail_owned_job "$job" "cannot inspect resumed job"
+    stat=${stat#"${stat%%[![:space:]]*}"}
+    if [[ -n "$stat" && "$stat" != T* ]]; then break; fi
+    [[ $attempt -lt 100 ]] || fail_owned_job "$job" "owned job never resumed"
+    sleep 0.05 || fail_owned_job "$job" "resume polling failed"
     attempt=$((attempt + 1))
 done
-kill_running_jobs "$job" || fail "running-job cleanup failed"
-wait_owned "$job" || fail "running job did not exit within five seconds"
-set +m
+kill_running_jobs "$job" || fail_owned_job "$job" "running-job cleanup failed"
+wait_owned "$job" || fail_owned_job "$job" "running job did not exit within five seconds"
+[[ $rc -eq 143 ]] || fail_owned_job "$job" "running job exited with $rc, want 143 (SIGTERM)"
 job=''
-[[ $rc -eq 143 ]] || fail "running job exited with $rc, want 143 (SIGTERM)"
+
+# Regression: jobs -pr rejects a finished, un-waited job still listed by jobs -p.
+# Keep this in the owning script shell: Bash 3.2 loses the entry in a -c shell.
+true &
+finished=$!
+attempt=0
+while :; do
+    running=" $(jobs -pr | tr '\n' ' ') " || fail_owned_job "$finished" "cannot list running jobs for finished case"
+    [[ "$running" == *" $finished "* ]] || break
+    [[ $attempt -lt 100 ]] || fail_owned_job "$finished" "finished job never left jobs -pr"
+    sleep 0.05 || fail_owned_job "$finished" "finished-job polling failed"
+    attempt=$((attempt + 1))
+done
+owned=" $(jobs -p | tr '\n' ' ') " || fail_owned_job "$finished" "cannot list owned jobs for finished case"
+[[ "$owned" == *" $finished "* ]] || fail_owned_job "$finished" "finished job missing from jobs -p; discriminator is not live"
+kill_log="$logs/finished.log-only"
+: > "$kill_log" || fail_owned_job "$finished" "cannot create finished-job log"
+kill() { printf '%s\n' "$*" >> "$kill_log" || fail_owned_job "$finished" "cannot log signal" 2>&6; }
+kill_running_jobs "$finished" 6>&2 || fail_owned_job "$finished" "finished-job cleanup failed"
+contents=$(cat "$kill_log") || fail_owned_job "$finished" "cannot read finished-job log"
+[[ ! -s "$kill_log" ]] || fail_owned_job "$finished" "finished job reached log-only kill: $contents"
+unset -f kill || fail_owned_job "$finished" "cannot remove finished-job signal stub"
+wait "$finished" || fail_owned_job "$finished" "finished job wait failed"
+finished=''
 
 # Regression: empty input, unsafe targets and partial numeric matches cannot
 # pass a controlled job list. No signal in this block is ever forwarded.
@@ -294,6 +343,60 @@ helper=''
 [[ $rc -eq 0 ]] || fail "reaped-child helper exited with $rc, want 0"
 [[ -f "$helper_log" ]] || fail "reaped-child helper kill log missing"
 [[ ! -s "$helper_log" ]] || fail "helper reached reaped log-only kill: $(cat "$helper_log")"
+
+# Regression: reap_owned must only wait for a completed, un-waited owned job.
+# All earlier helpers are reaped before replacing the cleanup signal function.
+# Keep the job in this owning shell, and intercept both signals even in mutants.
+true &
+finished=$!
+attempt=0
+while :; do
+    running=" $(jobs -pr | tr '\n' ' ') " || fail_owned_job "$finished" "cannot list running jobs for reap case"
+    [[ "$running" == *" $finished "* ]] || break
+    [[ $attempt -lt 100 ]] || fail_owned_job "$finished" "reap job never left jobs -pr"
+    sleep 0.05 || fail_owned_job "$finished" "reap-job polling failed"
+    attempt=$((attempt + 1))
+done
+owned=" $(jobs -p | tr '\n' ' ') " || fail_owned_job "$finished" "cannot list owned jobs for reap case"
+[[ "$owned" == *" $finished "* ]] || fail_owned_job "$finished" "reap job missing from jobs -p; discriminator is not live"
+reap_log="$logs/reap.log-only"
+: > "$reap_log" || fail_owned_job "$finished" "cannot create reap log"
+reap_signal() {
+    # Log targets only, so any erroneous CONT call also gives decimal PID evidence.
+    if [[ $1 == -CONT ]]; then shift || fail_owned_job "$finished" "cannot parse reap signal" 2>&6; fi
+    printf '%s\n' "$@" >> "$reap_log" || fail_owned_job "$finished" "cannot log reap signal" 2>&6
+}
+reap_owned "$finished" 6>&2 || fail_owned_job "$finished" "completed-job reap failed"
+reap_signal() { builtin kill "$@"; }
+[[ $rc -eq 0 ]] || fail_owned_job "$finished" "completed reap job exited with $rc, want 0"
+owned=" $(jobs -p | tr '\n' ' ') " || fail_owned_job "$finished" "cannot list jobs after reap"
+[[ "$owned" != *" $finished "* ]] || fail_owned_job "$finished" "completed job was not reaped"
+contents=$(cat "$reap_log") || fail_owned_job "$finished" "cannot read reap log"
+[[ ! -s "$reap_log" ]] || fail_owned_job "$finished" "reap cleanup reached log-only kill: $contents"
+finished=''
+
+# Regression: reap_owned resumes, terminates and boundedly reaps a stopped child.
+ready="$scratch/reap.ready"
+mkfifo "$ready" || fail "cannot create reap-job FIFO"
+exec 4<> "$ready" || fail "cannot open reap-job FIFO"
+"$BASH" -c 'printf "ready\n" > "$1" || exit 1; exec sleep 60' _ "$ready" 4>&- &
+job=$!
+read -r -t 10 message <&4 || fail_owned_job "$job" "reap job never became ready"
+exec 4>&- || fail_owned_job "$job" "cannot close reap-job FIFO"
+[[ "$message" == ready ]] || fail_owned_job "$job" "unexpected reap-job readiness"
+builtin kill -STOP "$job" || fail_owned_job "$job" "cannot stop reap job"
+attempt=0
+while :; do
+    stat=$(ps -o stat= -p "$job") || fail_owned_job "$job" "cannot inspect stopped reap job"
+    stat=${stat#"${stat%%[![:space:]]*}"}
+    if [[ "$stat" == T* ]]; then break; fi
+    [[ $attempt -lt 100 ]] || fail_owned_job "$job" "reap job never stopped"
+    sleep 0.05 || fail_owned_job "$job" "reap stop polling failed"
+    attempt=$((attempt + 1))
+done
+reap_owned "$job" || fail_owned_job "$job" "stopped reap job did not exit within five seconds"
+[[ $rc -eq 143 ]] || fail_owned_job "$job" "stopped reap job exited with $rc, want 143 (SIGTERM)"
+job=''
 
 # S1's explicit cohort: assert every file exists, sources env.sh and is inspected.
 callers=(run-codec-allowlist run-index-interop run-phase2-allowlist run-phase3-gzip run-phase7-nested)

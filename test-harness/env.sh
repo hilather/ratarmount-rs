@@ -76,12 +76,13 @@ ratar_wait_mounted() {
 }
 
 # SIGTERM each given pid, skipping recorded PIDs that are not currently running
-# jobs of this shell (`jobs -pr` excludes stopped jobs). Pass `$!` of a simple
+# jobs of this shell. Pass `$!` of a simple
 # command or subshell: a pipeline's last PID may differ from `jobs -p`'s leader.
 # This is a numeric snapshot, not an identity guarantee: the snapshot-to-kill
 # race remains if a job exits and is reaped before `kill`. Same-shell PID reuse
 # by another running job also passes the guard, even if the recorded job was
-# reaped before cleanup.
+# reaped before cleanup. Without job control, a stopped owned job is still
+# signalled; it is our own child and the signal is delivered on resume.
 kill_running_jobs() {
     local running pid
     running=" $(jobs -pr | tr '\n' ' ') "
